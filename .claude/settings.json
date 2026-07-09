@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "okf": {
+      "source": {
+        "source": "directory",
+        "path": "."
+      }
+    }
+  },
+  "enabledPlugins": {
+    "okf-mcp@okf": true
+  }
+}

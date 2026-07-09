@@ -1,0 +1,310 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/inter";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: 'Inter Variable', sans-serif;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+    --background: oklch(0.9626 0.0021 197.1); /* #F1F3F3 — soft gray page */
+    --foreground: oklch(0.148 0.004 228.8);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.148 0.004 228.8);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.148 0.004 228.8);
+    --primary: oklch(0.52 0.105 223.128);
+    --primary-foreground: oklch(0.984 0.019 200.873);
+    --secondary: oklch(0.967 0.001 286.375);
+    --secondary-foreground: oklch(0.21 0.006 285.885);
+    --muted: oklch(0.963 0.002 197.1);
+    --muted-foreground: oklch(0.56 0.021 213.5);
+    --accent: oklch(0.963 0.002 197.1);
+    --accent-foreground: oklch(0.218 0.008 223.9);
+    --destructive: oklch(0.577 0.245 27.325);
+    --border: oklch(0.925 0.005 214.3);
+    --input: oklch(0.925 0.005 214.3);
+    --ring: oklch(0.723 0.014 214.4);
+    --chart-1: oklch(0.855 0.138 181.071);
+    --chart-2: oklch(0.704 0.14 182.503);
+    --chart-3: oklch(0.6 0.118 184.704);
+    --chart-4: oklch(0.511 0.096 186.391);
+    --chart-5: oklch(0.437 0.078 188.216);
+    --radius: 0.625rem;
+    /* Dark sidebar (#2E2E2E) against the light content area. Its sub-tokens are
+       flipped to light-on-dark so nav text, hover/active states, and borders
+       stay legible on the dark surface. */
+    --sidebar: oklch(0.3012 0 0); /* #2E2E2E */
+    --sidebar-foreground: oklch(0.97 0 0);
+    --sidebar-primary: oklch(0.685 0.169 237.323); /* sky, brightened for dark */
+    --sidebar-primary-foreground: oklch(0.977 0.013 236.62);
+    --sidebar-accent: oklch(0.37 0 0); /* hover/active: one step lighter */
+    --sidebar-accent-foreground: oklch(0.97 0 0);
+    --sidebar-border: oklch(1 0 0 / 10%);
+    --sidebar-ring: oklch(0.556 0 0);
+}
+
+.dark {
+    --background: oklch(0.1477 0.004 228.8); /* #090B0C — page background */
+    --foreground: oklch(0.987 0.002 197.1);
+    --card: oklch(0.218 0.008 223.9);
+    --card-foreground: oklch(0.987 0.002 197.1);
+    --popover: oklch(0.218 0.008 223.9);
+    --popover-foreground: oklch(0.987 0.002 197.1);
+    --primary: oklch(0.6 0.11 224.283);
+    --primary-foreground: oklch(0.984 0.019 200.873);
+    --secondary: oklch(0.274 0.006 286.033);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.275 0.011 216.9);
+    --muted-foreground: oklch(0.723 0.014 214.4);
+    --accent: oklch(0.275 0.011 216.9);
+    --accent-foreground: oklch(0.987 0.002 197.1);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.56 0.021 213.5);
+    --chart-1: oklch(0.855 0.138 181.071);
+    --chart-2: oklch(0.704 0.14 182.503);
+    --chart-3: oklch(0.6 0.118 184.704);
+    --chart-4: oklch(0.511 0.096 186.391);
+    --chart-5: oklch(0.437 0.078 188.216);
+    /* Darker sidebar (#161616) in dark mode — reads as a recessed panel against
+       the lighter content bg. Hover accent is a lighter gray so it stays
+       visible on the near-black surface. */
+    --sidebar: oklch(0.2002 0 0); /* #161616 */
+    --sidebar-foreground: oklch(0.97 0 0);
+    --sidebar-primary: oklch(0.685 0.169 237.323);
+    --sidebar-primary-foreground: oklch(0.293 0.066 243.157);
+    --sidebar-accent: oklch(0.3 0 0);
+    --sidebar-accent-foreground: oklch(0.97 0 0);
+    --sidebar-border: oklch(1 0 0 / 10%);
+    --sidebar-ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+
+  /* Tailwind v4's Preflight resets buttons/role=button to cursor:default (the
+     raw browser default), unlike v3. Restore the pointer for enabled clickable
+     controls — covers shadcn Button, tabs, sidebar items, tree rows, and the
+     Select trigger. Disabled controls keep the default arrow. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  label[for],
+  summary {
+    cursor: pointer;
+    }
+}
+
+/* Rendered concept-doc markdown. Hand-rolled (no @tailwindcss/typography dep)
+   and scoped so it never leaks into the app chrome. Uses semantic tokens only. */
+@layer components {
+  .okf-prose {
+    @apply text-sm leading-relaxed text-foreground;
+  }
+  .okf-prose > :first-child { @apply mt-0; }
+  .okf-prose h1 { @apply mt-6 mb-3 text-xl font-semibold tracking-tight; }
+  .okf-prose h2 { @apply mt-6 mb-2 border-b pb-1 text-lg font-semibold tracking-tight; }
+  .okf-prose h3 { @apply mt-5 mb-2 text-base font-semibold; }
+  .okf-prose h4 { @apply mt-4 mb-1 text-sm font-semibold; }
+  .okf-prose p { @apply my-3; }
+  .okf-prose ul { @apply my-3 list-disc pl-6; }
+  .okf-prose ol { @apply my-3 list-decimal pl-6; }
+  .okf-prose li { @apply my-1; }
+  .okf-prose li > ul, .okf-prose li > ol { @apply my-1; }
+  .okf-prose a { @apply font-medium text-primary underline-offset-4 hover:underline; }
+  .okf-prose blockquote {
+    @apply my-3 border-l-2 border-border pl-4 text-muted-foreground italic;
+  }
+  .okf-prose hr { @apply my-6; }
+  .okf-prose code {
+    @apply rounded bg-muted px-1.5 py-0.5 font-mono text-[0.8125em];
+  }
+  .okf-prose pre {
+    @apply my-3 overflow-x-auto rounded-md border bg-muted p-3 text-xs;
+  }
+  .okf-prose pre code {
+    @apply bg-transparent p-0 text-xs;
+  }
+  /* highlight.js (rehype-highlight) token colors, mapped onto our theme tokens
+     so SQL/code highlighting reads well in BOTH light and dark mode instead of
+     shipping a fixed-palette hljs theme. Keywords use the primary (cyan); the
+     rest lean on chart/muted tokens. */
+  .okf-prose .hljs-keyword,
+  .okf-prose .hljs-selector-tag,
+  .okf-prose .hljs-literal,
+  .okf-prose .hljs-section,
+  .okf-prose .hljs-built_in,
+  .okf-prose .hljs-name {
+    color: var(--primary);
+    font-weight: 600;
+  }
+  .okf-prose .hljs-string,
+  .okf-prose .hljs-attr,
+  .okf-prose .hljs-template-tag,
+  .okf-prose .hljs-addition {
+    color: var(--chart-2);
+  }
+  .okf-prose .hljs-number,
+  .okf-prose .hljs-symbol,
+  .okf-prose .hljs-bullet,
+  .okf-prose .hljs-link {
+    color: var(--chart-4);
+  }
+  .okf-prose .hljs-title,
+  .okf-prose .hljs-type,
+  .okf-prose .hljs-function .hljs-title {
+    color: var(--chart-1);
+  }
+  .okf-prose .hljs-comment,
+  .okf-prose .hljs-quote,
+  .okf-prose .hljs-meta {
+    color: var(--muted-foreground);
+    font-style: italic;
+  }
+  .okf-prose table {
+    @apply my-3 block w-full max-w-full overflow-x-auto border-collapse text-sm;
+  }
+  .okf-prose th {
+    @apply border bg-muted px-3 py-1.5 text-left font-medium;
+  }
+  .okf-prose td { @apply border px-3 py-1.5 align-top; }
+  .okf-prose img { @apply my-3 max-w-full rounded-md border; }
+
+  /* Inline markdown for a single feed row: keep GFM inline formatting (bold,
+     code, links) but flatten block structure so it stays on one line and can be
+     truncated by the parent's `truncate`. */
+  .okf-inline-md { @apply inline; }
+  .okf-inline-md * { @apply inline; }
+  .okf-inline-md code {
+    @apply rounded bg-muted px-1 py-0.5 font-mono text-[0.85em];
+  }
+  .okf-inline-md a {
+    @apply font-medium text-primary underline-offset-4 hover:underline;
+  }
+  /* Collapse list markers / breaks that would otherwise force wrapping. */
+  .okf-inline-md ul, .okf-inline-md ol, .okf-inline-md li {
+    @apply list-none p-0;
+  }
+  .okf-inline-md br { display: none; }
+
+  /* Thin, transparent-track scrollbar for native overflow panes (the live feed).
+     The default track paints an opaque bar that looks heavy against the card;
+     make it transparent and give the thumb a subtle, theme-aware tint. */
+  .okf-thin-scroll {
+    scrollbar-width: thin;                         /* Firefox */
+    scrollbar-color: var(--border) transparent;    /* thumb / track */
+  }
+  .okf-thin-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .okf-thin-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .okf-thin-scroll::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: 9999px;
+    /* Inset the thumb so it reads as a slim pill on the transparent track. */
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  .okf-thin-scroll::-webkit-scrollbar-thumb:hover {
+    background-color: var(--muted-foreground);
+    background-clip: padding-box;
+  }
+}
+
+/* Radix ScrollArea's viewport wraps its children in a div with
+   `min-width:100%; display:table`. A table box shrink-wraps to content width, so
+   a long, unbreakable child (e.g. a deep concept file name) makes the pane grow
+   past its container instead of the child truncating. For the Browse concepts
+   tree we want the opposite: fill the width and truncate. Force that wrapper to
+   block so `w-full` rows resolve against the card, not their content. Scoped to
+   the tree only — the doc viewer's ScrollArea keeps table for wide code/tables. */
+.okf-tree-scroll [data-slot="scroll-area-viewport"] > div {
+  display: block !important;
+}
+
+/* React Flow theming — map its defaults (white panels, blue edges) onto our
+   semantic tokens so the graph looks native in both light and dark mode. */
+.okf-graph {
+  /* Edges use a muted-foreground tint (visible in both light and dark, unlike
+     --border which is ~10% white in dark mode) and match the arrow markers. */
+  --xy-edge-stroke-default: color-mix(in oklch, var(--muted-foreground) 55%, transparent);
+  --xy-edge-stroke-selected-default: var(--primary);
+  --xy-attribution-background-color-default: transparent;
+}
+.okf-graph .react-flow__controls {
+  @apply overflow-hidden rounded-lg border bg-card shadow-sm;
+  border-color: var(--border);
+}
+.okf-graph .react-flow__controls-button {
+  @apply border-0 bg-card text-foreground;
+  border-bottom: 1px solid var(--border);
+}
+.okf-graph .react-flow__controls-button:hover {
+  @apply bg-muted;
+}
+.okf-graph .react-flow__controls-button svg {
+  fill: currentColor;
+}
+.okf-graph .react-flow__attribution {
+  @apply text-[10px];
+  color: var(--muted-foreground);
+}
+.okf-graph .react-flow__edge-path {
+  stroke-width: 1.5;
+}
+/* Dim edges/nodes not part of the current focus set. */
+.okf-graph .react-flow__edge.is-dimmed { opacity: 0.12; }

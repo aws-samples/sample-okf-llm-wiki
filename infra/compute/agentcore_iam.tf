@@ -1,0 +1,386 @@
+# IAM execution roles for the two AgentCore runtimes. These perms apply to ALL
+# agent code and can't be scoped per-invocation, so keep them least-privilege.
+
+data "aws_iam_policy_document" "agentcore_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["bedrock-agentcore.amazonaws.com"]
+    }
+    # Canonical confused-deputy guards for the AgentCore service principal.
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:aws:bedrock-agentcore:${var.region}:${local.account_id}:*"]
+    }
+  }
+}
+
+# Baseline permissions EVERY AgentCore runtime execution role needs — the
+# create-time validator rejects the role without them. Straight from the AWS
+# "IAM Permissions for AgentCore Runtime" doc: ECR image pull + auth token,
+# CloudWatch Logs for the runtime log group, X-Ray traces, and the scoped
+# PutMetricData. Attached to BOTH runtimes' roles.
+data "aws_iam_policy_document" "agentcore_baseline" {
+  statement {
+    sid       = "ECRImageAccess"
+    actions   = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+    resources = ["arn:aws:ecr:${var.region}:${local.account_id}:repository/*"]
+  }
+  statement {
+    sid       = "ECRTokenAccess"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"] # GetAuthorizationToken does not support resource scoping
+  }
+  statement {
+    sid       = "LogGroup"
+    actions   = ["logs:CreateLogGroup", "logs:DescribeLogStreams"]
+    resources = ["arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/bedrock-agentcore/runtimes/*"]
+  }
+  statement {
+    sid       = "LogGroupDescribe"
+    actions   = ["logs:DescribeLogGroups"]
+    resources = ["arn:aws:logs:${var.region}:${local.account_id}:log-group:*"]
+  }
+  statement {
+    sid       = "LogStream"
+    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"]
+  }
+  statement {
+    sid       = "XRay"
+    actions   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:GetSamplingRules", "xray:GetSamplingTargets"]
+    resources = ["*"]
+  }
+  statement {
+    sid       = "Metrics"
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = ["bedrock-agentcore"]
+    }
+  }
+}
+
+# --- Harvest DATA role (assumed per-invocation, down-scoped) -------------------
+# The Glue/Athena/table-data grants a harvest NEEDS are inherently broad on the
+# STATIC role — the target database isn't known until invoke time (threats #9/#60,
+# and AgentCore exposes the execution role to any in-VM code via MMDS, so a
+# tool-layer allow-list is NOT a credential boundary). So these broad grants live
+# on a SEPARATE data role that the harvest runtime assumes PER INVOCATION with an
+# inline STS session policy pinned to the one database + workgroup being harvested
+# (see services/harvest/src/harvest/clients.py:build_scoped_session). The session
+# policy can only INTERSECT this ceiling, so the effective per-run permission is
+# the single dataset — enforced by IAM, outside the (injectable) Python process.
+#
+# Actions that genuinely cannot be ARN-scoped stay here at the ceiling:
+#   - glue:GetDatabases (list) is catalog-level only, and
+#   - TableDataRead s3:GetObject is "*" because Glue tables point at arbitrary
+#     buckets (e.g. the BIRD data bucket) — the session policy keeps these broad.
+data "aws_iam_policy_document" "harvest_data" {
+  # checkov:skip=CKV_AWS_108:Accepted residual — TableDataRead s3:GetObject must be "*" because a Glue table's storage location can be any bucket; contained by the per-invocation STS session policy (clients._session_policy), not this static ceiling.
+  # checkov:skip=CKV_AWS_111:Athena/S3 write is scoped to the dedicated results bucket; the remaining broad reads are metadata/list actions that do not support ARN scoping. See the block comment above.
+  # checkov:skip=CKV_AWS_356:glue:GetDatabases and athena:* are catalog/workgroup-level actions that cannot be pinned to one resource ARN; cross-database containment is carried by the per-invocation session policy's pinned Glue table ARNs.
+  statement {
+    sid = "GlueReadOnly"
+    actions = [
+      "glue:GetDatabase", "glue:GetDatabases",
+      "glue:GetTable", "glue:GetTables",
+      "glue:GetPartitions", "glue:GetTableVersions",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "AthenaSampling"
+    actions = [
+      "athena:StartQueryExecution", "athena:GetQueryExecution",
+      "athena:GetQueryResults", "athena:StopQueryExecution",
+    ]
+    resources = ["*"]
+  }
+
+  # Athena WRITES results to the dedicated results bucket (scoped).
+  statement {
+    sid       = "AthenaResultsWrite"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:GetBucketLocation"]
+    resources = [aws_s3_bucket.athena_results.arn, "${aws_s3_bucket.athena_results.arn}/*"]
+  }
+
+  # Athena READS the table data locations, which can live in ANY bucket a Glue
+  # table points at (e.g. the BIRD data bucket) — so read stays broad.
+  statement {
+    sid       = "TableDataRead"
+    actions   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
+    resources = ["*"]
+  }
+
+  # Lake Formation-governed catalogs (var.enable_lakeformation): the query engine
+  # calls lakeformation:GetDataAccess on the caller's behalf to obtain short-lived,
+  # LF-vended S3 credentials scoped to the governed table's location. GetDataAccess
+  # does NOT support resource-level scoping, so it is "*". This grant is necessary
+  # but NOT sufficient — the adopter must also GRANT the role LF SELECT/DESCRIBE and
+  # register the data location (see docs/LAKE_FORMATION.md); LF then AND's with IAM.
+  # NOTE: must ALSO be added to the per-invocation session policy in clients.py
+  # (build the session policy sends is intersected with this role), else it's stripped.
+  dynamic "statement" {
+    for_each = var.enable_lakeformation ? [1] : []
+    content {
+      sid       = "LakeFormationDataAccess"
+      actions   = ["lakeformation:GetDataAccess"]
+      resources = ["*"]
+    }
+  }
+}
+
+# Trust: ONLY the harvest execution role may assume the data role.
+data "aws_iam_policy_document" "harvest_data_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.harvest.arn]
+    }
+  }
+}
+
+resource "aws_iam_role" "harvest_data" {
+  name               = "${var.name_prefix}-harvest-data"
+  assume_role_policy = data.aws_iam_policy_document.harvest_data_assume.json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "harvest_data" {
+  name   = "harvest-data-policy"
+  role   = aws_iam_role.harvest_data.id
+  policy = data.aws_iam_policy_document.harvest_data.json
+}
+
+# --- Harvest runtime (execution) role -----------------------------------------
+# The EXECUTION role (what AgentCore assumes for the microVM) holds only what the
+# runtime needs to bootstrap: Bedrock InvokeModel, bundle read/write (via the S3
+# Files mount), the registry status write, the S3 Files mount grants, and — the
+# key change — sts:AssumeRole on the harvest DATA role above. Glue/Athena/table
+# reads were MOVED to the data role and are reached only through the scoped,
+# per-invocation assume; a compromised runtime that reads the execution-role creds
+# from MMDS can at most re-assume the data role (bounded by its ceiling), not read
+# Glue/Athena account-wide directly.
+
+data "aws_iam_policy_document" "harvest" {
+  # Down-scope hop: assume the data role per invocation with an inline session
+  # policy pinned to the target database + workgroup (clients.build_scoped_session).
+  statement {
+    sid       = "AssumeDataRole"
+    actions   = ["sts:AssumeRole"]
+    resources = [aws_iam_role.harvest_data.arn]
+  }
+
+  statement {
+    sid       = "BedrockInvoke"
+    actions   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+    resources = ["*"]
+  }
+
+  # Bedrock Mantle (OpenAI-compatible endpoint) — only needed when the harvest
+  # model is a GPT id (var.harvest_model starts with "openai."). Mantle is a
+  # SEPARATE IAM namespace from bedrock:* — the bedrock:InvokeModel grant above
+  # does NOT cover it. The bearer token provide_token() mints inherits THIS
+  # role's identity, so the role itself needs these actions:
+  #   - CreateInference: invoke time (missing -> 401 permission_denied at call)
+  #   - Get*/List*: model discovery/sync
+  # ...scoped to the Mantle "default" project in the Mantle region (independent
+  # of var.region; GPT-5.x is only in us-east-2/us-west-2). CallWithBearerToken
+  # is the bearer-auth action itself and is not project- or region-scopable, so
+  # it takes resources=["*"]. Present only when a GPT model is selected, so the
+  # role stays least-privilege on the default Converse (Claude) path.
+  dynamic "statement" {
+    for_each = startswith(var.harvest_model, "openai.") ? [1] : []
+    content {
+      sid = "BedrockMantleInvoke"
+      actions = [
+        "bedrock-mantle:CreateInference",
+        "bedrock-mantle:GetInference",
+        "bedrock-mantle:GetModel",
+        "bedrock-mantle:ListModels",
+      ]
+      resources = [
+        "arn:aws:bedrock-mantle:${var.harvest_mantle_region}:${local.account_id}:project/default",
+      ]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = startswith(var.harvest_model, "openai.") ? [1] : []
+    content {
+      sid       = "BedrockMantleBearerToken"
+      actions   = ["bedrock-mantle:CallWithBearerToken"]
+      resources = ["*"]
+    }
+  }
+
+  # Code Interpreter data plane — the run_code sandbox for extracting text from
+  # binary .context/ docs. Scoped to the one custom interpreter we provision
+  # (SANDBOX/network-isolated). Only present when var.enable_code_interpreter, so
+  # the harvest role stays least-privilege when the feature is off.
+  dynamic "statement" {
+    for_each = var.enable_code_interpreter ? [1] : []
+    content {
+      sid = "CodeInterpreterInvoke"
+      actions = [
+        "bedrock-agentcore:StartCodeInterpreterSession",
+        "bedrock-agentcore:InvokeCodeInterpreter",
+        "bedrock-agentcore:StopCodeInterpreterSession",
+      ]
+      resources = [aws_bedrockagentcore_code_interpreter.harvest[0].code_interpreter_arn]
+    }
+  }
+
+  statement {
+    sid = "BundleBucketReadWrite"
+    actions = [
+      "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
+    ]
+    resources = [
+      local.d.bundle_bucket_arn,
+      "${local.d.bundle_bucket_arn}/*",
+    ]
+  }
+
+  # The agent reports its own lifecycle back to the registry status row
+  # (queued -> running -> complete|failed) so the UI's GET /harvest reflects
+  # reality. UpdateItem only (touches status/updated_at/detail); the Control
+  # API owns the initial put. Scoped to the single registry table.
+  statement {
+    sid       = "RegistryStatusWrite"
+    actions   = ["dynamodb:UpdateItem"]
+    resources = [local.d.registry_table_arn]
+  }
+
+  # S3 Files mount. Canonical form (AWS "File system configurations" doc): the
+  # RESOURCE is the FILE-SYSTEM arn, gated by an ArnEquals condition on
+  # s3files:AccessPointArn — NOT the access-point arn as the resource.
+  dynamic "statement" {
+    for_each = local.harvest_has_fs ? [1] : []
+    content {
+      sid       = "S3FilesMount"
+      actions   = ["s3files:ClientMount", "s3files:ClientWrite", "s3files:GetAccessPoint"]
+      resources = [local.harvest_fs_arn]
+      condition {
+        test     = "ArnEquals"
+        variable = "s3files:AccessPointArn"
+        values   = [local.harvest_access_point_arn]
+      }
+    }
+  }
+
+  # The CreateAgentRuntime validator probes an (undocumented, evolving) set of
+  # s3files read/list/describe actions — and list actions don't support
+  # resource-level scoping, so granting them on a specific ARN leaves them denied
+  # on "*". Rather than chase each probed action one at a time, grant the entire
+  # READ-ONLY s3files family (Get*/List*/Describe*) on "*". This covers any probe
+  # while granting NO mutating actions (no Create/Delete/Client*/Put), so it's
+  # still least-privilege for a read/validate surface. The actual mount grant
+  # (ClientMount/ClientWrite, above) stays tightly scoped with the condition.
+  dynamic "statement" {
+    for_each = local.harvest_has_fs ? [1] : []
+    content {
+      sid       = "S3FilesReadOnly"
+      actions   = ["s3files:Get*", "s3files:List*", "s3files:Describe*"]
+      resources = ["*"]
+    }
+  }
+}
+
+resource "aws_iam_role" "harvest" {
+  name               = "${var.name_prefix}-harvest-runtime"
+  assume_role_policy = data.aws_iam_policy_document.agentcore_assume.json
+  tags               = var.tags
+}
+
+# Merge the shared baseline (ECR/logs/xray) with the harvest-specific perms into
+# ONE policy so it's all in place before CreateAgentRuntime validates the role.
+data "aws_iam_policy_document" "harvest_full" {
+  source_policy_documents = [
+    data.aws_iam_policy_document.agentcore_baseline.json,
+    data.aws_iam_policy_document.harvest.json,
+  ]
+}
+
+resource "aws_iam_role_policy" "harvest" {
+  name   = "harvest-policy"
+  role   = aws_iam_role.harvest.id
+  policy = data.aws_iam_policy_document.harvest_full.json
+}
+
+# --- Consumption MCP runtime role --------------------------------------------
+# Read the bundle bucket, embed the query (Bedrock), and query S3 Vectors. The
+# QueryVectors-with-filter/metadata 403 trap means we MUST also grant GetVectors.
+
+data "aws_iam_policy_document" "consumption" {
+  statement {
+    sid       = "BundleBucketRead"
+    actions   = ["s3:GetObject", "s3:ListBucket"]
+    resources = [local.d.bundle_bucket_arn, "${local.d.bundle_bucket_arn}/*"]
+  }
+
+  statement {
+    sid       = "BedrockEmbed"
+    actions   = ["bedrock:InvokeModel"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "S3VectorsQuery"
+    # GetVectors is REQUIRED alongside QueryVectors for filtered / metadata
+    # queries, else 403.
+    actions   = ["s3vectors:QueryVectors", "s3vectors:GetVectors", "s3vectors:GetIndex"]
+    resources = [local.d.vector_index_arn, local.d.vector_bucket_arn]
+  }
+
+  statement {
+    sid       = "RegistryRead"
+    actions   = ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:Scan"]
+    resources = [local.d.registry_table_arn]
+  }
+}
+
+resource "aws_iam_role" "consumption" {
+  name               = "${var.name_prefix}-consumption-runtime"
+  assume_role_policy = data.aws_iam_policy_document.agentcore_assume.json
+  tags               = var.tags
+}
+
+data "aws_iam_policy_document" "consumption_full" {
+  source_policy_documents = [
+    data.aws_iam_policy_document.agentcore_baseline.json,
+    data.aws_iam_policy_document.consumption.json,
+  ]
+}
+
+resource "aws_iam_role_policy" "consumption" {
+  name   = "consumption-policy"
+  role   = aws_iam_role.consumption.id
+  policy = data.aws_iam_policy_document.consumption_full.json
+}
+
+# IAM is eventually consistent: after PutRolePolicy, a CreateAgentRuntime call
+# issued seconds later can validate against a STALE snapshot of the role and
+# report a permission as missing (the error oscillates between s3files actions
+# across applies — the tell-tale sign of a propagation race, not a wrong policy).
+# Wait for the policy changes to propagate before either runtime is created.
+resource "time_sleep" "iam_propagation" {
+  triggers = {
+    harvest_policy      = aws_iam_role_policy.harvest.policy
+    harvest_data_policy = aws_iam_role_policy.harvest_data.policy
+    consumption_policy  = aws_iam_role_policy.consumption.policy
+  }
+  create_duration = "30s"
+}

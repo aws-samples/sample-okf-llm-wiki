@@ -1,0 +1,22 @@
+# OKF deployment config — copy to scripts/.deployment.config and fill in.
+# scripts/.deployment.config is gitignored (holds environment-specific ids).
+# All values are printed by `terraform output` after a deploy.
+
+# --- Deploy (deploy.sh) ---
+AWS_REGION=us-east-1
+TF_STATE_BUCKET=okf-tfstate-<account-id>
+NAME_PREFIX=okf
+ADMIN_EMAIL=
+ADMIN_USERNAME=
+ADMIN_GIVEN_NAME=
+ADMIN_FAMILY_NAME=
+HARVEST_IMAGE_URI=
+CONSUMPTION_IMAGE_URI=
+
+# --- MCP token helper (refresh-okf-token.sh) ---
+# Public SPA client id (ships in the UI bundle; not a secret) + user pool id.
+# From: terraform output user_pool_client_id  and the Cognito pool id.
+OKF_USER_POOL_ID=us-east-1_XXXXXXXXX
+OKF_WEB_CLIENT_ID=xxxxxxxxxxxxxxxxxxxxxxxxxx
+# Region for the token helper; falls back to AWS_REGION above if unset.
+# OKF_TOKEN_REGION=us-east-1

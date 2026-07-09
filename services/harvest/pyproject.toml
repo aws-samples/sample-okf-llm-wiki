@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "okf-harvest"
+version = "0.1.0"
+description = "OKF harvest agent: LangChain deepagents deep agent on Bedrock AgentCore Runtime"
+requires-python = ">=3.11"
+dependencies = [
+    "okf-core",
+    "deepagents>=0.6.12,<0.8",
+    "langchain>=1.3",
+    # ChatBedrockConverse lives in the standalone langchain-aws partner package,
+    # which we import directly (agent.py) — depend on it explicitly rather than
+    # relying on the langchain[aws] extra to pull a compatible version.
+    "langchain-aws>=1.6",
+    # GPT on Bedrock Mantle: ChatOpenAI (agent.py) drives the Mantle OpenAI-
+    # compatible endpoint, and aws-bedrock-token-generator mints the SigV4-derived
+    # bearer key it authenticates with. Both are imported lazily inside
+    # _build_mantle_openai, so the module still imports for tests without them.
+    "langchain-openai>=1.3",
+    "aws-bedrock-token-generator>=1.0",
+    "langchain-quickjs>=0.3",
+    "bedrock-agentcore>=1.16",
+    "boto3>=1.43",
+    # Observability: ADOT SDK. LangChain/LangGraph spans are emitted via the
+    # langsmith SDK's native OTEL bridge (a transitive dep of langchain), gated by
+    # LANGSMITH_TRACING + LANGSMITH_OTEL_ONLY env on the runtime — no separate
+    # framework instrumentor. Mirror of requirements.txt.
+    "aws-opentelemetry-distro>=0.10.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,24 @@
+# Runtime deps for the harvest AgentCore container.
+# okf-core is installed from the local wheel/source in the Docker build.
+deepagents>=0.6.12,<0.8
+langchain>=1.3
+# ChatBedrockConverse (agent.py) — standalone partner package, declared explicitly.
+langchain-aws>=1.6
+# GPT on Bedrock Mantle (agent.py): ChatOpenAI against the OpenAI-compatible
+# endpoint + the bearer-token generator it authenticates with. Lazily imported.
+langchain-openai>=1.3
+aws-bedrock-token-generator>=1.0
+langchain-quickjs>=0.3
+bedrock-agentcore>=1.16
+boto3>=1.43
+pyyaml>=6.0.3
+networkx>=3.4
+# --- AgentCore Observability -------------------------------------------------
+# ADOT SDK: the `opentelemetry-instrument` launcher + AWS OTLP exporter that
+# ships spans to CloudWatch (see Dockerfile CMD + OTEL_* env in the runtime TF).
+aws-opentelemetry-distro>=0.10.0
+# LangChain/LangGraph (deepagents) LLM/tool/sub-agent spans are emitted via the
+# langsmith SDK's NATIVE OTEL bridge (langsmith is a transitive dep of langchain),
+# gated by LANGSMITH_TRACING + LANGSMITH_OTEL_ONLY on the runtime — it reuses the
+# ADOT global provider. No separate framework instrumentor needed (the previous
+# openinference-instrumentation-langchain was inert and has been removed).

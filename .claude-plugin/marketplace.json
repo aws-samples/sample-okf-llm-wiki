@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "okf",
+  "description": "OKF on AWS — local plugin marketplace.",
+  "owner": {
+    "name": "Aubrey Oosthuizen & Edvin Hallvaxhiu"
+  },
+  "plugins": [
+    {
+      "name": "okf-mcp",
+      "description": "Connects Claude Code to the OKF Data wiki consumption MCP server (Bedrock AgentCore) and provides a skill to fetch/refresh its OAuth2 access token.",
+      "source": "./okf-mcp"
+    }
+  ]
+}

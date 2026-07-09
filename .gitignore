@@ -1,0 +1,33 @@
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+.pytest_cache/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+.build/
+
+# Node / UI
+node_modules/
+ui/dist/
+ui/.env
+
+# Deploy config (region, state bucket, admin user, image URIs)
+scripts/.deployment.config
+
+# OKF consumption MCP refresh token (30-day Cognito credential)
+scripts/.okf-refresh-token
+
+# Benchmark harness (local BIRD/Spider2 eval scratch: gold, reports, manifests)
+benchmark/
+
+# OS
+.DS_Store
+
+# Local PUMS test dataset (data + Census PDFs; not for VCS)
+/benchmark/pums/

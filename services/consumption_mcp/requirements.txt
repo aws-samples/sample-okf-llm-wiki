@@ -1,0 +1,9 @@
+# Runtime deps for the consumption MCP AgentCore container.
+# okf-core and okf-aws are installed from local source in the Docker build.
+mcp>=1.28
+boto3>=1.43
+pyyaml>=6.0.3
+networkx>=3.4
+# AgentCore Observability: ADOT SDK for MCP/HTTP/boto3 spans. No LangChain here,
+# so no framework instrumentor is needed (see Dockerfile CMD + runtime OTEL env).
+aws-opentelemetry-distro>=0.10.0

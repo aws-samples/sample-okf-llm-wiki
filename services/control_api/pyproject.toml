@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "okf-control-api"
+version = "0.1.0"
+description = "OKF Control API: Cognito-authed HTTP API (API GW v2 + Lambda) for domain registry, context uploads, harvest control, and bundle browsing"
+requires-python = ">=3.11"
+dependencies = [
+    "okf-core",
+    "okf-aws",
+    "boto3>=1.43",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "moto[s3,dynamodb]>=5.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,455 @@
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react"
+import ReactMarkdown from "react-markdown"
+import remarkGfm from "remark-gfm"
+import rehypeHighlight from "rehype-highlight"
+import {
+  ChevronRightIcon,
+  FileTextIcon,
+  FolderIcon,
+  FolderOpenIcon,
+} from "lucide-react"
+
+import { buildTree, parseDocument, resolveConceptLink } from "@/lib/bundle"
+import { cn } from "@/lib/utils"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Badge } from "@/components/ui/badge"
+import {
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import { Skeleton } from "@/components/ui/skeleton"
+import { Spinner } from "@/components/ui/spinner"
+
+// Browse a harvested bundle: a directory tree of concepts + a markdown viewer.
+export default function BrowseView({ api, selection, concept, onConceptChange }) {
+  const domain = selection?.data_domain
+  const dataset = selection?.dataset
+  const hasSelection = Boolean(domain && dataset)
+
+  if (!hasSelection) {
+    return (
+      <Alert>
+        <FileTextIcon />
+        <AlertTitle>Select a dataset first</AlertTitle>
+        <AlertDescription>
+          Pick a dataset from the sidebar to browse its knowledge bundle.
+        </AlertDescription>
+      </Alert>
+    )
+  }
+
+  return (
+    <FilesPane
+      api={api}
+      domain={domain}
+      dataset={dataset}
+      concept={concept}
+      onConceptChange={onConceptChange}
+    />
+  )
+}
+
+function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
+  const [files, setFiles] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [content, setContent] = useState("")
+  const [loadingDoc, setLoadingDoc] = useState(false)
+  const [docError, setDocError] = useState(null)
+
+  // Selected concept: local state so a click updates the tree/viewer instantly,
+  // synced to the URL `concept` prop so browser back/forward (which change the
+  // prop) also move between docs. Without the local state there'd be a one-frame
+  // lag: the URL updates async via hashchange before the prop flows back.
+  const [selectedId, setSelectedId] = useState(concept || null)
+  useEffect(() => {
+    setSelectedId(concept || null)
+  }, [concept])
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const list = await api.listBundle(domain, dataset)
+      setFiles(Array.isArray(list) ? list : [])
+    } catch (e) {
+      setError(e.message || String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [api, domain, dataset])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  // Concept id -> S3 key, so an in-doc link (which resolves to a concept id)
+  // can be opened without re-listing.
+  const keyByConcept = useMemo(() => {
+    const m = new Map()
+    for (const f of files) m.set(f.concept_id, f.key)
+    return m
+  }, [files])
+
+  const tree = useMemo(() => buildTree(files), [files])
+
+  // Fetch the selected concept's doc whenever the selection (URL) or the file
+  // listing changes. The file list is needed to resolve concept id -> S3 key.
+  useEffect(() => {
+    if (!selectedId || loading) {
+      setContent("")
+      setDocError(null)
+      return
+    }
+    const key = keyByConcept.get(selectedId)
+    if (!key) {
+      setContent("")
+      setDocError(`Not found in this bundle: ${selectedId}`)
+      return
+    }
+    let alive = true
+    setLoadingDoc(true)
+    setDocError(null)
+    setContent("")
+    api
+      .readBundleFile(domain, dataset, key)
+      .then((res) => {
+        if (alive) setContent(res?.text ?? "")
+      })
+      .catch((e) => {
+        if (alive) setDocError(e.message || String(e))
+      })
+      .finally(() => {
+        if (alive) setLoadingDoc(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [api, domain, dataset, selectedId, keyByConcept, loading])
+
+  // Selecting a file / following an in-doc link: update local state immediately
+  // (instant tree highlight + fetch) AND the URL (for history/back-forward).
+  const openConcept = useCallback(
+    (conceptId) => {
+      setSelectedId(conceptId)
+      onConceptChange?.(conceptId)
+    },
+    [onConceptChange]
+  )
+
+  return (
+    // Fill the content region; on md+ it's a two-column grid (tree | viewer)
+    // that stretches to the full height so both cards use all vertical space.
+    <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 md:h-full md:grid-rows-1 md:grid-cols-[minmax(240px,320px)_1fr]">
+      <Card className="min-h-0 gap-0 py-0 max-md:h-[50vh]">
+        <CardHeader className="border-b px-4 py-3">
+          <CardTitle className="text-sm">Concepts</CardTitle>
+          <CardDescription>
+            {files.length} file{files.length === 1 ? "" : "s"}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="min-h-0 flex-1 p-0">
+          {error ? (
+            <div className="p-4">
+              <Alert variant="destructive">
+                <AlertTitle>Failed to list bundle</AlertTitle>
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+            </div>
+          ) : loading ? (
+            <div className="flex flex-col gap-2 p-4">
+              <Skeleton className="h-7 w-full" />
+              <Skeleton className="h-7 w-3/4" />
+              <Skeleton className="h-7 w-5/6" />
+            </div>
+          ) : files.length === 0 ? (
+            <div className="p-4">
+              <Alert>
+                <FileTextIcon />
+                <AlertTitle>No bundle files</AlertTitle>
+                <AlertDescription>
+                  Run a harvest for this dataset to generate concept docs.
+                </AlertDescription>
+              </Alert>
+            </div>
+          ) : (
+            // okf-tree-scroll forces Radix's viewport wrapper (display:table,
+            // which shrink-wraps to content width and lets long names grow the
+            // pane) to block, so the tree fills the card width and long file
+            // names truncate instead of overflowing. See index.css.
+            <ScrollArea className="okf-tree-scroll h-full">
+              <div className="p-2">
+                <FileTree
+                  nodes={tree}
+                  selectedId={selectedId}
+                  onSelect={openConcept}
+                />
+              </div>
+            </ScrollArea>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className="min-h-0 gap-0 py-0 max-md:h-[70vh]">
+        <CardHeader className="border-b px-4 py-3">
+          {selectedId ? (
+            <ConceptBreadcrumb conceptId={selectedId} />
+          ) : (
+            <CardTitle className="text-sm text-muted-foreground">
+              No file selected
+            </CardTitle>
+          )}
+        </CardHeader>
+        <CardContent className="min-h-0 flex-1 p-0">
+          <ScrollArea className="h-full">
+            <div className="p-5">
+              {loadingDoc ? (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Spinner />
+                  Loading…
+                </div>
+              ) : docError ? (
+                <Alert variant="destructive">
+                  <AlertTitle>Failed to read file</AlertTitle>
+                  <AlertDescription>{docError}</AlertDescription>
+                </Alert>
+              ) : !selectedId ? (
+                <p className="text-sm text-muted-foreground">
+                  Select a concept on the left to render its markdown.
+                </p>
+              ) : (
+                <ConceptDoc
+                  conceptId={selectedId}
+                  text={content}
+                  onNavigate={openConcept}
+                />
+              )}
+            </div>
+          </ScrollArea>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+// Recursive directory tree. Directories are collapsible (open by default);
+// files are selectable rows. Depth drives the indent so nesting reads clearly.
+function FileTree({ nodes, selectedId, onSelect, depth = 0 }) {
+  return (
+    <ul className="flex flex-col">
+      {nodes.map((node) =>
+        node.type === "dir" ? (
+          // Key is type-qualified because a concept id can be BOTH a file
+          // ("tables") and a directory prefix ("tables/races"), yielding two
+          // sibling nodes that share `path`. Plain path keys would collide.
+          <TreeDir
+            key={`dir:${node.path}`}
+            node={node}
+            selectedId={selectedId}
+            onSelect={onSelect}
+            depth={depth}
+          />
+        ) : (
+          <TreeFile
+            key={`file:${node.path}`}
+            node={node}
+            selected={selectedId === node.conceptId}
+            onSelect={onSelect}
+            depth={depth}
+          />
+        )
+      )}
+    </ul>
+  )
+}
+
+function TreeDir({ node, selectedId, onSelect, depth }) {
+  const [open, setOpen] = useState(true)
+  return (
+    <li>
+      <Collapsible open={open} onOpenChange={setOpen}>
+        <CollapsibleTrigger
+          className="flex w-full items-center gap-1.5 rounded-md py-1.5 pr-2 text-sm font-medium transition-colors hover:bg-muted"
+          style={{ paddingLeft: `${depth * 12 + 8}px` }}
+        >
+          <ChevronRightIcon
+            className={cn(
+              "size-3.5 shrink-0 text-muted-foreground transition-transform",
+              open && "rotate-90"
+            )}
+          />
+          {open ? (
+            <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
+          ) : (
+            <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
+          )}
+          {/* min-w-0 lets the flex item shrink below its content so `truncate`
+              (overflow-hidden + ellipsis) actually engages; without it a long
+              name grows the row past the card's width. */}
+          <span className="min-w-0 truncate">{node.name}</span>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <FileTree
+            nodes={node.children}
+            selectedId={selectedId}
+            onSelect={onSelect}
+            depth={depth + 1}
+          />
+        </CollapsibleContent>
+      </Collapsible>
+    </li>
+  )
+}
+
+function TreeFile({ node, selected, onSelect, depth }) {
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={() => onSelect(node.conceptId)}
+        style={{ paddingLeft: `${depth * 12 + 8}px` }}
+        className={cn(
+          "flex w-full items-center gap-1.5 rounded-md py-1.5 pr-2 text-left text-sm transition-colors hover:bg-muted",
+          selected && "bg-muted font-medium text-foreground"
+        )}
+      >
+        {/* Spacer standing in for the folder rows' chevron (size-3.5), so the
+            file icon lines up with sibling folders' icons (the flex gap-1.5
+            supplies the matching gap). */}
+        <span className="size-3.5 shrink-0" aria-hidden="true" />
+        <FileTextIcon className="size-4 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 truncate">{node.name}</span>
+      </button>
+    </li>
+  )
+}
+
+// Full concept path as a breadcrumb, e.g. references / joins / races__results.
+function ConceptBreadcrumb({ conceptId }) {
+  const parts = conceptId.split("/")
+  return (
+    <Breadcrumb>
+      <BreadcrumbList className="text-xs sm:gap-1.5">
+        {parts.map((part, i) => {
+          const last = i === parts.length - 1
+          return (
+            <Fragment key={i}>
+              <BreadcrumbItem>
+                {last ? (
+                  <BreadcrumbPage className="font-mono">{part}</BreadcrumbPage>
+                ) : (
+                  <span className="font-mono text-muted-foreground">
+                    {part}
+                  </span>
+                )}
+              </BreadcrumbItem>
+              {!last && <BreadcrumbSeparator />}
+            </Fragment>
+          )
+        })}
+      </BreadcrumbList>
+    </Breadcrumb>
+  )
+}
+
+// Render one concept doc: strip the YAML frontmatter, show its title/type/tags
+// as a compact header, then render the body as GFM markdown. Intra-bundle
+// links (relative `.md`) are rewritten to full concept ids and intercepted so
+// clicking one opens that concept in place instead of navigating the browser.
+function ConceptDoc({ conceptId, text, onNavigate }) {
+  const { frontmatter, body } = useMemo(() => parseDocument(text), [text])
+
+  const components = useMemo(
+    () => ({
+      a({ href, children, ...props }) {
+        const resolved = href ? resolveConceptLink(href, conceptId) : null
+        if (resolved) {
+          return (
+            <a
+              href={`#${resolved.conceptId}`}
+              onClick={(e) => {
+                e.preventDefault()
+                onNavigate(resolved.conceptId)
+              }}
+              {...props}
+            >
+              {children}
+            </a>
+          )
+        }
+        // External / non-concept link: open safely in a new tab.
+        return (
+          <a href={href} target="_blank" rel="noreferrer noopener" {...props}>
+            {children}
+          </a>
+        )
+      },
+    }),
+    [conceptId, onNavigate]
+  )
+
+  const title = frontmatter.title
+  const type = frontmatter.type
+  const description = frontmatter.description
+  const tags = Array.isArray(frontmatter.tags) ? frontmatter.tags : []
+  const resource = frontmatter.resource
+  const hasHeader = title || type || description || tags.length > 0
+
+  return (
+    <div className="flex flex-col gap-4">
+      {hasHeader && (
+        <div className="flex flex-col gap-2 border-b pb-4">
+          <div className="flex flex-wrap items-center gap-2">
+            {type && <Badge variant="secondary">{type}</Badge>}
+            {tags.map((t) => (
+              <Badge key={t} variant="outline">
+                {t}
+              </Badge>
+            ))}
+          </div>
+          {title && (
+            <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
+          )}
+          {description && (
+            <p className="text-sm text-muted-foreground">{description}</p>
+          )}
+          {resource && /^https?:\/\//.test(resource) && (
+            <a
+              href={resource}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="w-fit truncate font-mono text-xs text-primary underline-offset-4 hover:underline"
+            >
+              {resource}
+            </a>
+          )}
+        </div>
+      )}
+      <div className="okf-prose">
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+          components={components}
+        >
+          {body}
+        </ReactMarkdown>
+      </div>
+    </div>
+  )
+}
