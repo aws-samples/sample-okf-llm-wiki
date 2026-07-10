@@ -242,7 +242,8 @@ stage_compute() {
     -var="name_prefix=${NAME_PREFIX:-okf}" \
     -var="durable_state_bucket=$TF_STATE_BUCKET" \
     -var="harvest_image_uri=${HARVEST_IMAGE_URI:-}" \
-    -var="consumption_image_uri=${CONSUMPTION_IMAGE_URI:-}"
+    -var="consumption_image_uri=${CONSUMPTION_IMAGE_URI:-}" \
+    -var="control_api_provisioned_concurrency=${CONTROL_API_PROVISIONED_CONCURRENCY:-0}"
   ok "Compute stack applied."
 }
 
