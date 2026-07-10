@@ -1,6 +1,22 @@
 # IAM execution roles for the two AgentCore runtimes. These perms apply to ALL
 # agent code and can't be scoped per-invocation, so keep them least-privilege.
 
+locals {
+  # Bedrock Mantle (OpenAI-compatible) perms are needed whenever a GPT model is
+  # REACHABLE at harvest time — NOT just when it's the deploy-time default. The
+  # harvest UI's per-run picker lets a caller select any model in
+  # harvest_model_catalog, and the Control API validates against that catalog and
+  # passes the choice through as a per-invocation override (the runtime does not
+  # re-allowlist it). So a Claude-default deploy can still route a single harvest
+  # to Mantle. Gating the grant on var.harvest_model alone left those runs failing
+  # with 401 permission_denied on bedrock-mantle:CreateInference. Grant when the
+  # default OR any catalog entry is an openai.* id.
+  harvest_mantle_enabled = anytrue(concat(
+    [startswith(var.harvest_model, "openai.")],
+    [for m in var.harvest_model_catalog : startswith(m.model, "openai.")],
+  ))
+}
+
 data "aws_iam_policy_document" "agentcore_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -189,20 +205,21 @@ data "aws_iam_policy_document" "harvest" {
     resources = ["*"]
   }
 
-  # Bedrock Mantle (OpenAI-compatible endpoint) — only needed when the harvest
-  # model is a GPT id (var.harvest_model starts with "openai."). Mantle is a
-  # SEPARATE IAM namespace from bedrock:* — the bedrock:InvokeModel grant above
-  # does NOT cover it. The bearer token provide_token() mints inherits THIS
-  # role's identity, so the role itself needs these actions:
+  # Bedrock Mantle (OpenAI-compatible endpoint) — needed when a GPT id is
+  # reachable at harvest time (see local.harvest_mantle_enabled: the deploy-time
+  # default OR any catalog entry the UI picker can select). Mantle is a SEPARATE
+  # IAM namespace from bedrock:* — the bedrock:InvokeModel grant above does NOT
+  # cover it. The bearer token provide_token() mints inherits THIS role's
+  # identity, so the role itself needs these actions:
   #   - CreateInference: invoke time (missing -> 401 permission_denied at call)
   #   - Get*/List*: model discovery/sync
   # ...scoped to the Mantle "default" project in the Mantle region (independent
   # of var.region; GPT-5.x is only in us-east-2/us-west-2). CallWithBearerToken
   # is the bearer-auth action itself and is not project- or region-scopable, so
-  # it takes resources=["*"]. Present only when a GPT model is selected, so the
-  # role stays least-privilege on the default Converse (Claude) path.
+  # it takes resources=["*"]. Absent when no GPT model is reachable, so the role
+  # stays least-privilege on a Converse-only (Claude) catalog.
   dynamic "statement" {
-    for_each = startswith(var.harvest_model, "openai.") ? [1] : []
+    for_each = local.harvest_mantle_enabled ? [1] : []
     content {
       sid = "BedrockMantleInvoke"
       actions = [
@@ -218,7 +235,7 @@ data "aws_iam_policy_document" "harvest" {
   }
 
   dynamic "statement" {
-    for_each = startswith(var.harvest_model, "openai.") ? [1] : []
+    for_each = local.harvest_mantle_enabled ? [1] : []
     content {
       sid       = "BedrockMantleBearerToken"
       actions   = ["bedrock-mantle:CallWithBearerToken"]
