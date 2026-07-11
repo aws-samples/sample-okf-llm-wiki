@@ -53,9 +53,30 @@ resource "aws_lambda_function" "this" {
   timeout          = var.timeout
   memory_size      = var.memory_size
 
+  # Provisioned concurrency attaches to a published version, so only publish
+  # when it's enabled (avoids minting a new version on every deploy otherwise).
+  publish = var.provisioned_concurrency > 0
+
   environment {
     variables = var.environment
   }
 
   tags = var.tags
+}
+
+# When provisioned concurrency is requested, front the published version with a
+# stable "live" alias and keep N environments pre-warmed on it. Callers invoke
+# the alias (see invoke_arn output) so requests land on the warm instances.
+resource "aws_lambda_alias" "live" {
+  count            = var.provisioned_concurrency > 0 ? 1 : 0
+  name             = "live"
+  function_name    = aws_lambda_function.this.function_name
+  function_version = aws_lambda_function.this.version
+}
+
+resource "aws_lambda_provisioned_concurrency_config" "this" {
+  count                             = var.provisioned_concurrency > 0 ? 1 : 0
+  function_name                     = aws_lambda_function.this.function_name
+  qualifier                         = aws_lambda_alias.live[0].name
+  provisioned_concurrent_executions = var.provisioned_concurrency
 }

@@ -13,6 +13,10 @@ ADMIN_FAMILY_NAME=
 HARVEST_IMAGE_URI=
 CONSUMPTION_IMAGE_URI=
 
+# --- Optional Configuration --- #
+# Set CONTROL_API_PROVISIONED_CONCURRENCY to 1 to enable always on Lambda for improved performance
+CONTROL_API_PROVISIONED_CONCURRENCY=0
+
 # --- MCP token helper (refresh-okf-token.sh) ---
 # Public SPA client id (ships in the UI bundle; not a secret) + user pool id.
 # From: terraform output user_pool_client_id  and the Cognito pool id.

@@ -10,6 +10,9 @@ module "control_api_fn" {
   policy_json = data.aws_iam_policy_document.control_api.json
   timeout     = 30
   memory_size = 512
+  # Keep N environments pre-warmed to eliminate cold starts on the browser-facing
+  # control plane. 0 disables it. See modules/lambda for how the alias is wired.
+  provisioned_concurrency = var.control_api_provisioned_concurrency
   environment = merge(local.common_env, {
     OKF_HARVEST_RUNTIME_ARN = try(aws_bedrockagentcore_agent_runtime.harvest[0].agent_runtime_arn, "")
     OKF_ATHENA_WORKGROUP    = var.athena_workgroup
@@ -140,6 +143,9 @@ resource "aws_lambda_permission" "control_api" {
   statement_id  = "AllowAPIGWInvoke"
   action        = "lambda:InvokeFunction"
   function_name = module.control_api_fn.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.control.execution_arn}/*/*"
+  # When provisioned concurrency is on, integration_uri targets the "live" alias,
+  # so the invoke permission must be scoped to that qualifier or API GW gets 403.
+  qualifier  = module.control_api_fn.qualifier
+  principal  = "apigateway.amazonaws.com"
+  source_arn = "${aws_apigatewayv2_api.control.execution_arn}/*/*"
 }
