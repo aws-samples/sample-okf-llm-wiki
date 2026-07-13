@@ -17,6 +17,7 @@ The bundles are Open Knowledge Format (OKF) bundles — a bundle is a directory 
 - 🏗️ [Architecture](./docs/ARCHITECTURE.md) — how the pieces fit and the reasoning behind them
 - 📐 [Conventions](./docs/CONVENTIONS.md) — the contract between services (S3 layout, DynamoDB shapes, env vars)
 - 📘 [API Reference](./docs/API_REFERENCE.md) — external API shapes the code was written against
+- 📊 [Benchmark](./benchmark/mini_dev/) — BIRD mini_dev text-to-SQL evaluation (EX 74.0, [report PDF](./benchmark/mini_dev/OKF_mini_dev_report.pdf))
 
 ---
 
@@ -28,6 +29,22 @@ The bundles are Open Knowledge Format (OKF) bundles — a bundle is a directory 
 - **Served Over MCP** - Any MCP-capable agent can discover, read, and semantically search your bundles with `list_domains`, `list_directory`, `read_page`, `glob`, `grep`, `get_backlinks`, and `semantic_search`.
 - **Machine Credentials** - Mint scoped OAuth2 credentials so applications and agents can call the MCP server programmatically.
 - **Web Console** - Register datasets, upload context docs, run and watch harvests, browse bundles, and explore the link graph from a React UI.
+
+---
+
+## Benchmark
+
+Does an OKF bundle carry enough about a database for an agent to answer real analytical questions — without ever seeing the schema? We tested this on [BIRD mini_dev](https://github.com/bird-bench/mini_dev), 500 curated text-to-SQL questions across 11 databases, using the official bird-bench grader on the original SQLite databases.
+
+An agent whose *only* knowledge source was the OKF wiki (read over MCP, ~4.5 reads per question) scored **EX = 74.0** — above every published leaderboard entry — reconstructing every table, column, join, and value format from the bundle alone.
+
+| | EX (Execution Accuracy) |
+|---|---|
+| **agent + OKF wiki** | **74.0** |
+| TA + GPT-4o (best published) | 63.0 |
+| GPT-4 | 47.8 |
+
+Full methodology, per-database breakdown, and operational KPIs (tool usage, agent duration) in the [benchmark report (PDF)](./benchmark/mini_dev/OKF_mini_dev_report.pdf) and the [detailed results](./benchmark/mini_dev/RESULTS.md). The benchmark is fully reproducible from this repo — see [`benchmark/mini_dev/`](./benchmark/mini_dev/).
 
 ---
 
