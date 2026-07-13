@@ -415,7 +415,7 @@ def test_post_harvest_forwards_valid_model_effort(cfg, agentcore):
             body={
                 "data_domain": "sales",
                 "dataset": "orders",
-                "model": "openai.gpt-5.5",
+                "model": "openai.gpt-5.6-sol",
                 "effort": "high",
             },
         ),
@@ -423,7 +423,7 @@ def test_post_harvest_forwards_valid_model_effort(cfg, agentcore):
     )
     assert resp["statusCode"] == 200
     payload = agentcore.last_payload()
-    assert payload["model"] == "openai.gpt-5.5"
+    assert payload["model"] == "openai.gpt-5.6-sol"
     assert payload["effort"] == "high"
 
 
@@ -435,12 +435,12 @@ def test_post_harvest_defaults_effort_when_only_model_given(cfg, agentcore):
             body={
                 "data_domain": "sales",
                 "dataset": "orders",
-                "model": "openai.gpt-5.5",
+                "model": "openai.gpt-5.6-sol",
             },
         ),
         cfg,
     )
-    # Catalog default effort for gpt-5.5 is xhigh.
+    # Catalog default effort for gpt-5.6-sol is xhigh.
     assert agentcore.last_payload()["effort"] == "xhigh"
 
 
@@ -462,7 +462,7 @@ def test_post_harvest_unknown_model_400(cfg, agentcore):
 
 
 def test_post_harvest_effort_not_offered_400(cfg, agentcore):
-    # "max" is valid for Claude but NOT offered for gpt-5.5 -> reject.
+    # An effort the catalog doesn't offer for the model (bogus level) -> reject.
     resp = app.route(
         _event(
             "POST",
@@ -470,8 +470,8 @@ def test_post_harvest_effort_not_offered_400(cfg, agentcore):
             body={
                 "data_domain": "sales",
                 "dataset": "orders",
-                "model": "openai.gpt-5.5",
-                "effort": "max",
+                "model": "openai.gpt-5.6-sol",
+                "effort": "ultra",
             },
         ),
         cfg,
@@ -551,12 +551,12 @@ def test_get_harvest_status_surfaces_model_effort(cfg):
             "sk": {"S": "STATUS"},
             "status": {"S": "running"},
             "mode": {"S": "full"},
-            "model": {"S": "openai.gpt-5.5"},
+            "model": {"S": "openai.gpt-5.6-sol"},
             "effort": {"S": "xhigh"},
         },
     )
     body = _json(app.route(_event("GET", "/harvest/sales/orders"), cfg))
-    assert body["status"]["model"] == "openai.gpt-5.5"
+    assert body["status"]["model"] == "openai.gpt-5.6-sol"
     assert body["status"]["effort"] == "xhigh"
 
 

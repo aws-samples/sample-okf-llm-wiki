@@ -26,9 +26,9 @@ Mirrors the design of :mod:`okf_core.sources`.
         "default_effort": "xhigh"
       },
       {
-        "model": "openai.gpt-5.5",
-        "label": "GPT-5.5",
-        "efforts": ["low", "medium", "high", "xhigh"],
+        "model": "openai.gpt-5.6-sol",
+        "label": "GPT-5.6 Sol",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
         "default_effort": "xhigh"
       }
     ]
@@ -49,8 +49,8 @@ from typing import Any
 #: The single effort vocabulary shared end-to-end. These are the strings the
 #: harvest agent already understands: on the Converse (Claude) path they ride
 #: verbatim into ``output_config.effort``; on the GPT path they map onto OpenAI's
-#: ``reasoning_effort`` scale (``max``/``xhigh`` -> ``xhigh``). Ordered
-#: low -> high so a UI can render them in a sensible order.
+#: ``reasoning_effort`` scale — verbatim on GPT-5.6 (which added ``max`` above
+#: ``xhigh``). Ordered low -> high so a UI can render them in a sensible order.
 EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
 #: The default effort when a harvest doesn't specify one — maximum reasoning, to
@@ -66,10 +66,10 @@ EFFORTS_KEY = "efforts"
 DEFAULT_EFFORT_KEY = "default_effort"
 
 #: The built-in catalog: one Anthropic model (Converse) + one OpenAI model
-#: (Mantle). GPT collapses ``max`` onto ``xhigh`` (see ``harvest.agent._GPT_
-#: EFFORT``), so the GPT entry omits ``max`` rather than offering a level that
-#: silently degrades to another. Terraform's ``var.harvest_model_catalog``
-#: overrides this in a real deployment.
+#: (Mantle). GPT-5.6 (Sol/Luna/Terra) added ``max`` as a distinct native level
+#: above ``xhigh`` (``harvest.agent._GPT_EFFORT`` now passes it through verbatim),
+#: so the GPT entry offers the full ladder — same as Claude. Terraform's
+#: ``var.harvest_model_catalog`` overrides this in a real deployment.
 DEFAULT_CATALOG: list[dict[str, Any]] = [
     {
         MODEL_KEY: "global.anthropic.claude-opus-4-8",
@@ -78,9 +78,9 @@ DEFAULT_CATALOG: list[dict[str, Any]] = [
         DEFAULT_EFFORT_KEY: "xhigh",
     },
     {
-        MODEL_KEY: "openai.gpt-5.5",
-        LABEL_KEY: "GPT-5.5",
-        EFFORTS_KEY: ["low", "medium", "high", "xhigh"],
+        MODEL_KEY: "openai.gpt-5.6-sol",
+        LABEL_KEY: "GPT-5.6 Sol",
+        EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
         DEFAULT_EFFORT_KEY: "xhigh",
     },
 ]

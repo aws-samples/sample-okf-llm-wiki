@@ -23,8 +23,8 @@ def test_model_config_from_payload_absent_is_none():
 
 def test_model_config_from_payload_builds_override(monkeypatch):
     monkeypatch.delenv("OKF_HARVEST_MAX_TOKENS", raising=False)
-    cfg = ep._model_config_from_payload({"model": "openai.gpt-5.5", "effort": "high"})
-    assert cfg["model"] == "openai.gpt-5.5"
+    cfg = ep._model_config_from_payload({"model": "openai.gpt-5.6-sol", "effort": "high"})
+    assert cfg["model"] == "openai.gpt-5.6-sol"
     assert cfg["effort"] == "high"
 
 

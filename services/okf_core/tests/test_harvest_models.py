@@ -15,7 +15,7 @@ from okf_core import harvest_models as hm
 def test_default_catalog_has_both_providers():
     models = [e["model"] for e in hm.DEFAULT_CATALOG]
     assert "global.anthropic.claude-opus-4-8" in models
-    assert "openai.gpt-5.5" in models
+    assert "openai.gpt-5.6-sol" in models
 
 
 def test_parse_catalog_empty_falls_back_to_default():
@@ -46,27 +46,27 @@ def test_parse_catalog_non_list_raises():
 
 def test_allowed_efforts_and_default():
     cat = hm.DEFAULT_CATALOG
-    assert "xhigh" in hm.allowed_efforts(cat, "openai.gpt-5.5")
-    # GPT omits "max" (it collapses onto xhigh), so it must NOT be offered.
-    assert "max" not in hm.allowed_efforts(cat, "openai.gpt-5.5")
+    assert "xhigh" in hm.allowed_efforts(cat, "openai.gpt-5.6-sol")
+    # GPT-5.6 added "max" as a native level, so it IS offered now (same as Claude).
+    assert "max" in hm.allowed_efforts(cat, "openai.gpt-5.6-sol")
     assert "max" in hm.allowed_efforts(cat, "global.anthropic.claude-opus-4-8")
     assert hm.allowed_efforts(cat, "nope") == ()
-    assert hm.default_effort_for(cat, "openai.gpt-5.5") == "xhigh"
+    assert hm.default_effort_for(cat, "openai.gpt-5.6-sol") == "xhigh"
     assert hm.default_effort_for(cat, "unknown") == hm.DEFAULT_EFFORT
 
 
 def test_validate_model_effort_ok():
     cat = hm.DEFAULT_CATALOG
-    assert hm.validate_model_effort(cat, "openai.gpt-5.5", "high") == (
-        "openai.gpt-5.5",
+    assert hm.validate_model_effort(cat, "openai.gpt-5.6-sol", "high") == (
+        "openai.gpt-5.6-sol",
         "high",
     )
 
 
 def test_validate_model_effort_defaults_when_effort_omitted():
     cat = hm.DEFAULT_CATALOG
-    assert hm.validate_model_effort(cat, "openai.gpt-5.5", None) == (
-        "openai.gpt-5.5",
+    assert hm.validate_model_effort(cat, "openai.gpt-5.6-sol", None) == (
+        "openai.gpt-5.6-sol",
         "xhigh",
     )
 
@@ -82,6 +82,7 @@ def test_validate_model_effort_unknown_model_raises():
 
 
 def test_validate_model_effort_effort_not_offered_raises():
-    # "max" is valid for Claude but NOT offered for gpt-5.5 -> reject.
+    # An effort the model doesn't list (here a bogus level) -> reject. Guards the
+    # trust boundary: only catalog-offered (model, effort) pairs reach Bedrock.
     with pytest.raises(hm.ModelCatalogError):
-        hm.validate_model_effort(hm.DEFAULT_CATALOG, "openai.gpt-5.5", "max")
+        hm.validate_model_effort(hm.DEFAULT_CATALOG, "openai.gpt-5.6-sol", "ultra")

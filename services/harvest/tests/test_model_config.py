@@ -76,8 +76,8 @@ def test_resolve_model_config_overrides_win_over_env(monkeypatch):
     monkeypatch.setenv("OKF_HARVEST_MODEL", "us.anthropic.claude-opus-4-8")
     monkeypatch.setenv("OKF_HARVEST_EFFORT", "medium")
     monkeypatch.delenv("OKF_HARVEST_MAX_TOKENS", raising=False)
-    cfg = ag.resolve_model_config(model_override="openai.gpt-5.5", effort_override="high")
-    assert cfg["model"] == "openai.gpt-5.5"
+    cfg = ag.resolve_model_config(model_override="openai.gpt-5.6-sol", effort_override="high")
+    assert cfg["model"] == "openai.gpt-5.6-sol"
     assert cfg["effort"] == "high"
     # max_tokens default keys off the RESOLVED (override) model -> GPT ceiling.
     assert cfg["max_tokens"] == ag.DEFAULT_GPT_MAX_TOKENS
@@ -87,8 +87,8 @@ def test_resolve_model_config_partial_override_falls_back_per_field(monkeypatch)
     # Only a model override: effort still comes from env (or its default).
     monkeypatch.setenv("OKF_HARVEST_EFFORT", "low")
     monkeypatch.delenv("OKF_HARVEST_MODEL", raising=False)
-    cfg = ag.resolve_model_config(model_override="openai.gpt-5.5")
-    assert cfg["model"] == "openai.gpt-5.5"
+    cfg = ag.resolve_model_config(model_override="openai.gpt-5.6-sol")
+    assert cfg["model"] == "openai.gpt-5.6-sol"
     assert cfg["effort"] == "low"  # from env, not overridden
 
 
@@ -173,7 +173,7 @@ def test_cap_subagent_concurrency_ignores_bad_limit(monkeypatch):
 
 @pytest.mark.parametrize(
     "model",
-    ["openai.gpt-5.5", "openai.gpt-5.4", "openai.gpt-oss-120b", "gpt-5.5"],
+    ["openai.gpt-5.6-sol", "openai.gpt-5.4", "openai.gpt-oss-120b", "gpt-5.5"],
 )
 def test_is_openai_model_true_for_gpt(model):
     assert ag._is_openai_model(model) is True
@@ -192,10 +192,11 @@ def test_is_openai_model_false_for_claude(model):
 
 
 def test_gpt_effort_maps_converse_levels():
-    # GPT-5.5 accepts xhigh, so our top levels must NOT be capped at high (that
-    # would silently downgrade the deliberately-max harvest effort).
+    # GPT-5.6 added "max" as a distinct level above xhigh, so the whole ladder
+    # passes through verbatim — in particular "max" must NOT collapse to "xhigh"
+    # (that would silently downgrade a deliberately-max harvest).
+    assert ag._gpt_effort("max") == "max"  # native level, not capped at xhigh
     assert ag._gpt_effort("xhigh") == "xhigh"
-    assert ag._gpt_effort("max") == "xhigh"  # no OpenAI level above xhigh
     assert ag._gpt_effort("high") == "high"
     assert ag._gpt_effort("medium") == "medium"
     assert ag._gpt_effort("low") == "low"
@@ -214,15 +215,15 @@ def test_resolve_model_config_gpt_max_tokens_default(monkeypatch):
     # An UNSET OKF_HARVEST_MAX_TOKENS picks the GPT ceiling for a GPT model...
     for k in ("OKF_HARVEST_MAX_TOKENS", "OKF_HARVEST_EFFORT"):
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("OKF_HARVEST_MODEL", "openai.gpt-5.5")
+    monkeypatch.setenv("OKF_HARVEST_MODEL", "openai.gpt-5.6-sol")
     cfg = ag.resolve_model_config()
-    assert cfg["model"] == "openai.gpt-5.5"
+    assert cfg["model"] == "openai.gpt-5.6-sol"
     assert cfg["max_tokens"] == ag.DEFAULT_GPT_MAX_TOKENS
 
 
 def test_resolve_model_config_explicit_max_tokens_wins_for_gpt(monkeypatch):
     # ...but an explicit value is authoritative regardless of provider.
-    monkeypatch.setenv("OKF_HARVEST_MODEL", "openai.gpt-5.5")
+    monkeypatch.setenv("OKF_HARVEST_MODEL", "openai.gpt-5.6-sol")
     monkeypatch.setenv("OKF_HARVEST_MAX_TOKENS", "8000")
     assert ag.resolve_model_config()["max_tokens"] == 8000
 
@@ -269,9 +270,9 @@ def test_build_mantle_openai_wiring_defaults(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     captured, _state = _install_openai_stubs(monkeypatch)
 
-    ag._build_mantle_openai("openai.gpt-5.5", "xhigh", 32000, callbacks=None)
+    ag._build_mantle_openai("openai.gpt-5.6-sol", "xhigh", 32000, callbacks=None)
 
-    assert captured["model"] == "openai.gpt-5.5"
+    assert captured["model"] == "openai.gpt-5.6-sol"
     # Default Mantle region (independent of AWS_REGION) drives the base URL + token.
     # GPT-5.x is served on the Responses API at the /openai/v1 path.
     assert captured["base_url"] == (
@@ -343,6 +344,6 @@ def test_build_model_dispatches_gpt_to_mantle(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     captured, _state = _install_openai_stubs(monkeypatch)
 
-    ag._build_model("openai.gpt-5.5", "high", 32000, callbacks=None)
+    ag._build_model("openai.gpt-5.6-sol", "high", 32000, callbacks=None)
 
-    assert captured["model"] == "openai.gpt-5.5"  # went through the OpenAI stub
+    assert captured["model"] == "openai.gpt-5.6-sol"  # went through the OpenAI stub
