@@ -81,7 +81,7 @@ DEFAULT_BEDROCK_MAX_ATTEMPTS = 5
 # that inherits the runtime's IAM identity (no API key / Secrets Manager). A
 # model id starting with "openai." / "gpt-" selects this path (see
 # _is_openai_model); anything else stays on Converse. Set OKF_HARVEST_MODEL to
-# e.g. "openai.gpt-5.5" to run GPT.
+# e.g. "openai.gpt-5.6-sol" to run GPT.
 #
 # Region is INDEPENDENT of AWS_REGION: GPT-5.x on Mantle lives only in
 # us-east-2 / us-west-2, while the harvest runtime itself may deploy elsewhere
@@ -96,13 +96,17 @@ DEFAULT_MANTLE_REGION = "us-east-2"
 DEFAULT_GPT_MAX_TOKENS = 32000
 
 # Map Converse effort levels onto OpenAI's reasoning_effort scale
-# (none|minimal|low|medium|high|xhigh). GPT-5.5 accepts xhigh (its own default is
-# medium), so DON'T collapse our top levels to high — that would silently cap the
-# deliberately-max harvest effort. Converse "max" has no OpenAI equivalent above
-# xhigh, so it maps to xhigh. Unknown values fall through to xhigh so a
-# Claude-tuned effort never quietly downgrades the authoring model.
+# (none|minimal|low|medium|high|xhigh|max). GPT-5.6 (Sol/Luna/Terra) added "max"
+# as a distinct level ABOVE xhigh, so our whole vocabulary now passes through
+# verbatim — every Converse level has a same-named OpenAI level. In particular
+# DON'T collapse "max"->"xhigh" (that silently downgrades a deliberately-max
+# harvest) or the top levels to "high". Which efforts a given model actually
+# accepts is model-specific (e.g. gpt-5.4 rejects "max"); that's enforced by the
+# model catalog (the trust boundary) + Bedrock, NOT a client-side allow-list here,
+# mirroring the Converse path. Unknown values fall through to xhigh so a stray
+# effort string never quietly downgrades the authoring model.
 _GPT_EFFORT = {
-    "max": "xhigh",
+    "max": "max",
     "xhigh": "xhigh",
     "high": "high",
     "medium": "medium",
@@ -244,7 +248,7 @@ def _bedrock_config():
 def _is_openai_model(model: str) -> bool:
     """True when ``model`` names an OpenAI GPT model served on Bedrock Mantle.
 
-    Mantle GPT ids are ``openai.<name>`` (e.g. ``openai.gpt-5.5``); the bare
+    Mantle GPT ids are ``openai.<name>`` (e.g. ``openai.gpt-5.6-sol``); the bare
     ``gpt-`` form is accepted too for local/dev use. Everything else — the
     ``us./eu./global.anthropic.*`` Converse profiles — stays on Converse.
     """

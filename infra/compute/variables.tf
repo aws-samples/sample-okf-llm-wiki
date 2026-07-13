@@ -54,7 +54,7 @@ variable "harvest_vpc_security_group_ids" {
 
 variable "harvest_model" {
   type        = string
-  description = "Harvest model id. An anthropic.* Converse inference profile (e.g. global.anthropic.claude-opus-4-8) runs on the bedrock-runtime Converse API; an openai.* id (e.g. openai.gpt-5.5) runs on the Bedrock Mantle OpenAI-compatible endpoint in harvest_mantle_region."
+  description = "Harvest model id. An anthropic.* Converse inference profile (e.g. global.anthropic.claude-opus-4-8) runs on the bedrock-runtime Converse API; an openai.* id (e.g. openai.gpt-5.6-sol) runs on the Bedrock Mantle OpenAI-compatible endpoint in harvest_mantle_region."
   default     = "global.anthropic.claude-opus-4-8"
 }
 
@@ -89,8 +89,10 @@ variable "harvest_max_subagent_concurrency" {
 # VITE_HARVEST_MODEL_CATALOG (the dropdown options). Each entry lists the model
 # id, a display label, the allowed efforts, and the default effort. `harvest_model`
 # above remains the deploy-time DEFAULT used when a harvest request omits a model.
-# GPT collapses "max" onto "xhigh" (harvest.agent._GPT_EFFORT), so the GPT entry
-# omits "max" rather than offering an effort that silently degrades.
+# GPT-5.6 added "max" as a distinct native level above "xhigh" (harvest.agent.
+# _GPT_EFFORT passes it through verbatim), so the GPT entry offers the full ladder.
+# Efforts are per-model: an older GPT id (e.g. gpt-5.4) that rejects "max" must NOT
+# list it here — the catalog is the trust boundary Bedrock validation backs up.
 variable "harvest_model_catalog" {
   type = list(object({
     model          = string
@@ -107,9 +109,9 @@ variable "harvest_model_catalog" {
       default_effort = "xhigh"
     },
     {
-      model          = "openai.gpt-5.5"
-      label          = "GPT-5.5"
-      efforts        = ["low", "medium", "high", "xhigh"]
+      model          = "openai.gpt-5.6-sol"
+      label          = "GPT-5.6 Sol"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "xhigh"
     },
   ]
@@ -151,7 +153,7 @@ variable "athena_workgroup" {
 variable "control_api_provisioned_concurrency" {
   type        = number
   description = "Pre-warmed execution environments for the control API Lambda, to minimize cold starts on the browser-facing plane. 0 disables it."
-  default     = 0
+  default     = 6
 }
 
 variable "athena_output_location" {

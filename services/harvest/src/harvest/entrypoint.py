@@ -13,7 +13,7 @@ Payload (from the Control API's InvokeAgentRuntime call):
     "mode": "full" | "incremental",
     "changed_table": "customers",     # incremental only
     "diff": {...}                      # incremental only, optional
-    "model": "openai.gpt-5.5",        # optional per-harvest override; falls
+    "model": "openai.gpt-5.6-sol",    # optional per-harvest override; falls
     "effort": "xhigh"                 # back to OKF_HARVEST_* env when omitted
   }
 

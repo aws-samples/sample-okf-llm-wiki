@@ -71,13 +71,13 @@ def test_report_status_records_model_and_effort():
         data_domain="d",
         dataset="ds",
         status="running",
-        model="openai.gpt-5.5",
+        model="openai.gpt-5.6-sol",
         effort="xhigh",
     )
     call = ddb.calls[0]
     assert call["ExpressionAttributeNames"]["#m"] == "model"
     assert call["ExpressionAttributeNames"]["#e"] == "effort"
-    assert call["ExpressionAttributeValues"][":m"] == {"S": "openai.gpt-5.5"}
+    assert call["ExpressionAttributeValues"][":m"] == {"S": "openai.gpt-5.6-sol"}
     assert call["ExpressionAttributeValues"][":e"] == {"S": "xhigh"}
 
 
