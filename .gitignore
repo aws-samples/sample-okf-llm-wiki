@@ -23,11 +23,17 @@ scripts/.deployment.config
 # OKF consumption MCP refresh token (30-day Cognito credential)
 scripts/.okf-refresh-token
 
-# Benchmark harness (local BIRD/Spider2 eval scratch: gold, reports, manifests)
-benchmark/
+# Internal benchmark scratch (BIRD/Spider2 eval WIP: gold, reports, A/B arms, PUMS
+# data + Census PDFs). The PUBLISHED benchmark lives in benchmark/ and is tracked.
+.benchmark/
+
+# Benchmark: downloaded third-party data + working dirs (never committed — see
+# benchmark/mini_dev/fetch_data.py; data is downloaded, not vendored)
+benchmark/mini_dev/data/
+benchmark/mini_dev/_ws/
+benchmark/mini_dev/evaluation/
+# Report: keep the PDF + generator (build_report.py); the HTML is regenerated output
+benchmark/mini_dev/report.html
 
 # OS
 .DS_Store
-
-# Local PUMS test dataset (data + Census PDFs; not for VCS)
-/benchmark/pums/
