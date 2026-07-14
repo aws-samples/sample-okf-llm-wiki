@@ -5,11 +5,13 @@ import remarkGfm from "remark-gfm"
 import rehypeHighlight from "rehype-highlight"
 import {
   CheckCircle2Icon,
+  ChevronDownIcon,
   CircleDashedIcon,
   CoinsIcon,
   DatabaseIcon,
   FileTextIcon,
   ListTreeIcon,
+  MessageSquareTextIcon,
   PlayIcon,
   SearchIcon,
   SlidersHorizontalIcon,
@@ -24,6 +26,14 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { ButtonGroup } from "@/components/ui/button-group"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Dialog,
   DialogClose,
@@ -112,6 +122,11 @@ export default function HarvestView({ api, selection }) {
   const [error, setError] = useState(null)
   const [starting, setStarting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const [startingAnnotations, setStartingAnnotations] = useState(false)
+  // Confirm modal before a full harvest OVERWRITES an existing bundle (a full
+  // run wipes and re-authors every doc — clean_authored_output — so a misclick
+  // is destructive). Only gated when a bundle already exists; see requestStartHarvest.
+  const [confirmFullOpen, setConfirmFullOpen] = useState(false)
   // Per-harvest model/effort picker — a persisted USER PREFERENCE (localStorage),
   // so it survives a page refresh. Initialised from loadPreference() (validated
   // against the current catalog) and saved on every change. Sent on the next
@@ -337,6 +352,43 @@ export default function HarvestView({ api, selection }) {
     }
   }
 
+  // Re-harvest driven by the caller's wiki annotations. The backend takes the
+  // same per-dataset lease, sweeps orphaned notes, and only invokes the agent if
+  // some live annotations remain (else returns {status:"complete", skipped}).
+  const startAnnotationHarvest = async () => {
+    if (!hasSelection) return
+    setStartingAnnotations(true)
+    try {
+      const res = await api.runAnnotationHarvest(domain, dataset)
+      if (res?.skipped) {
+        toast.info(
+          res.orphaned
+            ? `No live annotations — ${res.orphaned} auto-resolved as orphaned.`
+            : "No open annotations to apply. Select text in Browse to add some."
+        )
+        await poll()
+        return
+      }
+      toast.success(
+        `Annotation harvest queued for ${res.annotations} annotation(s)` +
+          (res.orphaned ? ` (${res.orphaned} orphaned)` : "")
+      )
+      resetFeed()
+      await poll()
+      startPolling()
+      startFeed()
+    } catch (err) {
+      const msg = err.message || String(err)
+      toast.error(
+        /-> 409/.test(msg)
+          ? "A harvest is already running for this dataset."
+          : `Could not start annotation harvest: ${msg}`
+      )
+    } finally {
+      setStartingAnnotations(false)
+    }
+  }
+
   const cancelHarvest = async () => {
     if (!hasSelection) return
     setCancelling(true)
@@ -397,6 +449,18 @@ export default function HarvestView({ api, selection }) {
   const showUpdated =
     inner.updated_at && TERMINAL_STATUSES.has(currentStatus)
 
+  // Full harvest is destructive when a bundle already exists (it wipes + rebuilds
+  // every doc, discarding any prior authoring incl. applied annotations). Confirm
+  // in that case; on a first-ever harvest (no bundle yet) start straight away.
+  const requestStartHarvest = () => {
+    if (ready) setConfirmFullOpen(true)
+    else startHarvest()
+  }
+  const confirmStartHarvest = () => {
+    setConfirmFullOpen(false)
+    startHarvest()
+  }
+
   return (
     // h-full: fill the content region (which is bounded by the viewport / the
     // floating sidebar's bottom gap), so the card — and its live feed — grow to
@@ -437,10 +501,50 @@ export default function HarvestView({ api, selection }) {
                 Cancel harvest
               </Button>
             ) : (
-              <Button onClick={startHarvest} disabled={starting}>
-                {starting ? <Spinner /> : <PlayIcon data-icon="inline-start" />}
-                Start full harvest
-              </Button>
+              // A split control: the dropdown (LEFT) offers the annotation
+              // re-harvest; the primary button (RIGHT) runs a full harvest.
+              // no-overlap (ml-0): two solid buttons share a seam, so a visible
+              // divider reads better than the default 1px border-overlap (which
+              // would hide under the neighbour).
+              <ButtonGroup className="[&>*:not(:first-child)]:ml-0">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      size="icon"
+                      disabled={starting || startingAnnotations}
+                      aria-label="More harvest options"
+                      title="More harvest options"
+                      // Buttons carry `border border-transparent bg-clip-padding`;
+                      // in dark mode that transparent 1px reveals the near-black
+                      // page behind the button (a stray dark ring). Tint the border
+                      // to the fill (border-primary) so it blends into the blue.
+                      className="border-primary"
+                    >
+                      {startingAnnotations ? <Spinner /> : <ChevronDownIcon />}
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-56">
+                    <DropdownMenuLabel>Re-harvest</DropdownMenuLabel>
+                    <DropdownMenuItem
+                      onSelect={startAnnotationHarvest}
+                      disabled={startingAnnotations}
+                    >
+                      <MessageSquareTextIcon />
+                      Apply my annotations
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <Button
+                  onClick={requestStartHarvest}
+                  disabled={starting}
+                  // border-primary blends the transparent edges into the fill (no
+                  // dark ring in dark mode); the left edge is the divider seam.
+                  className="border-primary border-l-primary-foreground/30"
+                >
+                  {starting ? <Spinner /> : <PlayIcon data-icon="inline-start" />}
+                  Start full harvest
+                </Button>
+              </ButtonGroup>
             )}
           </div>
           <HarvestSettingsDialog
@@ -451,6 +555,32 @@ export default function HarvestView({ api, selection }) {
             onModelChange={onModelChange}
             onEffortChange={setEffort}
           />
+          <Dialog open={confirmFullOpen} onOpenChange={setConfirmFullOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Re-run a full harvest?</DialogTitle>
+                <DialogDescription>
+                  <span className="font-medium text-foreground">
+                    {domain}/{dataset}
+                  </span>{" "}
+                  already has a knowledge bundle. A full harvest rebuilds it from
+                  scratch — every existing doc is discarded and re-authored,
+                  including any applied annotations and manual edits. This can't be
+                  undone. To apply new feedback without a rebuild, use{" "}
+                  <span className="font-medium">Apply my annotations</span> instead.
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <DialogClose asChild>
+                  <Button variant="outline">Cancel</Button>
+                </DialogClose>
+                <Button variant="destructive" onClick={confirmStartHarvest}>
+                  <PlayIcon data-icon="inline-start" />
+                  Rebuild bundle
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </CardHeader>
         <CardContent className="flex min-h-0 flex-1 flex-col gap-4">
           {error ? (

@@ -106,10 +106,15 @@ worth folding in. Then always finish with pass 4.
    *independent of the domain* — organize however the knowledge wants to be
    organized. Common conventions, all optional:
    - `datasets/`, `tables/` — for data catalogs.
-   - `references/` — for standalone reference docs (reusable definitions:
-     metrics, joins, known issues). Sub-conventions: `references/metrics/`,
-     `references/joins/`.
-   - Flat at root — fine for small bundles.
+   - `references/<type>/<slug>.md` — for standalone reference docs (reusable
+     definitions). Every extracted fact that becomes its own doc lives under a
+     **fact-typed parent folder** (`references/metrics/`, `references/joins/`,
+     `references/enums/`, `references/named_sets/`, `references/glossary/`,
+     `references/known_issues/`), one doc per item. This folder scheme is
+     **canonical** — it is what keeps bundles uniform across every harvest — so
+     don't file a reference doc directly under `references/` or invent another
+     folder. See `references/fact-types.md` (Routing summary) for the full table.
+   - Flat at root — fine for small bundles of non-reference concepts.
 3. **Pick `type` values.** Short, descriptive, self-explanatory strings:
    `Glue Table`, `Glue Database`, `API Endpoint`, `Metric`, `Playbook`,
    `Reference`. Types are **not** registered anywhere; pick consistent values and
@@ -218,8 +223,9 @@ such documents are present:
   doc; do not summarize its structure and point the reader back at the uploaded
   file — the reader cannot see uploaded files (see "Consumers read only the
   bundle" below).
-- **Mint a `references/` doc** only for a reusable definition (entity, metric,
-  enum, join path, named set) that a provided document genuinely supports.
+- **Mint a `references/<type>/<slug>.md` doc** only for a reusable definition
+  (entity, metric, enum, join path, named set) that a provided document genuinely
+  supports — always under its fact-typed folder (see `references/fact-types.md`).
 - **Cite the uploaded document**, not a guessed public origin (see Citations).
 
 If no context documents were provided, **skip this pass entirely** — do not

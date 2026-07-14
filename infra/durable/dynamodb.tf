@@ -63,7 +63,7 @@ data "aws_iam_policy_document" "dynamodb_cmk" {
 
 resource "aws_kms_key" "dynamodb" {
   count                   = var.dynamodb_customer_managed_cmk ? 1 : 0
-  description             = "${var.name_prefix} DynamoDB tables (registry + freshness) at-rest CMK"
+  description             = "${var.name_prefix} DynamoDB tables (registry + freshness + annotations) at-rest CMK"
   enable_key_rotation     = true
   deletion_window_in_days = 30
   policy                  = data.aws_iam_policy_document.dynamodb_cmk[0].json
@@ -126,6 +126,49 @@ resource "aws_dynamodb_table" "freshness" {
   attribute {
     name = "sk"
     type = "S"
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = local.dynamodb_kms_key_arn
+  }
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  tags = var.tags
+}
+
+# Wiki annotations: user-scoped feedback on concept docs, awaiting an
+# annotation-mode re-harvest. Isolation is STRUCTURAL — the partition key embeds
+# the author's Cognito subject (pk = "ANNO#<domain>#<dataset>#<user_sub>"), so a
+# user's Query can only ever read their OWN annotations; there is no cross-user
+# read path. Item shapes are documented in docs/CONVENTIONS.md and are load-bearing.
+#
+# TTL is on `expires_at`, which is set ONLY when an annotation reaches a terminal
+# state (resolved / rejected / orphaned) — an OPEN annotation carries no
+# expires_at and never expires. Terminal annotations linger 7 days as history,
+# then DynamoDB reaps them. A dedicated table (not registry/freshness) keeps this
+# sweep OFF the durable rows: a stray expires_at can only ever delete an
+# annotation, never a domain mapping or a Glue-version marker.
+resource "aws_dynamodb_table" "annotations" {
+  name         = "${var.name_prefix}-annotations"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
   }
 
   server_side_encryption {

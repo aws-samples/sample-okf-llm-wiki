@@ -156,11 +156,15 @@ ORDER BY revenue DESC
 
 ## Reference doc (a standalone, reusable definition)
 
-Lives under `references/`. Used for an entity definition, enum/status catalog,
-field glossary, units/convention note — something *referenceable by name* and
-useful to **two or more** concepts (or load-bearing background for one). `type`
-is `Reference`; `resource` points at the underlying asset (a Glue ARN) when there
-is one, and is omitted for a purely abstract definition.
+Lives under a **fact-typed folder** in `references/` — `references/<type>/<slug>.md`
+(e.g. `references/enums/status.md`, `references/glossary/gross_margin.md`), one doc
+per item. This folder scheme is canonical (see `references/fact-types.md` Routing
+summary); never put a reference doc directly under `references/`. Used for an entity
+definition, enum/status catalog, field-glossary term, units/convention note —
+something *referenceable by name* and useful to **two or more** concepts (or
+load-bearing background for one). `type` is `Reference`; `resource` points at the
+underlying asset (a Glue ARN) when there is one, and is omitted for a purely
+abstract definition.
 
 ```markdown
 ---

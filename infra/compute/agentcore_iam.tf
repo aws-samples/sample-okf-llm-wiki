@@ -281,6 +281,18 @@ data "aws_iam_policy_document" "harvest" {
     resources = [local.d.registry_table_arn]
   }
 
+  # Annotation-mode re-harvest write-back. When the run finishes, the RUNNER
+  # (not the LLM — the agent has zero DynamoDB tools) reconciles the agent's
+  # on-mount resolution file into the annotations table: each processed note is
+  # flipped to resolved/rejected with the agent's verdict comment and a 7-day
+  # expires_at. UpdateItem only; the Control API owns the initial put + the
+  # orphan sweep. Scoped to the single annotations table.
+  statement {
+    sid       = "AnnotationResolveWrite"
+    actions   = ["dynamodb:UpdateItem"]
+    resources = [local.d.annotations_table_arn]
+  }
+
   # S3 Files mount. Canonical form (AWS "File system configurations" doc): the
   # RESOURCE is the FILE-SYSTEM arn, gated by an ArnEquals condition on
   # s3files:AccessPointArn — NOT the access-point arn as the resource.

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from control_api import handlers
@@ -77,11 +78,14 @@ class Config:
         logs=None,
         harvest_log_group: str = "",
         harvest_model_catalog=None,
+        annotations_table: str = "okf-annotations",
     ):
         self.bucket = bucket
         self.registry_table = registry_table
         self.freshness_table = freshness_table
         self.harvest_runtime_arn = harvest_runtime_arn
+        # User-scoped wiki annotations (feedback awaiting an annotation harvest).
+        self.annotations_table = annotations_table
         self.s3 = s3
         self.ddb = ddb
         self.glue = glue
@@ -142,6 +146,9 @@ class Config:
             harvest_model_catalog=harvest_models.parse_catalog(
                 os.environ.get("OKF_HARVEST_MODEL_CATALOG")
             ),
+            annotations_table=os.environ.get(
+                "OKF_ANNOTATIONS_TABLE", "okf-annotations"
+            ),
         )
 
 
@@ -155,20 +162,45 @@ class Config:
 # ``caller`` is the verified identity from the JWT authorizer's claims (email or
 # sub) — used to attribute/authorize per-user actions (e.g. credential vending).
 
+@dataclass(frozen=True)
+class Caller:
+    """The verified caller identity from the JWT authorizer.
+
+    Two facets, both trustworthy (they come from the validated token, not the
+    request body). ``ident`` is the human-facing label (email, falling back to
+    sub) used for ATTRIBUTION — a credential's ``created_by``, an annotation's
+    ``author``. ``sub`` is the immutable, opaque Cognito subject used for
+    ISOLATION — it's baked into the annotation partition key, so it must never
+    change under a user and must be ``#``-delimiter-safe (a UUID is both). Kept
+    separate because attribution wants the readable value while isolation needs
+    the stable one.
+    """
+
+    ident: str | None = None
+    sub: str | None = None
+
+    def __bool__(self) -> bool:  # truthiness == "we have an identity"
+        return bool(self.ident or self.sub)
+
+    def __str__(self) -> str:  # so existing ``caller``-as-str uses keep working
+        return self.ident or self.sub or ""
+
+
 RouteFn = Callable[
-    [Config, dict[str, str], dict[str, Any] | None, dict[str, str], str | None],
+    [Config, dict[str, str], dict[str, Any] | None, dict[str, str], Caller],
     tuple[int, Any],
 ]
 
 
-def _caller_identity(event: dict[str, Any]) -> str | None:
-    """The verified caller identity from the API GW JWT authorizer claims.
+def _caller_identity(event: dict[str, Any]) -> Caller:
+    """The verified caller identity (ident + sub) from the JWT authorizer claims.
 
     The authorizer validates the token before we run and injects the decoded
-    claims at ``requestContext.authorizer.jwt.claims``. We prefer ``email`` (what
-    the UI shows) and fall back to ``sub`` (always present, immutable). This is
-    the ONLY trustworthy caller identity — never trust an identity carried in the
-    request body, which any caller can set.
+    claims at ``requestContext.authorizer.jwt.claims``. ``ident`` prefers
+    ``email`` (what the UI shows) and falls back to ``sub``; ``sub`` is captured
+    separately for user-scoped partition keys. This is the ONLY trustworthy
+    caller identity — never trust an identity carried in the request body, which
+    any caller can set.
     """
     # Use `or {}` at every level: a key can be PRESENT with a null value (e.g.
     # ``authorizer: null``), where ``.get(k, {})`` would return None and the next
@@ -179,9 +211,10 @@ def _caller_identity(event: dict[str, Any]) -> str | None:
     jwt = authz.get("jwt") or {}
     claims = jwt.get("claims") or {}
     if not isinstance(claims, dict):
-        return None
-    ident = claims.get("email") or claims.get("sub")
-    return ident or None
+        return Caller()
+    sub = claims.get("sub") or None
+    ident = claims.get("email") or sub
+    return Caller(ident=ident or None, sub=sub)
 
 
 def _r_list_glue(cfg, params, body, query, caller):
@@ -322,7 +355,7 @@ def _r_create_credential(cfg, params, body, query, caller):
     # revoke, so it MUST come from the verified JWT identity — never the request
     # body (which any caller can set to impersonate another owner). Fall back to
     # a body value only when there is no authorizer identity (e.g. local tests).
-    created_by = caller or (body or {}).get("created_by")
+    created_by = caller.ident or (body or {}).get("created_by")
     return 200, handlers.create_credential(
         cfg.cognito,
         cfg.ddb,
@@ -339,13 +372,14 @@ def _r_delete_credential(cfg, params, body, query, caller):
         raise ApiError(500, "credential vending not configured (pool)")
     # Pass the verified caller so the handler can enforce that a credential is
     # only revocable by the user who created it (and only if this API vended it).
+    # ``created_by`` was stamped from ``caller.ident`` (email), so compare on that.
     return 200, handlers.delete_credential(
         cfg.cognito,
         cfg.ddb,
         user_pool_id=cfg.user_pool_id,
         registry_table=cfg.registry_table,
         client_id=params["client_id"],
-        caller=caller,
+        caller=caller.ident,
     )
 
 
@@ -421,6 +455,85 @@ def _r_trigger_harvest(cfg, params, body, query, caller):
         changed_table=body.get("changed_table"),
         model=model,
         effort=effort,
+    )
+
+
+def _r_trigger_annotation_harvest(cfg, params, body, query, caller):
+    if not cfg.harvest_runtime_arn:
+        raise ApiError(500, "OKF_HARVEST_RUNTIME_ARN not configured")
+    # Enrich with the declared domain's description/context (same as a full
+    # harvest) so the agent applies annotations domain-aware.
+    domain_meta = handlers.get_domain(
+        cfg.ddb, registry_table=cfg.registry_table, data_domain=params["domain"]
+    )
+    return 200, handlers.trigger_annotation_harvest(
+        cfg.agentcore,
+        cfg.ddb,
+        cfg.s3,
+        registry_table=cfg.registry_table,
+        annotations_table=cfg.annotations_table,
+        bucket=cfg.bucket,
+        runtime_arn=cfg.harvest_runtime_arn,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        user_sub=caller.sub,
+        domain_meta=domain_meta,
+    )
+
+
+# -- Annotations (user-scoped feedback on concept docs) ---------------------
+
+
+def _r_list_annotations(cfg, params, body, query, caller):
+    return 200, handlers.list_annotations(
+        cfg.ddb,
+        annotations_table=cfg.annotations_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        user_sub=caller.sub,
+        # Optional ?concept=<id> narrows to one page's annotations.
+        concept_id=query.get("concept"),
+    )
+
+
+def _r_create_annotation(cfg, params, body, query, caller):
+    body = body or {}
+    block_line = body.get("block_line")
+    try:
+        block_line = int(block_line) if block_line is not None else None
+    except (TypeError, ValueError):
+        block_line = None
+    return 200, handlers.create_annotation(
+        cfg.ddb,
+        annotations_table=cfg.annotations_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        user_sub=caller.sub,
+        author=caller.ident,
+        concept_id=handlers._require(body, "concept_id"),
+        quote=handlers._require(body, "quote"),
+        note=handlers._require(body, "note"),
+        prefix=body.get("prefix") or "",
+        suffix=body.get("suffix") or "",
+        block_line=block_line,
+    )
+
+
+def _r_delete_annotation(cfg, params, body, query, caller):
+    # concept_id is a slash-delimited path (``tables/races``), so it can't be a
+    # single-segment path param — it rides in ?concept=<id>. Together with the
+    # {annotation_id} path param it reconstructs the sk within the caller's pk.
+    concept_id = query.get("concept")
+    if not concept_id:
+        raise ApiError(400, "missing required query param: concept")
+    return 200, handlers.delete_annotation(
+        cfg.ddb,
+        annotations_table=cfg.annotations_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        user_sub=caller.sub,
+        concept_id=concept_id,
+        annotation_id=params["annotation_id"],
     )
 
 
@@ -520,9 +633,15 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("DELETE", "/context/{domain}/{dataset}/{filename}", _r_delete_context),
     ("GET", "/context/{domain}/{dataset}", _r_list_context),
     ("POST", "/harvest", _r_trigger_harvest),
+    ("POST", "/harvest/{domain}/{dataset}/annotations/run", _r_trigger_annotation_harvest),
     ("POST", "/harvest/{domain}/{dataset}/cancel", _r_cancel_harvest),
     ("GET", "/harvest/{domain}/{dataset}/events", _r_get_harvest_events),
     ("GET", "/harvest/{domain}/{dataset}", _r_get_harvest),
+    # Annotations: fixed-suffix + method disambiguate; concept id rides in
+    # ?concept= (it has slashes, so can't be a path segment).
+    ("GET", "/annotations/{domain}/{dataset}", _r_list_annotations),
+    ("POST", "/annotations/{domain}/{dataset}", _r_create_annotation),
+    ("DELETE", "/annotations/{domain}/{dataset}/{annotation_id}", _r_delete_annotation),
     ("GET", "/bundle/{domain}/{dataset}/graph", _r_bundle_graph),
     ("GET", "/bundle/{domain}/{dataset}/file", _r_bundle_file),
     ("GET", "/bundle/{domain}/{dataset}", _r_list_bundle),

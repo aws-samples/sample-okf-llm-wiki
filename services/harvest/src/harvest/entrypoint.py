@@ -10,9 +10,11 @@ Payload (from the Control API's InvokeAgentRuntime call):
   {
     "data_domain": "sales",
     "dataset": "orders",              # the Glue database name
-    "mode": "full" | "incremental",
+    "mode": "full" | "incremental" | "annotated",
     "changed_table": "customers",     # incremental only
     "diff": {...}                      # incremental only, optional
+    "user_sub": "<cognito sub>",      # annotated only (whose annotations)
+    "annotations": [{...}],            # annotated only (the live feedback)
     "model": "openai.gpt-5.6-sol",    # optional per-harvest override; falls
     "effort": "xhigh"                 # back to OKF_HARVEST_* env when omitted
   }
@@ -29,7 +31,11 @@ import os
 import threading
 
 from harvest.clients import build_source, dataset_root
-from harvest.runner import run_full_harvest, run_incremental_harvest
+from harvest.runner import (
+    run_annotation_harvest,
+    run_full_harvest,
+    run_incremental_harvest,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("harvest.entrypoint")
@@ -90,6 +96,19 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             domain_context=domain_context,
             session_id=session_id,
         )
+    elif mode == "annotated":
+        run_annotation_harvest(
+            source=source,
+            dataset_root=root,
+            data_domain=data_domain,
+            dataset=dataset,
+            user_sub=payload["user_sub"],
+            annotations=payload.get("annotations") or [],
+            model_config=model_config,
+            domain_description=domain_description,
+            domain_context=domain_context,
+            session_id=session_id,
+        )
     else:
         run_full_harvest(
             source=source,
@@ -123,7 +142,7 @@ def _model_config_from_payload(payload: dict) -> dict | None:
 
 
 def _safe(payload: dict) -> dict:
-    return {
+    safe = {
         k: payload.get(k)
         for k in (
             "data_domain",
@@ -134,8 +153,13 @@ def _safe(payload: dict) -> dict:
             "effort",
             "domain_description",
             "domain_context",
+            "user_sub",
         )
     }
+    # Never log annotation bodies (reader feedback text); just how many there were.
+    if payload.get("annotations") is not None:
+        safe["annotations"] = f"<{len(payload.get('annotations') or [])} items>"
+    return safe
 
 
 def _validate(payload: dict) -> str | None:
@@ -152,6 +176,11 @@ def _validate(payload: dict) -> str | None:
             return f"missing required field: {key}"
     if mode == "incremental" and not payload.get("changed_table"):
         return "incremental mode requires 'changed_table'"
+    if mode == "annotated":
+        if not payload.get("user_sub"):
+            return "annotated mode requires 'user_sub'"
+        if not payload.get("annotations"):
+            return "annotated mode requires a non-empty 'annotations' list"
     return None
 
 

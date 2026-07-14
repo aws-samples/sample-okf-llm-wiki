@@ -129,6 +129,49 @@ export function makeApi(token) {
       ),
     bundleGraph: (domain, dataset) =>
       request(token, "GET", `/bundle/${domain}/${dataset}/graph`),
+
+    // Annotations (user-scoped feedback on concept docs). All calls are scoped
+    // server-side to the caller's Cognito sub — you only ever see/act on your
+    // own. `concept` (a slash path like tables/races) rides in the query string
+    // for list/delete since it can't be a path segment.
+    listAnnotations: (domain, dataset, concept) =>
+      request(
+        token,
+        "GET",
+        `/annotations/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}` +
+          (concept ? `?concept=${encodeURIComponent(concept)}` : "")
+      ),
+    // anchor = { quote, prefix, suffix, block_line } captured from the selection.
+    createAnnotation: (domain, dataset, conceptId, note, anchor = {}) =>
+      request(
+        token,
+        "POST",
+        `/annotations/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}`,
+        {
+          concept_id: conceptId,
+          note,
+          quote: anchor.quote,
+          ...(anchor.prefix ? { prefix: anchor.prefix } : {}),
+          ...(anchor.suffix ? { suffix: anchor.suffix } : {}),
+          ...(anchor.block_line != null ? { block_line: anchor.block_line } : {}),
+        }
+      ),
+    deleteAnnotation: (domain, dataset, conceptId, annotationId) =>
+      request(
+        token,
+        "DELETE",
+        `/annotations/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/` +
+          `${encodeURIComponent(annotationId)}?concept=${encodeURIComponent(conceptId)}`
+      ),
+    // Run the caller's open annotations through an annotation-mode re-harvest.
+    // The server takes the lease, sweeps orphans, and invokes only if some live
+    // annotations remain (else returns {status:"complete", skipped:true}).
+    runAnnotationHarvest: (domain, dataset) =>
+      request(
+        token,
+        "POST",
+        `/harvest/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/annotations/run`
+      ),
   }
 }
 

@@ -41,13 +41,13 @@ between a wiki an agent can query and one it can't.
 
 | # | Fact type | Look for in the docs | Lands in the OKF bundle |
 |---|-----------|----------------------|-------------------------|
-| 1 | **BUSINESS_TERM** | glossaries, "also known as / aka", acronym expansions, non-English labels, "the business calls this X" | the column's `# Schema` description; if it's a confusable alias, a `# Gotchas` note; a reusable term → `references/glossary.md` |
+| 1 | **BUSINESS_TERM** | glossaries, "also known as / aka", acronym expansions, non-English labels, "the business calls this X" | the column's `# Schema` description; if it's a confusable alias, a `# Gotchas` note; a reusable term → `references/glossary/<term>.md` |
 | 2 | **METRIC_DEFINITION** | "calculated as", "defined as", KPI formulas, "= sum(...) / ...", numerator/denominator prose | `references/metrics/<slug>.md` (owns the SQL); tables link it from `# Metrics` |
 | 3 | **JOIN_CONDITION** | ER diagrams, "foreign key", "joins to … on …", "one-to-many", relationship tables — **plus joins no doc mentions:** `grep .metadata/columns.tsv` for shared keys | `references/joins/<a>__<b>.md` (owns the `ON` clause); both tables link it from `# Joins`. **Verify keys match + establish cardinality with a real query before documenting; a doc's asserted join that fails or fans out unexpectedly is a `# Gotchas` finding** |
 | 4 | **CODE_ENUM** | data dictionaries, **code lists**, value tables, "1 = …, 2 = …", "valid values", category enumerations, status-flag legends | small set → inline in the `# Schema` row description; large set (>~15) → `references/enums/<column>.md`. **See below.** |
 | 5 | **FILTER_RULE** | "by default we exclude", "only count active", "unless stated we filter …", source-preference rules | `# Gotchas` (the rule) and/or the metric doc's `## When to use which`; a global default → dataset overview |
 | 6 | **GRAIN_STATEMENT** | "one row per", "each record represents", "unique by", primary-key notes | table prose ("one row per X") — **measure it, don't just copy** (grain-verification rule) |
-| 7 | **CAVEAT** | "note that", "be careful", "known issue", "caution", footnotes, "data quality" sections | `# Gotchas` on the affected table; a cross-cutting one → `references/known_issues.md` |
+| 7 | **CAVEAT** | "note that", "be careful", "known issue", "caution", footnotes, "data quality" sections | `# Gotchas` on the affected table; a cross-cutting one → `references/known_issues/<slug>.md` |
 | 8 | **TEMPORAL_RULE** | fiscal-calendar definitions, timezone notes, "as of", partition/refresh/SLA docs, "snapshot vs event" | `# Gotchas` or table prose; partitioning goes in `# Schema`/prose per the source adapter |
 | 9 | **MEASURED_IN** | units in parentheses/headers, "in USD", "in kg", "(%)", "amounts in thousands", scaling factors | the column's `# Schema` description (state the unit + any scale/implied decimals) |
 | 10 | **DATA_LINEAGE** | "sourced from", "derived from", ETL/pipeline docs, "upstream table", refresh diagrams | dataset/table `# Overview` prose. **Only what a doc/source states — never a guessed public origin** |
@@ -158,15 +158,29 @@ decode is worse than a missing one.
 - **`# Common query patterns`** — QUERY_PATTERN.
 - **`# Overview` prose** (in `datasets/<dataset>.md` or `tables/<table>.md`) —
   GRAIN_STATEMENT, BUSINESS_CONTEXT, DATA_LINEAGE.
-- **`references/…` docs** (all carry `type: Reference` + `title`/`description`,
-  and `# Citations` when minted from an uploaded doc — see the templates):
-  `references/metrics/<slug>.md` — METRIC_DEFINITION; `references/joins/<a>__<b>.md`
-  — JOIN_CONDITION; `references/enums/<column>.md` — large CODE_ENUM;
-  `references/named_sets/<name>.md` — NAMED_SET **and** LIFECYCLE_STAGE (a
-  business-stage→raw-codes mapping is named-set-shaped, not one column's legend);
-  `references/glossary.md` — reusable BUSINESS_TERM; `references/known_issues.md`
-  — cross-cutting CAVEAT. These subdirs are conventional, not enforced — any
-  `references/…` path with `type: Reference` is valid.
+- **`references/<type>/<slug>.md` docs** (all carry `type: Reference` +
+  `title`/`description`, and `# Citations` when minted from an uploaded doc — see
+  the templates). **Every extracted fact that becomes a standalone doc lives under
+  a fact-typed parent folder — one doc per item, folder named for the fact type.
+  This layout is CANONICAL, not optional: it is what makes bundles uniform across
+  every harvest and dataset, so a consuming agent finds a metric under
+  `references/metrics/` in every bundle.** Do NOT put a reference doc directly
+  under `references/` or invent a different folder name.
+
+  | Fact type | Folder | Example path |
+  |---|---|---|
+  | METRIC_DEFINITION | `references/metrics/` | `references/metrics/revenue_per_customer.md` |
+  | JOIN_CONDITION | `references/joins/` | `references/joins/<a>__<b>.md` |
+  | large CODE_ENUM | `references/enums/` | `references/enums/<column>.md` |
+  | NAMED_SET / LIFECYCLE_STAGE | `references/named_sets/` | `references/named_sets/<name>.md` |
+  | reusable BUSINESS_TERM | `references/glossary/` | `references/glossary/<term>.md` |
+  | cross-cutting CAVEAT | `references/known_issues/` | `references/known_issues/<slug>.md` |
+
+  Notes: LIFECYCLE_STAGE is named-set-shaped (a business stage → its raw status/
+  event codes), so it goes under `references/named_sets/` — not one column's
+  legend. `glossary/` and `known_issues/` are **one doc per term / per issue**
+  (each independently linkable), NOT a single collecting file. The slug is a short
+  kebab/snake identifier for the item (`gross_margin`, `duplicate_race_rows`).
 
 Every fact still obeys the core rules: real, verified against the source where
 possible, in the source's SQL dialect, and cited to the doc it came from.

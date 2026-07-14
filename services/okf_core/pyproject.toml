@@ -13,7 +13,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+# markdown-it-py is a TEST-ONLY oracle: test_annotations_renderer_oracle.py
+# renders a kitchen-sink doc with a real CommonMark renderer (same lineage as the
+# UI's react-markdown) to verify annotation orphan re-anchoring against genuine
+# rendered text. The runtime stays dep-minimal (pyyaml + networkx only); the test
+# importorskips it, so it's skipped — not failed — if this extra isn't installed.
+dev = ["pytest>=7.0", "markdown-it-py>=3.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

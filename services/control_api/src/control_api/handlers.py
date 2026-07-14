@@ -22,8 +22,10 @@ from typing import Any
 from datetime import timedelta
 
 from okf_aws import bundle_prefix, is_bundle_ready, parse_bundle_key, state_marker_key
+from okf_core import annotations as anno
 from okf_core.domain import DOMAIN_DATASET
 from okf_core.links import extract_links_with_headings
+from okf_core.paths import parse_concept_id
 from okf_core.session import HARVEST_LEASE_STALE_SECONDS, runtime_session_id
 from okf_core.sources import (
     SourceError,
@@ -1649,6 +1651,600 @@ def bundle_graph(s3, *, bucket: str, data_domain: str, dataset: str) -> dict[str
         obj = s3.get_object(Bucket=bucket, Key=key)
         files[loc.concept_id] = obj["Body"].read().decode("utf-8")
     return build_graph_json(files)
+
+
+# --------------------------------------------------------------------------- #
+# Wiki annotations (user-scoped feedback -> annotation-mode re-harvest)
+# --------------------------------------------------------------------------- #
+#
+# Item shape + the orphan/quote-match invariants live in okf_core.annotations
+# (imported as ``anno``). Isolation is STRUCTURAL: the partition key embeds the
+# caller's immutable Cognito ``sub``, so a Query can only return that user's own
+# annotations. Every handler here therefore takes ``user_sub`` and refuses to run
+# without it — a missing subject must never collapse users into a shared partition.
+
+# Length caps so one annotation can't bloat the item (DynamoDB 400 KB item cap)
+# or the harvest payload. Generous for real feedback; a hard boundary against abuse.
+_ANNO_QUOTE_MAX = 2000
+_ANNO_CONTEXT_MAX = 200  # prefix / suffix each
+_ANNO_NOTE_MAX = 4000
+
+# Cap the number of live annotations one run sends to the agent. Each carries a
+# quote (<=2 KB) + note (<=4 KB) + context, and the whole set is JSON-encoded into
+# ONE InvokeAgentRuntime payload; an unbounded set could exceed the payload byte
+# limit and fail the invoke unrecoverably (the user could never apply them). 100
+# is far above any real single review and bounds the worst case well under the limit.
+_ANNO_RUN_MAX = 100
+
+
+def _require_user_sub(user_sub: str | None) -> str:
+    """The verified caller subject, or a 401 — never fall through to no scope."""
+    if not user_sub:
+        raise ApiError(401, "authenticated user required for annotations")
+    return user_sub
+
+
+def _int_or_none(value: Any) -> int | None:
+    """Parse a DynamoDB numeric string to int, tolerating corruption.
+
+    A stored ``block_line`` that isn't a parseable int (data corruption / a future
+    writer bug) must NOT 500 the whole list read — one bad row shouldn't break the
+    sidebar. Returns None on anything non-integer.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _annotation_to_dict(item: dict[str, Any]) -> dict[str, Any]:
+    """Deserialize a DynamoDB annotation item to the UI/JSON shape."""
+    return {
+        "annotation_id": _s(item.get("annotation_id")),
+        "concept_id": _s(item.get("concept_id")),
+        "author": _s(item.get("author")),
+        "quote": _s(item.get("quote")),
+        "prefix": _s(item.get("prefix")),
+        "suffix": _s(item.get("suffix")),
+        # Tolerate a corrupt N so one bad row can't 500 the whole list read.
+        "block_line": _int_or_none(item.get("block_line", {}).get("N")),
+        "note": _s(item.get("note")),
+        "status": _s(item.get("status")),
+        "outcome": _s(item.get("outcome")),
+        "resolution": _s(item.get("resolution")),
+        "created_at": _s(item.get("created_at")),
+        "updated_at": _s(item.get("updated_at")),
+    }
+
+
+def create_annotation(
+    ddb,
+    *,
+    annotations_table: str,
+    data_domain: str,
+    dataset: str,
+    user_sub: str | None,
+    author: str | None,
+    concept_id: str,
+    quote: str,
+    note: str,
+    prefix: str = "",
+    suffix: str = "",
+    block_line: int | None = None,
+) -> dict[str, Any]:
+    """Persist one open annotation, scoped to the caller.
+
+    ``quote`` is the selected passage (a TextQuoteSelector anchor); ``prefix`` /
+    ``suffix`` are the minimal disambiguating context the UI captured; ``note`` is
+    the user's feedback. ``author`` is the human-facing label for display only —
+    ISOLATION is via ``user_sub`` in the partition key, never ``author``.
+    """
+    user_sub = _require_user_sub(user_sub)
+    if not concept_id:
+        raise ApiError(400, "missing required field: concept_id")
+    # A concept id is a slash path of validated segments (never contains '#',
+    # which is our sk delimiter). Reject anything else at the boundary.
+    try:
+        parse_concept_id(concept_id)
+    except ValueError as e:
+        raise ApiError(400, f"invalid concept_id: {concept_id!r}") from e
+    quote = (quote or "").strip()
+    note = (note or "").strip()
+    if not quote:
+        raise ApiError(400, "missing required field: quote")
+    if not note:
+        raise ApiError(400, "missing required field: note")
+
+    annotation_id = uuid.uuid4().hex
+    now = _now_iso()
+    item: dict[str, Any] = {
+        "pk": {"S": anno.annotation_pk(data_domain, dataset, user_sub)},
+        "sk": {"S": anno.annotation_sk(concept_id, annotation_id)},
+        "data_domain": {"S": data_domain},
+        "dataset": {"S": dataset},
+        "concept_id": {"S": concept_id},
+        "annotation_id": {"S": annotation_id},
+        "quote": {"S": quote[:_ANNO_QUOTE_MAX]},
+        "note": {"S": note[:_ANNO_NOTE_MAX]},
+        "status": {"S": anno.STATUS_OPEN},
+        "created_at": {"S": now},
+        "updated_at": {"S": now},
+    }
+    if author:
+        item["author"] = {"S": author}
+    if prefix:
+        item["prefix"] = {"S": prefix[:_ANNO_CONTEXT_MAX]}
+    if suffix:
+        item["suffix"] = {"S": suffix[:_ANNO_CONTEXT_MAX]}
+    if block_line is not None:
+        item["block_line"] = {"N": str(int(block_line))}
+    ddb.put_item(TableName=annotations_table, Item=item)
+    return _annotation_to_dict(item)
+
+
+def _query_user_annotations(
+    ddb,
+    *,
+    annotations_table: str,
+    data_domain: str,
+    dataset: str,
+    user_sub: str,
+    concept_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Raw DynamoDB items for the caller's annotations in this dataset.
+
+    Single-partition Query on the user-scoped pk (optionally narrowed to one
+    concept via a ``begins_with`` on the sk). Returns raw items so callers that
+    need to UpdateItem (the orphan sweep) keep the keys.
+    """
+    pk = anno.annotation_pk(data_domain, dataset, user_sub)
+    kwargs: dict[str, Any] = {
+        "TableName": annotations_table,
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": pk}},
+    }
+    if concept_id is not None:
+        kwargs["KeyConditionExpression"] = "pk = :pk AND begins_with(sk, :skp)"
+        kwargs["ExpressionAttributeValues"][":skp"] = {
+            "S": anno.concept_sk_prefix(concept_id)
+        }
+    items: list[dict[str, Any]] = []
+    while True:
+        resp = ddb.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+    return items
+
+
+def list_annotations(
+    ddb,
+    *,
+    annotations_table: str,
+    data_domain: str,
+    dataset: str,
+    user_sub: str | None,
+    concept_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """List the caller's annotations (optionally for one concept), newest first."""
+    user_sub = _require_user_sub(user_sub)
+    items = _query_user_annotations(
+        ddb,
+        annotations_table=annotations_table,
+        data_domain=data_domain,
+        dataset=dataset,
+        user_sub=user_sub,
+        concept_id=concept_id,
+    )
+    out = [_annotation_to_dict(it) for it in items]
+    out.sort(key=lambda a: a.get("created_at") or "", reverse=True)
+    return out
+
+
+def delete_annotation(
+    ddb,
+    *,
+    annotations_table: str,
+    data_domain: str,
+    dataset: str,
+    user_sub: str | None,
+    concept_id: str,
+    annotation_id: str,
+) -> dict[str, Any]:
+    """Delete one of the caller's annotations.
+
+    Conditioned on the item existing so a delete of someone else's id (which
+    can't be in this caller's partition anyway) or a stale id is a clean 404, not
+    a silent no-op.
+    """
+    user_sub = _require_user_sub(user_sub)
+    key = {
+        "pk": {"S": anno.annotation_pk(data_domain, dataset, user_sub)},
+        "sk": {"S": anno.annotation_sk(concept_id, annotation_id)},
+    }
+    try:
+        ddb.delete_item(
+            TableName=annotations_table,
+            Key=key,
+            ConditionExpression="attribute_exists(pk)",
+        )
+    except Exception as e:  # noqa: BLE001 - map a missing item to 404
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            raise ApiError(404, f"no such annotation: {annotation_id}") from e
+        raise
+    return {"deleted": True, "annotation_id": annotation_id}
+
+
+def _resolve_annotation(
+    ddb,
+    *,
+    annotations_table: str,
+    pk: str,
+    sk: str,
+    outcome: str,
+    resolution: str,
+    now_iso: str,
+    expires_at: int,
+) -> None:
+    """Flip one annotation to resolved with an outcome + comment + 7-day TTL.
+
+    Best-effort per item (a single failed write must not abort the whole sweep):
+    the caller logs and continues. ``expires_at`` (epoch seconds) is set ONLY
+    here — an open annotation never carries it, so only resolved rows expire.
+    """
+    try:
+        ddb.update_item(
+            TableName=annotations_table,
+            Key={"pk": {"S": pk}, "sk": {"S": sk}},
+            UpdateExpression=(
+                "SET #s = :s, outcome = :o, resolution = :r, "
+                "updated_at = :u, expires_at = :e"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": {"S": anno.STATUS_RESOLVED},
+                ":o": {"S": outcome},
+                ":r": {"S": (resolution or "")[:_ANNO_NOTE_MAX]},
+                ":u": {"S": now_iso},
+                ":e": {"N": str(expires_at)},
+            },
+        )
+    except Exception:  # noqa: BLE001 - one bad write shouldn't fail the batch
+        import logging
+
+        logging.getLogger("control_api").warning(
+            "failed to resolve annotation %s (continuing)", sk, exc_info=True
+        )
+
+
+def _set_status_row(
+    ddb,
+    *,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    status: str,
+    detail: str,
+) -> None:
+    """Terminal-set the harvest STATUS row from the Control API (skip/abort paths).
+
+    Used both when the orphan sweep resolves EVERY annotation (nothing to invoke →
+    ``complete``) and to RELEASE the lease if the pre-flight itself fails
+    (``failed``). Flip is guarded to in-flight so a raced cancel/terminal write
+    wins. Best-effort: a failed status write never masks the caller's own outcome.
+    """
+    try:
+        ddb.update_item(
+            TableName=registry_table,
+            Key={
+                "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+                "sk": {"S": "STATUS"},
+            },
+            UpdateExpression="SET #s = :s, updated_at = :u, detail = :d",
+            ConditionExpression="attribute_not_exists(pk) OR #s = :queued OR #s = :running",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": {"S": status},
+                ":u": {"S": _now_iso()},
+                ":d": {"S": detail[:1024]},
+                ":queued": {"S": "queued"},
+                ":running": {"S": "running"},
+            },
+        )
+    except Exception:  # noqa: BLE001 - status is best-effort, lease still frees
+        import logging
+
+        logging.getLogger("control_api").warning(
+            "failed to close status row for %s/%s (continuing)",
+            data_domain,
+            dataset,
+            exc_info=True,
+        )
+
+
+def _set_annotation_status(
+    ddb, *, annotations_table: str, pk: str, sk: str, status: str, now_iso: str
+) -> bool:
+    """Set one annotation's ``status`` (+ updated_at). Best-effort; returns success.
+
+    Used to flip survivors to ``in_review`` and to revert them to ``open``. Never
+    raises — a single failed write is logged and skipped so a batch keeps moving.
+    """
+    if not (pk and sk):
+        return False
+    try:
+        ddb.update_item(
+            TableName=annotations_table,
+            Key={"pk": {"S": pk}, "sk": {"S": sk}},
+            UpdateExpression="SET #s = :s, updated_at = :u",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": {"S": status}, ":u": {"S": now_iso}},
+        )
+        return True
+    except Exception:  # noqa: BLE001 - best-effort per item
+        import logging
+
+        logging.getLogger("control_api").warning(
+            "failed to set annotation %s -> %s (continuing)", sk, status, exc_info=True
+        )
+        return False
+
+
+def trigger_annotation_harvest(
+    agentcore,
+    ddb,
+    s3,
+    *,
+    registry_table: str,
+    annotations_table: str,
+    bucket: str,
+    runtime_arn: str,
+    data_domain: str,
+    dataset: str,
+    user_sub: str | None,
+    domain_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run the caller's open annotations through an annotation-mode re-harvest.
+
+    Ordering is the whole point:
+
+    1. **Take the per-dataset lease first** (mode ``annotated``) so the bundle
+       can't change under the sweep and no full/incremental run races us. A held
+       lease -> 409.
+    2. **Orphan sweep** — for each open annotation, load its target doc from S3
+       and try to re-anchor the quote (``anno.is_orphaned``). A note whose passage
+       is gone (doc dropped, or quote no longer present) is auto-resolved
+       ``orphaned`` with a 7-day TTL — the agent never sees it.
+    3. **Branch**:
+       * every open note orphaned (or none open) -> nothing to apply: close the
+         status row ``complete`` and DON'T invoke the runtime (the payoff of doing
+         this in the pre-flight, not inside an expensive agent run).
+       * some survive -> flip them ``in_review`` and invoke the runtime with only
+         the live notes. On invoke failure, release the lease AND revert
+         ``in_review`` -> ``open`` so the feedback isn't silently lost.
+    """
+    user_sub = _require_user_sub(user_sub)
+    if not runtime_arn:
+        raise ApiError(500, "OKF_HARVEST_RUNTIME_ARN not configured")
+
+    # Fresh session per run (like a full harvest, NOT the incremental affinity id):
+    # a one-shot job wants a new microVM with a clean S3 Files mount rather than
+    # reattaching to a warm/stale one left by a prior incremental run.
+    session_id = runtime_session_id(
+        data_domain, dataset, unique_token=uuid.uuid4().hex
+    )
+    if not acquire_harvest_lease(
+        ddb,
+        registry_table=registry_table,
+        data_domain=data_domain,
+        dataset=dataset,
+        mode="annotated",
+        session_id=session_id,
+    ):
+        raise ApiError(
+            409,
+            f"a harvest for {data_domain}/{dataset} is already queued or running",
+        )
+
+    # EVERYTHING after the lease is taken runs under try/except: if the pre-flight
+    # (Query, S3 reads, sweep) or the invoke raises, we MUST release the lease
+    # (mark the row failed) or the dataset wedges at `queued` for the 8h stale
+    # window. `flipped` tracks survivors moved to in_review so we can revert them.
+    now = _now_iso()
+    expires_at = int(
+        (datetime.now(timezone.utc) + timedelta(seconds=anno.HISTORY_TTL_SECONDS)).timestamp()
+    )
+    flipped: list[tuple[str, str]] = []
+    try:
+        # We reclaim BOTH open and in_review notes. An in_review note here is a
+        # straggler from a prior run that died between flipping it and finishing
+        # (the lease we now hold proves no run is currently active), so it's safe —
+        # and necessary — to re-process it, else it would be stranded forever (an
+        # open-only query would never see it again).
+        actionable = [
+            it
+            for it in _query_user_annotations(
+                ddb,
+                annotations_table=annotations_table,
+                data_domain=data_domain,
+                dataset=dataset,
+                user_sub=user_sub,
+            )
+            if _s(it.get("status")) in (anno.STATUS_OPEN, anno.STATUS_IN_REVIEW)
+        ]
+
+        # Cache each concept doc's body so N annotations on one page cost one GET.
+        body_cache: dict[str, str | None] = {}
+
+        def _load_body(concept_id: str) -> str | None:
+            if concept_id in body_cache:
+                return body_cache[concept_id]
+            key = f"{bundle_prefix(data_domain, dataset)}{concept_id}.md"
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                body_cache[concept_id] = obj["Body"].read().decode("utf-8")
+            except Exception as e:  # noqa: BLE001 - a MISSING doc -> orphan (None)
+                code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+                if code in ("NoSuchKey", "404", "NotFound"):
+                    body_cache[concept_id] = None
+                else:
+                    # A non-404 S3 error (throttle, AccessDenied) is NOT "the doc
+                    # is gone" — re-raise so the outer handler releases the lease
+                    # rather than silently orphaning a note whose doc we couldn't read.
+                    raise
+            return body_cache[concept_id]
+
+        survivors: list[dict[str, Any]] = []
+        orphaned = 0
+        for it in actionable:
+            concept_id = _s(it.get("concept_id")) or ""
+            quote = _s(it.get("quote")) or ""
+            body = _load_body(concept_id)
+            if anno.is_orphaned(body, quote):
+                _resolve_annotation(
+                    ddb,
+                    annotations_table=annotations_table,
+                    pk=_s(it.get("pk")),
+                    sk=_s(it.get("sk")),
+                    outcome=anno.OUTCOME_ORPHANED,
+                    resolution=anno.ORPHAN_RESOLUTION_MESSAGE,
+                    now_iso=now,
+                    expires_at=expires_at,
+                )
+                orphaned += 1
+            else:
+                survivors.append(it)
+
+        # Nothing live to act on: close the run out here, skip the agent entirely.
+        if not survivors:
+            detail = (
+                f"No live annotations to apply — {orphaned} auto-resolved as orphaned."
+                if orphaned
+                else "No open annotations to apply."
+            )
+            _set_status_row(
+                ddb,
+                registry_table=registry_table,
+                data_domain=data_domain,
+                dataset=dataset,
+                status="complete",
+                detail=detail,
+            )
+            return {
+                "status": "complete",
+                "skipped": True,
+                "data_domain": data_domain,
+                "dataset": dataset,
+                "annotations": 0,
+                "orphaned": orphaned,
+            }
+
+        # Bound the payload: the whole survivor set is JSON-encoded into ONE invoke
+        # payload, so an unbounded set could exceed the byte limit and fail
+        # unrecoverably. Refuse up front (before flipping any status) with a clear
+        # 400 so the caller can delete/prune rather than hit an opaque invoke error.
+        if len(survivors) > _ANNO_RUN_MAX:
+            _set_status_row(
+                ddb,
+                registry_table=registry_table,
+                data_domain=data_domain,
+                dataset=dataset,
+                status="failed",
+                detail=f"too many open annotations ({len(survivors)} > {_ANNO_RUN_MAX})",
+            )
+            raise ApiError(
+                400,
+                f"too many open annotations to apply in one run "
+                f"({len(survivors)}; max {_ANNO_RUN_MAX}). Delete some and retry.",
+            )
+
+        # Mark survivors in_review so a second run can't double-process them. Track
+        # what we flipped so the failure path can revert. (A death BETWEEN this loop
+        # and the invoke leaves them in_review, but the next run reclaims in_review
+        # notes above — so they're never permanently stranded.)
+        for it in survivors:
+            pk, sk = _s(it.get("pk")), _s(it.get("sk"))
+            if _set_annotation_status(
+                ddb,
+                annotations_table=annotations_table,
+                pk=pk,
+                sk=sk,
+                status=anno.STATUS_IN_REVIEW,
+                now_iso=now,
+            ):
+                flipped.append((pk, sk))
+
+        # The runner writes these through the mount, prompts the agent to assess +
+        # apply, then reconciles the agent's verdicts back to DDB (UpdateItem). It
+        # needs pk/sk-reconstruction data: user_sub + concept_id + annotation_id.
+        payload_annotations = [
+            {
+                "annotation_id": _s(it.get("annotation_id")),
+                "concept_id": _s(it.get("concept_id")),
+                "quote": _s(it.get("quote")),
+                "prefix": _s(it.get("prefix")) or "",
+                "suffix": _s(it.get("suffix")) or "",
+                "block_line": _int_or_none(it.get("block_line", {}).get("N")),
+                "note": _s(it.get("note")),
+            }
+            for it in survivors
+        ]
+        payload: dict[str, Any] = {
+            "data_domain": data_domain,
+            "dataset": dataset,
+            "mode": "annotated",
+            "user_sub": user_sub,
+            "annotations": payload_annotations,
+        }
+        if domain_meta:
+            if domain_meta.get("description"):
+                payload["domain_description"] = domain_meta["description"]
+            if domain_meta.get("context"):
+                payload["domain_context"] = domain_meta["context"]
+
+        agentcore.invoke_agent_runtime(
+            agentRuntimeArn=runtime_arn,
+            runtimeSessionId=session_id,
+            payload=json.dumps(payload).encode(),
+            qualifier="DEFAULT",
+        )
+    except ApiError:
+        # Already status-set + surfaced with the right code (e.g. the run-cap 400);
+        # any survivors were not yet flipped, so nothing to revert. Re-raise as-is.
+        raise
+    except Exception as e:  # noqa: BLE001 - release lease + revert notes, then raise
+        _set_status_row(
+            ddb,
+            registry_table=registry_table,
+            data_domain=data_domain,
+            dataset=dataset,
+            status="failed",
+            detail=f"annotation harvest failed: {type(e).__name__}",
+        )
+        # Revert in_review -> open so no feedback is stranded by a failed run.
+        for rpk, rsk in flipped:
+            _set_annotation_status(
+                ddb,
+                annotations_table=annotations_table,
+                pk=rpk,
+                sk=rsk,
+                status=anno.STATUS_OPEN,
+                now_iso=_now_iso(),
+            )
+        raise ApiError(502, f"annotation harvest could not be started: {type(e).__name__}")
+
+    return {
+        "status": "queued",
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "annotations": len(survivors),
+        "orphaned": orphaned,
+    }
 
 
 # --------------------------------------------------------------------------- #
