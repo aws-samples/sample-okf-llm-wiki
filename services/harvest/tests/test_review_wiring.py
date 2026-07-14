@@ -32,6 +32,41 @@ def test_supervisor_runs_review_pass_via_task_fanout():
     assert "CONFIRMED" in p or "confirmed" in p
 
 
+def test_supervisor_review_must_run_in_subagents_not_the_executor():
+    # Adversarial review must go through the dynamic `reviewer` sub-agents, never
+    # the supervisor itself — an author reviewing its own work carries the
+    # author's bias. The prompt must explicitly forbid self-review and name the
+    # bias rationale so the independence isn't optimized away.
+    p = prompts.SUPERVISOR_PROMPT
+    assert "Do NOT review the docs yourself" in p
+    assert "bias" in p.lower()
+
+
+def test_reviewer_flags_volatile_stats_and_missing_joins():
+    # The reviewer enforces the two new authoring bars: no decaying stats baked in,
+    # and joins the doc failed to discover/verify.
+    p = prompts.REVIEWER_PROMPT
+    assert "volatile stats" in p.lower() or "row count" in p.lower()
+    assert "cardinality" in p.lower()
+    # Probes for a join the doc missed (beyond what context named).
+    assert "columns.tsv" in p
+
+
+def test_runtime_carries_essence_and_context_convergence_bars():
+    # All three prompts share _RUNTIME, so all must carry: verify context (don't
+    # transcribe on faith), don't let context cap join discovery, and omit
+    # volatile numbers (capture essence).
+    for prompt in (
+        prompts.SUPERVISOR_PROMPT,
+        prompts.TABLE_AUTHOR_PROMPT,
+        prompts.REVIEWER_PROMPT,
+    ):
+        low = prompt.lower()
+        assert "verify" in low
+        assert "columns.tsv" in prompt  # join discovery beyond context
+        assert "volatile" in low or "decay" in low  # essence over stats
+
+
 def test_supervisor_forbids_response_schema_on_task():
     # responseSchema drives langchain's AutoStrategy -> ProviderStrategy, which
     # emits native output_config.format alongside adaptive thinking. Bedrock's

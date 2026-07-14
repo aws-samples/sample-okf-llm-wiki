@@ -154,7 +154,10 @@ opens `full` in a modal on click. `tool_call`/`tool_result` share a `call_id`
 so the UI folds them into one row. **`subagent`** events power the UI's fleet
 squares (the dynamic reviewer/table-author fan-out): they carry
 `{phase: start|complete|error, batch, sub_id, subagent_type?}` where `batch` is
-the `eval` tool-call id grouping one fan-out and `sub_id` is the per-dispatch id.
+the top-level `eval` tool-call id grouping one fan-out wave (NOT the event's own
+`eval_id`, a REPL-local counter that resets to `call_0` on every `eval()` and so
+can't tell one wave from the next — the emitter correlates each sub-agent to the
+current top-level `eval` call_id) and `sub_id` is the per-dispatch id.
 They come from `langchain_quickjs`'s custom stream (the run loop uses
 `.stream(stream_mode=["custom"], subgraphs=True)`, since `.invoke()` drops these
 into a no-op writer). The UI grows a row of squares as sub-agents START (there is

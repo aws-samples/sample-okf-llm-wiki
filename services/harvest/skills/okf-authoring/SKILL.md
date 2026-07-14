@@ -46,6 +46,50 @@ concept the reader CAN open, unlike the source file). Point at the source **only
 under `# Citations`, as provenance for where you copied a fact FROM — never in
 the body as a place for the reader to go.
 
+## Source and context must converge — verify, don't defer
+
+A bundle has two authoring inputs: the **primary source** (what the data
+structurally *is* — schema, real values, measured grain) and any **uploaded
+context** (what humans *say* the data means — dictionaries, join docs, metric
+definitions). Neither is authoritative alone. The final bundle is their
+**reconciliation**: every load-bearing fact should hold in both, and where they
+disagree, that disagreement is itself knowledge worth capturing.
+
+- **Context is a lead, not gospel.** A join, grain, enum, or metric asserted in a
+  context doc is a hypothesis to CONFIRM against the live source — not a fact to
+  transcribe on faith. Run the query. If the data contradicts the doc, the data
+  wins, and the discrepancy earns a `# Gotchas` note ("the dictionary lists
+  status `9` but no row uses it"; "the ERD claims a 1:1 join, but N ids fan out").
+- **Never let context make you lazy.** Being handed one join does not license
+  skipping the rest. Still `grep .metadata/columns.tsv` for every shared key,
+  still probe the plausible relationships the docs never mentioned, still measure
+  the grain yourself. Context should *widen* your investigation, never cap it —
+  the join a human wrote down is often not the only (or the best) one.
+- **Fuse, don't staple.** The essence of the data emerges from putting source and
+  context in dialogue, not from concatenating them. A fact only the source
+  reveals and a fact only the context explains both belong; a fact they
+  contradict is the single most valuable thing you can surface for a consumer.
+
+## Capture the essence, not the volatile numbers
+
+Favor facts that describe what the data *is* over statistics that merely describe
+its current *size*. Row counts, byte sizes, distinct-value tallies, and "latest
+date" values drift with every load — bake one into the prose and the bundle is
+stale by the next refresh, and the number taught the reader little about meaning
+anyway.
+
+- **Measure volatile stats to VERIFY, then leave them out.** Counting rows to
+  confirm a grain, or scanning distinct values to decode an enum, is exactly
+  right — that is authoring-time verification. But the *output* is the verified
+  grain ("one row per race") or the decoded legend, NOT the `COUNT(*)` you ran to
+  get there.
+- **Omit row counts, table sizes, and freshness timestamps by default.** Include
+  a magnitude only when it is genuinely load-bearing *and* reasonably stable —
+  a fixed enum cardinality ("530 occupation codes"), or an order-of-magnitude that
+  changes how one must query ("billions of rows — always filter the partition
+  key"). A precise, decaying count is noise; a stable, decision-shaping magnitude
+  is signal. When in doubt, leave the number out and state the structure instead.
+
 ## Workflow
 
 Authoring a bundle has up to three passes. Run pass 1 always; run pass 2 to
@@ -111,6 +155,16 @@ one `write` action. Steps per concept:
      tables; a per-row count vs a same-named detail table; per-period vs
      cumulative values). For each confusable pair, sample real values from both
      and write an explicit contrast — see the `# Gotchas` convention under Body.
+   - **Discover joins yourself — don't wait to be told.** Find candidate
+     relationships by grepping the cross-table column index for every shared key
+     (`grep <name> .metadata/columns.tsv`), not just the joins a context doc
+     happens to mention. For each candidate, VERIFY it against live data before
+     documenting it — confirm the keys actually match on both sides and establish
+     the cardinality (1:1, 1:many, many:many) with a real query, e.g.
+     `SELECT COUNT(*) FROM a JOIN b ON a.k = b.k` vs the row counts, or a
+     duplicate-key probe on the presumed FK. Document only joins that hold; if a
+     context doc's asserted join fails or has surprising cardinality, that is a
+     `# Gotchas`-worthy finding.
    - **Detect column families in wide tables.** If a table has many columns
      (rule of thumb: >~30), don't reflexively enumerate them one per row. Cluster
      the column names by their shared pattern — a common prefix/suffix, a numeric
@@ -147,6 +201,14 @@ such documents are present:
 - **Read them, then augment** the relevant concept docs with what they actually
   state — following the augmentation rules (preserve the existing doc; add, don't
   shrink). One uploaded doc may inform multiple concepts.
+- **Verify every context claim against the live source; don't just transcribe it.**
+  A join condition, grain statement, metric formula, or enum value from a context
+  doc is a hypothesis — confirm it with `run_sql`/`sample_rows` before it enters
+  the bundle (see "Source and context must converge"). Where the data contradicts
+  the doc, the data wins and the discrepancy becomes a `# Gotchas` note. And a
+  context doc that documents *one* join/metric does not excuse you from probing
+  the relationships and columns it left out — context widens the investigation,
+  it never caps it.
 - **Decode coded columns.** A data dictionary or code list you were given is the
   legend for opaque coded columns (`status`, `region_code`, education/occupation
   codes). Transcribe the code→meaning mapping — small sets inline in `# Schema`,
@@ -334,8 +396,11 @@ Then quality (soft, but do it — conformance checks none of these): one-sentenc
 SQL/examples are real, not invented, **and in the source's pinned dialect**;
 every asset's **grain is measured, not assumed**; wide tables **summarize
 repeating column families** instead of enumerating every column; every confusable
-column/metric carries a `# Gotchas` note; citations point to sources you actually
-used.
+column/metric carries a `# Gotchas` note; **every join/enum/metric taken from a
+context doc was verified against live data** (and joins beyond those the context
+mentioned were sought out); **volatile stats (row counts, sizes, freshness
+timestamps) are omitted** unless a magnitude is stable and decision-shaping;
+citations point to sources you actually used.
 
 ## Files in this skill
 

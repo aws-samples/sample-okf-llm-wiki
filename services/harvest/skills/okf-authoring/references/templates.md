@@ -36,13 +36,19 @@ timestamp: 2026-05-28T00:00:00Z
 ---
 
 # Overview
-<1–2 paragraphs: what the dataset is, who produces it, what it's used for.>
+<1–2 paragraphs: what the dataset is, who produces it, what it's used for.
+ Describe the tables and their grains; avoid baking in volatile row counts —
+ see "Capture the essence, not the volatile numbers" in SKILL.md.>
 
 # Using the dataset
-<How to access/query it. A short sample query if helpful.>
+<How to access/query it. A short, representative sample query if helpful — prefer
+ one that shows a real analytical shape (a join, a group-by) over a bare
+ `COUNT(*)`, which models nothing about what the data means.>
 
 ```sql
-SELECT COUNT(*) FROM "<database>"."<table>"
+SELECT <dimension>, <aggregate>
+FROM "<database>"."<table>"
+GROUP BY <dimension>
 ```
 
 # Citations

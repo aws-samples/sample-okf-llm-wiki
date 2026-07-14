@@ -74,8 +74,10 @@ export default function DomainsView({ api, onChanged }) {
   }, [load, onChanged])
 
   return (
-    <div className="flex flex-col gap-4">
-      <Card>
+    // h-full so the card fills the content region; the table body then scrolls
+    // internally (sticky header) instead of the whole card scrolling as a block.
+    <div className="flex h-full flex-col gap-4">
+      <Card className="min-h-0 flex-1">
         <CardHeader className="border-b">
           <CardTitle className="flex items-center gap-2">
             <GlobeIcon className="size-4" />
@@ -93,7 +95,7 @@ export default function DomainsView({ api, onChanged }) {
             <NewDomainDialog api={api} onCreated={refresh} />
           </div>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex min-h-0 flex-1 flex-col">
           {error ? (
             <Alert variant="destructive">
               <AlertTitle>Failed to load domains</AlertTitle>
@@ -110,12 +112,16 @@ export default function DomainsView({ api, onChanged }) {
               <AlertTitle>No domains declared</AlertTitle>
               <AlertDescription>
                 Create a domain with the "New domain" button to define a business
-                area. Then map Glue databases into it from the Mappings page.
+                area. Then map Glue databases into it from the Datasets page.
               </AlertDescription>
             </Alert>
           ) : (
-            <Table>
-              <TableHeader>
+            <Table containerClassName="min-h-0 flex-1 overflow-y-auto">
+              {/* Stick the th cells (not the thead — sticky on thead is flaky
+                  cross-browser) so the header pins while the body scrolls. bg-card
+                  keeps rows from showing through; a bottom ring stands in for the
+                  row border, which scrolls away with a sticky element. */}
+              <TableHeader className="[&_th]:sticky [&_th]:top-0 [&_th]:z-10 [&_th]:bg-card [&_th]:shadow-[inset_0_-1px_0_var(--border)] [&_tr]:border-0 [&_tr:hover]:bg-transparent">
                 <TableRow>
                   <TableHead>Domain</TableHead>
                   <TableHead>Description</TableHead>
