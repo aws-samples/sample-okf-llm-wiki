@@ -83,7 +83,7 @@ import GraphView from "@/views/GraphView.jsx"
 // dataset-scoped views so the breadcrumb can hint when nothing is picked.
 const NAV = [
   { key: "domains", label: "Domains", icon: GlobeIcon, needsSelection: false },
-  { key: "mappings", label: "Mappings", icon: DatabaseIcon, needsSelection: false },
+  { key: "mappings", label: "Datasets", icon: DatabaseIcon, needsSelection: false },
   { key: "context", label: "Context Docs", icon: FileTextIcon, needsSelection: true },
   { key: "harvest", label: "Harvest", icon: PlayIcon, needsSelection: true },
   { key: "browse", label: "Browse", icon: BoxesIcon, needsSelection: true },
@@ -131,7 +131,7 @@ function DatasetPicker({ datasets, selectionKey, onChange }) {
   if (!datasets.length) {
     return (
       <span className="text-sm text-muted-foreground">
-        No datasets — create a mapping in Mappings.
+        No datasets — create a mapping in Datasets.
       </span>
     )
   }

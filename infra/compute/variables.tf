@@ -153,7 +153,7 @@ variable "athena_workgroup" {
 variable "control_api_provisioned_concurrency" {
   type        = number
   description = "Pre-warmed execution environments for the control API Lambda, to minimize cold starts on the browser-facing plane. 0 disables it."
-  default     = 6
+  default     = 10
 }
 
 variable "athena_output_location" {

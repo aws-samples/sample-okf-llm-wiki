@@ -6,10 +6,17 @@ import { cn } from "@/lib/utils"
 
 function Table({
   className,
+  containerClassName,
   ...props
 }) {
   return (
-    <div data-slot="table-container" className="relative w-full overflow-x-auto">
+    // containerClassName lets a caller turn this wrapper into the vertical scroll
+    // region (e.g. `min-h-0 flex-1 overflow-auto`) so a `sticky` TableHeader pins
+    // to its top while the body scrolls. Default stays horizontal-scroll only.
+    <div
+      data-slot="table-container"
+      className={cn("relative w-full overflow-x-auto", containerClassName)}
+    >
       <table
         data-slot="table"
         className={cn("w-full caption-bottom text-sm", className)}

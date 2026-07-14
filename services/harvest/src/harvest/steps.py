@@ -67,8 +67,9 @@ KIND_AGENT = "agent"  # an AIMessage (the model said/decided something)
 KIND_TOOL_CALL = "tool_call"  # the agent invoked a tool (shaped into a label)
 KIND_TOOL_RESULT = "tool_result"  # a tool returned; carries ok=True/False only
 # A sub-agent fan-out lifecycle event (the "fleet squares"). Carries a `phase`
-# (start|complete|error), a `batch` (the eval tool-call id that groups a fan-out)
-# and a per-dispatch `id`. Sourced from langchain_quickjs's custom stream — the
+# (start|complete|error), a `batch` (the top-level `eval` tool-call id that groups
+# one fan-out wave) and a per-dispatch `id`. Sourced from langchain_quickjs's
+# custom stream — the
 # UI grows a row of squares as sub-agents actually start (there is no reliable
 # pre-start "planned" count: the model builds the fan-out list dynamically).
 KIND_SUBAGENT = "subagent"
@@ -328,6 +329,21 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         # the tool pairing above. Bounded: only sub-agent runs are added (top-level
         # runs never are), and each is discarded when its turn ends/errors.
         self._subagent_llm_runs: set[str] = set()
+        # Fleet-batch correlation. langchain_quickjs's per-event ``eval_id`` is a
+        # REPL-LOCAL counter that resets to ``call_0`` on EVERY ``eval()`` call, so
+        # it does NOT distinguish one fan-out from the next — every wave would share
+        # ``call_0`` and the UI (which keys its fleet row by batch) would fold the
+        # reviewer fan-out into the table-author row created at the first wave's
+        # position. Instead we group by the TOP-LEVEL ``eval`` tool-call id, which
+        # IS globally unique per fan-out (and is what CONVENTIONS documents ``batch``
+        # to be). Top-level evals never overlap — a tool call blocks the agent turn
+        # until it returns — so the most-recent eval call_id is the current wave.
+        # ``_fleet_batch_of`` pins each sub-agent's batch at START so a late
+        # complete/error still lands in the right row even if a new eval has since
+        # begun. Guarded by the same lock (subagent events arrive on the drain loop;
+        # eval tool_starts fire on the callback surface).
+        self._current_eval_batch = ""
+        self._fleet_batch_of: dict[str, str] = {}
         # Cumulative token usage across EVERY model turn in the run — top-level AND
         # sub-agent (sub-agents emit no feed row but dominate the spend, so they
         # must count). Guarded by the same lock as _seq since sub-agent turns end
@@ -520,6 +536,12 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         cid = self._call_id(run_id)
         with self._lock:
             self._emitted_calls.add(cid)
+            # An ``eval`` (the QuickJS fan-out dispatcher) opens a NEW fleet batch:
+            # its globally-unique call_id groups the sub-agents it spawns. Recorded
+            # here (top-level, so it's not filtered) and read by emit_subagent_event
+            # to give each wave its own row instead of all sharing REPL ``call_0``.
+            if shaped["tool"] == "eval":
+                self._current_eval_batch = cid
         self._emit(
             {
                 "kind": KIND_TOOL_CALL,
@@ -591,16 +613,37 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         ``event`` is a langchain_quickjs ``SubagentStreamEvent``
         (``{type:'subagent', phase, id, eval_id?, subagent_type?, label?, ...}``).
         We forward only the fields the fleet view needs, keyed by ``batch``
-        (the eval_id) and the per-dispatch ``sub_id`` (the event ``id``).
+        (the fan-out group) and the per-dispatch ``sub_id`` (the event ``id``).
+
+        ``batch`` is NOT the event's own ``eval_id`` — that's a REPL-local counter
+        that resets to ``call_0`` on every ``eval()``, so distinct fan-outs would
+        collide into one row. We use the top-level ``eval`` tool-call id instead
+        (``_current_eval_batch``), which is globally unique per wave. A sub-agent's
+        batch is PINNED at its ``start`` and reused on its ``complete``/``error`` so
+        a late terminal event lands in the right row even after a new eval opened.
         """
         phase = event.get("phase")
         if phase not in (PHASE_START, PHASE_COMPLETE, PHASE_ERROR):
             return
+        sub_id = event.get("id") or ""
+        with self._lock:
+            if phase == PHASE_START:
+                # Pin this sub-agent to the wave that's currently dispatching. Fall
+                # back to the raw eval_id if no top-level eval was seen (defensive:
+                # e.g. the static `task` path), so a batch is never empty.
+                batch = self._current_eval_batch or event.get("eval_id") or ""
+                if sub_id:
+                    self._fleet_batch_of[sub_id] = batch
+            else:
+                # Terminal: reuse the batch pinned at start; fall back to current.
+                batch = self._fleet_batch_of.pop(sub_id, None)
+                if batch is None:
+                    batch = self._current_eval_batch or event.get("eval_id") or ""
         out: dict[str, Any] = {
             "kind": KIND_SUBAGENT,
             "phase": phase,
-            "batch": event.get("eval_id") or "",
-            "sub_id": event.get("id") or "",
+            "batch": batch,
+            "sub_id": sub_id,
         }
         if phase == PHASE_START:
             out["label"] = shape_subagent_label(

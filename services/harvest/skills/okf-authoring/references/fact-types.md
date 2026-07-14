@@ -21,8 +21,16 @@ For each context doc, and for each table you author:
    these facts hide in real documentation.
 2. **Route each fact** to its OKF home (the "Lands in" column). One doc usually
    yields several fact types across several concepts.
-3. **Ground it**: quote/verify against the primary source where you can
-   (`run_sql`/`sample_rows`); cite the uploaded doc under `# Citations`.
+3. **Ground it**: a fact from a context doc is a *hypothesis*, not a settled fact.
+   VERIFY it against the primary source (`run_sql`/`sample_rows`) before it enters
+   the bundle — confirm the join keys match on both sides and check the
+   cardinality, run the metric SQL, sample the coded column to see the codes the
+   doc claims. Where the data contradicts the doc, the data wins and the
+   discrepancy is a CAVEAT worth a `# Gotchas` note. Cite the uploaded doc under
+   `# Citations`. And a context doc naming one join/metric does not cap your
+   search: still probe the shared keys and relationships it never mentioned
+   (`grep .metadata/columns.tsv`) — context widens the investigation, never limits
+   it.
 
 The single most common miss is **CODE_ENUM** — coded columns whose meanings sit
 in a data dictionary or code list you were given but didn't fully transcribe.
@@ -35,7 +43,7 @@ between a wiki an agent can query and one it can't.
 |---|-----------|----------------------|-------------------------|
 | 1 | **BUSINESS_TERM** | glossaries, "also known as / aka", acronym expansions, non-English labels, "the business calls this X" | the column's `# Schema` description; if it's a confusable alias, a `# Gotchas` note; a reusable term → `references/glossary.md` |
 | 2 | **METRIC_DEFINITION** | "calculated as", "defined as", KPI formulas, "= sum(...) / ...", numerator/denominator prose | `references/metrics/<slug>.md` (owns the SQL); tables link it from `# Metrics` |
-| 3 | **JOIN_CONDITION** | ER diagrams, "foreign key", "joins to … on …", "one-to-many", relationship tables | `references/joins/<a>__<b>.md` (owns the `ON` clause); both tables link it from `# Joins` |
+| 3 | **JOIN_CONDITION** | ER diagrams, "foreign key", "joins to … on …", "one-to-many", relationship tables — **plus joins no doc mentions:** `grep .metadata/columns.tsv` for shared keys | `references/joins/<a>__<b>.md` (owns the `ON` clause); both tables link it from `# Joins`. **Verify keys match + establish cardinality with a real query before documenting; a doc's asserted join that fails or fans out unexpectedly is a `# Gotchas` finding** |
 | 4 | **CODE_ENUM** | data dictionaries, **code lists**, value tables, "1 = …, 2 = …", "valid values", category enumerations, status-flag legends | small set → inline in the `# Schema` row description; large set (>~15) → `references/enums/<column>.md`. **See below.** |
 | 5 | **FILTER_RULE** | "by default we exclude", "only count active", "unless stated we filter …", source-preference rules | `# Gotchas` (the rule) and/or the metric doc's `## When to use which`; a global default → dataset overview |
 | 6 | **GRAIN_STATEMENT** | "one row per", "each record represents", "unique by", primary-key notes | table prose ("one row per X") — **measure it, don't just copy** (grain-verification rule) |

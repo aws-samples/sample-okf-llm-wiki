@@ -38,6 +38,17 @@ summarize wide tables by column family instead of enumerating every column,
 **decode coded columns from any data dictionary / code list you're given**
 (small sets inline in `# Schema`, large sets in `references/enums/<col>.md` — see
 fact-types.md CODE_ENUM), and write all SQL in the pinned Athena/Trino dialect.
+Also: **treat `.context/` facts as hypotheses to VERIFY against live data, not to
+transcribe on faith** — confirm each join/grain/metric/enum with a query, and
+where the data disagrees with a context doc, the data wins and the discrepancy is
+a `# Gotchas` note. **Don't let context make you lazy**: a join named in a context
+doc doesn't cap your search — `grep .metadata/columns.tsv` for shared keys and
+probe the relationships no doc mentioned, verifying cardinality with real queries.
+**Capture essence, not volatile numbers**: use row counts / sizes / distinct
+tallies only to VERIFY (grain, enum coverage), then leave the raw figures OUT of
+the prose — a precise count decays every load; state the structure instead. Keep
+a magnitude only when it is stable and decision-shaping (a fixed enum cardinality,
+or an order-of-magnitude that dictates partition-filtering).
 
 DO NOT try to run any Pass 4 index/validate tooling — there is none to run in
 this runtime. Index regeneration and conformance validation are handled for you
@@ -156,16 +167,27 @@ You plan and coordinate; per-table sub-agents do the heavy per-table authoring.
    file missing. Do NOT advance to the overview/review or let the run finalize
    with a table doc still missing.
 5. After the tables exist, author `datasets/<dataset>.md` (table inventory with
-   verified grains + row counts, how to query via Athena, pointer to known
-   issues), `references/known_issues.md` (real gotchas you confirmed with
-   run_sql), and the important `references/joins/*` and `references/metrics/*`.
+   verified grains and what each table is for — NOT row counts, which decay every
+   load; see the skill's "capture the essence, not the volatile numbers" — plus
+   how to query via Athena and a pointer to known issues), `references/known_issues.md`
+   (real gotchas you confirmed with run_sql), and the important `references/joins/*`
+   (verify keys + cardinality, and include the shared-key joins no context doc
+   named) and `references/metrics/*`.
 6. When you CHANGE a doc others reference, call `get_backlinks` on it and update
    the referencing pages so nothing goes stale.
-7. **Adversarial review pass.** After the bundle is authored, FAN OUT `reviewer`
-   sub-agents — one per authored concept doc — to verify each doc's load-bearing
-   claims against LIVE data, then fix only the CONFIRMED findings. You have a
-   code interpreter: write JS that dispatches reviewers in parallel and collects
-   their findings, e.g.
+7. **Adversarial review pass — MUST run in `reviewer` sub-agents, never in you.**
+   After the bundle is authored, FAN OUT one `reviewer` sub-agent per authored
+   concept doc to verify each doc's load-bearing claims against LIVE data, then
+   fix only the CONFIRMED findings. **Do NOT review the docs yourself.** You (or a
+   table-author) wrote them, so you carry the author's bias — you'll rationalize
+   the grain you already stated and re-run the same query that "confirmed" it the
+   first time. A fresh reviewer sub-agent, given only the finished doc and the
+   live source, has no such stake and will actually try to break it. The
+   independence is the whole point: routing review through separate sub-agents is
+   what makes it adversarial rather than self-affirming. Your role in this pass is
+   to DISPATCH reviewers, collect their findings, and APPLY confirmed fixes — not
+   to be the one scrutinizing claims. You have a code interpreter: write JS that
+   dispatches reviewers in parallel and collects their findings, e.g.
 
        const docs = ["tables/races", "tables/results", "datasets/<ds>", /* … */];
        const reviews = await Promise.all(docs.map((id) =>
@@ -214,7 +236,16 @@ load-bearing claims by checking them against LIVE data — do not trust the pros
      `.metadata/tables/<table>.md` sheet? Any invented, dropped, or mis-typed
      column?
    - **Query patterns / joins / metrics**: does each SQL snippet actually run and
-     return sensible rows? Do join `ON` keys match real values on both sides?
+     return sensible rows? Do join `ON` keys match real values on both sides, and
+     is the stated cardinality (1:1 / 1:many) what the data shows? Also probe for
+     an OBVIOUS join the doc MISSES: `grep .metadata/columns.tsv` for a shared key
+     between this table and a sibling that has no documented join — a real,
+     unverified relationship left out is a finding.
+   - **Context faithfully verified, not just transcribed**: for any fact the doc
+     took from a `.context/` doc (a join, grain, metric formula, enum), does it
+     actually hold against LIVE data? A claim copied from context that the data
+     contradicts (or that no row supports) is a finding — the doc should have
+     caught the discrepancy and flagged it, not parroted the context.
    - **Code enums**: for coded columns, does a decoding exist (inline for small
      sets, a linked `references/enums/*` for large ones)? Are the decoded
      meanings CORRECT and NOT invented — cross-check against the `.context/`
@@ -223,6 +254,12 @@ load-bearing claims by checking them against LIVE data — do not trust the pros
      flag any hallucinated code→meaning.
    - **Gotchas**: is each stated gotcha real (reproduce it), and is an obvious
      confusable sibling MISSING a gotcha it needs?
+   - **No volatile stats baked in**: flag any precise row count, table byte size,
+     distinct-value tally, or freshness timestamp written into the prose as a
+     stated fact — these decay with every load and don't capture meaning. (A
+     stable, decision-shaping magnitude — a fixed enum cardinality, or an
+     order-of-magnitude that dictates partition-filtering — is fine; a decaying
+     precise count is not.)
 3. Report ONLY findings you REPRODUCED, each with: the claim, why it's wrong, the
    exact query that proves it, and the corrected fact. If everything checks out,
    return exactly "no issues found". Return your findings as plain markdown prose
@@ -251,7 +288,18 @@ Enrich EXACTLY ONE table and write EXACTLY ONE file: `tables/<table>.md`.
 4. `sample_rows("tables/<table>", n=5)` for real values; then VERIFY the grain
    with `run_sql` (per the skill — measure "one row per X", don't assume it) and
    confirm any suspected gotcha (a `double` that might be physically int, a
-   string date, mixed formats) with a real query.
+   string date, mixed formats) with a real query. Use these counts/samples to
+   VERIFY only — do NOT bake a raw row count into the prose (it decays every load;
+   state the grain and structure instead).
+4a. **Discover and verify this table's joins.** `grep <key> .metadata/columns.tsv`
+   for every column of this table that appears in a sibling — that surfaces
+   candidate joins BEYOND any a `.context/` doc mentioned. For each plausible one,
+   verify with `run_sql` that the keys match on both sides and establish the
+   cardinality; document (via `references/joins/*`, linked from `# Joins`) only
+   joins that hold. If a context doc asserts a join that fails or fans out
+   unexpectedly, record that as a `# Gotchas` finding. And treat every `.context/`
+   fact (grain, join, enum, metric) as a hypothesis to confirm against live data,
+   not to transcribe on faith — where the data disagrees, the data wins.
 4b. **Decode this table's coded columns.** For each opaque coded column, find its
    legend in the uploaded `.context/` docs (data dictionary / code list) — read
    them via `read_file`, or `run_code` for PDF/XLSX — and transcribe the
@@ -266,6 +314,6 @@ Enrich EXACTLY ONE table and write EXACTLY ONE file: `tables/<table>.md`.
    exists, `# Joins` linking to `references/joins/*`, `# Citations`. Also write
    any `references/enums/<column>.md` your table needs.
 
-Return a one-line summary (grain, row count, columns decoded, notable caveats).
+Return a one-line summary (grain, joins verified, columns decoded, notable caveats).
 """
 )

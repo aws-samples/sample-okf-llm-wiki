@@ -621,6 +621,98 @@ def test_emit_subagent_ignores_unknown_phase():
     assert events == []
 
 
+def _fleet_batch(events, sub_id):
+    """The batch a sub-agent's START event was assigned."""
+    for e in events:
+        if e.get("kind") == KIND_SUBAGENT and e.get("sub_id") == sub_id:
+            return e["batch"]
+    raise AssertionError(f"no subagent event for {sub_id}")
+
+
+def test_distinct_eval_waves_get_distinct_batches():
+    """Regression: langchain_quickjs's per-event ``eval_id`` is a REPL-LOCAL counter
+    that resets to ``call_0`` on every ``eval()``, so a table-author wave and a
+    later reviewer wave both arrive tagged ``eval_id="call_0"``. The emitter MUST
+    group them by the top-level ``eval`` tool-call id instead, or the UI folds both
+    waves into one fleet row anchored at the first wave's position (the observed
+    bug: reviewer squares glued to the early table-author section)."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+
+    # Wave 1: the model's first eval() dispatches table-authors. Its custom-stream
+    # events carry the colliding REPL id "call_0".
+    em.on_tool_start({"name": "eval"}, "", run_id="eval-aaa", inputs={"code": "..."})
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "start", "id": "t1", "eval_id": "call_0",
+         "subagent_type": "table-author", "label": "Author races"}
+    )
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "start", "id": "t2", "eval_id": "call_0",
+         "subagent_type": "table-author", "label": "Author results"}
+    )
+
+    # Wave 2: a LATER eval() dispatches reviewers — same colliding "call_0".
+    em.on_tool_start({"name": "eval"}, "", run_id="eval-bbb", inputs={"code": "..."})
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "start", "id": "r1", "eval_id": "call_0",
+         "subagent_type": "reviewer", "label": "Review races"}
+    )
+
+    b1 = _fleet_batch(events, "t1")
+    assert _fleet_batch(events, "t2") == b1  # same wave -> same row
+    b2 = _fleet_batch(events, "r1")
+    assert b2 != b1  # different wave -> different row (the fix)
+    assert b1 == "eval-aaa" and b2 == "eval-bbb"
+
+
+def test_subagent_terminal_reuses_start_batch_after_new_wave_opens():
+    """A sub-agent's complete/error can arrive AFTER a new eval() has opened the
+    next wave. It must land in the row it started in (pinned at start), not the
+    current wave — else a straggler's terminal square would flip a square in the
+    wrong (new) row."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+
+    em.on_tool_start({"name": "eval"}, "", run_id="eval-1", inputs={})
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "start", "id": "s1", "eval_id": "call_0"}
+    )
+    # A second eval opens before s1 finishes.
+    em.on_tool_start({"name": "eval"}, "", run_id="eval-2", inputs={})
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "start", "id": "s2", "eval_id": "call_0"}
+    )
+    # s1 (from wave 1) finally completes.
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "complete", "id": "s1", "eval_id": "call_0"}
+    )
+
+    s1_complete = [
+        e for e in events
+        if e.get("sub_id") == "s1" and e["phase"] == PHASE_COMPLETE
+    ][0]
+    assert s1_complete["batch"] == "eval-1"  # pinned to its start wave
+    assert _fleet_batch(events, "s2") == "eval-2"
+
+
+def test_non_eval_tool_call_does_not_open_a_fleet_batch():
+    """Only ``eval`` opens a new wave. An intervening top-level tool call (e.g.
+    ``ls``) between dispatches must NOT reset the batch, so sub-agents keep landing
+    in the open wave's row."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "eval"}, "", run_id="eval-x", inputs={})
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "start", "id": "a", "eval_id": "call_0"}
+    )
+    em.on_tool_start({"name": "ls"}, "", run_id="ls-1", inputs={"path": "/tables"})
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "start", "id": "b", "eval_id": "call_0"}
+    )
+    assert _fleet_batch(events, "a") == "eval-x"
+    assert _fleet_batch(events, "b") == "eval-x"
+
+
 def test_subagent_events_share_seq_space_with_steps():
     # Fleet events use the SAME monotonic seq as step events, so a single ?since
     # cursor pages the whole feed in order.
