@@ -21,11 +21,17 @@ from pathlib import Path
 from typing import Any
 
 from harvest.agent import build_harvest_agent, resolve_model_config
+from harvest.annotations import (
+    build_annotations_client,
+    resolve_annotation,
+    revert_to_open,
+)
 from harvest.code_interpreter import build_sandbox
 from harvest.finalize import finalize_bundle, mark_in_progress
 from harvest.fsutil import clean_authored_output, write_text
 from harvest.glue_source import GlueAthenaSource
 from harvest.metadata_export import export_metadata
+from harvest.prompts import build_annotation_prompt
 from harvest.status import build_registry_client, report_status
 
 log = logging.getLogger(__name__)
@@ -437,4 +443,261 @@ def run_incremental_harvest(
         only_if_active=True,
     )
     log.info("Incremental harvest complete: %s.%s", dataset, changed_table)
+    return state
+
+
+# The agent writes its per-annotation verdicts here (through the mount); the
+# runner reads it back and reconciles to DynamoDB. Under .harvest/ so it's an
+# input/scratch path the guard leaves alone and finalize never publishes.
+ANNOTATION_RESULTS_REL = ".harvest/annotation_results.json"
+
+
+def _reconcile_annotation_results(
+    client_table,
+    dataset_root: Path,
+    *,
+    data_domain: str,
+    dataset: str,
+    user_sub: str,
+    survivors: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Read the agent's verdict file and flip each annotation's DDB row.
+
+    ``client_table`` is the shared (client, table) tuple (or None → no-op) so the
+    caller builds one boto3 client for the whole run. ``survivors`` is the payload
+    list the run was dispatched with. We resolve each annotation the agent ruled
+    on (applied/rejected + comment) and REVERT any it left unaddressed back to
+    ``open`` so that feedback isn't silently lost. Returns a
+    ``{applied, rejected, reverted}`` tally so the caller can report what actually
+    happened (a run that applied nothing must not read as a plain success). All
+    best-effort: the S3 bundle is already the durable result; a write-back hiccup
+    must not fail the harvest.
+    """
+    tally = {"applied": 0, "rejected": 0, "reverted": 0}
+    if client_table is None:
+        return tally
+
+    verdicts: dict[str, dict[str, Any]] = {}
+    results_path = dataset_root / ANNOTATION_RESULTS_REL
+    if results_path.exists():
+        try:
+            raw = json.loads(results_path.read_text(encoding="utf-8"))
+            entries = raw if isinstance(raw, list) else raw.get("results", [])
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("annotation_id"):
+                    verdicts[entry["annotation_id"]] = entry
+        except Exception:  # noqa: BLE001 - a malformed file -> revert everything
+            log.warning(
+                "Could not parse %s; reverting all in-review annotations",
+                ANNOTATION_RESULTS_REL,
+                exc_info=True,
+            )
+
+    for ann in survivors:
+        aid = ann.get("annotation_id")
+        concept_id = ann.get("concept_id")
+        if not aid or not concept_id:
+            continue
+        verdict = verdicts.get(aid)
+        if verdict is None:
+            # The agent didn't rule on this one — return it to the open pool.
+            revert_to_open(
+                client_table,
+                data_domain=data_domain,
+                dataset=dataset,
+                user_sub=user_sub,
+                concept_id=concept_id,
+                annotation_id=aid,
+            )
+            tally["reverted"] += 1
+            continue
+        outcome = verdict.get("outcome", "")
+        resolve_annotation(
+            client_table,
+            data_domain=data_domain,
+            dataset=dataset,
+            user_sub=user_sub,
+            concept_id=concept_id,
+            annotation_id=aid,
+            outcome=outcome,
+            comment=verdict.get("comment", ""),
+        )
+        # resolve_annotation coerces any non-"applied" outcome to rejected.
+        tally["applied" if outcome == "applied" else "rejected"] += 1
+    return tally
+
+
+def run_annotation_harvest(
+    *,
+    source: GlueAthenaSource,
+    dataset_root: str | Path,
+    data_domain: str,
+    dataset: str,
+    user_sub: str,
+    annotations: list[dict[str, Any]],
+    model_config: dict[str, Any] | None = None,
+    recursion_limit: int = 400,
+    domain_description: str | None = None,
+    domain_context: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Apply a user's wiki annotations to the bundle, then reconcile verdicts.
+
+    Scoped/in-place like the incremental path (no ``clean_authored_output``): the
+    agent assesses each annotation against LIVE data, edits the affected doc when
+    the feedback is factually grounded (augmentation guard applies), and writes a
+    per-annotation verdict + comment to ``.harvest/annotation_results.json``. The
+    runner then reconciles that file to DynamoDB (resolve applied/rejected; revert
+    any the agent skipped back to open).
+
+    The Control API already ran the orphan pre-flight, so every annotation here is
+    expected to still anchor to the live doc.
+    """
+    dataset_root = Path(dataset_root)
+    started = _now_iso()
+    registry = build_registry_client()
+    # One annotations client for the whole run (reconcile + any failure revert),
+    # instead of rebuilding boto3 clients per path.
+    anno_client = build_annotations_client()
+
+    def _clear_scratch() -> None:
+        # Remove the on-mount scratch files on EVERY exit (success or failure), so
+        # a partial results file can't leak into a later run's reconcile.
+        for rel in ("annotations.json", "annotation_results.json"):
+            f = dataset_root / ".harvest" / rel
+            try:
+                if f.exists():
+                    f.unlink()
+            except OSError:
+                log.warning("Could not remove scratch %s (continuing)", rel)
+
+    try:
+        mark_in_progress(
+            dataset_root, data_domain=data_domain, dataset=dataset, timestamp=started
+        )
+
+        # Persist the annotations through the mount so the agent reads them with
+        # its file tools (the pending.json precedent). A stale results file from a
+        # prior run must not leak into this one's reconcile — clear it up front.
+        write_text(
+            dataset_root / ".harvest" / "annotations.json",
+            json.dumps(annotations, indent=2) + "\n",
+        )
+        stale_results = dataset_root / ANNOTATION_RESULTS_REL
+        if stale_results.exists():
+            stale_results.unlink()
+
+        resolved_config = model_config or resolve_model_config()
+        report_status(
+            registry,
+            data_domain=data_domain,
+            dataset=dataset,
+            status="running",
+            model=resolved_config.get("model"),
+            effort=resolved_config.get("effort"),
+        )
+
+        # Refresh the read-only .metadata/ snapshot so the agent verifies each
+        # annotation against current Glue metadata. Best-effort accelerator.
+        try:
+            export_metadata(source, dataset_root)
+        except Exception:  # noqa: BLE001 - snapshot is an accelerator, not a hard dep
+            log.warning(
+                "Metadata snapshot failed for %s/%s (annotated); continuing",
+                data_domain,
+                dataset,
+                exc_info=True,
+            )
+
+        prompt = build_annotation_prompt(
+            dataset=dataset,
+            annotations=annotations,
+            results_rel=ANNOTATION_RESULTS_REL,
+            domain_description=domain_description,
+            domain_context=domain_context,
+        )
+        emitter = _build_emitter(
+            data_domain=data_domain, dataset=dataset, session_id=session_id
+        )
+        with _sandbox_for(dataset_root) as sandbox:
+            built = build_harvest_agent(
+                source,
+                dataset_root,
+                sandbox=sandbox,
+                step_emitter=emitter,
+                **resolved_config,
+            )
+            config = _invoke_config(recursion_limit, emitter)
+            _run_agent(built.agent, prompt, config, emitter)
+
+        state = finalize_bundle(
+            dataset_root,
+            data_domain=data_domain,
+            dataset=dataset,
+            tables=source.table_names(),
+            timestamp=_now_iso(),
+            table_versions=_table_versions(source),
+        )
+    except Exception as e:  # noqa: BLE001 - report failure, then re-raise
+        # only_if_active: don't clobber a `cancelled` row if a cancel raced ahead.
+        report_status(
+            registry,
+            data_domain=data_domain,
+            dataset=dataset,
+            status="failed",
+            detail=f"{type(e).__name__}: {e}",
+            only_if_active=True,
+        )
+        # A failed run leaves the survivors stuck in_review — return them to open
+        # so the feedback survives (mirrors the Control API's invoke-failure revert).
+        for ann in annotations:
+            revert_to_open(
+                anno_client,
+                data_domain=data_domain,
+                dataset=dataset,
+                user_sub=user_sub,
+                concept_id=ann.get("concept_id"),
+                annotation_id=ann.get("annotation_id"),
+            )
+        _clear_scratch()
+        raise
+
+    # Reconcile the agent's verdicts back to DynamoDB (resolve/revert per note).
+    # Best-effort: a reconcile hiccup must not fail an already-finalized bundle nor
+    # skip the terminal status write below (which would wedge the row at `running`).
+    tally = {"applied": 0, "rejected": 0, "reverted": 0}
+    try:
+        tally = _reconcile_annotation_results(
+            anno_client,
+            dataset_root,
+            data_domain=data_domain,
+            dataset=dataset,
+            user_sub=user_sub,
+            survivors=annotations,
+        )
+    except Exception:  # noqa: BLE001 - never let write-back break a finished harvest
+        log.warning(
+            "Annotation write-back failed for %s/%s (bundle already finalized)",
+            data_domain,
+            dataset,
+            exc_info=True,
+        )
+    _clear_scratch()
+
+    # Report the outcome in the status detail so a run that APPLIED NOTHING (agent
+    # wrote no/garbage verdicts -> all reverted) doesn't read as a plain success:
+    # the reverted notes are open again, and the detail says so.
+    detail = (
+        f"annotations: {tally['applied']} applied, "
+        f"{tally['rejected']} rejected, {tally['reverted']} returned to open"
+    )
+    report_status(
+        registry,
+        data_domain=data_domain,
+        dataset=dataset,
+        status="complete",
+        detail=detail,
+        only_if_active=True,
+    )
+    log.info("Annotation harvest complete: %s/%s (%s)", data_domain, dataset, detail)
     return state

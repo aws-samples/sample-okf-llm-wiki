@@ -7,12 +7,14 @@ import {
   FileTextIcon,
   FolderIcon,
   FolderOpenIcon,
+  MessageSquareTextIcon,
 } from "lucide-react"
 
 import { buildTree, parseDocument, resolveConceptLink } from "@/lib/bundle"
 import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -33,8 +35,20 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
+import {
+  AnnotationSidebar,
+  SelectionAnnotator,
+  useAnnotations,
+} from "@/views/AnnotationSidebar.jsx"
 
 // Browse a harvested bundle: a directory tree of concepts + a markdown viewer.
 export default function BrowseView({ api, selection, concept, onConceptChange }) {
@@ -153,9 +167,28 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
     [onConceptChange]
   )
 
+  // Annotations for this dataset (user-scoped server-side). Shared by the
+  // in-doc selection popover and the slide-in sidebar so both stay in sync.
+  const annotations = useAnnotations(api, domain, dataset)
+  const [annotationsOpen, setAnnotationsOpen] = useState(false)
+  const openCount = useMemo(
+    () => annotations.items.filter((a) => a.status !== "resolved").length,
+    [annotations.items]
+  )
+
+  // Jump to a concept from the annotations panel, then close the overlay so the
+  // reader lands on the doc.
+  const openConceptFromSidebar = useCallback(
+    (conceptId) => {
+      openConcept(conceptId)
+      setAnnotationsOpen(false)
+    },
+    [openConcept]
+  )
+
   return (
     // Fill the content region; on md+ it's a two-column grid (tree | viewer)
-    // that stretches to the full height so both cards use all vertical space.
+    // that stretches to the full height. Annotations live in a slide-in Sheet.
     <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 md:h-full md:grid-rows-1 md:grid-cols-[minmax(240px,320px)_1fr]">
       <Card className="min-h-0 gap-0 py-0 max-md:h-[50vh]">
         <CardHeader className="border-b px-4 py-3">
@@ -207,7 +240,7 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
       </Card>
 
       <Card className="min-h-0 gap-0 py-0 max-md:h-[70vh]">
-        <CardHeader className="border-b px-4 py-3">
+        <CardHeader className="flex flex-row items-center justify-between gap-2 border-b px-4 py-3">
           {selectedId ? (
             <ConceptBreadcrumb conceptId={selectedId} />
           ) : (
@@ -215,6 +248,22 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
               No file selected
             </CardTitle>
           )}
+          {/* Open the annotations panel. The badge shows how many of the
+              caller's notes are still open (unresolved) for this dataset. */}
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={() => setAnnotationsOpen(true)}
+          >
+            <MessageSquareTextIcon className="size-3.5" />
+            Annotations
+            {openCount > 0 && (
+              <Badge variant="secondary" className="ml-1">
+                {openCount}
+              </Badge>
+            )}
+          </Button>
         </CardHeader>
         <CardContent className="min-h-0 flex-1 p-0">
           <ScrollArea className="h-full">
@@ -234,16 +283,57 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
                   Select a concept on the left to render its markdown.
                 </p>
               ) : (
-                <ConceptDoc
+                // Wrap the rendered doc so a text selection surfaces the
+                // "Annotate" popover; a saved note refreshes the sidebar list.
+                <SelectionAnnotator
+                  api={api}
+                  domain={domain}
+                  dataset={dataset}
                   conceptId={selectedId}
-                  text={content}
-                  onNavigate={openConcept}
-                />
+                  onCreated={annotations.reload}
+                >
+                  <ConceptDoc
+                    conceptId={selectedId}
+                    text={content}
+                    onNavigate={openConcept}
+                  />
+                </SelectionAnnotator>
               )}
             </div>
           </ScrollArea>
         </CardContent>
       </Card>
+
+      {/* Annotations: a floating panel that slides in from the RIGHT. Floating
+          (inset from the edges + rounded) rather than flush to the screen edge:
+          the inset-y / right offsets + rounded-2xl override the Sheet's default
+          full-height flush styling, and w-auto lets the max-w cap the width. */}
+      <Sheet open={annotationsOpen} onOpenChange={setAnnotationsOpen}>
+        <SheetContent
+          side="right"
+          className="data-[side=right]:inset-y-3 data-[side=right]:right-3 data-[side=right]:h-auto data-[side=right]:w-[92vw] data-[side=right]:rounded-2xl data-[side=right]:border data-[side=right]:sm:max-w-md"
+        >
+          <SheetHeader className="border-b p-4">
+            <SheetTitle className="flex items-center gap-2">
+              <MessageSquareTextIcon className="size-4" />
+              Annotations
+            </SheetTitle>
+            <SheetDescription>Your feedback for this dataset</SheetDescription>
+          </SheetHeader>
+          <div className="min-h-0 flex-1 p-4">
+            <AnnotationSidebar
+              api={api}
+              domain={domain}
+              dataset={dataset}
+              annotations={annotations.items}
+              loading={annotations.loading}
+              error={annotations.error}
+              reload={annotations.reload}
+              onOpenConcept={openConceptFromSidebar}
+            />
+          </div>
+        </SheetContent>
+      </Sheet>
     </div>
   )
 }
@@ -375,8 +465,30 @@ function ConceptBreadcrumb({ conceptId }) {
 function ConceptDoc({ conceptId, text, onNavigate }) {
   const { frontmatter, body } = useMemo(() => parseDocument(text), [text])
 
-  const components = useMemo(
-    () => ({
+  const components = useMemo(() => {
+    // Stamp each block with its 1-based source line (from react-markdown's hast
+    // `node.position`) as `data-sl`, so a text selection can recover the source
+    // line of its enclosing block (annotationAnchor.nearestBlockLine). The line
+    // is BODY-relative (frontmatter is stripped before render) — a hint for the
+    // agent to jump near, never the anchor's source of truth (that's the quote).
+    const withPos = (Tag) =>
+      function Block({ node, ...props }) {
+        const line = node?.position?.start?.line
+        return <Tag {...(line != null ? { "data-sl": line } : {})} {...props} />
+      }
+    return {
+      p: withPos("p"),
+      li: withPos("li"),
+      h1: withPos("h1"),
+      h2: withPos("h2"),
+      h3: withPos("h3"),
+      h4: withPos("h4"),
+      h5: withPos("h5"),
+      h6: withPos("h6"),
+      td: withPos("td"),
+      th: withPos("th"),
+      blockquote: withPos("blockquote"),
+      pre: withPos("pre"),
       a({ href, children, ...props }) {
         const resolved = href ? resolveConceptLink(href, conceptId) : null
         if (resolved) {
@@ -400,9 +512,8 @@ function ConceptDoc({ conceptId, text, onNavigate }) {
           </a>
         )
       },
-    }),
-    [conceptId, onNavigate]
-  )
+    }
+  }, [conceptId, onNavigate])
 
   const title = frontmatter.title
   const type = frontmatter.type

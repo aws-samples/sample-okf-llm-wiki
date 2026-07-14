@@ -229,7 +229,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e services/okf_core -e services/okf_aws         # shared libs
 pip install -e services/harvest -e services/reindex -e services/incremental \
             -e services/control_api -e services/consumption_mcp --no-deps
-pip install pytest "moto[s3,dynamodb]"
+pip install pytest "moto[s3,dynamodb]" "markdown-it-py>=3.0"
 ./scripts/run_tests.sh          # unit tests + the offline end-to-end harvest test
 
 cd ui && npm ci && npm run build

@@ -18,13 +18,14 @@ locals {
 
   # Common env for the Lambdas + runtimes (names frozen in docs/CONVENTIONS.md).
   common_env = {
-    AWS_REGION_NAME     = var.region
-    OKF_ACCOUNT_ID      = local.account_id
-    OKF_BUNDLE_BUCKET   = local.d.bundle_bucket
-    OKF_VECTOR_BUCKET   = local.d.vector_bucket
-    OKF_VECTOR_INDEX    = local.d.vector_index
-    OKF_REGISTRY_TABLE  = local.d.registry_table
-    OKF_FRESHNESS_TABLE = local.d.freshness_table
+    AWS_REGION_NAME       = var.region
+    OKF_ACCOUNT_ID        = local.account_id
+    OKF_BUNDLE_BUCKET     = local.d.bundle_bucket
+    OKF_VECTOR_BUCKET     = local.d.vector_bucket
+    OKF_VECTOR_INDEX      = local.d.vector_index
+    OKF_REGISTRY_TABLE    = local.d.registry_table
+    OKF_FRESHNESS_TABLE   = local.d.freshness_table
+    OKF_ANNOTATIONS_TABLE = local.d.annotations_table
   }
 
   # Source dirs for the Lambda deployment packages (populated by

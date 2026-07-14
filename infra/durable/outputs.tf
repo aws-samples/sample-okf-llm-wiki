@@ -49,6 +49,14 @@ output "freshness_table_arn" {
   value = aws_dynamodb_table.freshness.arn
 }
 
+output "annotations_table" {
+  value = aws_dynamodb_table.annotations.name
+}
+
+output "annotations_table_arn" {
+  value = aws_dynamodb_table.annotations.arn
+}
+
 output "user_pool_id" {
   value = aws_cognito_user_pool.pool.id
 }

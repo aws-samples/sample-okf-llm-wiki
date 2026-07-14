@@ -23,6 +23,7 @@ REGION = "us-east-1"
 BUCKET = "okf-bundle-test"
 REGISTRY = "okf-registry"
 FRESHNESS = "okf-freshness"
+ANNOTATIONS = "okf-annotations"
 HARVEST_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/harvest-abc"
 USER_POOL_ID = "us-east-1_testpool"
 MCP_SCOPE = "okf-mcp/invoke"
@@ -36,7 +37,7 @@ def aws():
         s3 = boto3.client("s3", region_name=REGION)
         s3.create_bucket(Bucket=BUCKET)
         ddb = boto3.client("dynamodb", region_name=REGION)
-        for name in (REGISTRY, FRESHNESS):
+        for name in (REGISTRY, FRESHNESS, ANNOTATIONS):
             ddb.create_table(
                 TableName=name,
                 KeySchema=[
@@ -97,4 +98,5 @@ def cfg(aws, glue, agentcore, cognito, logs):
         mcp_scope=MCP_SCOPE,
         logs=logs,
         harvest_log_group=HARVEST_LOG_GROUP,
+        annotations_table=ANNOTATIONS,
     )

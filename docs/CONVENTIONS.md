@@ -13,9 +13,10 @@ okf/<data_domain>/
     ├── index.md                     # auto-generated (regenerate_indexes)
     ├── datasets/<dataset>.md        # type: Glue Database
     ├── tables/<table>.md            # type: Glue Table (one per table)
-    ├── references/joins/<a>__<b>.md  # type: Reference
-    ├── references/metrics/<name>.md  # type: Reference
-    ├── references/known_issues.md    # type: Reference
+    ├── references/<type>/<slug>.md   # type: Reference — canonical fact-typed
+    │                                 #   folders: joins/ metrics/ enums/
+    │                                 #   named_sets/ glossary/ known_issues/
+    │                                 #   (one doc per item; see okf-authoring skill)
     ├── .context/                     # user-uploaded source docs (persisted)
     ├── .metadata/                    # read-only Glue metadata snapshot (per run)
     └── .harvest/state.json           # commit marker (status: complete | in_progress)
@@ -227,6 +228,51 @@ vector.
 `sk = "VERSION"`, attrs `{version_id, update_time, last_seen_at}`. The
 incremental path uses this to confirm a real change before re-harvesting.
 
+### `okf-annotations` — user feedback on the wiki
+
+Partition key `pk` (S), sort key `sk` (S). A separate table (not registry/
+freshness) so its DynamoDB **TTL sweep** — on `expires_at` — can never reap a
+durable row; the worst a stray `expires_at` can do is delete an annotation.
+
+**Annotation.** `pk = "ANNO#<data_domain>#<dataset>#<user_sub>"`,
+`sk = "<concept_id>#<annotation_id>"`, attrs `{data_domain, dataset, concept_id,
+annotation_id, author?, quote, prefix?, suffix?, block_line?, note, status,
+outcome?, resolution?, created_at, updated_at, expires_at?}`.
+
+**Isolation is structural.** The author's immutable Cognito `sub` is baked into
+the partition key, so a user's `Query` can only ever return their OWN annotations
+— there is no cross-user read path (readers pass `user_sub` from the verified JWT,
+never the body). `sub` (not `email`) is used because it never changes and is
+`#`-delimiter-safe. `author` is the human-facing label (email) for display only.
+
+**Anchoring is a quote, not a coordinate.** `quote` is the selected passage; the
+UI grows `prefix`/`suffix` (see `okf_core.annotations.normalize_text` / the UI's
+`minimalUniqueContext`) only until the `(prefix+quote+suffix)` window is unique in
+the doc, so two identical quotes on a page are distinguishable. `block_line` is a
+body-relative source-line HINT (from react-markdown's `node.position`, stamped as
+`data-sl`) the agent can jump near — never the source of truth. A re-harvest
+rewrites the doc, so any coordinate would go stale; the quote is what survives.
+
+**Lifecycle.** `status` ∈ `open | in_review | resolved`; `outcome` (set with
+`resolved`) ∈ `applied | rejected | orphaned`. `expires_at` (epoch seconds, 7-day
+TTL — `okf_core.annotations.HISTORY_TTL_SECONDS`) is set ONLY at resolution, so an
+open/in_review annotation never expires. The Control API's `run` pre-flight
+(`POST /harvest/{domain}/{dataset}/annotations/run`) takes the per-dataset lease,
+then for each of the caller's open annotations loads the target doc from S3 and
+re-anchors the `quote` (`is_orphaned`): a note whose passage is gone is
+auto-resolved `orphaned` (with `ORPHAN_RESOLUTION_MESSAGE`) and the agent never
+sees it. If EVERY open note orphans (or none are open), the run is **skipped** —
+the status row is set `complete` and the runtime is NOT invoked. Otherwise the
+survivors are flipped `in_review` and sent in the `annotated` payload; on invoke
+failure the Control API reverts them to `open` so no feedback is stranded. After
+the run, the harvest RUNNER (not the agent — it has no DynamoDB tools) reconciles
+the agent's on-mount verdict file to `resolved` with `outcome`+`resolution`, and
+reverts any survivor the agent didn't rule on back to `open`.
+
+CRUD: `GET|POST /annotations/{domain}/{dataset}` and
+`DELETE /annotations/{domain}/{dataset}/{annotation_id}?concept=<id>` (the concept
+id has slashes, so it rides in the query string, not a path segment).
+
 ## Harvest invocation payload
 
 `InvokeAgentRuntime(agentRuntimeArn=<harvest arn>, runtimeSessionId=<per-dataset
@@ -249,6 +295,20 @@ id>, payload=json.dumps({...}).encode())`, where the payload is either:
   "domain_context": "Covers all B2C sales; refunds excluded." }
 ```
 
+or, for an annotation run (apply a user's wiki feedback in place):
+
+```json
+{ "data_domain": "sales", "dataset": "orders", "mode": "annotated",
+  "user_sub": "<cognito sub>",
+  "annotations": [
+    { "annotation_id": "…", "concept_id": "tables/orders",
+      "quote": "one row per order", "prefix": "", "suffix": "",
+      "block_line": 12, "note": "grain is per line-item, not per order" }
+  ],
+  "domain_description": "Revenue & order pipelines",
+  "domain_context": "Covers all B2C sales; refunds excluded." }
+```
+
 or, for writing/refreshing a domain's concept doc through the mount:
 
 ```json
@@ -256,6 +316,15 @@ or, for writing/refreshing a domain's concept doc through the mount:
   "description": "Revenue & order pipelines",
   "context": "Covers all B2C sales; refunds excluded." }
 ```
+
+The `annotated` payload carries only the LIVE annotations (the Control API's
+pre-flight already resolved any orphans) plus the `user_sub` needed to reconstruct
+each annotation's DynamoDB key for the runner's write-back. The agent assesses
+each note against live data, edits the doc when it holds up (augmentation guard
+applies), and writes a per-annotation `{outcome, comment}` verdict to
+`.harvest/annotation_results.json` on the mount; the runner reconciles that to the
+`okf-annotations` table. It reuses the incremental path's scoped, in-place
+approach (no `clean_authored_output`) and the deterministic per-dataset session id.
 
 `domain_description` and `domain_context` are optional enrichment keys added by
 the Control API (and the incremental orchestrator) from the `DOMAIN#/META` row.
@@ -306,6 +375,7 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_VECTOR_INDEX` | S3 Vectors index name |
 | `OKF_REGISTRY_TABLE` | DynamoDB registry table (default `okf-registry`) |
 | `OKF_FRESHNESS_TABLE` | DynamoDB freshness table (default `okf-freshness`) |
+| `OKF_ANNOTATIONS_TABLE` | DynamoDB annotations table (default `okf-annotations`) — user-scoped wiki feedback + the harvest runner's resolution write-back |
 | `OKF_HARVEST_RUNTIME_ARN` | AgentCore harvest runtime ARN |
 | `OKF_ATHENA_OUTPUT` / `OKF_ATHENA_WORKGROUP` | Athena results |
 | `OKF_MOUNT_PATH` | S3 Files mount (default `/mnt/data`) |

@@ -65,8 +65,11 @@ data "aws_iam_policy_document" "control_api" {
     resources = ["*"]
   }
   statement {
+    # registry + freshness as before; annotations table for the user-scoped
+    # annotation CRUD routes AND the pre-flight orphan sweep (Query the caller's
+    # partition, UpdateItem to auto-resolve orphaned notes) — see handlers.
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
-    resources = [local.d.registry_table_arn, local.d.freshness_table_arn]
+    resources = [local.d.registry_table_arn, local.d.freshness_table_arn, local.d.annotations_table_arn]
   }
   statement {
     actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
