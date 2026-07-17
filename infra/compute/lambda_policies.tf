@@ -68,8 +68,18 @@ data "aws_iam_policy_document" "control_api" {
     # registry + freshness as before; annotations table for the user-scoped
     # annotation CRUD routes AND the pre-flight orphan sweep (Query the caller's
     # partition, UpdateItem to auto-resolve orphaned notes) — see handlers.
-    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
-    resources = [local.d.registry_table_arn, local.d.freshness_table_arn, local.d.annotations_table_arn]
+    # chat index table for the per-user conversation list (GET/rename/delete);
+    # chat checkpoint table for the delete-purge (Query/Scan the conversation's
+    # checkpoint items + DeleteItem). The chat RUNTIME owns the writes to both;
+    # the Control API only reads/renames/deletes for the sidebar.
+    actions = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
+    resources = [
+      local.d.registry_table_arn,
+      local.d.freshness_table_arn,
+      local.d.annotations_table_arn,
+      local.d.chat_table_arn,
+      local.d.chat_checkpoints_table_arn,
+    ]
   }
   statement {
     actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]

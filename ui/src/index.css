@@ -168,7 +168,42 @@
   }
   .okf-prose hr { @apply my-6; }
   .okf-prose code {
-    @apply rounded bg-muted px-1.5 py-0.5 font-mono text-[0.8125em];
+    /* A foreground-tint background (not bg-muted): in light mode --muted ≈
+       --background, so bg-muted was invisible against the chat surface. A tint of
+       --foreground reads in BOTH themes (subtle gray on light, subtle light on
+       dark), same technique as the label-grid cells. */
+    @apply rounded px-1.5 py-0.5 font-mono text-[0.8125em];
+    background-color: color-mix(in oklch, var(--foreground) 8%, transparent);
+    border: 1px solid color-mix(in oklch, var(--foreground) 8%, transparent);
+  }
+  /* Concept-id label — inline code SHAPED like a bundle doc id (tables/races,
+     references/metrics/race_wins) rendered as a subtle primary-tinted pill so it
+     reads as an identifier, not raw code. Deliberately NO icon: this is inferred
+     from the string, not a verified file, so it must not assert "this doc exists".
+     Scoped to .okf-prose (chat + doc markdown). */
+  .okf-prose .okf-concept-label {
+    @apply inline-flex items-center rounded-md align-baseline font-mono text-[0.8125em] font-medium whitespace-nowrap;
+    padding: 0.05em 0.4em;
+    color: var(--primary);
+    background-color: color-mix(in oklch, var(--primary) 12%, transparent);
+    border: 1px solid color-mix(in oklch, var(--primary) 22%, transparent);
+  }
+  /* Citation chip — a small source LABEL the agent emits after a claim
+     (<cite src="tables/races">), shown as the doc's short name with a hover popup
+     (kind + full path + dataset). Sits inline with a small gap so it never crowds
+     the preceding word or the next chip. Muted-primary pill, mono, no icon. */
+  .okf-prose .okf-cite {
+    @apply mx-0.5 inline-flex cursor-default items-center rounded-md align-baseline font-mono font-medium whitespace-nowrap;
+    font-size: 0.7em;
+    padding: 0.15em 0.45em;
+    color: var(--primary);
+    background-color: color-mix(in oklch, var(--primary) 10%, transparent);
+    border: 1px solid color-mix(in oklch, var(--primary) 22%, transparent);
+  }
+  .okf-prose .okf-cite:hover,
+  .okf-prose .okf-cite:focus-visible {
+    background-color: color-mix(in oklch, var(--primary) 18%, transparent);
+    outline: none;
   }
   .okf-prose pre {
     @apply my-3 overflow-x-auto rounded-md border bg-muted p-3 text-xs;
@@ -267,12 +302,14 @@
 
 /* Radix ScrollArea's viewport wraps its children in a div with
    `min-width:100%; display:table`. A table box shrink-wraps to content width, so
-   a long, unbreakable child (e.g. a deep concept file name) makes the pane grow
-   past its container instead of the child truncating. For the Browse concepts
-   tree we want the opposite: fill the width and truncate. Force that wrapper to
-   block so `w-full` rows resolve against the card, not their content. Scoped to
-   the tree only — the doc viewer's ScrollArea keeps table for wide code/tables. */
-.okf-tree-scroll [data-slot="scroll-area-viewport"] > div {
+   a long, unbreakable child (a deep concept file name in the tree; a wide code
+   line or GFM table in the doc) makes the PANE grow past its container instead of
+   the child scrolling/truncating within it. Force that wrapper to `block` so its
+   children resolve against the card width, not their own content — the tree rows
+   then truncate, and the doc's CodeView/`.okf-label-grid` do their OWN horizontal
+   scroll rather than stretching the whole doc column past the viewport. */
+.okf-tree-scroll [data-slot="scroll-area-viewport"] > div,
+.okf-doc-scroll [data-slot="scroll-area-viewport"] > div {
   display: block !important;
 }
 
@@ -308,3 +345,272 @@
 }
 /* Dim edges/nodes not part of the current focus set. */
 .okf-graph .react-flow__edge.is-dimmed { opacity: 0.12; }
+
+/* Agent avatar — a 3×3 grid of TINY uniform dots, the same grain size as the
+   effort-slider dots (~2px on a 6px pitch). While answering, each dot LIGHTS UP
+   through the effort fade colors (staggered → ripples across the grid); when the
+   agent is done the animation stops and each dot HOLDS its current color. No
+   scale/opacity change — just color. Transparent background, pure CSS. */
+.okf-agent-dots {
+  display: grid;
+  grid-template-columns: repeat(3, 8px); /* 8px pitch between dot centers */
+  grid-template-rows: repeat(3, 8px);
+  place-content: center;
+  place-items: center;
+  background: transparent;
+}
+.okf-agent-dots > span {
+  width: 3.5px; /* a bit bigger than the slider grain */
+  height: 3.5px;
+  border-radius: 50%;
+  background-color: color-mix(in oklch, var(--primary) 25%, transparent);
+  /* The glow animation is ALWAYS applied but PAUSED by default — so when the
+     agent finishes, each dot FREEZES on whatever color it had reached. `.is-
+     active` merely resumes play. */
+  animation: okf-agent-glow 1.3s ease-in-out infinite;
+  animation-play-state: paused;
+}
+/* Light up through the fade (faint → light-primary → dark "Smarter" primary)
+   while answering; the inline stagger ripples the glow across the grid. */
+.okf-agent-dots.is-active > span {
+  animation-play-state: running;
+}
+/* Peak color is per-dot (--okf-dot-peak, set inline) so each dot brightens to its
+   OWN shade of the fade — the grid twinkles instead of all-lighting-the-same. */
+@keyframes okf-agent-glow {
+  0%,
+  100% {
+    background-color: color-mix(in oklch, var(--primary) 22%, transparent);
+  }
+  50% {
+    background-color: color-mix(
+      in oklch,
+      var(--primary) var(--okf-dot-peak, 90%),
+      black 10%
+    );
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .okf-agent-dots > span {
+    animation: none;
+  }
+}
+
+/* Reasoning-effort slider — dotted track + a larger round thumb (the "Faster ↔
+   Smarter" control in the chat composer's Effort popover). Overrides the shadcn
+   Slider's thin bar: the track becomes a taller pill with a repeating-dot mask so
+   it reads as a dotted field; the filled range keeps the primary tint; the thumb
+   is a white puck. Scoped to `.okf-effort-slider` so no other slider is touched. */
+.okf-effort-slider [data-slot="slider"] {
+  padding: 2px 0;
+}
+/* The TRACK is the UNFILLED base: a plain dotted field, no color. The colored
+   fill only appears where the thumb has passed (the range, below). */
+.okf-effort-slider [data-slot="slider-track"] {
+  height: 18px !important;
+  border-radius: 6px;
+  background-color: color-mix(in oklch, var(--foreground) 8%, transparent);
+  background-image: radial-gradient(
+    circle at center,
+    color-mix(in oklch, var(--foreground) 38%, transparent) 0.9px,
+    transparent 1.2px
+  );
+  background-size: 6px 6px;
+  background-repeat: repeat;
+}
+/* The filled RANGE spans start→thumb ONLY (Radix sizes it). It paints the SAME
+   light→dark fade the full track would show, but the linear-gradient layer is
+   sized to calc(100% / frac) so that gradient maps across the WHOLE track — the
+   range (only `frac` wide) reveals just the 0→thumb slice. Result: the fill
+   fades continuously (never a flat block) and only shows up to the thumb.
+   A brighter dot field tiles over it. */
+.okf-effort-slider [data-slot="slider-range"] {
+  --_frac: var(--okf-effort-frac, 1);
+  border-radius: 6px 0 0 6px;
+  background-color: transparent;
+  background-image:
+    radial-gradient(
+      circle at center,
+      rgb(0 0 0 / 0.28) 0.9px,
+      transparent 1.2px
+    ),
+    linear-gradient(
+      to right,
+      /* Faster end = LIGHTER (primary lifted toward white); Smarter end = DARKER
+         (primary pushed toward black). Full opacity — no transparent mix — so the
+         light→dark swing is obvious in BOTH themes (mixing toward white/black,
+         not toward the near-black dark-mode track, is what makes it read). */
+      color-mix(in oklch, var(--primary) 60%, white) 0%,
+      color-mix(in oklch, var(--primary) 70%, white) 30%,
+      var(--primary) 62%,
+      color-mix(in oklch, var(--primary) 62%, black) 100%
+    );
+  background-size:
+    6px 6px,
+    calc(100% / var(--_frac)) 100%;
+  background-position:
+    0 0,
+    left center;
+  background-repeat: repeat, no-repeat;
+}
+.okf-effort-slider [data-slot="slider-thumb"] {
+  height: 22px;
+  width: 14px;
+  border-radius: 5px;
+  background-color: #fff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.35);
+}
+
+/* Label-grid table — cells rendered as gapped, zebra-tinted "label" blocks with a
+   small radius, separated in BOTH directions. Shared by the chat tool-result
+   tables and chat markdown tables. UNLAYERED on purpose: it must win over the
+   `@layer components` `.okf-prose table/th/td` rules (unlayered > layered),
+   without a specificity war — and it leaves Browse/Harvest doc tables (which
+   don't get this class) with their bordered style. Uses color-mix(oklch) tints
+   so it tracks light/dark automatically (same technique as the graph edges).
+
+   The element carrying `.okf-label-grid` is the SCROLL CONTAINER: a thin,
+   transparent, always-slim scrollbar (cross-browser), with right/bottom padding
+   so the bar sits in its own lane instead of on top of the cells. */
+.okf-label-grid {
+  max-width: 100%;
+  overflow: auto;
+  /* Lanes for the scrollbars (right = vertical, bottom = horizontal) so they
+     never overlap the cell blocks. */
+  padding: 0 5px 5px 0;
+  /* Firefox: thin + transparent track. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+/* WebKit / Blink (Chrome, Safari, Edge): slim, transparent track, pill thumb —
+   the SAME width on hover (never thickens), just a stronger tint. */
+.okf-label-grid::-webkit-scrollbar { width: 8px; height: 8px; }
+.okf-label-grid::-webkit-scrollbar-track { background: transparent; }
+.okf-label-grid::-webkit-scrollbar-thumb {
+  background-color: var(--border);
+  border-radius: 9999px;
+  border: 2px solid transparent;   /* inset → reads as a slim pill */
+  background-clip: padding-box;
+}
+.okf-label-grid::-webkit-scrollbar-thumb:hover {
+  background-color: var(--muted-foreground);
+  background-clip: padding-box;
+}
+.okf-label-grid::-webkit-scrollbar-corner { background: transparent; }
+
+.okf-label-grid table {
+  display: table;
+  width: auto;
+  min-width: 100%;
+  margin: 0;
+  border-collapse: separate;   /* cells as separate blocks */
+  border-spacing: 2px;         /* the gaps between labels (x + y) */
+  overflow: visible;           /* the wrapper scrolls, not the table */
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+/* Neutralize shadcn's row border + hover fill (when rendered via <Table>) —
+   the CELLS carry all the color as label blocks. Harmless for md <tr> too. */
+.okf-label-grid tr {
+  border: 0;
+  background: transparent;
+}
+.okf-label-grid th,
+.okf-label-grid td {
+  border: 0;
+  border-radius: 4px;          /* small radius = smooth-edged label */
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.okf-label-grid th {
+  /* Same vertical padding as the body cells (td: 6px 10px) so the header row is
+     exactly as tall as a data row. height:auto overrides shadcn <TableHead>'s h-10
+     (2.5rem) — without it the tool-result headers stay 40px tall regardless of
+     padding (markdown tables use a raw <th> with no h-10). */
+  height: auto;
+  line-height: 1.45;
+  vertical-align: top;
+  background-color: color-mix(in oklch, var(--foreground) 12%, transparent);
+  color: var(--muted-foreground);
+  font-weight: 500;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.okf-label-grid td {
+  background-color: color-mix(in oklch, var(--foreground) 5%, transparent);
+  color: var(--foreground);
+}
+/* Zebra: even rows a shade stronger so each row reads as its own band. */
+.okf-label-grid tbody tr:nth-child(even) td {
+  background-color: color-mix(in oklch, var(--foreground) 9%, transparent);
+}
+
+/* Wrap modifier (opt-in) — for the Browse doc tables: let long cell text WRAP
+   onto multiple lines instead of the default nowrap+scroll (which suits the
+   chat's compact tool-result grids). The table fills the container (fixed layout,
+   width:100%) and wraps within it; long unbreakable tokens break rather than
+   force horizontal overflow, so a wide table no longer pushes past the viewport. */
+.okf-label-grid-wrap table {
+  table-layout: fixed;
+  width: 100%;
+}
+.okf-label-grid-wrap th,
+.okf-label-grid-wrap td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* shadcn "text-shimmer" utility — the animated streaming-text effect paired with
+   Marker (chat reasoning/tool headers while a step is running). A muted→bright→
+   muted gradient clipped to the text, swept left-to-right. Theme-aware via the
+   existing --muted-foreground / --foreground tokens (works in light + dark). */
+@utility text-shimmer {
+  color: transparent;
+  background-clip: text;
+  -webkit-background-clip: text;
+  background-color: var(--muted-foreground);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    transparent 35%,
+    var(--foreground) 50%,
+    transparent 65%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 250% 100%;
+  animation: text-shimmer 2.8s ease-in-out infinite;
+}
+@keyframes text-shimmer {
+  0% { background-position: 150% 0; }
+  100% { background-position: -150% 0; }
+}
+
+/* Chat transcript top/bottom fade. shadcn's `scroll-fade-*` utilities (built on
+   the scroll-timeline API) get split into a lazy CSS chunk by Vite and don't
+   reliably land on the chat viewport, so we own an explicit, always-emitted mask
+   here. A static top+bottom fade: content dissolves into the top of the layout
+   and under the docked composer instead of hard-cutting. Sizes match the previous
+   scroll-fade-t-10 / scroll-fade-b-16 (2.5rem top, 4rem bottom). */
+@utility okf-chat-fade {
+  --okf-fade-t: 2.5rem;
+  --okf-fade-b: 4rem;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--okf-fade-t),
+    #000 calc(100% - var(--okf-fade-b)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--okf-fade-t),
+    #000 calc(100% - var(--okf-fade-b)),
+    transparent 100%
+  );
+}

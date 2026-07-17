@@ -79,6 +79,8 @@ class Config:
         harvest_log_group: str = "",
         harvest_model_catalog=None,
         annotations_table: str = "okf-annotations",
+        chat_threads_table: str = "okf-chat",
+        chat_checkpoint_table: str = "okf-chat-checkpoints",
     ):
         self.bucket = bucket
         self.registry_table = registry_table
@@ -86,6 +88,11 @@ class Config:
         self.harvest_runtime_arn = harvest_runtime_arn
         # User-scoped wiki annotations (feedback awaiting an annotation harvest).
         self.annotations_table = annotations_table
+        # Chat conversation index (sidebar list) + the LangGraph checkpoint table
+        # (purged on delete). The chat RUNTIME owns the writes; the Control API
+        # reads/renames/deletes for the UI.
+        self.chat_threads_table = chat_threads_table
+        self.chat_checkpoint_table = chat_checkpoint_table
         self.s3 = s3
         self.ddb = ddb
         self.glue = glue
@@ -148,6 +155,10 @@ class Config:
             ),
             annotations_table=os.environ.get(
                 "OKF_ANNOTATIONS_TABLE", "okf-annotations"
+            ),
+            chat_threads_table=os.environ.get("OKF_CHAT_THREADS_TABLE", "okf-chat"),
+            chat_checkpoint_table=os.environ.get(
+                "OKF_CHAT_CHECKPOINT_TABLE", "okf-chat-checkpoints"
             ),
         )
 
@@ -537,6 +548,63 @@ def _r_delete_annotation(cfg, params, body, query, caller):
     )
 
 
+# -- Dataset guidance (shared authoring instructions) -----------------------
+
+
+def _r_get_dataset_guidance(cfg, params, body, query, caller):
+    return 200, handlers.get_dataset_guidance(
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_set_dataset_guidance(cfg, params, body, query, caller):
+    body = body or {}
+    # `guidance` may be an empty string (clearing) — so accept it explicitly
+    # rather than via _require, which rejects falsy values.
+    return 200, handlers.set_dataset_guidance(
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        guidance=body.get("guidance", ""),
+    )
+
+
+# -- Chat conversations (per-user sidebar list) -----------------------------
+
+
+def _r_list_chat_threads(cfg, params, body, query, caller):
+    return 200, handlers.list_chat_threads(
+        cfg.ddb,
+        threads_table=cfg.chat_threads_table,
+        user_sub=caller.sub,
+    )
+
+
+def _r_rename_chat_thread(cfg, params, body, query, caller):
+    body = body or {}
+    return 200, handlers.rename_chat_thread(
+        cfg.ddb,
+        threads_table=cfg.chat_threads_table,
+        user_sub=caller.sub,
+        thread_id=params["thread_id"],
+        title=handlers._require(body, "title"),
+    )
+
+
+def _r_delete_chat_thread(cfg, params, body, query, caller):
+    return 200, handlers.delete_chat_thread(
+        cfg.ddb,
+        threads_table=cfg.chat_threads_table,
+        checkpoint_table=cfg.chat_checkpoint_table,
+        user_sub=caller.sub,
+        thread_id=params["thread_id"],
+    )
+
+
 def _r_cancel_harvest(cfg, params, body, query, caller):
     if not cfg.harvest_runtime_arn:
         raise ApiError(500, "OKF_HARVEST_RUNTIME_ARN not configured")
@@ -642,6 +710,17 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("GET", "/annotations/{domain}/{dataset}", _r_list_annotations),
     ("POST", "/annotations/{domain}/{dataset}", _r_create_annotation),
     ("DELETE", "/annotations/{domain}/{dataset}/{annotation_id}", _r_delete_annotation),
+    # Dataset guidance (shared authoring instructions). PUT (not PATCH) for the
+    # same API Gateway CORS reason as the chat rename above.
+    ("GET", "/guidance/{domain}/{dataset}", _r_get_dataset_guidance),
+    ("PUT", "/guidance/{domain}/{dataset}", _r_set_dataset_guidance),
+    # Chat conversations (per-user sidebar list). thread_id is a single opaque
+    # segment (a UUID the SPA generates), so it's a clean path param. Rename is
+    # PUT (not PATCH) because the API Gateway CORS allow_methods + the CORS_HEADERS
+    # above enumerate GET/PUT/POST/DELETE/OPTIONS — PATCH would fail preflight.
+    ("GET", "/chat/threads", _r_list_chat_threads),
+    ("PUT", "/chat/threads/{thread_id}", _r_rename_chat_thread),
+    ("DELETE", "/chat/threads/{thread_id}", _r_delete_chat_thread),
     ("GET", "/bundle/{domain}/{dataset}/graph", _r_bundle_graph),
     ("GET", "/bundle/{domain}/{dataset}/file", _r_bundle_file),
     ("GET", "/bundle/{domain}/{dataset}", _r_list_bundle),

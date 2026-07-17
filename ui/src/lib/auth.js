@@ -6,6 +6,13 @@ const region = import.meta.env.VITE_AWS_REGION
 const clientId = import.meta.env.VITE_COGNITO_CLIENT_ID
 const hostedUiDomain = import.meta.env.VITE_COGNITO_DOMAIN
 
+// The chat side-panel calls the chat AgentCore runtime DIRECTLY with the user's
+// ACCESS token, which the runtime's JWT authorizer accepts on the okf-chat/invoke
+// scope. So the SPA must REQUEST that scope at login (the app client is granted it
+// in durable cognito.tf). VITE_CHAT_SCOPE is the full scope string from the
+// compute ui_env output; default matches the resource server identifier.
+const chatScope = import.meta.env.VITE_CHAT_SCOPE || "okf-chat/invoke"
+
 export const cognitoAuthConfig = {
   // The Cognito issuer serves /.well-known/openid-configuration for OIDC
   // autodiscovery. VITE_COGNITO_AUTHORITY is exactly the issuer URL.
@@ -13,7 +20,10 @@ export const cognitoAuthConfig = {
   client_id: clientId,
   redirect_uri: window.location.origin + "/callback.html",
   response_type: "code", // authorization-code + PKCE (S256); no client secret
-  scope: "openid email profile",
+  // openid/email/profile for login + the chat scope so the access token can call
+  // the chat runtime directly. (The MCP scope is granted to the app client too,
+  // but the SPA doesn't call MCP directly, so it isn't requested here.)
+  scope: `openid email profile ${chatScope}`,
   post_logout_redirect_uri: window.location.origin + "/",
 
   // Full Cognito sign-out lives on the hosted-UI domain, not the issuer host.

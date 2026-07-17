@@ -92,9 +92,11 @@ anyway.
 
 ## Workflow
 
-Authoring a bundle has up to three passes. Run pass 1 always; run pass 2 to
+Authoring a bundle runs through the passes below. Run pass 1 always; run pass 2 to
 cross-link; run pass 3 only when the caller provided uploaded context documents
-worth folding in. Then always finish with pass 4.
+worth folding in; always finish with pass 4 (indexes + conformance). When your
+runtime supports independent verification (e.g. reviewer sub-agents), run pass 5 —
+an adversarial review — over the finished bundle.
 
 ### Pass 0 — Plan the bundle (before writing anything)
 
@@ -197,7 +199,7 @@ caller explicitly uploaded — documents made available to you for this bundle
 such documents are present:
 
 - **Read them through the fact-type lens.** `references/fact-types.md` is the
-  extraction checklist: it names the ~18 fact types worth capturing (business
+  extraction checklist: it names the ~20 fact types worth capturing (business
   terms, metric definitions, join conditions, **code/enum legends**, filter
   rules, grain, caveats, units, lineage, named sets, …), tells you the **cue
   phrases to look for** in docs to find each, and — critically — **where each
@@ -228,6 +230,23 @@ such documents are present:
   supports — always under its fact-typed folder (see `references/fact-types.md`).
 - **Cite the uploaded document**, not a guessed public origin (see Citations).
 
+**Large `.context/` folders — extract facts once, up front, don't re-read per
+concept.** When the uploaded context is sizable (many docs, a multi-sheet data
+dictionary, a long PDF spec), reading the whole folder afresh while authoring
+*each* concept is wasteful and lossy — the tenth table pays the reading cost again
+and still misses the enum that lived on page 40. Instead do a **single up-front
+extraction pass**: read every context doc through the `references/fact-types.md`
+lens and produce a compact, **routed fact digest** — one entry per fact tagged
+with (fact type, the exact claim, the target **concept id + section** it lands in,
+its verification status, and the source `.context/<file>`), with full enum legends
+transcribed verbatim under their target `references/enums/<col>`. Author each
+concept from that digest, not from a fresh re-read. If your runtime lets you
+dispatch sub-agents (a fact-extractor / reviewer pattern), fan the extraction out
+across the docs so the heavy reading happens once and off your main context, then
+thread each concept's slice of the digest to whoever authors it. The digest is a
+working artifact, not a bundle doc — it never ships; only the facts it routes into
+concept docs do.
+
 If no context documents were provided, **skip this pass entirely** — do not
 speculate about where the data "comes from," do not add links to public datasets,
 docs sites, or repositories, and do not attribute a schema to an external origin
@@ -247,6 +266,32 @@ make sure every doc you wrote is conformant. If your environment does not, use
 whatever index/validate tooling it provides. Either way, the **Conformance
 checklist** at the end of this skill is the definition of done — verify against
 it, and never hand-write `index.md` files.
+
+### Pass 5 — Adversarial review (when your runtime supports it)
+
+Conformance (pass 4) checks that a doc is well-formed; it does not check that the
+doc is *true*. A grain stated but never measured, a join copied from a context doc
+that actually fans out, an enum decoded from the wrong column, an SQL snippet that
+errors — all pass conformance and all mislead a consumer. So when your runtime can
+dispatch independent verifiers (reviewer sub-agents), run an adversarial review
+over the finished bundle before declaring done.
+
+- **Independence is the point.** The author of a doc carries the author's bias —
+  it will rationalize the grain it already stated and re-run the same query that
+  "confirmed" it. Route review through a SEPARATE agent given only the finished
+  doc and the live source, prompted to REFUTE the load-bearing claims (grain,
+  join keys + cardinality, enum decodings, gotchas, every SQL snippet) against
+  live data. A finding is only real if a query reproduces it; fix only confirmed
+  findings.
+- **Cover the WHOLE bundle, not a subset.** Build the review list by enumerating
+  the actual authored docs on disk, not from memory — one reviewer per
+  `tables/*`, per `references/**/*` (joins, metrics, enums, named_sets, glossary,
+  known_issues), and the `datasets/*` overview. Exclude only reserved generated
+  files (`index.md`, `log.md`). Reviewing only the tables, a "representative"
+  sample, or only the docs you think are risky is a spot check, not a review — the
+  bugs you miss are precisely the ones in the docs you skipped. If you must bound
+  the pass, say which docs went unreviewed rather than letting a partial pass read
+  as a complete one.
 
 ## Frontmatter
 
@@ -412,5 +457,5 @@ citations point to sources you actually used.
 
 - `references/spec-condensed.md` — the normative OKF v0.1 rules, condensed.
 - `references/templates.md` — copy-paste frontmatter+body templates per concept type.
-- `references/fact-types.md` — the fact-extraction checklist: ~18 fact types (business terms, metrics, joins, code/enum legends, caveats, units, named sets, …), the cue phrases to find each in docs, and where each lands in the bundle. Read it in Pass 3 (folding in uploaded context) and when mining the source for gotchas/enums.
+- `references/fact-types.md` — the fact-extraction checklist: ~20 fact types (business terms, metrics, joins, code/enum legends, caveats, units, named sets, canonical recipes, …), the cue phrases to find each in docs, and where each lands in the bundle. Read it in Pass 3 (folding in uploaded context) and when mining the source for gotchas/enums.
 - `references/sources/` — per-backend adapters (Athena+Glue, Redshift, …): source-specific schema extraction, `type`/`resource`/dialect conventions, type vocabulary, idioms, and gotchas. See `references/sources/index.md` to pick one or add a new one.

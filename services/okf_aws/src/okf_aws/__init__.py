@@ -10,6 +10,15 @@ from okf_aws.embeddings import (
     put_vector,
     query_vectors,
 )
+from okf_aws.model_factory import (
+    build_bedrock_converse,
+    build_mantle_openai,
+    build_model,
+    gpt_effort,
+    is_openai_model,
+    mantle_token_provider,
+    thinking_fields,
+)
 from okf_aws.s3_bundle import (
     ConceptLocation,
     bundle_prefix,
@@ -26,6 +35,13 @@ __all__ = [
     "embed_text",
     "put_vector",
     "query_vectors",
+    "build_bedrock_converse",
+    "build_mantle_openai",
+    "build_model",
+    "gpt_effort",
+    "is_openai_model",
+    "mantle_token_provider",
+    "thinking_fields",
     "ConceptLocation",
     "bundle_prefix",
     "domain_doc_key",

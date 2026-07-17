@@ -44,6 +44,24 @@ resource "aws_cognito_resource_server" "mcp" {
   }
 }
 
+# Resource server for the chat-agent runtime. Its own custom scope
+# (`okf-chat/invoke`) is what the chat runtime's AgentCore JWT authorizer trusts
+# (allowed_scopes). Kept SEPARATE from `okf-mcp` deliberately: the chat surface is
+# independently grantable/revocable, and a vended MCP machine client does not
+# implicitly gain the human chat surface (and vice-versa). The SPA app client
+# carries this scope too (below) so a logged-in human's access token satisfies
+# the chat authorizer — the browser calls the chat runtime directly with it.
+resource "aws_cognito_resource_server" "chat" {
+  user_pool_id = aws_cognito_user_pool.pool.id
+  identifier   = "okf-chat"
+  name         = "${var.name_prefix}-chat"
+
+  scope {
+    scope_name        = "invoke"
+    scope_description = "Invoke the OKF chat agent runtime"
+  }
+}
+
 # Public SPA client: authorization-code + PKCE, NO client secret.
 resource "aws_cognito_user_pool_client" "web" {
   name         = "${var.name_prefix}-web"
@@ -53,8 +71,15 @@ resource "aws_cognito_user_pool_client" "web" {
   allowed_oauth_flows_user_pool_client = true
   allowed_oauth_flows                  = ["code"]
   # openid/email/profile for login + the MCP scope so human sessions also satisfy
-  # the scopes-based MCP authorizer (the SPA and M2M clients pass the same check).
-  allowed_oauth_scopes         = ["openid", "email", "profile", aws_cognito_resource_server.mcp.scope_identifiers[0]]
+  # the scopes-based MCP authorizer, + the chat scope so the SPA's access token
+  # satisfies the chat runtime's authorizer (the browser calls it directly).
+  allowed_oauth_scopes = [
+    "openid",
+    "email",
+    "profile",
+    aws_cognito_resource_server.mcp.scope_identifiers[0],
+    aws_cognito_resource_server.chat.scope_identifiers[0],
+  ]
   supported_identity_providers = ["COGNITO"]
 
   callback_urls = var.ui_callback_urls

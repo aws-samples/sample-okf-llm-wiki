@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "okf-chat"
+version = "0.1.0"
+description = "OKF chat agent: LangGraph agent on Bedrock AgentCore Runtime, streamed to the UI as Sparky-style typed SSE chunks"
+requires-python = ">=3.11"
+dependencies = [
+    "okf-core",
+    # Shared LLM client factory (Converse + Mantle GPT builders) — chat builds
+    # its models the same way harvest does.
+    "okf-aws",
+    # The consumption tool logic (pure ConsumptionTools) is reused IN-PROCESS as
+    # the agent's tools — no MCP hop. Depend on the package for its tools module.
+    "okf-consumption-mcp",
+    # LangGraph react agent, streamed DIRECTLY by chat.server (graph.astream ->
+    # Sparky-style typed SSE chunks: text / think / tool / end). No AG-UI adapter.
+    "langchain>=1.0",
+    "langgraph>=0.6",
+    # DynamoDB-backed checkpointer for per-thread conversation memory.
+    "langgraph-checkpoint-aws",
+    # ChatBedrockConverse (Claude) + ChatOpenAI-on-Mantle (GPT) — imported lazily
+    # by okf_aws.model_factory; declared here so the container has them.
+    "langchain-aws>=1.6",
+    "langchain-openai>=1.3",
+    "aws-bedrock-token-generator>=1.0",
+    # Raw FastAPI app hosting /invocations + /ping (we own the app so we control
+    # CORS on the streaming response — see server.py).
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    # Decode the AgentCore-validated Cognito JWT (unverified) for the `sub`.
+    "PyJWT>=2.10",
+    "boto3>=1.43",
+    # Observability: ADOT SDK. LangChain/LangGraph spans via the langsmith native
+    # OTEL bridge (transitive), gated by LANGSMITH_* env on the runtime.
+    "aws-opentelemetry-distro>=0.10.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "moto[s3,dynamodb]>=5.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

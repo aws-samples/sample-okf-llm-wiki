@@ -24,6 +24,8 @@ BUCKET = "okf-bundle-test"
 REGISTRY = "okf-registry"
 FRESHNESS = "okf-freshness"
 ANNOTATIONS = "okf-annotations"
+CHAT_THREADS = "okf-chat"
+CHAT_CHECKPOINTS = "okf-chat-checkpoints"
 HARVEST_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/harvest-abc"
 USER_POOL_ID = "us-east-1_testpool"
 MCP_SCOPE = "okf-mcp/invoke"
@@ -37,7 +39,8 @@ def aws():
         s3 = boto3.client("s3", region_name=REGION)
         s3.create_bucket(Bucket=BUCKET)
         ddb = boto3.client("dynamodb", region_name=REGION)
-        for name in (REGISTRY, FRESHNESS, ANNOTATIONS):
+        # Lowercase pk/sk tables (our own item shapes).
+        for name in (REGISTRY, FRESHNESS, ANNOTATIONS, CHAT_THREADS):
             ddb.create_table(
                 TableName=name,
                 KeySchema=[
@@ -50,6 +53,20 @@ def aws():
                 ],
                 BillingMode="PAY_PER_REQUEST",
             )
+        # The chat checkpoint table's schema is dictated by DynamoDBSaver:
+        # UPPERCASE PK/SK (see infra/durable/dynamodb.tf).
+        ddb.create_table(
+            TableName=CHAT_CHECKPOINTS,
+            KeySchema=[
+                {"AttributeName": "PK", "KeyType": "HASH"},
+                {"AttributeName": "SK", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "PK", "AttributeType": "S"},
+                {"AttributeName": "SK", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
         yield {"s3": s3, "ddb": ddb}
 
 
@@ -99,4 +116,6 @@ def cfg(aws, glue, agentcore, cognito, logs):
         logs=logs,
         harvest_log_group=HARVEST_LOG_GROUP,
         annotations_table=ANNOTATIONS,
+        chat_threads_table=CHAT_THREADS,
+        chat_checkpoint_table=CHAT_CHECKPOINTS,
     )

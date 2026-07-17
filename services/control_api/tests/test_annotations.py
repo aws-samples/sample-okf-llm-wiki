@@ -253,6 +253,88 @@ def test_run_all_orphaned_skips_invoke_and_completes(cfg):
     assert st["status"]["status"] == "complete"
 
 
+# --- dataset guidance ------------------------------------------------------
+
+
+def _seed_mapping(cfg, domain="sales", dataset="orders"):
+    """Create the DATASET# mapping row so guidance get/set has a row to target."""
+    handlers.declare_domain(cfg.ddb, registry_table=cfg.registry_table, data_domain=domain)
+    handlers.upsert_domain_mapping(
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        data_domain=domain,
+        dataset=dataset,
+        glue_database=dataset,
+    )
+
+
+def _set_guidance(cfg, text, domain="sales", dataset="orders"):
+    return app.route(
+        _event("PUT", f"/guidance/{domain}/{dataset}", body={"guidance": text}), cfg
+    )
+
+
+def _get_guidance(cfg, domain="sales", dataset="orders"):
+    return _json(app.route(_event("GET", f"/guidance/{domain}/{dataset}"), cfg))
+
+
+def test_guidance_crud_marks_dirty(cfg):
+    _seed_mapping(cfg)
+    # Set guidance → it comes back and is DIRTY (never harvested at this version).
+    r = _set_guidance(cfg, "  Focus on race results; ignore staging tables.  ")
+    assert r["statusCode"] == 200
+    saved = _json(r)
+    assert saved["guidance"] == "Focus on race results; ignore staging tables."
+    assert saved["guidance_dirty"] is True
+    got = _get_guidance(cfg)
+    assert got["guidance"] == "Focus on race results; ignore staging tables."
+    assert got["guidance_dirty"] is True
+
+
+def test_guidance_set_missing_mapping_is_404(cfg):
+    # No DATASET# row → 404 (a stray dataset id).
+    r = _set_guidance(cfg, "x", dataset="ghost")
+    assert r["statusCode"] == 404
+
+
+def test_dirty_guidance_forces_run_with_zero_annotations(cfg):
+    # The key new behavior: a changed guidance re-harvests even with NO annotations
+    # (today's logic would short-circuit and skip the agent).
+    _seed_mapping(cfg)
+    _set_guidance(cfg, "Decode the status column from the data dictionary.")
+    r = _run(cfg)
+    body = _json(r)
+    assert body["status"] == "queued"
+    assert body["annotations"] == 0
+    assert body["guidance_applied"] is True
+    # The agent WAS invoked, in annotated mode, carrying the guidance (no notes).
+    assert len(cfg.agentcore.calls) == 1
+    payload = json.loads(cfg.agentcore.calls[0]["payload"].decode())
+    assert payload["mode"] == "annotated"
+    assert payload["annotations"] == []
+    assert payload["dataset_guidance"] == "Decode the status column from the data dictionary."
+    assert payload["dataset_guidance_version"]  # the version being applied
+
+
+def test_clean_guidance_still_skips_when_no_annotations(cfg):
+    # Guidance present but NOT dirty (no updated version pending) → still skip.
+    _seed_mapping(cfg)
+    _set_guidance(cfg, "some guidance")
+    # Simulate it already applied: stamp applied_version = current updated_at.
+    got = _get_guidance(cfg)
+    cfg.ddb.update_item(
+        TableName=cfg.registry_table,
+        Key={"pk": {"S": "DOMAIN#sales"}, "sk": {"S": "DATASET#orders"}},
+        UpdateExpression="SET guidance_applied_version = :v",
+        ExpressionAttributeValues={":v": {"S": got["guidance_updated_at"]}},
+    )
+    assert _get_guidance(cfg)["guidance_dirty"] is False
+    r = _run(cfg)
+    body = _json(r)
+    assert body["status"] == "complete" and body["skipped"] is True
+    assert len(cfg.agentcore.calls) == 0
+
+
 def test_run_missing_doc_orphans_all(cfg):
     # No S3 doc at all for the concept -> every annotation on it is orphaned.
     app.route(

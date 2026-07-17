@@ -32,7 +32,11 @@ from harvest.fsutil import clean_authored_output, write_text
 from harvest.glue_source import GlueAthenaSource
 from harvest.metadata_export import export_metadata
 from harvest.prompts import build_annotation_prompt
-from harvest.status import build_registry_client, report_status
+from harvest.status import (
+    build_registry_client,
+    report_status,
+    stamp_guidance_applied,
+)
 
 log = logging.getLogger(__name__)
 
@@ -168,6 +172,29 @@ def _table_versions(source: GlueAthenaSource) -> dict[str, str]:
     return versions
 
 
+def _guidance_preamble(dataset_guidance: str | None) -> str:
+    """A prompt block carrying the operator's dataset guidance, or "" when none.
+
+    Framed as authoritative, dataset-specific instructions the author MUST honour
+    — but still subordinate to the live data (guidance is a lead to verify, like a
+    .context/ doc, not a fact to transcribe blindly). Shared by all three run modes
+    so the guidance steers full, incremental, and annotation harvests identically.
+    """
+    text = (dataset_guidance or "").strip()
+    if not text:
+        return ""
+    return (
+        "## Operator guidance for THIS dataset (authoritative)\n"
+        "The operator provided the following dataset-specific instructions. Treat "
+        "them as high-priority steering for how to author this bundle — what to "
+        "emphasize, decode, exclude, or interpret. They reflect real domain "
+        "knowledge the catalog can't convey. Still verify any factual claim against "
+        "live data (guidance is a lead, not gospel; where the data disagrees, note "
+        "the discrepancy), but follow the operator's intent about focus and framing:\n\n"
+        f"{text}\n\n"
+    )
+
+
 def run_full_harvest(
     *,
     source: GlueAthenaSource,
@@ -178,6 +205,8 @@ def run_full_harvest(
     recursion_limit: int = 1000,
     domain_description: str | None = None,
     domain_context: str | None = None,
+    dataset_guidance: str | None = None,
+    dataset_guidance_version: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Author (or refresh) the entire dataset bundle end to end."""
@@ -260,6 +289,7 @@ def run_full_harvest(
             )
         prompt = (
             f"{domain_preamble}"
+            f"{_guidance_preamble(dataset_guidance)}"
             f"Harvest the Glue database `{dataset}` (data domain `{data_domain}`) into "
             f"a complete OKF bundle. It has {len(tables)} table(s): "
             f"{', '.join(tables)}.\n\n"
@@ -316,6 +346,13 @@ def run_full_harvest(
         status="complete",
         only_if_active=True,
     )
+    # The bundle now reflects this guidance version — clear its DIRTY state.
+    stamp_guidance_applied(
+        registry,
+        data_domain=data_domain,
+        dataset=dataset,
+        version=dataset_guidance_version,
+    )
     log.info("Harvest complete: %s/%s (%d tables)", data_domain, dataset, len(tables))
     return state
 
@@ -332,6 +369,8 @@ def run_incremental_harvest(
     recursion_limit: int = 400,
     domain_description: str | None = None,
     domain_context: str | None = None,
+    dataset_guidance: str | None = None,
+    dataset_guidance_version: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Re-review one changed table and the docs that reference it."""
@@ -387,6 +426,7 @@ def run_incremental_harvest(
             )
         prompt = (
             f"{domain_preamble}"
+            f"{_guidance_preamble(dataset_guidance)}"
             f"The Glue table `{changed_table}` in database `{dataset}` changed. "  # nosec B608 - a natural-language instruction to the harvest agent, not a SQL query; no SQL is constructed or executed here.
             f"Review its OKF doc `tables/{changed_table}` against the current Glue "
             f"metadata (`.metadata/tables/{changed_table}.md`) and a fresh sample "
@@ -441,6 +481,12 @@ def run_incremental_harvest(
         dataset=dataset,
         status="complete",
         only_if_active=True,
+    )
+    stamp_guidance_applied(
+        registry,
+        data_domain=data_domain,
+        dataset=dataset,
+        version=dataset_guidance_version,
     )
     log.info("Incremental harvest complete: %s.%s", dataset, changed_table)
     return state
@@ -539,6 +585,8 @@ def run_annotation_harvest(
     recursion_limit: int = 400,
     domain_description: str | None = None,
     domain_context: str | None = None,
+    dataset_guidance: str | None = None,
+    dataset_guidance_version: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply a user's wiki annotations to the bundle, then reconcile verdicts.
@@ -615,6 +663,7 @@ def run_annotation_harvest(
             results_rel=ANNOTATION_RESULTS_REL,
             domain_description=domain_description,
             domain_context=domain_context,
+            dataset_guidance=dataset_guidance,
         )
         emitter = _build_emitter(
             data_domain=data_domain, dataset=dataset, session_id=session_id
@@ -698,6 +747,14 @@ def run_annotation_harvest(
         status="complete",
         detail=detail,
         only_if_active=True,
+    )
+    # The bundle now reflects this guidance version — clear its DIRTY state. (A
+    # zero-annotation run that ran ONLY because guidance was dirty still lands here.)
+    stamp_guidance_applied(
+        registry,
+        data_domain=data_domain,
+        dataset=dataset,
+        version=dataset_guidance_version,
     )
     log.info("Annotation harvest complete: %s/%s (%s)", data_domain, dataset, detail)
     return state

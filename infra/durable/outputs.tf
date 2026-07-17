@@ -57,6 +57,22 @@ output "annotations_table_arn" {
   value = aws_dynamodb_table.annotations.arn
 }
 
+output "chat_checkpoints_table" {
+  value = aws_dynamodb_table.chat_checkpoints.name
+}
+
+output "chat_checkpoints_table_arn" {
+  value = aws_dynamodb_table.chat_checkpoints.arn
+}
+
+output "chat_table" {
+  value = aws_dynamodb_table.chat.name
+}
+
+output "chat_table_arn" {
+  value = aws_dynamodb_table.chat.arn
+}
+
 output "user_pool_id" {
   value = aws_cognito_user_pool.pool.id
 }
@@ -87,6 +103,12 @@ output "cognito_hosted_ui_domain" {
 # trusts and every vended M2M client is granted.
 output "mcp_scope" {
   value = aws_cognito_resource_server.mcp.scope_identifiers[0]
+}
+
+# The full custom scope string (`okf-chat/invoke`) the chat runtime's AgentCore
+# JWT authorizer trusts; the SPA carries it so its access token can call chat.
+output "chat_scope" {
+  value = aws_cognito_resource_server.chat.scope_identifiers[0]
 }
 
 # OAuth2 token endpoint for the client_credentials (M2M) grant. Machine clients

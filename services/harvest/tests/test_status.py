@@ -159,3 +159,48 @@ def test_report_status_swallows_conditional_check_failure():
 def test_build_registry_client_none_without_env(monkeypatch):
     monkeypatch.delenv("OKF_REGISTRY_TABLE", raising=False)
     assert status.build_registry_client() is None
+
+
+# --- stamp_guidance_applied (clears guidance dirty on a successful harvest) --
+
+
+def test_stamp_guidance_applied_writes_version_to_mapping_row():
+    ddb = _FakeDDB()
+    status.stamp_guidance_applied(
+        (ddb, "okf-registry"),
+        data_domain="sport",
+        dataset="formula_1",
+        version="v-123",
+    )
+    assert len(ddb.calls) == 1
+    call = ddb.calls[0]
+    # Targets the DATASET# mapping row, NOT the HARVEST# status row.
+    assert call["Key"] == {
+        "pk": {"S": "DOMAIN#sport"},
+        "sk": {"S": "DATASET#formula_1"},
+    }
+    assert "guidance_applied_version" in call["UpdateExpression"]
+    assert call["ExpressionAttributeValues"][":v"] == {"S": "v-123"}
+
+
+def test_stamp_guidance_applied_noop_without_version():
+    # A run carrying no guidance passes version=None → nothing written.
+    ddb = _FakeDDB()
+    status.stamp_guidance_applied(
+        (ddb, "t"), data_domain="d", dataset="ds", version=None
+    )
+    assert ddb.calls == []
+
+
+def test_stamp_guidance_applied_swallows_ddb_error():
+    # Best-effort: a write failure must never break a finalized bundle.
+    status.stamp_guidance_applied(
+        (_FakeDDB(raise_on_update=True), "t"),
+        data_domain="d",
+        dataset="ds",
+        version="v1",
+    )  # no exception
+
+
+def test_stamp_guidance_applied_noop_when_registry_none():
+    status.stamp_guidance_applied(None, data_domain="d", dataset="ds", version="v1")

@@ -1,7 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
-import rehypeHighlight from "rehype-highlight"
 import {
   ChevronRightIcon,
   FileTextIcon,
@@ -10,6 +9,7 @@ import {
   MessageSquareTextIcon,
 } from "lucide-react"
 
+import { CodeView } from "@/components/chat/CodeView"
 import { buildTree, parseDocument, resolveConceptLink } from "@/lib/bundle"
 import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -49,6 +49,17 @@ import {
   SelectionAnnotator,
   useAnnotations,
 } from "@/views/AnnotationSidebar.jsx"
+
+// Pull plain text out of react-markdown's children (string | array | nodes) —
+// used to extract a fenced block's source for CodeView (same helper as chat).
+function textOf(children) {
+  if (children == null) return ""
+  if (typeof children === "string") return children
+  if (Array.isArray(children)) return children.map(textOf).join("")
+  if (typeof children === "object" && children.props)
+    return textOf(children.props.children)
+  return String(children)
+}
 
 // Browse a harvested bundle: a directory tree of concepts + a markdown viewer.
 export default function BrowseView({ api, selection, concept, onConceptChange }) {
@@ -239,7 +250,11 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
         </CardContent>
       </Card>
 
-      <Card className="min-h-0 gap-0 py-0 max-md:h-[70vh]">
+      {/* min-w-0: this is the grid's `1fr` doc column. Grid items default to
+          min-width:auto, so a wide child (a table or a long code line) would grow
+          the track past the viewport instead of scrolling internally. min-w-0 lets
+          the track shrink so the inner ScrollArea + label-grid/CodeView scroll. */}
+      <Card className="min-h-0 min-w-0 gap-0 py-0 max-md:h-[70vh]">
         <CardHeader className="flex flex-row items-center justify-between gap-2 border-b px-4 py-3">
           {selectedId ? (
             <ConceptBreadcrumb conceptId={selectedId} />
@@ -266,8 +281,8 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
           </Button>
         </CardHeader>
         <CardContent className="min-h-0 flex-1 p-0">
-          <ScrollArea className="h-full">
-            <div className="p-5">
+          <ScrollArea className="okf-doc-scroll h-full">
+            <div className="min-w-0 p-5">
               {loadingDoc ? (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Spinner />
@@ -488,7 +503,43 @@ function ConceptDoc({ conceptId, text, onNavigate }) {
       td: withPos("td"),
       th: withPos("th"),
       blockquote: withPos("blockquote"),
-      pre: withPos("pre"),
+      // Tables + fenced code render the SAME way as the chat agent: GFM tables get
+      // the shared label-grid look (index.css `.okf-label-grid`), and fenced code
+      // renders through the read-only CodeView (language label + copy + highlight)
+      // instead of a bare highlighted <pre>. `data-sl` is preserved on the wrapper
+      // so annotation anchoring still finds the block's source line.
+      table({ node, children, ...props }) {
+        const line = node?.position?.start?.line
+        // okf-label-grid-wrap: doc tables WRAP long cell text (prose docs, not the
+        // chat's compact tool-result grids which keep nowrap + per-column config).
+        return (
+          <div
+            className="okf-label-grid okf-label-grid-wrap"
+            {...(line != null ? { "data-sl": line } : {})}
+          >
+            <table {...props}>{children}</table>
+          </div>
+        )
+      },
+      pre({ node, children }) {
+        const line = node?.position?.start?.line
+        const child = Array.isArray(children) ? children[0] : children
+        const cls = child?.props?.className || ""
+        const match = /language-(\w+)/.exec(cls)
+        if (child?.props) {
+          return (
+            <div {...(line != null ? { "data-sl": line } : {})}>
+              <CodeView
+                code={textOf(child.props.children)}
+                language={match?.[1]}
+              />
+            </div>
+          )
+        }
+        return (
+          <pre {...(line != null ? { "data-sl": line } : {})}>{children}</pre>
+        )
+      },
       a({ href, children, ...props }) {
         const resolved = href ? resolveConceptLink(href, conceptId) : null
         if (resolved) {
@@ -553,11 +604,7 @@ function ConceptDoc({ conceptId, text, onNavigate }) {
         </div>
       )}
       <div className="okf-prose">
-        <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
-          rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
-          components={components}
-        >
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
           {body}
         </ReactMarkdown>
       </div>

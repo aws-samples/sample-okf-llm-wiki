@@ -30,6 +30,11 @@ module "control_api_fn" {
     # validates a chosen model/effort against this before invoking the runtime.
     # Same value the UI receives via VITE_HARVEST_MODEL_CATALOG (see outputs.tf).
     OKF_HARVEST_MODEL_CATALOG = jsonencode(var.harvest_model_catalog)
+    # Chat conversation index (sidebar list) + the LangGraph checkpoint table the
+    # delete route purges. The chat runtime writes both; the Control API only
+    # reads/renames/deletes for the UI (GET/PUT/DELETE /chat/threads).
+    OKF_CHAT_THREADS_TABLE    = local.d.chat_table
+    OKF_CHAT_CHECKPOINT_TABLE = local.d.chat_checkpoints_table
   })
   tags = var.tags
 }

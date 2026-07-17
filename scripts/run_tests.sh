@@ -10,7 +10,7 @@ cd "$ROOT"
 # shellcheck disable=SC1091
 source "$ROOT/.venv/bin/activate"
 
-SERVICES=(okf_core okf_aws harvest reindex incremental control_api consumption_mcp)
+SERVICES=(okf_core okf_aws harvest reindex incremental control_api consumption_mcp chat)
 fail=0
 
 for svc in "${SERVICES[@]}"; do

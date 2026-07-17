@@ -11,7 +11,13 @@ Wires together, per the design:
 - ``OKFGuardMiddleware`` (frontmatter + augmentation guard, timestamp auto-fill,
   graph dirty-flag) — attached to the main agent AND the per-table sub-agent
   (sub-agent middleware/tools REPLACE, so we pass them explicitly);
-- one dynamic ``table-author`` sub-agent, fanned out one-per-table;
+- four dynamic sub-agents the supervisor fans out via ``task()``: ``table-author``
+  (one per table), ``reference-author`` (one per cross-cutting reference — metric,
+  named-set, glossary term, known-issue, or the usage-guardrails contract),
+  ``reviewer`` (one per authored doc, adversarial read-only verification), and
+  ``context-extractor`` (read-only; mines the uploaded ``.context/`` docs for
+  verified facts and returns a routed digest — fanned out one-per-doc/group for a
+  large ``.context/`` so the heavy reading happens once);
 - an optional ``run_code`` tool backed by a network-isolated AgentCore Code
   Interpreter sandbox (when a ``CodeSandbox`` is supplied), so the agent can
   extract text from binary ``.context/`` docs (PDF/DOCX/PPTX/XLSX) the built-in
@@ -34,7 +40,13 @@ from harvest.glue_source import GlueAthenaSource
 from harvest.graph_tools import make_graph_tools
 from harvest.guard_engine import OKFGuardEngine
 from harvest.okf_guard import OKFGuardMiddleware
-from harvest.prompts import REVIEWER_PROMPT, SUPERVISOR_PROMPT, TABLE_AUTHOR_PROMPT
+from harvest.prompts import (
+    CONTEXT_EXTRACTOR_PROMPT,
+    REFERENCE_AUTHOR_PROMPT,
+    REVIEWER_PROMPT,
+    SUPERVISOR_PROMPT,
+    TABLE_AUTHOR_PROMPT,
+)
 from harvest.source_tools import make_source_tools
 from okf_core.link_graph import LinkGraph
 
@@ -95,23 +107,11 @@ DEFAULT_MANTLE_REGION = "us-east-2"
 # the GPT builder uses if the caller didn't lower it from the Claude default.
 DEFAULT_GPT_MAX_TOKENS = 32000
 
-# Map Converse effort levels onto OpenAI's reasoning_effort scale
-# (none|minimal|low|medium|high|xhigh|max). GPT-5.6 (Sol/Luna/Terra) added "max"
-# as a distinct level ABOVE xhigh, so our whole vocabulary now passes through
-# verbatim — every Converse level has a same-named OpenAI level. In particular
-# DON'T collapse "max"->"xhigh" (that silently downgrades a deliberately-max
-# harvest) or the top levels to "high". Which efforts a given model actually
-# accepts is model-specific (e.g. gpt-5.4 rejects "max"); that's enforced by the
-# model catalog (the trust boundary) + Bedrock, NOT a client-side allow-list here,
-# mirroring the Converse path. Unknown values fall through to xhigh so a stray
-# effort string never quietly downgrades the authoring model.
-_GPT_EFFORT = {
-    "max": "max",
-    "xhigh": "xhigh",
-    "high": "high",
-    "medium": "medium",
-    "low": "low",
-}
+# Converse effort levels map onto OpenAI's reasoning_effort scale verbatim (the
+# mapping now lives in okf_aws.model_factory.GPT_EFFORT_MAP — GPT-5.6 added "max"
+# above xhigh, so every Converse level has a same-named OpenAI level and nothing
+# is collapsed). _gpt_effort delegates there; this fallback constant is retained
+# for callers/tests that reference it directly.
 DEFAULT_GPT_REASONING_EFFORT = "xhigh"
 
 
@@ -202,15 +202,12 @@ def resolve_model_config(
 def _thinking_fields(effort: str) -> dict[str, Any]:
     """additionalModelRequestFields for adaptive thinking at the given effort.
 
-    `thinking.type=adaptive` + `output_config.effort=<level>`. The effort MUST
-    live in a separate output_config object (putting it inside `thinking` is a
-    ValidationException). We pass the effort through verbatim — Bedrock validates
-    it against the specific model (valid values differ per model), so no
-    client-side allow-list here.
+    Thin wrapper over the shared :func:`okf_aws.model_factory.thinking_fields`
+    (kept as a module-private alias so harvest's callers/tests are unchanged).
     """
-    if not effort:
-        raise ValueError("effort must be a non-empty string")
-    return {"thinking": {"type": "adaptive"}, "output_config": {"effort": effort}}
+    from okf_aws.model_factory import thinking_fields
+
+    return thinking_fields(effort)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -248,18 +245,21 @@ def _bedrock_config():
 def _is_openai_model(model: str) -> bool:
     """True when ``model`` names an OpenAI GPT model served on Bedrock Mantle.
 
-    Mantle GPT ids are ``openai.<name>`` (e.g. ``openai.gpt-5.6-sol``); the bare
-    ``gpt-`` form is accepted too for local/dev use. Everything else — the
-    ``us./eu./global.anthropic.*`` Converse profiles — stays on Converse.
+    Thin wrapper over the shared :func:`okf_aws.model_factory.is_openai_model`.
     """
-    return model.startswith("openai.") or model.startswith("gpt-")
+    from okf_aws.model_factory import is_openai_model
+
+    return is_openai_model(model)
 
 
 def _gpt_effort(effort: str) -> str:
-    """Map a Converse effort level onto OpenAI's ``reasoning_effort`` scale."""
-    if not effort:
-        raise ValueError("effort must be a non-empty string")
-    return _GPT_EFFORT.get(effort, DEFAULT_GPT_REASONING_EFFORT)
+    """Map a Converse effort level onto OpenAI's ``reasoning_effort`` scale.
+
+    Thin wrapper over the shared :func:`okf_aws.model_factory.gpt_effort`.
+    """
+    from okf_aws.model_factory import gpt_effort
+
+    return gpt_effort(effort)
 
 
 def _build_model(model: str, effort: str, max_tokens: int, callbacks=None):
@@ -286,19 +286,21 @@ def _build_model(model: str, effort: str, max_tokens: int, callbacks=None):
 def _build_bedrock_converse(model: str, effort: str, max_tokens: int, callbacks=None):
     """Construct a ChatBedrockConverse with adaptive thinking configured.
 
-    Built explicitly (rather than passing a model string to create_deep_agent)
-    so the thinking config rides on the model via additional_model_request_fields
-    — no reliance on kwarg-forwarding through deepagents. The botocore ``config``
-    lifts the read timeout + retries so long Opus 4.8 turns don't ReadTimeout.
+    Reads harvest's deploy-time knobs (AWS_REGION, the OKF_HARVEST_BEDROCK_*
+    botocore timeouts) and delegates construction to the shared factory. Built
+    explicitly (rather than passing a model string to create_deep_agent) so the
+    thinking config rides on the model — no reliance on kwarg-forwarding through
+    deepagents. The botocore ``config`` lifts the read timeout + retries so long
+    Opus 4.8 turns don't ReadTimeout.
     """
-    from langchain_aws import ChatBedrockConverse
+    from okf_aws.model_factory import build_bedrock_converse
 
-    return ChatBedrockConverse(
-        model=model,
-        region_name=os.environ.get("AWS_REGION", "us-east-1"),
-        max_tokens=max_tokens,
-        additional_model_request_fields=_thinking_fields(effort),
-        config=_bedrock_config(),
+    return build_bedrock_converse(
+        model,
+        effort,
+        max_tokens,
+        region=os.environ.get("AWS_REGION", "us-east-1"),
+        botocore_config=_bedrock_config(),
         callbacks=callbacks,
     )
 
@@ -314,75 +316,54 @@ _MANTLE_TOKEN_TTL_SECONDS = 1800  # 30 min: comfortably under the ~1h creds life
 def _mantle_token_provider(region: str):
     """A callable that returns a FRESH Mantle bearer token, cached briefly.
 
-    langchain_openai / the openai SDK accept ``api_key`` as a ``Callable[[], str]``
-    and invoke it PER REQUEST (openai `_refresh_api_key`), so returning a callable
-    here — rather than a pre-minted string — is what keeps a long harvest
-    authenticated: every request re-reads a currently-valid token. We cache the
-    token for ``_MANTLE_TOKEN_TTL_SECONDS`` so we don't run a SigV4 presign on
-    every single call, while staying well under the signing creds' ~1h life.
-    ``provide_token`` re-signs with whatever creds the default chain currently
-    holds, so it naturally picks up refreshed role credentials.
+    Thin wrapper over :func:`okf_aws.model_factory.mantle_token_provider`, pinned
+    to harvest's ``_MANTLE_TOKEN_TTL_SECONDS``. The token is a SigV4-presigned
+    URL whose life is bounded by the signing role creds (~1h on AgentCore), so a
+    single token can't cover an 8h harvest; the openai SDK re-invokes this
+    callable per request, so each call re-reads a fresh (cached ~30 min) token.
     """
-    import time
+    from okf_aws.model_factory import mantle_token_provider
 
-    from aws_bedrock_token_generator import provide_token
-
-    cache: dict[str, Any] = {"token": None, "exp": 0.0}
-
-    def _provider() -> str:
-        now = time.time()
-        if cache["token"] is None or now >= cache["exp"]:
-            cache["token"] = provide_token(region=region)
-            cache["exp"] = now + _MANTLE_TOKEN_TTL_SECONDS
-        return cache["token"]
-
-    return _provider
+    return mantle_token_provider(region, ttl_seconds=_MANTLE_TOKEN_TTL_SECONDS)
 
 
 def _build_mantle_openai(model: str, effort: str, max_tokens: int, callbacks=None):
     """Construct a ChatOpenAI pointed at the Bedrock Mantle OpenAI endpoint.
 
-    Auth is a short-lived bearer token minted by ``provide_token(region=...)``:
-    a SigV4-derived Bedrock API key that inherits the runtime role's IAM (so the
+    Reads harvest's Mantle knobs (OKF_HARVEST_MANTLE_*) and delegates
+    construction to the shared factory. Auth is a short-lived bearer token: a
+    SigV4-derived Bedrock API key that inherits the runtime role's IAM (so the
     existing ``bedrock:InvokeModel*`` grant covers it — no API key or Secrets
-    Manager). Crucially we pass a TOKEN PROVIDER CALLABLE (not a pre-minted
-    string): the token is a presigned URL whose life is bounded by the signing
-    role creds (~1h on AgentCore), so a single token can't cover an 8h harvest.
-    The openai SDK re-invokes the callable per request, so each call re-reads a
-    fresh (cached ~30 min) token. See ``_mantle_token_provider``.
+    Manager), passed as a PROVIDER CALLABLE the openai SDK re-invokes per request.
 
     The Mantle REGION is deliberately separate from ``AWS_REGION`` (GPT-5.x is
-    only in us-east-2/us-west-2); both the base URL and the token use it. The
-    botocore ``config`` knobs don't apply to ChatOpenAI (it's an httpx client),
+    only in us-east-2/us-west-2); both the base URL and the token use it. GPT-5.x
+    is served ONLY on the Responses API (/openai/v1); an operator running a
+    gpt-oss model can flip OKF_HARVEST_MANTLE_USE_RESPONSES_API=false (→ /v1 Chat
+    Completions). The botocore config doesn't apply to ChatOpenAI (httpx client),
     so the read timeout + retry budget map onto ``timeout``/``max_retries``.
     """
-    from langchain_openai import ChatOpenAI
+    from okf_aws.model_factory import build_mantle_openai
 
     region = os.environ.get("OKF_HARVEST_MANTLE_REGION", DEFAULT_MANTLE_REGION)
-    # GPT-5.x on Mantle is served ONLY on the Responses API, at the /openai/v1
-    # path (NOT the /v1 Chat Completions path, which is for the gpt-oss models).
-    # So default to the Responses surface; an operator running a gpt-oss model can
-    # flip OKF_HARVEST_MANTLE_USE_RESPONSES_API=false and point the base URL at
-    # /v1. use_responses_api=True makes langchain_openai speak Responses.
     use_responses = os.environ.get(
         "OKF_HARVEST_MANTLE_USE_RESPONSES_API", "true"
     ).lower() not in ("false", "0", "")
-    default_path = "openai/v1" if use_responses else "v1"
-    base_url = os.environ.get(
-        "OKF_HARVEST_MANTLE_BASE_URL",
-        f"https://bedrock-mantle.{region}.api.aws/{default_path}",
-    )
-    return ChatOpenAI(
-        model=model,
-        base_url=base_url,
-        api_key=_mantle_token_provider(region),
+    # An explicit base-URL override wins; otherwise the shared factory derives it
+    # from region + the Responses/ChatCompletions choice.
+    base_url = os.environ.get("OKF_HARVEST_MANTLE_BASE_URL")
+    return build_mantle_openai(
+        model,
+        effort,
+        max_tokens,
+        region=region,
         use_responses_api=use_responses,
-        max_tokens=max_tokens,
-        reasoning_effort=_gpt_effort(effort),
+        base_url=base_url,
         timeout=_int_env("OKF_HARVEST_MANTLE_READ_TIMEOUT", DEFAULT_BEDROCK_READ_TIMEOUT),
         max_retries=_int_env(
             "OKF_HARVEST_MANTLE_MAX_ATTEMPTS", DEFAULT_BEDROCK_MAX_ATTEMPTS
         ),
+        token_ttl_seconds=_MANTLE_TOKEN_TTL_SECONDS,
         callbacks=callbacks,
     )
 
@@ -558,6 +539,28 @@ def build_harvest_agent(
         "middleware": [guard],
     }
 
+    # Dynamic sub-agent, dispatched once per CROSS-CUTTING reference item (a
+    # metric, named-set, glossary term, known-issue, or the dataset's usage-
+    # guardrails contract). Mirrors table-author (guard + source/graph tools, it
+    # does the writing) so a reference gets the same dedicated, verify-against-live
+    # attention a table does — instead of the supervisor first-drafting them all
+    # serially. Per-table enums/joins stay with the table-author (co-located with
+    # the table they verified); this one owns the references that span tables.
+    reference_author = {
+        "name": "reference-author",
+        "description": (
+            "Author exactly one CROSS-CUTTING reference doc and write its file: a "
+            "metric (references/metrics/*), named_set/lifecycle (references/"
+            "named_sets/*), glossary term (references/glossary/*), known-issue "
+            "(references/known_issues/*), or the dataset usage-guardrails contract "
+            "(references/usage_guardrails.md). Pass the concept id + fact type + a "
+            "grounding brief. NOT for per-table enums/joins (table-author owns those)."
+        ),
+        "system_prompt": REFERENCE_AUTHOR_PROMPT,
+        "tools": all_tools,
+        "middleware": [guard],
+    }
+
     # Adversarial reviewer — READ-ONLY. Verifies an authored doc's load-bearing
     # claims (the stated grain, join keys, gotchas, SQL) against LIVE data via
     # run_sql/sample_rows, and reports only findings it could reproduce. No guard
@@ -575,6 +578,28 @@ def build_harvest_agent(
         "tools": all_tools,  # source + graph tools; read_file comes from the backend
     }
 
+    # Context fact-extractor — READ-ONLY. Reads the uploaded `.context/` docs once
+    # (text via read_file, binary via the run_code sandbox), mines them for the
+    # fact types (enums, joins, metrics, grain, caveats), verifies each against
+    # live data, and returns a compact routed digest the supervisor threads into
+    # the table-authors. Fanned out one-per-doc/group for a LARGE `.context/` so
+    # the heavy reading happens once, off the supervisor's and authors' context. No
+    # guard (it never writes bundle files); it gets the same source + graph +
+    # run_code tools (read_file comes from the backend).
+    context_extractor = {
+        "name": "context-extractor",
+        "description": (
+            "Extract verified facts from the uploaded `.context/` source docs and "
+            "return a compact, routed digest (enum legends, joins, metrics, grain, "
+            "caveats — each tagged with the target concept id + section). Pass which "
+            "`.context/` doc(s) to cover. Use for LARGE `.context/` folders so the "
+            "docs are read once, not re-read by every table-author. READ-ONLY — "
+            "returns plain-text findings, writes nothing."
+        ),
+        "system_prompt": CONTEXT_EXTRACTOR_PROMPT,
+        "tools": all_tools,  # source + graph + run_code; read_file from the backend
+    }
+
     main_middleware = [guard]
     if interpreter_mw is not None:
         main_middleware.append(interpreter_mw)
@@ -584,7 +609,7 @@ def build_harvest_agent(
         tools=all_tools,
         system_prompt=SUPERVISOR_PROMPT,
         middleware=main_middleware,
-        subagents=[table_author, reviewer],
+        subagents=[table_author, reference_author, reviewer, context_extractor],
         backend=backend,
         skills=skills_arg,
     )

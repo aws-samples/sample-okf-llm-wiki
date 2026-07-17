@@ -3,11 +3,17 @@
 // hash keeps deep links working on refresh with no server rewrite and never
 // collides with the `?code=&state=` OAuth params. The location becomes:
 //
-//   #/<section>[/<domain>/<dataset>[/<concept…>]]
+//   #/<section>[/<domain>/<dataset>[/<concept…>]]     data-scoped views
 //   e.g. #/browse/sport/formula_1/tables/races
 //
-// domain and dataset are always single segments (validated server-side); the
-// concept id (which may contain "/") is everything after them.
+//   #/chat[/<threadId>]                                the chat page
+//   e.g. #/chat/6f1c…-uuid
+//
+// Chat is DIFFERENT: it is not dataset-scoped (the agent reads the whole wiki;
+// the "@" picker narrows relevance in-message, not via the URL), so its single
+// trailing segment is the CONVERSATION id, not a domain/dataset. domain/dataset
+// are single segments (validated server-side); the concept id (which may contain
+// "/") is everything after them.
 
 import { useCallback, useEffect, useState } from "react"
 
@@ -23,19 +29,35 @@ export function parseHash() {
         return s
       }
     })
-  const [section, domain, dataset, ...conceptParts] = parts
+  const [section, ...rest] = parts
+  // Chat: the one trailing segment is the conversation id — never a dataset.
+  if (section === "chat") {
+    return {
+      section,
+      selectionKey: null,
+      concept: null,
+      threadId: rest[0] || null,
+    }
+  }
+  const [domain, dataset, ...conceptParts] = rest
   return {
     section: section || null,
     selectionKey: domain && dataset ? `${domain}/${dataset}` : null,
     concept: conceptParts.length ? conceptParts.join("/") : null,
+    threadId: null,
   }
 }
 
-export function buildHash({ section, selectionKey, concept }) {
+export function buildHash({ section, selectionKey, concept, threadId }) {
   const segs = []
   if (section) segs.push(section)
-  if (selectionKey) segs.push(...selectionKey.split("/"))
-  if (concept) segs.push(...concept.split("/"))
+  if (section === "chat") {
+    // Chat carries only its conversation id (no dataset/concept).
+    if (threadId) segs.push(threadId)
+  } else {
+    if (selectionKey) segs.push(...selectionKey.split("/"))
+    if (concept) segs.push(...concept.split("/"))
+  }
   return "#/" + segs.map(encodeURIComponent).join("/")
 }
 
@@ -73,7 +95,8 @@ export function useRouter() {
     setRoute((prev) =>
       prev.section === parsed.section &&
       prev.selectionKey === parsed.selectionKey &&
-      prev.concept === parsed.concept
+      prev.concept === parsed.concept &&
+      prev.threadId === parsed.threadId
         ? prev
         : parsed
     )

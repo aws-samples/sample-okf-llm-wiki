@@ -1,0 +1,1022 @@
+"""Raw FastAPI app hosting the chat agent on AgentCore Runtime (HTTP protocol).
+
+This is a **Sparky-style** chat runtime: the browser POSTs directly to this
+runtime's ``/invocations`` URL (Cognito JWT bearer, no proxy), and we own the
+whole wire contract instead of an AG-UI adapter. The request/response shapes are
+Sparky's:
+
+Request body — a ``type``-discriminated ``input`` envelope::
+
+    {"input": {"type": "send",  "prompt": "...", "model_id": "...", "budget_level": 3,
+               "dataset_scope": {"data_domain": "...", "dataset": "..."}}}
+    {"input": {"type": "get_session_history"}}
+    {"input": {"type": "delete_history"}}
+    {"input": {"type": "prepare", ...}}    # keep-warm, no LLM call
+
+Response — for ``send``, a ``text/event-stream`` of ``data: {json}\\n\\n`` frames
+carrying Sparky's **typed chunks**, produced by consuming the LangGraph run's
+``astream(stream_mode=["messages","updates"])``:
+
+    {"type": "think",  "content": "..."}          reasoning (Converse reasoning_content / GPT summary)
+    {"type": "tool", "id": ..., "tool_name": ..., "tool_start": true,  "content": <args>}
+    {"type": "tool", "id": ..., "tool_name": ..., "tool_start": false, "content": <result>, "error": bool}
+    {"type": "text",  "content": "..."}           assistant answer tokens
+    {"type": "error", "error_code": ..., "message": ...}
+    {"end": true, "token_stats": {...}, "checkpoint_id": "..."}
+
+Why hand-rolled rather than the ``ag_ui_langgraph`` adapter: the front end renders
+reasoning + tool calls + markdown tables itself (like Sparky), so it needs the raw
+typed chunks, not AG-UI's ``TEXT_MESSAGE_*``/``TOOL_CALL_*``/``REASONING_*`` event
+model. Owning both layers is what removes the whole class of adapter rendering-slot
+bugs.
+
+Per-user isolation: the checkpoint / history thread id is namespaced with the
+Cognito ``sub`` (``f"{sub}:{client_thread_id}"``) so one user can never read or
+resume another's conversation by sending their thread id. The session-id header
+(== the client thread id) is what the browser sends; ``sub`` comes from the
+(AgentCore-validated) JWT, decoded here WITHOUT re-verifying the signature.
+
+Guarded imports keep this module importable in the unit venv without
+fastapi/langgraph; only ``__main__`` (the container entrypoint) needs the full
+stack. The pure request logic lives in helpers that tests drive directly.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+from typing import Any, AsyncGenerator, Callable
+
+# ``from __future__ import annotations`` turns every annotation into a string,
+# and FastAPI resolves a route handler's annotations with ``get_type_hints``
+# against the DEFINING MODULE's globals. The route handlers live inside
+# ``build_app`` but their ``Request`` annotation is resolved here — so ``Request``
+# must exist at module scope or FastAPI mistakes it for a query param (422).
+try:  # pragma: no cover - import shape, not behaviour
+    from fastapi import Request
+except ImportError:  # pragma: no cover
+    Request = None  # type: ignore[assignment,misc]
+
+from chat import live_streams
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+}
+SESSION_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"
+
+# LangGraph recursion ceiling for one turn (matches Sparky). A chat turn that
+# needs >200 model/tool hops is a bug, not the norm.
+RECURSION_LIMIT = 200
+
+
+class MissingHeader(Exception):
+    """A required inbound header (session id / Authorization) was absent."""
+
+
+# --- request/identity helpers ------------------------------------------------
+
+
+def decode_sub(auth_header: str | None) -> str:
+    """Extract the Cognito ``sub`` from a ``Bearer <jwt>`` header.
+
+    The signature is NOT verified: AgentCore's JWT authorizer already validated
+    the token before the request reached this container. We only need the stable
+    per-user subject for checkpoint namespacing + conversation ownership.
+    """
+    if not auth_header:
+        raise MissingHeader("missing Authorization header")
+    import jwt  # PyJWT; deferred so the module imports without it
+
+    token = auth_header.removeprefix("Bearer ").strip()
+    claims = jwt.decode(token, options={"verify_signature": False})
+    sub = claims.get("sub")
+    if not sub:
+        raise MissingHeader("token has no 'sub' claim")
+    return sub
+
+
+def namespaced_thread_id(user_sub: str, client_thread_id: str) -> str:
+    """The internal thread id, namespaced by user so state can't be cross-read.
+
+    ``f"{sub}:{thread_id}"`` — isolation lives in the KEY, not in a check that can
+    be forgotten (mirrors the annotations table's structural per-user pk).
+    """
+    return f"{user_sub}:{client_thread_id}"
+
+
+def extract_scope(input_data: dict[str, Any] | None) -> dict[str, str] | None:
+    """Pull an optional dataset scope out of the input envelope.
+
+    Accepts either ``dataset_scope`` (snake) or ``datasetScope`` (camel). Returns
+    ``{"data_domain", "dataset"}`` or ``None`` (whole wiki). A partial/malformed
+    scope is treated as no scope.
+    """
+    if not input_data:
+        return None
+    scope = input_data.get("dataset_scope") or input_data.get("datasetScope")
+    if not isinstance(scope, dict):
+        return None
+    dd, ds = scope.get("data_domain"), scope.get("dataset")
+    if dd and ds:
+        return {"data_domain": str(dd), "dataset": str(ds)}
+    return None
+
+
+# The scope line is prefixed to the user message and separated by a blank line, so
+# it can be recognised + stripped on history reload (the bubble shows the user's
+# ORIGINAL text, not our injected preamble).
+_SCOPE_PREFIX_RE = re.compile(r"^\[Scope:[^\]]*\]\n\n", re.DOTALL)
+
+
+def scoped_prompt(prompt: str, scope: dict[str, str] | None) -> str:
+    """Prefix the user's message with the active dataset scope, when set.
+
+    Injected on the HUMAN message (not the system prompt) on purpose: the system
+    prompt is a static, cacheable prefix — rewriting it per-turn to name the scope
+    would invalidate the prompt cache every time the scope changed. A per-turn line
+    on the (already-new) user message tells the model which dataset it's scoped to
+    at zero cache cost, and naturally varies turn-to-turn if the user re-tags.
+
+    The tool schemas are ALSO pre-bound to this scope (chat.tools), so this line is
+    the model's explicit signal of the confinement its tools already enforce.
+    """
+    if not scope:
+        return prompt
+    dd, ds = scope["data_domain"], scope["dataset"]
+    return (
+        f"[Scope: the dataset {dd}/{ds}. Answer about this dataset; your wiki "
+        f"tools are already restricted to it. Only look beyond it if I explicitly "
+        f"ask to compare against another dataset.]\n\n{prompt}"
+    )
+
+
+def strip_scope_prefix(text: str) -> str:
+    """Remove a leading ``[Scope: …]`` preamble (added by :func:`scoped_prompt`).
+
+    Used on history reload so the user's message bubble shows what they typed, not
+    the injected scope line.
+    """
+    return _SCOPE_PREFIX_RE.sub("", text) if isinstance(text, str) else text
+
+
+# --- stream chunk translation (the crux) -------------------------------------
+
+
+def _tool_call_id(tc: Any) -> str | None:
+    if isinstance(tc, dict):
+        return tc.get("id") or tc.get("tool_call_id")
+    return getattr(tc, "id", None)
+
+
+def process_stream_data(
+    mode: str, data: Any
+) -> dict[str, Any] | list[dict[str, Any]] | None:
+    """Translate one LangGraph ``astream`` part into Sparky typed chunk(s).
+
+    ``mode`` is one of the requested ``stream_mode`` strings; ``data`` is that
+    mode's payload. Returns a chunk dict, a list of chunk dicts, or ``None`` to
+    drop the part. Mirrors Sparky's ``_process_stream_data`` but trimmed to the
+    chunk types the wiki chat emits (no canvas / browser / interrupts):
+
+    - ``updates``/``model`` → an AIMessage whose ``tool_calls`` are the reliable,
+      fully-assembled tool-START events (args parsed). This is where tool starts
+      come from — the streamed ``tool_call_chunks`` are partial JSON.
+    - ``messages`` → live tokens: ``AIMessageChunk`` string content is answer
+      ``text``; ``reasoning_content`` blocks are ``think``; a ``ToolMessage`` is
+      the tool RESULT.
+    """
+    from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+
+    if mode == "updates":
+        if not isinstance(data, dict):
+            return None
+        node = data.get("model") or data.get("agent")
+        if not isinstance(node, dict):
+            return None
+        out: list[dict[str, Any]] = []
+        for msg in node.get("messages", []) or []:
+            if isinstance(msg, AIMessage):
+                for tc in msg.tool_calls or []:
+                    out.append(
+                        {
+                            "type": "tool",
+                            "id": _tool_call_id(tc),
+                            "tool_name": tc.get("name")
+                            if isinstance(tc, dict)
+                            else getattr(tc, "name", None),
+                            "tool_start": True,
+                            "content": tc.get("args")
+                            if isinstance(tc, dict)
+                            else getattr(tc, "args", None),
+                            "error": False,
+                        }
+                    )
+        return out or None
+
+    if mode == "messages":
+        chunk = data[0] if isinstance(data, (list, tuple)) else data
+
+        # Tool RESULT: a completed ToolMessage flowing back from a tool node.
+        if isinstance(chunk, ToolMessage):
+            content = chunk.content
+            if isinstance(content, str) and content:
+                try:
+                    content = json.loads(content)
+                except json.JSONDecodeError:
+                    pass  # leave as raw string
+            return {
+                "type": "tool",
+                "id": chunk.tool_call_id,
+                "tool_name": chunk.name,
+                "tool_start": False,
+                "content": content,
+                "error": getattr(chunk, "status", None) == "error",
+            }
+
+        if not isinstance(chunk, AIMessageChunk):
+            return None
+
+        content = chunk.content
+        # String content = plain answer text.
+        if isinstance(content, str):
+            return {"type": "text", "content": content} if content else None
+
+        # List content = structured blocks. Two provider shapes:
+        #  - Converse (Claude): {"type":"reasoning_content","reasoning_content":{text}}
+        #  - GPT/Responses v1:  {"type":"reasoning","summary":[{"type":"summary_text",
+        #                        "text":…}, …]} (summary is a LIST; streaming deltas
+        #                        may carry a single {"text":…} or an "index"+text).
+        if isinstance(content, list):
+            chunks: list[dict[str, Any]] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    text = block.get("text", "")
+                    if text:
+                        chunks.append({"type": "text", "content": text})
+                elif btype in ("reasoning_content", "reasoning"):
+                    text = _reasoning_text(block)
+                    if text:
+                        chunks.append({"type": "think", "content": text})
+            if len(chunks) == 1:
+                return chunks[0]
+            return chunks or None
+
+    return None
+
+
+def _reasoning_text(block: dict[str, Any]) -> str:
+    """Pull reasoning text out of a content block across provider shapes.
+
+    Converse: ``reasoning_content`` is a dict/str with ``text``. GPT Responses v1:
+    ``summary`` is a LIST of ``{text}`` items (concatenate them); a streaming delta
+    may instead put the partial text under ``summary`` as a dict or a bare string,
+    or directly on the block's ``text``.
+    """
+    # Converse
+    rc = block.get("reasoning_content")
+    if isinstance(rc, dict):
+        return rc.get("text", "") or ""
+    if isinstance(rc, str):
+        return rc
+    # GPT Responses v1: summary list / dict / str
+    summ = block.get("summary")
+    if isinstance(summ, list):
+        return "".join(
+            s.get("text", "")
+            for s in summ
+            if isinstance(s, dict) and s.get("text")
+        )
+    if isinstance(summ, dict):
+        return summ.get("text", "") or ""
+    if isinstance(summ, str):
+        return summ
+    # Fallback: some delta frames carry the partial reasoning on `text`.
+    t = block.get("text")
+    return t if isinstance(t, str) else ""
+
+
+def _sse(obj: dict[str, Any]) -> str:
+    """Frame one chunk dict as an SSE ``data:`` line (Sparky wire format)."""
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+def _error_chunk(error_code: str, message: str, details: dict | None = None) -> dict:
+    chunk = {"type": "error", "error_code": error_code, "message": message}
+    if details is not None:
+        chunk["details"] = details
+    return chunk
+
+
+# --- dependency construction (container vs test) -----------------------------
+
+
+def build_deps(config: Any = None):
+    """Construct the live boto3 clients + config for a deployment.
+
+    Kept separate from the request logic so the container builds real clients from
+    the execution role while tests inject fakes. Returns ``(chat_config,
+    consumption_config, clients)``.
+    """
+    import boto3
+
+    from chat.config import ChatConfig
+    from consumption_mcp.tools import ConsumptionConfig
+
+    chat_config = config or ChatConfig.from_env()
+    region = chat_config.region
+    consumption_config = ConsumptionConfig(
+        bundle_bucket=chat_config.bundle_bucket,
+        vector_bucket=chat_config.vector_bucket,
+        vector_index=chat_config.vector_index,
+        registry_table=chat_config.registry_table,
+    )
+    clients = {
+        "s3": boto3.client("s3", region_name=region),
+        "s3vectors": boto3.client("s3vectors", region_name=region),
+        "bedrock_runtime": boto3.client("bedrock-runtime", region_name=region),
+        "ddb": boto3.resource("dynamodb", region_name=region).Table(
+            consumption_config.registry_table
+        ),
+    }
+    # Athena client for the optional read-only SQL tool — only built when the
+    # deploy flag is on (else the role has no Glue/Athena grants anyway).
+    if chat_config.sql_enabled:
+        clients["athena"] = boto3.client("athena", region_name=region)
+    return chat_config, consumption_config, clients
+
+
+def make_index_writer(chat_config: Any, ddb_client: Any = None) -> Callable:
+    """Return an ``index_writer(**kwargs)`` that upserts the conversation index row.
+
+    Uses a LOW-LEVEL dynamodb client (the threads writer speaks the wire format,
+    like the Control API). Best-effort inside; a failed write never breaks a run.
+    """
+    import datetime
+
+    import boto3
+
+    from chat.threads import touch_thread
+
+    ddb_client = ddb_client or boto3.client("dynamodb", region_name=chat_config.region)
+
+    def index_writer(*, user_sub, thread_id, title, model, effort, dataset_scope) -> None:
+        touch_thread(
+            ddb_client,
+            threads_table=chat_config.threads_table,
+            user_sub=user_sub,
+            thread_id=thread_id,
+            title=title or "",
+            model=model,
+            effort=effort,
+            dataset_scope=dataset_scope,
+            now_iso=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        )
+
+    return index_writer
+
+
+def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict) -> Callable:
+    """Return ``build_agent(model, effort, scope, checkpointer, features=…) -> CompiledStateGraph``.
+
+    A factory (not a singleton) because the model is PINNED PER CONVERSATION: each
+    run builds a graph for its resolved model. Cheap enough per run; the heavy
+    state (checkpoints) lives in DynamoDB, not the graph object.
+
+    ``features`` (default empty) is the per-run set of opted-in optional tools
+    (e.g. ``{"sql"}`` from the composer's "+" menu). The read-only SQL tool is
+    added only when the deploy flag is on AND the run opted in — see
+    :func:`make_agent_tools_with_features`.
+
+    NOTE: this returns the RAW compiled LangGraph graph (no AG-UI wrapper) —
+    ``stream_run`` drives ``.astream`` on it directly.
+    """
+    from chat.config import build_chat_model
+    from chat.graph import SYSTEM_PROMPT_WITH_SQL, build_graph
+    from chat.sql import AthenaSQL, make_sql_tool
+    from chat.tools import build_consumption_tools, make_agent_tools
+
+    # The Athena client is present only when sql is deploy-enabled (build_deps).
+    athena_client = clients.pop("athena", None)
+    tools_impl = build_consumption_tools(config=consumption_config, **clients)
+
+    def _sql_engine() -> AthenaSQL | None:
+        if not (chat_config.sql_enabled and athena_client is not None):
+            return None
+        return AthenaSQL(
+            athena=athena_client,
+            catalog=chat_config.athena_catalog,
+            output_location=chat_config.athena_output,
+            workgroup=chat_config.athena_workgroup,
+            max_rows=chat_config.sql_max_rows,
+        )
+
+    def _sql_scope(scope: dict | None) -> dict | None:
+        """Enrich a dataset scope with its real Glue database for the SQL default DB.
+
+        The UI-sent scope carries only ``{data_domain, dataset}``, but a dataset id
+        need not equal its Glue database name (the registry stores ``glue_database``
+        separately). run_sql's default database for unqualified names must be the
+        Glue DB, so resolve it from the registry mapping row here. Best-effort: on
+        any lookup failure make_sql_tool falls back to the dataset id (advisory —
+        the model is told to qualify tables anyway).
+        """
+        if not scope:
+            return scope
+        try:
+            resp = tools_impl.ddb.get_item(
+                Key={
+                    "pk": f"DOMAIN#{scope['data_domain']}",
+                    "sk": f"DATASET#{scope['dataset']}",
+                }
+            )
+            gdb = (resp.get("Item") or {}).get("glue_database")
+            if gdb:
+                return {**scope, "glue_database": gdb}
+        except Exception:  # noqa: BLE001 - fall back to the dataset id
+            pass
+        return scope
+
+    def build_agent(
+        model: str,
+        effort: str,
+        scope: dict | None,
+        checkpointer: Any,
+        features: set[str] | None = None,
+    ):
+        chat_model = build_chat_model(chat_config, model, effort)
+        agent_tools = make_agent_tools(tools_impl, dataset_scope=scope)
+        # Optional read-only SQL: both the deploy flag (engine present) and the
+        # per-run opt-in (features) are required. system_prompt gains a line so the
+        # model knows the tool exists this turn.
+        prompt = None
+        if features and "sql" in features:
+            engine = _sql_engine()
+            if engine is not None:
+                agent_tools = [
+                    *agent_tools,
+                    make_sql_tool(engine, dataset_scope=_sql_scope(scope)),
+                ]
+                prompt = SYSTEM_PROMPT_WITH_SQL
+        if prompt is not None:
+            return build_graph(chat_model, agent_tools, checkpointer, system_prompt=prompt)
+        return build_graph(chat_model, agent_tools, checkpointer)
+
+    return build_agent
+
+
+def make_checkpointer(chat_config: Any):
+    """Build the DynamoDBSaver checkpointer from config (PK/SK schema, optional TTL)."""
+    from langgraph_checkpoint_aws import DynamoDBSaver
+
+    return DynamoDBSaver(
+        table_name=chat_config.checkpoint_table,
+        region_name=chat_config.region,
+        ttl_seconds=chat_config.checkpoint_ttl_seconds,
+    )
+
+
+# --- history read / delete (Sparky-style, over the checkpointer) -------------
+
+
+def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
+    """Fold a LangGraph message list into the front end's chatTurns shape.
+
+    Each user message opens a turn; assistant text + tool messages fill its
+    ``aiMessage`` event list (the same typed-chunk shape the live stream emits),
+    capped with an ``{"end": true}`` marker so the renderer treats it as complete.
+    Restored turns carry text + tool blocks only — enough to re-read a past
+    conversation; live turns get the full reasoning stream.
+    """
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    def _text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        return ""
+
+    def _ai_events(content: Any) -> list[dict[str, Any]]:
+        """Turn a persisted AIMessage's content into ordered think/text events.
+
+        The checkpoint stores reasoning in the message content (Converse's
+        ``reasoning_content`` or GPT's ``reasoning`` summary blocks), so a reloaded
+        turn rebuilds the SAME think/text stream the live run emitted — otherwise
+        reasoning silently vanishes on history load. Reuses ``_reasoning_text`` so
+        both provider shapes are handled identically to the live path.
+        """
+        if isinstance(content, str):
+            return [{"type": "text", "content": content}] if content else []
+        events: list[dict[str, Any]] = []
+        if isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                btype = b.get("type")
+                if btype == "text" and b.get("text"):
+                    events.append({"type": "text", "content": b["text"]})
+                elif btype in ("reasoning_content", "reasoning"):
+                    txt = _reasoning_text(b)
+                    if txt:
+                        events.append({"type": "think", "content": txt})
+        return events
+
+    turns: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            if current:
+                current["aiMessage"].append({"end": True})
+                turns.append(current)
+            current = {
+                "id": f"turn_{len(turns)}",
+                # Strip the injected [Scope: …] preamble so the bubble shows the
+                # user's original text on reload.
+                "userMessage": strip_scope_prefix(_text(msg.content)),
+                "aiMessage": [],
+            }
+        elif isinstance(msg, AIMessage) and current is not None:
+            # Reasoning + answer text in content order (reasoning first), then the
+            # tool starts this message issued — mirrors the live stream order so a
+            # reloaded turn renders identically (reasoning included).
+            current["aiMessage"].extend(_ai_events(msg.content))
+            for tc in msg.tool_calls or []:
+                current["aiMessage"].append(
+                    {
+                        "type": "tool",
+                        "id": _tool_call_id(tc),
+                        "tool_name": tc.get("name")
+                        if isinstance(tc, dict)
+                        else getattr(tc, "name", None),
+                        "tool_start": True,
+                        "content": tc.get("args")
+                        if isinstance(tc, dict)
+                        else getattr(tc, "args", None),
+                    }
+                )
+        elif isinstance(msg, ToolMessage) and current is not None:
+            current["aiMessage"].append(
+                {
+                    "type": "tool",
+                    "id": msg.tool_call_id,
+                    "tool_name": msg.name,
+                    "tool_start": False,
+                    "content": msg.content,
+                    "error": getattr(msg, "status", None) == "error",
+                }
+            )
+    if current:
+        current["aiMessage"].append({"end": True})
+        turns.append(current)
+    return turns
+
+
+def read_history(
+    build_agent: Callable,
+    checkpointer: Any,
+    internal_thread_id: str,
+    *,
+    drop_inflight: bool = False,
+) -> dict[str, Any]:
+    """Return ``{"history": [chatTurns]}`` for a conversation (empty if none).
+
+    Builds a throwaway graph bound to the checkpointer and reads its persisted
+    state. Model/effort don't matter for a read, so use safe defaults.
+
+    ``drop_inflight`` (set when a LIVE run is active for this thread) drops the
+    trailing in-flight turn so the ``resume`` path can render it fresh from the
+    live buffer instead of showing it from the checkpoint AND replaying it (which
+    would duplicate). The in-flight turn is one that has NOT committed a final
+    answer yet — it may already carry checkpointed reasoning or a tool call
+    (LangGraph checkpoints at each node boundary, so a turn stopped mid-tool has
+    an AIMessage(tool_calls) with no text), but no assistant TEXT. A turn that DID
+    produce answer text is a completed turn and is always kept — this also avoids
+    dropping a prior completed turn when the active run's own human message hasn't
+    been checkpointed yet.
+    """
+    graph = build_agent("us.anthropic.claude-opus-4-8", "high", None, checkpointer)
+    cfg = {"configurable": {"thread_id": internal_thread_id}}
+    state = graph.get_state(cfg)
+    messages = (state.values or {}).get("messages", []) if state else []
+    turns = _messages_to_turns(messages)
+    if drop_inflight and turns:
+        last = turns[-1]
+        # No committed answer text → this is the turn the live run is still
+        # producing (empty, reasoning-only, or stopped mid-tool). resume() rebuilds
+        # it in full from the buffer, so drop it here to avoid a duplicate.
+        has_answer_text = any(
+            e.get("type") == "text" for e in last.get("aiMessage", [])
+        )
+        if not has_answer_text:
+            turns = turns[:-1]
+    return {"history": turns}
+
+
+def delete_history(checkpointer: Any, internal_thread_id: str) -> dict[str, Any]:
+    """Purge a conversation's checkpoints (used by the ``delete_history`` type)."""
+    checkpointer.delete_thread(internal_thread_id)
+    return {"type": "delete_history", "deleted": True}
+
+
+# --- the streaming run -------------------------------------------------------
+
+
+async def _produce_run_chunks(
+    input_data: dict[str, Any],
+    internal_id: str,
+    *,
+    chat_config: Any,
+    build_agent: Callable,
+    checkpointer: Any,
+    index_writer: Callable | None,
+    user_sub: str,
+    client_thread_id: str,
+    prompt: str,
+    on_graph: Callable[[Any], None],
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Drive one agent turn and YIELD raw typed chunk dicts (no SSE framing).
+
+    This is the run BODY: resolve/validate the model, upsert the index row, drive
+    ``graph.astream``, translate parts to typed chunks, and always finish with a
+    terminal ``{"end": …}`` (with token_stats + checkpoint_id) — or an ``error``
+    chunk then ``end`` on failure. It does NOT handle cancellation: the live-stream
+    runner catches that and invokes the checkpoint reconcile (via ``on_cancel``).
+    ``on_graph(graph)`` is called once the graph is built, so the caller can wire the
+    reconcile against it.
+    """
+    from langchain_core.messages import AIMessageChunk
+
+    from chat.sql import normalize_features
+
+    token_stats: dict[str, int] = {}
+    cfg = {
+        "configurable": {"thread_id": internal_id},
+        "recursion_limit": RECURSION_LIMIT,
+    }
+    graph = None
+    try:
+        model, effort = chat_config.resolve_model_effort(
+            input_data.get("model_id") or input_data.get("model"),
+            input_data.get("effort"),
+        )
+        scope = extract_scope(input_data)
+        # Per-run opted-in optional tools (composer "+" menu). Normalized to the
+        # server-recognized subset; the factory further gates each on its deploy
+        # flag, so an unknown/forbidden feature string is simply ignored here.
+        features = normalize_features(input_data.get("features"))
+
+        # Best-effort conversation-index upsert (sidebar). After validation so a
+        # rejected (model, effort) never seeds an index row; never fatal.
+        if index_writer is not None:
+            index_writer(
+                user_sub=user_sub,
+                thread_id=client_thread_id,
+                title=prompt,
+                model=model,
+                effort=effort,
+                dataset_scope=scope,
+            )
+
+        graph = build_agent(model, effort, scope, checkpointer, features=features)
+        on_graph(graph)
+
+        # Inject the dataset scope on the USER message (keeps the system prompt a
+        # static, cacheable prefix — see scoped_prompt). No-op when unscoped.
+        user_content = scoped_prompt(prompt, scope)
+
+        seen_text = False
+        async for mode, data in graph.astream(
+            {"messages": [{"role": "user", "content": user_content}]},
+            cfg,
+            stream_mode=["messages", "updates"],
+        ):
+            # Accumulate token usage from streamed chunks that carry it.
+            if mode == "messages":
+                chunk = data[0] if isinstance(data, (list, tuple)) else data
+                if isinstance(chunk, AIMessageChunk) and chunk.usage_metadata:
+                    u = chunk.usage_metadata
+                    details = u.get("input_token_details", {}) or {}
+                    token_stats["input_tokens"] = token_stats.get("input_tokens", 0) + (
+                        u.get("input_tokens") or 0
+                    )
+                    token_stats["output_tokens"] = token_stats.get("output_tokens", 0) + (
+                        u.get("output_tokens") or 0
+                    )
+                    token_stats["cache_read_input_tokens"] = token_stats.get(
+                        "cache_read_input_tokens", 0
+                    ) + (details.get("cache_read") or 0)
+                    token_stats["cache_creation_input_tokens"] = token_stats.get(
+                        "cache_creation_input_tokens", 0
+                    ) + (details.get("cache_creation") or 0)
+
+            produced = process_stream_data(mode, data)
+            if not produced:
+                continue
+            for chunk in produced if isinstance(produced, list) else [produced]:
+                # Strip leading newlines some models emit before real text.
+                if not seen_text and chunk.get("type") == "text":
+                    stripped = chunk["content"].lstrip("\n")
+                    if not stripped:
+                        continue
+                    chunk = {**chunk, "content": stripped}
+                    seen_text = True
+                elif chunk.get("type") in ("text", "think"):
+                    seen_text = True
+                yield chunk
+    except asyncio.CancelledError:
+        # Explicit stop — let the live-stream runner's on_cancel do the checkpoint
+        # repair + cancelled end marker; just propagate.
+        raise
+    except Exception as exc:  # noqa: BLE001 - surface ANY failure as an error chunk
+        yield _error_chunk("agent_error", str(exc))
+
+    # Terminal end marker (always), with token stats + the checkpoint id.
+    end_marker: dict[str, Any] = {"end": True}
+    if token_stats:
+        end_marker["token_stats"] = token_stats
+    try:
+        if graph is not None:
+            state = graph.get_state(cfg)
+            cp_id = (
+                state.config.get("configurable", {}).get("checkpoint_id")
+                if state and state.config
+                else None
+            )
+            if cp_id:
+                end_marker["checkpoint_id"] = cp_id
+    except Exception:  # noqa: BLE001 - the end marker is best-effort metadata
+        pass
+    yield end_marker
+
+
+def _cancel_end_marker() -> dict[str, Any]:
+    return {"end": True, "cancelled": True}
+
+
+async def stream_run(
+    input_data: dict[str, Any],
+    user_sub: str,
+    client_thread_id: str,
+    *,
+    chat_config: Any,
+    build_agent: Callable,
+    checkpointer: Any,
+    index_writer: Callable | None = None,
+) -> AsyncGenerator[str, None]:
+    """SSE frames for a ``send`` turn — as a DETACHED run the client subscribes to.
+
+    The run itself is a background task in the live-stream registry, NOT this HTTP
+    generator: the turn keeps going if the browser disconnects, and a later
+    ``resume`` re-subscribes (replay + live). This generator starts (or joins) that
+    run and relays its chunks as SSE. On cancellation the registry runner does the
+    checkpoint repair (chat.cancellation) — a dropped connection no longer cancels;
+    only an explicit ``stop`` (see :func:`stop_run`) does.
+    """
+    from chat.cancellation import reconcile_cancelled_turn
+
+    internal_id = namespaced_thread_id(user_sub, client_thread_id)
+    prompt = input_data.get("prompt", "")
+
+    # HARD GUARD: never invoke the model on an empty prompt. An empty/whitespace
+    # prompt reaching the send path (e.g. a resume/stop request that fell through
+    # to the default branch, or a stray client send) must NOT start a turn — that's
+    # what produced phantom "accidental send" replies. Emit a clean end and stop.
+    if not prompt.strip():
+        yield _sse({"end": True})
+        return
+
+    # If a live run already exists for this thread (e.g. a double-send), subscribe
+    # to it rather than starting a second — start() returns the existing stream.
+    graph_holder: dict[str, Any] = {"graph": None}
+    cfg = {"configurable": {"thread_id": internal_id}, "recursion_limit": RECURSION_LIMIT}
+
+    def _on_cancel() -> list[dict[str, Any]]:
+        # Repair the checkpoint's dangling tool calls (detached write) and emit the
+        # cancelled tool chunks + a cancelled end marker into the buffer.
+        graph = graph_holder["graph"]
+        out: list[dict[str, Any]] = []
+        if graph is not None:
+            out.extend(reconcile_cancelled_turn(graph, cfg))
+        out.append(_cancel_end_marker())
+        return out
+
+    source = _produce_run_chunks(
+        input_data,
+        internal_id,
+        chat_config=chat_config,
+        build_agent=build_agent,
+        checkpointer=checkpointer,
+        index_writer=index_writer,
+        user_sub=user_sub,
+        client_thread_id=client_thread_id,
+        prompt=prompt,
+        on_graph=lambda g: graph_holder.__setitem__("graph", g),
+    )
+    live_streams.start(internal_id, source, user_message=prompt, on_cancel=_on_cancel)
+
+    async for chunk in live_streams.subscribe(internal_id):
+        yield _sse(chunk)
+
+
+async def resume_run(user_sub: str, client_thread_id: str) -> AsyncGenerator[str, None]:
+    """SSE frames for a ``resume``: re-subscribe to an in-flight run (replay + live).
+
+    Yields the buffered backlog (what the client missed) then live chunks until the
+    run ends. If no run is active for the thread, emits a single ``no_active_stream``
+    marker so the client falls back to loading history from the checkpointer.
+    """
+    internal_id = namespaced_thread_id(user_sub, client_thread_id)
+    if not live_streams.is_active(internal_id):
+        yield _sse({"type": "no_active_stream"})
+        yield _sse({"end": True})
+        return
+    # Lead with the in-flight turn's user message so the client renders the whole
+    # turn (question + streaming answer) from the buffer — read_history dropped this
+    # turn (drop_inflight) precisely so it's rendered here, not duplicated.
+    stream = live_streams.get(internal_id)
+    if stream is not None and stream.user_message:
+        yield _sse({"type": "user_message", "content": stream.user_message})
+    async for chunk in live_streams.subscribe(internal_id):
+        yield _sse(chunk)
+
+
+async def stop_run(user_sub: str, client_thread_id: str) -> dict[str, Any]:
+    """Explicit stop: cancel the thread's live run (triggers the checkpoint repair)."""
+    internal_id = namespaced_thread_id(user_sub, client_thread_id)
+    cancelled = await live_streams.cancel(internal_id)
+    return {"type": "stop", "stopped": bool(cancelled)}
+
+
+async def stream_prepare() -> AsyncGenerator[str, None]:
+    """Keep-warm short-circuit: emit only the ``end`` marker, no LLM call.
+
+    A real (minimal) invocation to the same runtimeSessionId resets the AgentCore
+    idle timer without spending a model call. The client fires this optionally;
+    it must not create a turn or an index row.
+    """
+    yield _sse({"end": True})
+
+
+# --- app ---------------------------------------------------------------------
+
+
+def build_app(
+    chat_config: Any = None,
+    build_agent: Callable | None = None,
+    index_writer: Callable | None = None,
+):
+    """Build the FastAPI app wired to live deps. Requires fastapi + the stack.
+
+    ``chat_config`` / ``build_agent`` / ``index_writer`` are injectable for tests;
+    in the container they default to env-resolved live clients.
+    """
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse, StreamingResponse
+
+    if build_agent is None or chat_config is None:
+        chat_config, consumption_config, clients = build_deps(chat_config)
+        build_agent = make_agent_factory(chat_config, consumption_config, clients)
+    if index_writer is None:
+        index_writer = make_index_writer(chat_config)
+
+    checkpointer = make_checkpointer(chat_config)
+
+    app = FastAPI(title="OKF Chat Agent")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    sse_headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        **CORS_HEADERS,
+    }
+
+    @app.options("/invocations")
+    async def _preflight():
+        return JSONResponse({"ok": True}, headers=CORS_HEADERS)
+
+    @app.get("/ping")
+    async def _ping():
+        return {"status": "Healthy"}
+
+    def _stream_error(message: str, code: str = "bad_request"):
+        async def gen() -> AsyncGenerator[str, None]:
+            yield _sse(_error_chunk(code, message))
+            yield _sse({"end": True})
+
+        return StreamingResponse(gen(), media_type="text/event-stream", headers=sse_headers)
+
+    @app.post("/invocations")
+    async def _invocations(request: Request):
+        session_id = request.headers.get(SESSION_HEADER)
+        auth = request.headers.get("Authorization") or request.headers.get("authorization")
+        if not session_id or not auth:
+            return _stream_error("missing session id or Authorization header", "auth_error")
+        try:
+            user_sub = decode_sub(auth)
+            body = await request.json()
+        except (MissingHeader, ValueError, json.JSONDecodeError) as exc:
+            return _stream_error(f"bad request: {exc}", "auth_error")
+
+        input_data = body.get("input") if isinstance(body, dict) else None
+        if not isinstance(input_data, dict):
+            return _stream_error("missing 'input' object")
+        req_type = input_data.get("type", "send")
+
+        # The session-id header IS the client thread id (browser sets both equal).
+        client_thread_id = session_id
+        internal_id = namespaced_thread_id(user_sub, client_thread_id)
+
+        # Non-streaming control types return a JSON envelope (Sparky pattern).
+        if req_type == "get_session_history":
+            try:
+                # When a live run is in flight, drop its half-turn from history —
+                # the client's follow-up resume() renders it fresh from the buffer.
+                data = read_history(
+                    build_agent,
+                    checkpointer,
+                    internal_id,
+                    drop_inflight=live_streams.is_active(internal_id),
+                )
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(
+                    _error_chunk("internal_error", str(exc)), headers=CORS_HEADERS
+                )
+            return JSONResponse(data, headers=CORS_HEADERS)
+
+        if req_type == "delete_history":
+            try:
+                data = delete_history(checkpointer, internal_id)
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(
+                    _error_chunk("internal_error", str(exc)), headers=CORS_HEADERS
+                )
+            return JSONResponse(data, headers=CORS_HEADERS)
+
+        if req_type == "prepare":
+            return StreamingResponse(
+                stream_prepare(), media_type="text/event-stream", headers=sse_headers
+            )
+
+        # Resume: re-subscribe to an in-flight run (replay buffered chunks + live).
+        # Used when the client returns to a thread whose turn is still streaming.
+        if req_type == "resume":
+            return StreamingResponse(
+                resume_run(user_sub, client_thread_id),
+                media_type="text/event-stream",
+                headers=sse_headers,
+            )
+
+        # Stop: explicitly cancel the thread's in-flight run (the ONLY thing that
+        # cancels — a dropped connection no longer does). Triggers the checkpoint
+        # repair. JSON envelope, not a stream.
+        if req_type == "stop":
+            try:
+                data = await stop_run(user_sub, client_thread_id)
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(
+                    _error_chunk("internal_error", str(exc)), headers=CORS_HEADERS
+                )
+            return JSONResponse(data, headers=CORS_HEADERS)
+
+        # A streamed chat turn — ONLY for an explicit `send`. An unknown type must
+        # NOT fall through to the model (that's how a resume/stop against an
+        # out-of-sync backend produced phantom empty-prompt replies); reject it.
+        if req_type != "send":
+            return _stream_error(f"unknown request type: {req_type}", "bad_request")
+
+        gen = stream_run(
+            input_data,
+            user_sub,
+            client_thread_id,
+            chat_config=chat_config,
+            build_agent=build_agent,
+            checkpointer=checkpointer,
+            index_writer=index_writer,
+        )
+        return StreamingResponse(gen, media_type="text/event-stream", headers=sse_headers)
+
+    return app
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised only in the container
+    import uvicorn
+
+    uvicorn.run(build_app(), host="0.0.0.0", port=8080)  # nosec B104

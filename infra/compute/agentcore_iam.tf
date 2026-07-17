@@ -15,6 +15,13 @@ locals {
     [startswith(var.harvest_model, "openai.")],
     [for m in var.harvest_model_catalog : startswith(m.model, "openai.")],
   ))
+
+  # Same reasoning for the chat runtime: grant Mantle when a GPT id is reachable
+  # at chat time (the deploy-time default OR any catalog entry the picker offers).
+  chat_mantle_enabled = anytrue(concat(
+    [startswith(var.chat_model, "openai.")],
+    [for m in var.chat_model_catalog : startswith(m.model, "openai.")],
+  ))
 }
 
 data "aws_iam_policy_document" "agentcore_assume" {
@@ -400,6 +407,179 @@ resource "aws_iam_role_policy" "consumption" {
   policy = data.aws_iam_policy_document.consumption_full.json
 }
 
+# --- Chat agent runtime role -------------------------------------------------
+# The chat agent reads the wiki with the SAME read-only reach as consumption
+# (bundle read, Bedrock embed for semantic_search, S3 Vectors query, registry
+# read — it reuses ConsumptionTools in-process), PLUS: Bedrock InvokeModel for the
+# chat LLM (+ conditional Mantle for GPT), and read/write on the two chat tables
+# (the DynamoDBSaver checkpoints + the per-user conversation index). It has NO
+# Glue/Athena reach (it never touches source data) and NO bundle WRITE (read-only
+# over the wiki).
+data "aws_iam_policy_document" "chat" {
+  # checkov:skip=CKV_AWS_108:Only when var.enable_chat_sql — TableDataRead s3:GetObject must be "*" because a Glue table's storage location can be any bucket; read-only (no Put to source) and off by default.
+  # checkov:skip=CKV_AWS_111:Only when var.enable_chat_sql — Athena/S3 write is scoped to the dedicated results bucket; the remaining broad grants are read/list metadata actions that don't support ARN scoping. See the block comment on ChatSqlGlueRead.
+  # checkov:skip=CKV_AWS_356:glue list + athena:* are catalog/workgroup-level actions that cannot be pinned to one resource ARN (same residual as harvest_data); the runtime's read-only query guard bounds them.
+  statement {
+    sid       = "BundleBucketRead"
+    actions   = ["s3:GetObject", "s3:ListBucket"]
+    resources = [local.d.bundle_bucket_arn, "${local.d.bundle_bucket_arn}/*"]
+  }
+
+  # Titan embed for semantic_search AND the chat LLM (InvokeModel +
+  # WithResponseStream for token streaming). Both are the bedrock:* namespace.
+  statement {
+    sid       = "BedrockInvoke"
+    actions   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+    resources = ["*"]
+  }
+
+  # S3 Vectors query for semantic_search. GetVectors is REQUIRED alongside
+  # QueryVectors for filtered/metadata queries, else 403 (same trap as consumption).
+  statement {
+    sid       = "S3VectorsQuery"
+    actions   = ["s3vectors:QueryVectors", "s3vectors:GetVectors", "s3vectors:GetIndex"]
+    resources = [local.d.vector_index_arn, local.d.vector_bucket_arn]
+  }
+
+  # Registry read for list_domains / list_declared_domains.
+  statement {
+    sid       = "RegistryRead"
+    actions   = ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:Scan"]
+    resources = [local.d.registry_table_arn]
+  }
+
+  # Conversation memory: the DynamoDBSaver checkpoint table (full item R/W —
+  # get/put/query/delete_thread) + the per-user conversation INDEX table (the
+  # runtime creates/touches rows; the Control API also reads/deletes them).
+  statement {
+    sid = "ChatTablesReadWrite"
+    actions = [
+      "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:BatchGetItem",
+      "dynamodb:BatchWriteItem",
+    ]
+    resources = [local.d.chat_checkpoints_table_arn, local.d.chat_table_arn]
+  }
+
+  # Bedrock Mantle (OpenAI-compatible) — needed when a GPT id is reachable at chat
+  # time (deploy-time default OR any catalog entry the picker offers). Separate IAM
+  # namespace from bedrock:*; the bearer token provide_token() mints inherits this
+  # role's identity. Scoped to the Mantle "default" project in chat_mantle_region;
+  # CallWithBearerToken is not project/region-scopable so it takes "*". Absent when
+  # no GPT model is reachable, keeping the role least-privilege on a Claude catalog.
+  dynamic "statement" {
+    for_each = local.chat_mantle_enabled ? [1] : []
+    content {
+      sid = "BedrockMantleInvoke"
+      actions = [
+        "bedrock-mantle:CreateInference",
+        "bedrock-mantle:GetInference",
+        "bedrock-mantle:GetModel",
+        "bedrock-mantle:ListModels",
+      ]
+      resources = [
+        "arn:aws:bedrock-mantle:${var.chat_mantle_region}:${local.account_id}:project/default",
+      ]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = local.chat_mantle_enabled ? [1] : []
+    content {
+      sid       = "BedrockMantleBearerToken"
+      actions   = ["bedrock-mantle:CallWithBearerToken"]
+      resources = ["*"]
+    }
+  }
+
+  # Optional read-only SQL (var.enable_chat_sql): catalog-wide Glue metadata +
+  # Athena query READ, plus Athena results-bucket write. This is the ONE grant
+  # that lets the browser-facing chat runtime touch SOURCE DATA, so it's OFF by
+  # default and read-only by construction — NO glue:*Table (write), NO source-data
+  # PutObject. Unlike harvest, chat is NOT pinned to one database per invocation
+  # (no scoped STS hop), so these reads are catalog-wide; the runtime's query guard
+  # (SELECT/WITH/… only) + this write-free grant are the read-only boundary.
+  # Actions that can't be ARN-scoped (Glue list, athena:* workgroup-level, source
+  # TableDataRead across arbitrary buckets) stay at "*", same as harvest_data.
+  dynamic "statement" {
+    for_each = var.enable_chat_sql ? [1] : []
+    content {
+      sid = "ChatSqlGlueRead"
+      actions = [
+        "glue:GetDatabase", "glue:GetDatabases",
+        "glue:GetTable", "glue:GetTables",
+        "glue:GetPartitions", "glue:GetTableVersions",
+      ]
+      resources = ["*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_chat_sql ? [1] : []
+    content {
+      sid = "ChatSqlAthenaQuery"
+      actions = [
+        "athena:StartQueryExecution", "athena:GetQueryExecution",
+        "athena:GetQueryResults", "athena:StopQueryExecution",
+      ]
+      resources = ["*"]
+    }
+  }
+
+  # Athena WRITES query results to the dedicated results bucket (scoped) — this is
+  # the only write the SQL grant carries, and it's to a scratch bucket, not source.
+  dynamic "statement" {
+    for_each = var.enable_chat_sql ? [1] : []
+    content {
+      sid       = "ChatSqlAthenaResultsWrite"
+      actions   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:GetBucketLocation"]
+      resources = [aws_s3_bucket.athena_results.arn, "${aws_s3_bucket.athena_results.arn}/*"]
+    }
+  }
+
+  # Athena READS the table data locations, which can live in ANY bucket a Glue
+  # table points at — so source read stays broad (read-only; no Put here).
+  dynamic "statement" {
+    for_each = var.enable_chat_sql ? [1] : []
+    content {
+      sid       = "ChatSqlTableDataRead"
+      actions   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
+      resources = ["*"]
+    }
+  }
+
+  # Lake Formation-governed catalogs: the query engine calls GetDataAccess to get
+  # LF-vended, short-lived S3 creds for governed table data. Mirrors harvest_data;
+  # only added when BOTH SQL and LF are enabled. GetDataAccess can't be ARN-scoped.
+  dynamic "statement" {
+    for_each = var.enable_chat_sql && var.enable_lakeformation ? [1] : []
+    content {
+      sid       = "ChatSqlLakeFormationDataAccess"
+      actions   = ["lakeformation:GetDataAccess"]
+      resources = ["*"]
+    }
+  }
+}
+
+resource "aws_iam_role" "chat" {
+  name               = "${var.name_prefix}-chat-runtime"
+  assume_role_policy = data.aws_iam_policy_document.agentcore_assume.json
+  tags               = var.tags
+}
+
+data "aws_iam_policy_document" "chat_full" {
+  source_policy_documents = [
+    data.aws_iam_policy_document.agentcore_baseline.json,
+    data.aws_iam_policy_document.chat.json,
+  ]
+}
+
+resource "aws_iam_role_policy" "chat" {
+  name   = "chat-policy"
+  role   = aws_iam_role.chat.id
+  policy = data.aws_iam_policy_document.chat_full.json
+}
+
 # IAM is eventually consistent: after PutRolePolicy, a CreateAgentRuntime call
 # issued seconds later can validate against a STALE snapshot of the role and
 # report a permission as missing (the error oscillates between s3files actions
@@ -410,6 +590,7 @@ resource "time_sleep" "iam_propagation" {
     harvest_policy      = aws_iam_role_policy.harvest.policy
     harvest_data_policy = aws_iam_role_policy.harvest_data.policy
     consumption_policy  = aws_iam_role_policy.consumption.policy
+    chat_policy         = aws_iam_role_policy.chat.policy
   }
   create_duration = "30s"
 }

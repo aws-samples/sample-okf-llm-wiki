@@ -67,8 +67,65 @@ them**, never by inference. When present they are `# Gotchas`-grade or their own
 |---|-----------|----------------------|-------------------------|
 | 15 | **NAMED_SET** | "the X group consists of …", region/segment definitions, "Europe = these countries", curated value lists | `references/named_sets/<name>.md` — the business name + its governed `IN (…)` list; reference it from any metric/filter that uses it |
 | 16 | **LIFECYCLE_STAGE** | status-workflow diagrams, "an order is 'open' when status in …", stage→code mappings | `references/named_sets/<name>.md` (a business stage → its set of raw status/event codes is named-set-shaped) — or a `# Gotchas` note for a single simple mapping |
-| 17 | **AMBIGUOUS_TERM** | the same word defined two ways, "depending on context", "this can mean either …" | `# Gotchas` — state each genuinely-different sense and which column/filter each maps to, forcing disambiguation |
-| 18 | **DISJOINT_MEASURES** | "do not add", "mutually exclusive", "gross vs net", "don't UNION these", overlapping-population warnings | `# Gotchas` — an explicit never-sum/never-union warning naming the measures/tables and why |
+| 17 | **AMBIGUOUS_TERM** | the same word defined two ways, "depending on context", "this can mean either …" | `# Gotchas` on the table **AND** a line in `references/usage_guardrails.md` (see #19) — state each genuinely-different sense and which column/filter each maps to, forcing disambiguation |
+| 18 | **DISJOINT_MEASURES** | "do not add", "mutually exclusive", "gross vs net", "don't UNION these", overlapping-population warnings | `# Gotchas` **AND** `references/usage_guardrails.md` — an explicit never-sum/never-union warning naming the measures/tables and why |
+| 19 | **DATASET_GUARDRAIL** | any "how to work with this data correctly" rule that a consuming agent must obey to avoid a *confidently wrong* answer: measure additivity by type (flow vs stock/snapshot — what may be summed over time vs geography), when to ASK vs answer (a required dimension — period/region/grain/scope — is missing or a term resolves to >1 thing), when to BLOCK (a well-formed but semantically invalid computation, e.g. summing a non-additive stock over time; a metric the source explicitly withholds), when to REFUSE (out-of-domain / unserved capability), sentinel/reserved values that corrupt filters, default readings (a default scope/variant the data assumes), and "never fabricate — abstain if unresolvable" | `references/usage_guardrails.md` — the dataset's behavioural contract (see below). **Linked prominently from the dataset overview so a consumer reads it first.** |
+| 20 | **CANONICAL_RECIPE** | a non-trivial transform that MUST be applied identically on every query of a table — a snapshot/firmness dedup (`ROW_NUMBER` + a mandatory pre-filter), a required de-duplication, a standard collapse — anything where re-deriving it slightly differently changes the result | `references/recipes/<slug>.md` — the ONE authoritative, non-decomposable SQL fragment; every metric doc and every `# Common query patterns` snippet on the affected table LINKS it and never re-derives it (see the deep case below). |
+
+## DATASET_GUARDRAIL — the behavioural contract (`references/usage_guardrails.md`)
+
+This is the one doc a consuming agent should read **before** it queries — the
+rules that keep answers deterministic and hallucination-free. It concentrates the
+cross-cutting behavioural facts (additivity, ASK/BLOCK/REFUSE triggers, ambiguous
+terms, default readings, filter traps) that otherwise scatter across per-table
+`# Gotchas` where a consumer reading only one table would miss them.
+
+**Where the content comes from — derived + from `.context/`, never invented:**
+
+- **Derived from what you VERIFIED during harvest.** You already measure each
+  measure's additivity, find which terms are ambiguous, and discover which
+  capabilities the source does *not* serve. Promote those verified facts into
+  guardrail rules: "wins is a count — additive across seasons and circuits";
+  "points_standing is a snapshot — never sum across rounds; take the final-round
+  value"; "'season' term resolves to >1 column — ASK which".
+- **From uploaded `.context/` docs** that state working rules explicitly (a
+  query-rules doc, a methodology PDF's "do not" section, an SME guardrails file).
+  Cite them under `# Citations`.
+- **Never invent a rule.** A guardrail is a *verified* fact like any other: if the
+  data doesn't support "never sum X" and no doc states it, don't assert it. A
+  wrong guardrail yields a confidently-wrong refusal, which is as harmful as a
+  fabricated number.
+
+Shape it so a consumer can act on each rule: name the concrete measure/column/
+term, the rule, and the correct alternative. Group by disposition where it helps
+(what to answer directly, what to ASK about, what to BLOCK, what to REFUSE). This
+doc is authored by the supervisor's `reference-author` fan-out and **must be
+linked from `datasets/<dataset>.md`** (the file a consumer lands on first).
+
+## CANONICAL_RECIPE — the deep case (author a transform ONCE, apply it everywhere)
+
+Some tables require a non-trivial transform on **every** query — most commonly a
+snapshot/firmness **dedup** (a fact re-stated across reporting cycles, where you
+must pick exactly one row per business cell). When that recipe is described in
+prose, or shown slightly differently in two `# Common query patterns` snippets,
+consumers re-derive it inconsistently and silently change the result (a newer,
+non-final snapshot wins a cell it shouldn't).
+
+**Author it as ONE atomic, non-decomposable fragment** in
+`references/recipes/<slug>.md`, and make every metric doc + every query-pattern
+snippet on the affected table **link that recipe rather than restate an ORDER BY.**
+The recipe fragment must fuse *all* of its required parts — for a snapshot dedup:
+
+- the **mandatory pre-filter** (e.g. keep only final/actuals-class status rows)
+  placed **inside** the dedup subquery, named explicitly; and
+- the **`ROW_NUMBER` `ORDER BY` that leads with the correct key** (e.g. lead with
+  the firmness/status rank, not with a timestamp that only tiebreaks) — state which
+  ordering is authoritative and WHY, because a plausible re-ordering picks a
+  different winner.
+
+Verify the recipe with a real query (a row-count before/after the collapse proves
+it de-duplicates to the intended grain). A consumer must be able to copy the
+fragment verbatim; "dedup by latest snapshot" in prose is not enough.
 
 ## CODE_ENUM — the deep case (decode coded columns)
 
@@ -154,8 +211,21 @@ decode is worse than a missing one.
 - **`# Schema` row description** — BUSINESS_TERM, small CODE_ENUM, MEASURED_IN,
   MEASURE/DIMENSION marks.
 - **`# Gotchas`** — CAVEAT, FILTER_RULE, TEMPORAL_RULE, AMBIGUOUS_TERM,
-  DISJOINT_MEASURES, confusable BUSINESS_TERM.
-- **`# Common query patterns`** — QUERY_PATTERN.
+  DISJOINT_MEASURES, confusable BUSINESS_TERM. (The behaviour-shaping ones —
+  AMBIGUOUS_TERM, DISJOINT_MEASURES, additivity, ASK/BLOCK/REFUSE triggers — also
+  roll up into `references/usage_guardrails.md` so a consumer sees them in one
+  place, not only on the table they happen to open.)
+- **`references/usage_guardrails.md`** — DATASET_GUARDRAIL: the one behavioural
+  contract read before querying (additivity, ASK/BLOCK/REFUSE rules, default
+  readings, filter traps). Linked from the dataset overview.
+- **`references/recipes/<slug>.md`** — CANONICAL_RECIPE: a must-apply-identically
+  transform (e.g. snapshot dedup) authored once; metric + query-pattern docs LINK
+  it, never re-derive it.
+- **`# Common query patterns`** — QUERY_PATTERN. **On a snapshot/dedup table, the
+  snippet LINKS the `references/recipes/` dedup fragment rather than re-deriving an
+  ORDER BY. For any full-grain column omitted from the dedup `PARTITION BY`, state
+  WHY it's safe to drop — it's collapsed by a mandatory pre-filter named INSIDE the
+  subquery, or it stays in the partition.**
 - **`# Overview` prose** (in `datasets/<dataset>.md` or `tables/<table>.md`) —
   GRAIN_STATEMENT, BUSINESS_CONTEXT, DATA_LINEAGE.
 - **`references/<type>/<slug>.md` docs** (all carry `type: Reference` +
@@ -175,6 +245,13 @@ decode is worse than a missing one.
   | NAMED_SET / LIFECYCLE_STAGE | `references/named_sets/` | `references/named_sets/<name>.md` |
   | reusable BUSINESS_TERM | `references/glossary/` | `references/glossary/<term>.md` |
   | cross-cutting CAVEAT | `references/known_issues/` | `references/known_issues/<slug>.md` |
+  | CANONICAL_RECIPE | `references/recipes/` | `references/recipes/snapshot_dedup.md` |
+  | DATASET_GUARDRAIL | `references/` (single doc) | `references/usage_guardrails.md` |
+
+  `usage_guardrails.md` is the one exception to "one doc per item under a
+  fact-typed folder": it is a **single** behavioural-contract doc per dataset
+  (not a folder of many), sitting directly under `references/`, because a
+  consumer must find the whole contract in one read.
 
   Notes: LIFECYCLE_STAGE is named-set-shaped (a business stage → its raw status/
   event codes), so it goes under `references/named_sets/` — not one column's

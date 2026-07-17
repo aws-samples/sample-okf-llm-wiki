@@ -86,7 +86,10 @@ concept doc is written through the harvest mount at
 embedded and semantically searchable.
 
 **Domain mapping.** `pk = "DOMAIN#<data_domain>"`, `sk = "DATASET#<dataset>"`,
-attrs `{data_domain, dataset, source, glue_database, created_at}`. Requires a
+attrs `{data_domain, dataset, source, glue_database, created_at}` plus optional
+dataset-guidance attrs `{guidance, guidance_updated_at, guidance_applied_version}`
+(shared authoring instructions; see `okf_core.guidance` + the harvest payload's
+`dataset_guidance` above). Requires a
 pre-existing `META` row for the same `pk` (enforced by `assert_domain_declared`
 in the upsert adapter).
 
@@ -306,8 +309,20 @@ or, for an annotation run (apply a user's wiki feedback in place):
       "block_line": 12, "note": "grain is per line-item, not per order" }
   ],
   "domain_description": "Revenue & order pipelines",
-  "domain_context": "Covers all B2C sales; refunds excluded." }
+  "domain_context": "Covers all B2C sales; refunds excluded.",
+  "dataset_guidance": "Ignore the staging_* tables; status is decoded in the dictionary.",
+  "dataset_guidance_version": "2026-07-17T09:00:00+00:00" }
 ```
+
+`dataset_guidance` (optional, on every mode) is the dataset's shared authoring
+guidance — persistent, editable operator instructions (registry
+`DATASET#` row: `guidance`, `guidance_updated_at`, `guidance_applied_version`).
+It steers the harvest prompt; on a SUCCESSFUL run the runner stamps
+`guidance_applied_version = dataset_guidance_version` so the guidance clears its
+DIRTY state (`okf_core.guidance.is_dirty`). An `annotated` run is invoked when
+there are live annotations **or** the guidance is dirty — so editing guidance and
+re-running applies it even with zero annotations (a guidance-only re-harvest,
+`annotations: []`).
 
 or, for writing/refreshing a domain's concept doc through the mount:
 

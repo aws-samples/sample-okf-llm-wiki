@@ -1,0 +1,64 @@
+/* CodeView — read-only highlighted code block chrome (header + scrollable pre).
+   Colors come from the .okf-prose hljs token rules in index.css; this file only
+   does the container/header/scroll layout. Theme-aware via semantic tokens. */
+
+.okf-codeview {
+  margin: 8px 0;
+  max-width: 640px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background-color: var(--muted);
+}
+
+/* Full-width variant — fills the container instead of shrinking to the code's
+   natural width. Used by the SQL "Query" tab so it matches the result table. */
+.okf-codeview.okf-codeview-full {
+  max-width: 100%;
+  width: 100%;
+}
+
+.okf-codeview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px 2px 12px;
+  border-bottom: 1px solid var(--border);
+  background-color: color-mix(in oklch, var(--foreground) 4%, transparent);
+}
+
+.okf-codeview-lang {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+
+.okf-codeview-scroll {
+  overflow: auto;
+  max-height: 320px;
+}
+
+.okf-codeview-pre {
+  margin: 0;
+  padding: 12px;
+  background: transparent;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+/* The <code> carries .okf-prose so index.css's hljs-* token colors apply, but we
+   don't want .okf-prose's inline-code pill (bg/padding/radius) on a block. Reset
+   it so the code reads as a plain highlighted block. */
+.okf-codeview-pre code.okf-prose {
+  display: block;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  font-family: ui-monospace, "Monaco", "Menlo", "Consolas", monospace;
+  font-size: inherit;
+  color: var(--foreground);
+  white-space: pre;
+}

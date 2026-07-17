@@ -34,6 +34,10 @@ output "consumption_runtime_arn" {
   value = try(aws_bedrockagentcore_agent_runtime.consumption[0].agent_runtime_arn, "")
 }
 
+output "chat_runtime_arn" {
+  value = try(aws_bedrockagentcore_agent_runtime.chat[0].agent_runtime_arn, "")
+}
+
 output "reindex_queue_url" {
   value = aws_sqs_queue.reindex.id
 }
@@ -63,5 +67,18 @@ output "ui_env" {
     # (The Control API gets the same catalog as RAW JSON via OKF_HARVEST_MODEL_
     # CATALOG — that's a Lambda env var set directly by TF, never shell-eval'd.)
     VITE_HARVEST_MODEL_CATALOG = base64encode(jsonencode(var.harvest_model_catalog))
+    # Chat agent side-panel: the runtime ARN (the SPA builds the AgentCore data-
+    # plane /invocations URL from it, like VITE_MCP_RUNTIME_ARN), the scope the
+    # SPA's access token must satisfy the chat authorizer with, and the chat
+    # model/effort picker options. The catalog is BASE64 for the same shell-safety
+    # reason as the harvest one (the chat RUNTIME gets it as RAW JSON via
+    # OKF_CHAT_MODEL_CATALOG — a container env set directly by TF).
+    VITE_CHAT_RUNTIME_ARN   = try(aws_bedrockagentcore_agent_runtime.chat[0].agent_runtime_arn, "")
+    VITE_CHAT_SCOPE         = local.d.chat_scope
+    VITE_CHAT_MODEL_CATALOG = base64encode(jsonencode(var.chat_model_catalog))
+    # Whether the chat's read-only SQL tool is deploy-enabled (var.enable_chat_sql).
+    # Gates the composer's "+" → SQL affordance in the UI; the runtime + IAM are the
+    # real boundary (offering it when off just yields a 403/handled error).
+    VITE_CHAT_SQL_ENABLED = tostring(var.enable_chat_sql)
   }
 }
