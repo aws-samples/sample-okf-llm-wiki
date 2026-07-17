@@ -31,6 +31,12 @@ variable "consumption_image_uri" {
   default     = ""
 }
 
+variable "chat_image_uri" {
+  type        = string
+  description = "ECR image URI (ARM64) for the chat agent runtime. Empty = don't create the runtime (lets validate/plan run before the image exists)."
+  default     = ""
+}
+
 # S3 Files access point mounted (shared, runtime-scoped) at /mnt/data, rooted at
 # okf/. There is no native Terraform resource for an S3 Files access point yet,
 # so the ARN is provided out-of-band (created via CLI/console) and passed here.
@@ -115,6 +121,101 @@ variable "harvest_model_catalog" {
       default_effort = "xhigh"
     },
   ]
+}
+
+# --- Chat agent --------------------------------------------------------------
+
+variable "chat_model" {
+  type        = string
+  description = "Deploy-time DEFAULT chat model, used when a conversation omits a model. An anthropic.* Converse profile runs on the Converse API; an openai.* id runs on Bedrock Mantle in chat_mantle_region."
+  default     = "global.anthropic.claude-opus-4-8"
+}
+
+variable "chat_effort" {
+  type        = string
+  description = "Default adaptive-thinking effort / reasoning_effort for the chat model, passed through to Bedrock (validated per-model by Bedrock + the catalog, no TF allow-list)."
+  default     = "high"
+}
+
+variable "chat_max_tokens" {
+  type        = number
+  description = "Default max output tokens for a chat turn. Lower than harvest's — interactive chat wants snappier turns."
+  default     = 32000
+}
+
+variable "chat_mantle_region" {
+  type        = string
+  description = "AWS region for the Bedrock Mantle endpoint when a chat model is an openai.* GPT id. Independent of var.region (GPT-5.x on Mantle is only in us-east-2/us-west-2)."
+  default     = "us-east-2"
+}
+
+variable "chat_checkpoint_ttl_seconds" {
+  type        = number
+  description = "TTL (seconds) for chat conversation checkpoints; 0 = no expiry. When >0 the DynamoDBSaver stamps an epoch `ttl` attr and DynamoDB reaps idle conversations. Default 30 days."
+  default     = 2592000
+}
+
+variable "chat_idle_runtime_session_timeout" {
+  type        = number
+  description = "AgentCore idle-session timeout (seconds) for the chat runtime. A conversation resumes from the DynamoDB checkpointer after an idle stop, so this only trades cold-start latency vs warm-session cost. Default 30 min."
+  default     = 1800
+}
+
+# The models + reasoning-effort levels the chat UI's picker offers. Single source
+# of truth for the picker, SEPARATE from harvest_model_catalog so chat can offer a
+# lighter/faster model set than the heavyweight authoring agent. Fans out the same
+# three ways harvest's does: jsonencode'd into the chat runtime's
+# OKF_CHAT_MODEL_CATALOG (the runtime validates a per-conversation model/effort
+# before it reaches Bedrock — the trust boundary, since the browser calls the
+# runtime directly with no proxy) and base64(json) into the UI's
+# VITE_CHAT_MODEL_CATALOG (the dropdown). `chat_model` above is the deploy-time
+# DEFAULT used when a conversation omits a model. Efforts are per-model.
+variable "chat_model_catalog" {
+  type = list(object({
+    model          = string
+    label          = string
+    efforts        = list(string)
+    default_effort = string
+  }))
+  description = "Catalog of (model, allowed efforts) the chat UI offers and the chat runtime validates against."
+  # Chat is pinned to Opus 4.8 — a single-entry catalog (no model choice in the
+  # UI; the runtime rejects anything else). GPT-5.6 on Bedrock Mantle didn't
+  # return reasoning summaries and behaved inconsistently, so it's dropped here.
+  default = [
+    {
+      model          = "global.anthropic.claude-opus-4-8"
+      label          = "Claude Opus 4.8"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "high"
+    },
+  ]
+}
+
+# --- Chat read-only SQL (optional) -------------------------------------------
+
+variable "enable_chat_sql" {
+  type        = bool
+  default     = true
+  description = <<-EOT
+    Give the BROWSER-FACING chat agent a read-only SQL tool over the Glue catalog
+    (Athena). This is the ONE chat tool that touches source data, so it expands the
+    attack surface of a runtime users call directly — set to false to withhold the
+    Glue/Athena grants entirely if that's not acceptable. When true, the
+    chat runtime's IAM role gains catalog-wide READ-ONLY Glue/Athena + Athena
+    results-bucket write (NO write to source data), and OKF_CHAT_SQL_ENABLED is set
+    so the runtime offers run_sql. It still requires a per-conversation opt-in from
+    the UI (the composer "+" menu sends features:["sql"]) — the flag alone doesn't
+    force SQL on every chat. Read-only is enforced by IAM (no write grants) AND a
+    query guard in the runtime (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN, single statement).
+    Unlike harvest (pinned to one DB per invocation via a scoped STS session), chat
+    SQL is catalog-wide; scope it tighter by leaving this off if that's too broad.
+  EOT
+}
+
+variable "chat_sql_max_rows" {
+  type        = number
+  default     = 200
+  description = "Max rows the chat run_sql tool returns per query (the rest are truncated to bound a turn's token cost). Only used when var.enable_chat_sql = true."
 }
 
 variable "enable_code_interpreter" {

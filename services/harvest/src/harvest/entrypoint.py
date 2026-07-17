@@ -73,6 +73,13 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
     domain_description = payload.get("domain_description")
     domain_context = payload.get("domain_context")
 
+    # Dataset-level guidance (shared authoring instructions) + the version being
+    # applied. Steers the prompt on every mode; on a successful full/incremental/
+    # annotation run the runner stamps guidance_applied_version = this version so
+    # the guidance clears its DIRTY state.
+    dataset_guidance = payload.get("dataset_guidance")
+    dataset_guidance_version = payload.get("dataset_guidance_version")
+
     # Per-harvest model/effort override (chosen in the UI, validated by the
     # Control API against the TF catalog). When absent, resolve_model_config
     # falls back to the deploy-time OKF_HARVEST_* env vars — so this is fully
@@ -94,6 +101,8 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             model_config=model_config,
             domain_description=domain_description,
             domain_context=domain_context,
+            dataset_guidance=dataset_guidance,
+            dataset_guidance_version=dataset_guidance_version,
             session_id=session_id,
         )
     elif mode == "annotated":
@@ -107,6 +116,8 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             model_config=model_config,
             domain_description=domain_description,
             domain_context=domain_context,
+            dataset_guidance=dataset_guidance,
+            dataset_guidance_version=dataset_guidance_version,
             session_id=session_id,
         )
     else:
@@ -118,6 +129,8 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             model_config=model_config,
             domain_description=domain_description,
             domain_context=domain_context,
+            dataset_guidance=dataset_guidance,
+            dataset_guidance_version=dataset_guidance_version,
             session_id=session_id,
         )
 
@@ -179,8 +192,14 @@ def _validate(payload: dict) -> str | None:
     if mode == "annotated":
         if not payload.get("user_sub"):
             return "annotated mode requires 'user_sub'"
-        if not payload.get("annotations"):
-            return "annotated mode requires a non-empty 'annotations' list"
+        # A run must carry SOMETHING to do: open annotations to apply, OR pending
+        # dataset guidance to apply (a guidance-only re-harvest). The Control API
+        # only invokes this mode when at least one holds, so an empty payload for
+        # both is a programming error, not a valid run.
+        if not payload.get("annotations") and not payload.get("dataset_guidance"):
+            return (
+                "annotated mode requires open annotations or dataset guidance to apply"
+            )
     return None
 
 

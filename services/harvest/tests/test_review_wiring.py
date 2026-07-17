@@ -42,6 +42,21 @@ def test_supervisor_review_must_run_in_subagents_not_the_executor():
     assert "bias" in p.lower()
 
 
+def test_supervisor_review_covers_whole_bundle_not_a_subset():
+    # The review pass must be exhaustive: the supervisor is told to DISCOVER every
+    # authored doc (not review from memory / a sample) and dispatch one reviewer
+    # per doc for the complete set. A spot check is explicitly not a review.
+    p = prompts.SUPERVISOR_PROMPT
+    low = p.lower()
+    assert "whole bundle" in low or "complete set" in low
+    assert "subset" in low or "spot check" in low
+    assert "not from memory" in low or "discover" in low
+    # Enumerates on disk rather than a hand-typed partial list.
+    assert "glob" in low
+    # Coverage must be reported (docs existing == docs reviewed).
+    assert "must match" in low or "these MUST match" in p
+
+
 def test_reviewer_flags_volatile_stats_and_missing_joins():
     # The reviewer enforces the two new authoring bars: no decaying stats baked in,
     # and joins the doc failed to discover/verify.

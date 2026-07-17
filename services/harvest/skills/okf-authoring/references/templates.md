@@ -256,6 +256,104 @@ Use this join to attach customer attributes (segment, region) to each order.
 
 ---
 
+## Usage guardrails (`references/usage_guardrails.md`)
+
+The ONE behavioural contract a consuming agent reads before querying — the single
+exception to "one doc per fact-typed folder" (it lives directly under
+`references/`, one per dataset). Concentrates the cross-cutting rules that keep
+answers deterministic and hallucination-free: additivity by measure type, when to
+ASK / BLOCK / REFUSE, default readings, and filter/sentinel traps. Every rule is
+DERIVED from a verified harvest fact or stated in a cited `.context/` doc — never
+invented. **Link it from `datasets/<dataset>.md`** so a consumer meets it first.
+
+```markdown
+---
+type: Reference
+title: Usage guardrails
+description: Rules for querying this dataset correctly — additivity, when to ask/block/refuse, default readings, and filter traps.
+tags: [guardrails, behaviour]
+timestamp: 2026-05-28T00:00:00Z
+---
+
+Read this before querying. Every number returned must be executed against the
+served data, never guessed; if a value can't be resolved from the model, abstain.
+
+# Additivity by measure
+- `<flow_measure>` is a FLOW — additive across time AND geography; SUM freely over a bounded period.
+- `<stock_measure>` is a SNAPSHOT/STOCK — additive across geography at one point in time, but NEVER summed across periods (take the period-end value). See [the metric](metrics/<slug>.md).
+
+# Answer directly (COMMIT)
+- A fully-specified measure + dimension(s) + bounded period → answer, disclosing the default reading used (e.g. `<default_scope>` when scope is unstated).
+
+# Ask to clarify (ASK)
+- A required dimension is missing (no period / no region / no grain) → ask which; never emit an unbounded SUM.
+- A term resolves to more than one thing (`<ambiguous_term>` → {A, B}) → ask which, offering the candidates.
+
+# Block (well-formed but invalid)
+- `<stock_measure>` summed across time → refuse the number and explain; offer the period-end read instead.
+- `<withheld_metric>` is not served here → do not present a figure.
+
+# Refuse (out of domain)
+- `<unserved_capability>` (e.g. a metric this dataset does not hold) → decline plainly; never fabricate. (An unresolvable VALUE — a likely typo — is an ASK, not a REFUSE.)
+
+# Filter traps
+- `<sentinel>` in `<column>` means "<no-data/unknown>" — exclude it from aggregates.
+
+# Citations
+- .context/<any-rules-doc-you-transcribed>   (omit if all rules were derived from verified data)
+```
+
+---
+
+## Canonical recipe (`references/recipes/<slug>.md`)
+
+A transform that MUST be applied identically on every query of a table — most
+often a snapshot/firmness **dedup**. Authored ONCE as an atomic, copy-verbatim
+fragment; metric docs and `# Common query patterns` snippets on the affected table
+LINK it and never re-derive an ORDER BY. Verify with a before/after row-count that
+the collapse de-duplicates to the intended grain. See CANONICAL_RECIPE in
+fact-types.md.
+
+```markdown
+---
+type: Reference
+resource: arn:aws:glue:<region>:<account_id>:table/<database>/<table>
+title: Snapshot dedup — one row per <business cell>
+description: The mandatory, non-decomposable recipe to pick exactly one row per business cell from the re-stated snapshot fact. Apply verbatim on every query.
+tags: [recipe, dedup]
+timestamp: 2026-05-28T00:00:00Z
+---
+
+`<table>` re-states each business cell across reporting cycles. To get one row per
+cell you MUST apply this exact fragment — both parts, inside one subquery. Both
+are required; dropping either silently changes the result.
+
+```sql
+-- 1) mandatory pre-filter (INSIDE the subquery): keep only <final/actuals-class> rows
+-- 2) ROW_NUMBER ordered by <firmness key FIRST>, then <tiebreakers>
+SELECT ... FROM (
+  SELECT *,
+    ROW_NUMBER() OVER (
+      PARTITION BY <the business-cell grain columns>
+      ORDER BY <firmness_rank> DESC, <tiebreak_1> DESC, <tiebreak_2> DESC
+    ) AS rn
+  FROM <table>
+  WHERE <status_col> = '<final/closed>'
+) WHERE rn = 1
+```
+
+Why the ordering leads with `<firmness_rank>`, not a timestamp: <reason — a newer
+non-final snapshot must not win a cell>. Reduced-dedup-key note: any full-grain
+column omitted from `PARTITION BY` is safe to drop ONLY because `<named pre-filter,
+e.g. status = 'final'>` collapses it inside the subquery — state that, or keep the
+column in the partition.
+
+# Citations
+- arn:aws:glue:<region>:<account_id>:table/<database>/<table>
+```
+
+---
+
 ## Playbook / abstract concept (no underlying asset → no `resource`)
 
 ```markdown

@@ -7,9 +7,12 @@ import {
   DatabaseIcon,
   FileTextIcon,
   GlobeIcon,
+  HistoryIcon,
   KeyRoundIcon,
   LogInIcon,
   LogOutIcon,
+  MessageSquarePlusIcon,
+  MessagesSquareIcon,
   MonitorIcon,
   MoonIcon,
   NetworkIcon,
@@ -19,6 +22,8 @@ import {
   SunIcon,
 } from "lucide-react"
 
+import { ChatPanel } from "@/components/ChatPanel"
+import { useChatController } from "@/hooks/useChatController"
 import { makeApi } from "@/lib/api"
 import { signInPreservingRoute } from "@/lib/auth"
 import { useRouter } from "@/lib/route"
@@ -65,6 +70,9 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
+  SidebarMenuSub,
+  SidebarMenuSubButton,
+  SidebarMenuSubItem,
   SidebarProvider,
   useSidebar,
 } from "@/components/ui/sidebar"
@@ -83,11 +91,29 @@ import GraphView from "@/views/GraphView.jsx"
 // dataset-scoped views so the breadcrumb can hint when nothing is picked.
 const NAV = [
   { key: "domains", label: "Domains", icon: GlobeIcon, needsSelection: false },
-  { key: "mappings", label: "Datasets", icon: DatabaseIcon, needsSelection: false },
-  { key: "context", label: "Context Docs", icon: FileTextIcon, needsSelection: true },
+  {
+    key: "mappings",
+    label: "Datasets",
+    icon: DatabaseIcon,
+    needsSelection: false,
+  },
+  {
+    key: "context",
+    label: "Context Docs",
+    icon: FileTextIcon,
+    needsSelection: true,
+  },
   { key: "harvest", label: "Harvest", icon: PlayIcon, needsSelection: true },
   { key: "browse", label: "Browse", icon: BoxesIcon, needsSelection: true },
   { key: "graph", label: "Graph", icon: NetworkIcon, needsSelection: true },
+  // Chat spans the whole wiki (the "@" picker narrows it), so it needs no
+  // pre-selected dataset.
+  {
+    key: "chat",
+    label: "Chat",
+    icon: MessagesSquareIcon,
+    needsSelection: false,
+  },
   {
     key: "credentials",
     label: "Credentials",
@@ -152,7 +178,7 @@ function DatasetPicker({ datasets, selectionKey, onChange }) {
           // Match the old Select trigger's inline breadcrumb look: -ml-1.5
           // cancels the button's left padding so the TEXT lines up with the
           // content column's left edge, muted until hover, no focus ring box.
-          className="h-7 -ml-1.5 -translate-y-px gap-1 px-1.5 font-normal text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:ring-0 [&_svg]:text-muted-foreground/70"
+          className="-ml-1.5 h-7 -translate-y-px gap-1 px-1.5 font-normal text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:ring-0 [&_svg]:text-muted-foreground/70"
         >
           {selectionKey || "Select a dataset…"}
           <ChevronsUpDownIcon data-icon="inline-end" className="opacity-70" />
@@ -258,6 +284,24 @@ function SidebarBrand() {
 // affordance to reopen. On mobile it's always shown (there's no desktop rail).
 // It sits at the top-left, the same corner the panel scales out of, and reuses
 // the same button style as the in-sidebar toggle (default ghost colors here).
+// Chat has no top bar (it fills the full height), so when the sidebar is hidden
+// its expand toggle would be unreachable — float a small one at the top-left of
+// the chat area. Only rendered while the sidebar is collapsed / on mobile.
+function ChatCollapsedToggle() {
+  const { state, isMobile } = useSidebar()
+  if (!isMobile && state !== "collapsed") return null
+  return (
+    <div className="absolute top-2 left-2 z-20">
+      {/* Ghost/transparent by default (no fill or shadow) — just a hover tint,
+          matching the in-sidebar toggle. */}
+      <SidebarToggle
+        label="Expand sidebar"
+        className="size-8 hover:bg-foreground/10 dark:hover:bg-foreground/10"
+      />
+    </div>
+  )
+}
+
 function TopbarTrigger() {
   const { state, isMobile } = useSidebar()
   const collapsed = state === "collapsed"
@@ -278,7 +322,12 @@ function TopbarTrigger() {
 // the sidebar is hidden (collapsed, or on mobile), where the breadcrumb is the
 // sole section indicator. The dataset picker (on dataset-scoped views) always
 // shows so the current dataset stays visible/switchable.
-function TopbarBreadcrumb({ activeNav, datasets, selectionKey, onSelectionChange }) {
+function TopbarBreadcrumb({
+  activeNav,
+  datasets,
+  selectionKey,
+  onSelectionChange,
+}) {
   const { state, isMobile } = useSidebar()
   const showSection = isMobile || state === "collapsed"
   return (
@@ -353,8 +402,55 @@ function TopbarHeader({
       </div>
       {/* Mirror the toggle's footprint (size-8) so the breadcrumb column stays
           centered on the true axis rather than shifting right by the toggle. */}
-      {showToggle ? <div className="size-8 shrink-0" aria-hidden="true" /> : null}
+      {showToggle ? (
+        <div className="size-8 shrink-0" aria-hidden="true" />
+      ) : null}
     </header>
+  )
+}
+
+// The Chat nav entry + its sub-controls. The Chat button behaves like any nav
+// item; when chat is the ACTIVE section its controls (new chat, history) reveal
+// as sub-items beneath it — driven by the shared chat controller so they operate
+// the same conversation the chat page renders. The model is fixed (Opus 4.8);
+// effort lives in the composer, so no model/effort controls here.
+function ChatNav({ item, active, onNavigate, ctrl }) {
+  const { historyOpen, setHistoryOpen } = ctrl
+  return (
+    <SidebarMenuItem>
+      <SidebarMenuButton
+        isActive={active}
+        tooltip={item.label}
+        onClick={() => onNavigate(item.key)}
+      >
+        <item.icon />
+        <span>{item.label}</span>
+      </SidebarMenuButton>
+
+      {active ? (
+        <SidebarMenuSub>
+          <SidebarMenuSubItem>
+            <SidebarMenuSubButton
+              onClick={ctrl.startNewChat}
+              className="cursor-pointer"
+            >
+              <MessageSquarePlusIcon />
+              <span>New chat</span>
+            </SidebarMenuSubButton>
+          </SidebarMenuSubItem>
+          <SidebarMenuSubItem>
+            <SidebarMenuSubButton
+              isActive={historyOpen}
+              onClick={() => setHistoryOpen((v) => !v)}
+              className="cursor-pointer"
+            >
+              <HistoryIcon />
+              <span>History</span>
+            </SidebarMenuSubButton>
+          </SidebarMenuSubItem>
+        </SidebarMenuSub>
+      ) : null}
+    </SidebarMenuItem>
   )
 }
 
@@ -377,22 +473,42 @@ function Console({ auth, api }) {
     [push, section]
   )
 
-  // Sidebar navigation: switch section, keeping the selected dataset.
+  // Sidebar navigation: switch section, keeping the selected dataset. (buildHash
+  // ignores selectionKey for the chat section — chat is not dataset-scoped.)
   const navigate = useCallback(
     (key) => push({ section: key, selectionKey, concept: null }),
     [push, selectionKey]
   )
 
+  // Chat's conversation id lives in the URL (#/chat/<threadId>) so a chat is
+  // linkable/resumable. replace() (not push()) so switching conversations within
+  // chat doesn't spam the back-stack; ChatPanel drives this as the active
+  // conversation changes, and reads route.threadId back to open a linked chat.
+  const setChatThread = useCallback(
+    (threadId) => replace({ section: "chat", threadId }),
+    [replace]
+  )
+
+  // Shared chat control state (model/effort, new-chat, resume, history toggle),
+  // lifted here so the sidebar sub-items (ChatNav) and the chat page (ChatPanel)
+  // drive the SAME conversation. Reads/writes the #/chat/<threadId> URL.
+  const chat = useChatController({
+    urlThreadId: route.threadId,
+    onThreadChange: setChatThread,
+  })
+
   // Jump from the Graph view to the Browse view, opening a concept's doc.
   const openConceptInBrowse = useCallback(
-    (conceptId) => push({ section: "browse", selectionKey, concept: conceptId }),
+    (conceptId) =>
+      push({ section: "browse", selectionKey, concept: conceptId }),
     [push, selectionKey]
   )
 
   // Browse reports the concept it opened so the URL stays in sync (and Back
   // returns to the previously-open concept).
   const onBrowseConcept = useCallback(
-    (conceptId) => push({ section: "browse", selectionKey, concept: conceptId }),
+    (conceptId) =>
+      push({ section: "browse", selectionKey, concept: conceptId }),
     [push, selectionKey]
   )
 
@@ -418,6 +534,12 @@ function Console({ auth, api }) {
   // replace() so it doesn't add a spurious history entry.
   useEffect(() => {
     if (!datasets.length) return
+    // Chat is NOT dataset-scoped: its trailing URL segment is a conversation id,
+    // not a dataset, so it never has a selectionKey. Skip normalization here — it
+    // would rewrite #/chat/<threadId> to #/chat and strip the conversation id
+    // (buildHash drops selectionKey/concept for chat). The chat controller owns
+    // the threadId in the URL.
+    if (route.section === "chat") return
     const known = datasets.some(
       (d) => `${d.data_domain}/${d.dataset}` === selectionKey
     )
@@ -467,18 +589,28 @@ function Console({ auth, api }) {
             <SidebarGroupLabel>Manage</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
-                {NAV.map((item) => (
-                  <SidebarMenuItem key={item.key}>
-                    <SidebarMenuButton
-                      isActive={section === item.key}
-                      tooltip={item.label}
-                      onClick={() => navigate(item.key)}
-                    >
-                      <item.icon />
-                      <span>{item.label}</span>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                ))}
+                {NAV.map((item) =>
+                  item.key === "chat" ? (
+                    <ChatNav
+                      key={item.key}
+                      item={item}
+                      active={section === "chat"}
+                      onNavigate={navigate}
+                      ctrl={chat}
+                    />
+                  ) : (
+                    <SidebarMenuItem key={item.key}>
+                      <SidebarMenuButton
+                        isActive={section === item.key}
+                        tooltip={item.label}
+                        onClick={() => navigate(item.key)}
+                      >
+                        <item.icon />
+                        <span>{item.label}</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  )
+                )}
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
@@ -511,66 +643,77 @@ function Console({ auth, api }) {
           unbroken line in Harvest's raw-status <pre>), pushing past the
           viewport. min-w-0 lets it shrink so inner overflow containers scroll. */}
       <SidebarInset className="min-w-0">
-        {/* The floating sidebar adds an 8px outer gap (p-2) above its header, so
-            the brand sits at ~32px (8px gap + 8px header pad + half of the h-8
-            row); TopbarHeader's pt-4 matches that so the two stay parallel. */}
-        <TopbarHeader
-          centered={centered}
-          activeNav={activeNav}
-          datasets={datasets}
-          selectionKey={selectionKey}
-          onSelectionChange={setSelectionKey}
-        />
-
-        {/* Content region fills the viewport below the header. Browse/Graph get
-            the full width/height and manage their own internal scrolling; the
-            other views stay centered (max-w-6xl) and scroll as a block. Bottom
-            padding is pb-2 (8px) so the Browse cards' bottom edge lines up with
-            the floating sidebar's bottom gap (which is also p-2). */}
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pt-4 pb-2">
-          {section === "browse" ? (
-            // Full-width views still cap + center (max-w-7xl) so they leave a
-            // margin on both sides and line up under the top-bar toggle/picker.
-            // px-1 gives the cards' ring/shadow room like the centered column.
-            <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-1">
-              <BrowseView
-                api={api}
-                selection={selection}
-                concept={routeConcept}
-                onConceptChange={onBrowseConcept}
-              />
+        {/* Chat is a FULL-HEIGHT page: it fills the ENTIRE inset (no top bar), so
+            the transcript + composer own the whole vertical layout — its controls
+            live in the sidebar (ChatNav), not a header. A collapsed sidebar still
+            needs its expand toggle, so chat overlays a tiny floating one. Every
+            other section keeps the TopbarHeader (breadcrumb + dataset picker). */}
+        {section === "chat" ? (
+          <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+            <ChatCollapsedToggle />
+            <ChatPanel api={api} auth={auth} ctrl={chat} datasets={datasets} />
+          </div>
+        ) : (
+          <>
+            {/* The floating sidebar adds an 8px outer gap (p-2) above its header,
+                so the brand sits at ~32px; TopbarHeader's pt-4 matches that. */}
+            <TopbarHeader
+              centered={centered}
+              activeNav={activeNav}
+              datasets={datasets}
+              selectionKey={selectionKey}
+              onSelectionChange={setSelectionKey}
+            />
+            {/* Content region fills the viewport below the header. Browse/Graph
+                get the full width/height and manage their own internal scrolling;
+                the other views stay centered (max-w-6xl) and scroll as a block.
+                pb-2 (8px) lines the bottom edge up with the sidebar's p-2 gap. */}
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pt-4 pb-2">
+            {section === "browse" ? (
+              // Full-width views still cap + center (max-w-7xl) so they leave a
+              // margin on both sides and line up under the top-bar toggle/picker.
+              // px-1 gives the cards' ring/shadow room like the centered column.
+              <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-1">
+                <BrowseView
+                  api={api}
+                  selection={selection}
+                  concept={routeConcept}
+                  onConceptChange={onBrowseConcept}
+                />
+              </div>
+            ) : section === "graph" ? (
+              <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-1">
+                <GraphView
+                  api={api}
+                  selection={selection}
+                  onOpenConcept={openConceptInBrowse}
+                />
+              </div>
+            ) : (
+              // p-1 gives the cards' ring/shadow room so the vertical scroll
+              // container doesn't clip them — including the first card's top edge,
+              // which otherwise sits flush against the scroll container's top.
+              <div className="mx-auto min-h-0 w-full max-w-6xl flex-1 overflow-y-auto p-1">
+                {section === "domains" && (
+                  <DomainsView api={api} onChanged={loadDatasets} />
+                )}
+                {section === "mappings" && (
+                  <MappingsView api={api} onChanged={loadDatasets} />
+                )}
+                {section === "context" && (
+                  <ContextView api={api} selection={selection} />
+                )}
+                {section === "harvest" && (
+                  <HarvestView api={api} selection={selection} />
+                )}
+                {section === "credentials" && (
+                  <CredentialsView api={api} email={email} />
+                )}
+              </div>
+            )}
             </div>
-          ) : section === "graph" ? (
-            <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-1">
-              <GraphView
-                api={api}
-                selection={selection}
-                onOpenConcept={openConceptInBrowse}
-              />
-            </div>
-          ) : (
-            // p-1 gives the cards' ring/shadow room so the vertical scroll
-            // container doesn't clip them — including the first card's top edge,
-            // which otherwise sits flush against the scroll container's top.
-            <div className="mx-auto min-h-0 w-full max-w-6xl flex-1 overflow-y-auto p-1">
-              {section === "domains" && (
-                <DomainsView api={api} onChanged={loadDatasets} />
-              )}
-              {section === "mappings" && (
-                <MappingsView api={api} onChanged={loadDatasets} />
-              )}
-              {section === "context" && (
-                <ContextView api={api} selection={selection} />
-              )}
-              {section === "harvest" && (
-                <HarvestView api={api} selection={selection} />
-              )}
-              {section === "credentials" && (
-                <CredentialsView api={api} email={email} />
-              )}
-            </div>
-          )}
-        </div>
+          </>
+        )}
       </SidebarInset>
     </SidebarProvider>
   )

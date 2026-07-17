@@ -1,0 +1,23 @@
+# Runtime deps for the chat agent AgentCore container.
+# okf-core, okf-aws, and okf-consumption-mcp are installed from local source in
+# the Docker build (sibling packages).
+langchain>=1.0
+langgraph>=0.6
+langgraph-checkpoint-aws
+# ChatBedrockConverse (Claude) + ChatOpenAI-on-Mantle (GPT); imported lazily by
+# okf_aws.model_factory. aws-bedrock-token-generator mints the Mantle bearer.
+langchain-aws>=1.6
+langchain-openai>=1.3
+aws-bedrock-token-generator>=1.0
+# Raw FastAPI app on 0.0.0.0:8080 (/invocations + /ping); we own the app so we
+# control CORS on the SSE StreamingResponse for the browser-direct call.
+fastapi>=0.115
+uvicorn>=0.30
+pyjwt>=2.10
+boto3>=1.43
+pyyaml>=6.0.3
+networkx>=3.4
+# AgentCore Observability: ADOT SDK. LangChain/LangGraph LLM/tool spans are
+# emitted via the langsmith SDK's native OTEL bridge (transitive dep of
+# langchain), gated by LANGSMITH_TRACING + LANGSMITH_OTEL_ONLY on the runtime.
+aws-opentelemetry-distro>=0.10.0

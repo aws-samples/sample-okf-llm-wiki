@@ -207,12 +207,16 @@ stage_images() {
   ensure_builder  # recreate the buildx builder so BuildKit boots with fresh auth
   HARVEST_URI="$(build_push harvest okf-harvest)"
   CONSUMPTION_URI="$(build_push consumption_mcp okf-consumption)"
+  # The chat container builds from the same services/ context; its Dockerfile
+  # copies okf_core + okf_aws + consumption_mcp (reused in-process) + chat.
+  CHAT_URI="$(build_push chat okf-chat)"
   # Persist for the compute stage.
-  grep -v -E '^(HARVEST_IMAGE_URI|CONSUMPTION_IMAGE_URI)=' "$CONFIG" > "$CONFIG.tmp" 2>/dev/null || true
+  grep -v -E '^(HARVEST_IMAGE_URI|CONSUMPTION_IMAGE_URI|CHAT_IMAGE_URI)=' "$CONFIG" > "$CONFIG.tmp" 2>/dev/null || true
   mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null || true
   echo "HARVEST_IMAGE_URI=$HARVEST_URI" >> "$CONFIG"
   echo "CONSUMPTION_IMAGE_URI=$CONSUMPTION_URI" >> "$CONFIG"
-  ok "Images pushed: $HARVEST_URI , $CONSUMPTION_URI"
+  echo "CHAT_IMAGE_URI=$CHAT_URI" >> "$CONFIG"
+  ok "Images pushed: $HARVEST_URI , $CONSUMPTION_URI , $CHAT_URI"
 }
 
 # Verify an "<acct>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>" image tag really
@@ -234,6 +238,7 @@ stage_compute() {
   load_config
   verify_ecr_image "${HARVEST_IMAGE_URI:-}"
   verify_ecr_image "${CONSUMPTION_IMAGE_URI:-}"
+  verify_ecr_image "${CHAT_IMAGE_URI:-}"
   "$ROOT/scripts/build_lambdas.sh"
   tf "$ROOT/infra/compute" init -reconfigure -input=false \
     -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
@@ -243,6 +248,7 @@ stage_compute() {
     -var="durable_state_bucket=$TF_STATE_BUCKET" \
     -var="harvest_image_uri=${HARVEST_IMAGE_URI:-}" \
     -var="consumption_image_uri=${CONSUMPTION_IMAGE_URI:-}" \
+    -var="chat_image_uri=${CHAT_IMAGE_URI:-}" \
     -var="control_api_provisioned_concurrency=${CONTROL_API_PROVISIONED_CONCURRENCY:-0}"
   ok "Compute stack applied."
 }
@@ -496,7 +502,8 @@ stage_destroy() {
 
   if ! tf "$ROOT/infra/compute" destroy -auto-approve \
       -var="region=$AWS_REGION" -var="durable_state_bucket=$TF_STATE_BUCKET" \
-      -var="harvest_image_uri=${HARVEST_IMAGE_URI:-}" -var="consumption_image_uri=${CONSUMPTION_IMAGE_URI:-}"; then
+      -var="harvest_image_uri=${HARVEST_IMAGE_URI:-}" -var="consumption_image_uri=${CONSUMPTION_IMAGE_URI:-}" \
+      -var="chat_image_uri=${CHAT_IMAGE_URI:-}"; then
     die "compute destroy failed (see errors above). If it's a lingering S3 File System or a non-empty bucket, re-run: ./scripts/deploy.sh destroy --force"
   fi
   if ! tf "$ROOT/infra/durable" destroy -auto-approve -var="region=$AWS_REGION"; then

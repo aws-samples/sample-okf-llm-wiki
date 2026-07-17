@@ -181,3 +181,90 @@ resource "aws_dynamodb_table" "annotations" {
 
   tags = var.tags
 }
+
+# Chat-agent conversation checkpoints. Owned + written by the LangGraph
+# `DynamoDBSaver` (langgraph-checkpoint-aws), NOT by our code — so the KEY SCHEMA
+# is DICTATED BY THAT LIBRARY, not chosen here: partition key `PK` + sort key
+# `SK`, both String, UPPERCASE (verified against the installed package source).
+# One table holds both checkpoints and pending writes, distinguished by PK prefix
+# (`CHECKPOINT_<thread_id>` vs `WRITES_<thread_id>#<ns>#<ckpt_id>`) and queried
+# with begins_with(SK, …); there is NO GSI. Per-user isolation is STRUCTURAL: the
+# chat runtime namespaces the thread id with the caller's Cognito sub
+# (`<sub>:<thread_id>`) before it reaches the saver, so one user's checkpoints can
+# never be read under another user's thread id (see services/chat/server.py).
+#
+# TTL: the saver writes an epoch-seconds attribute named `ttl` (lowercase) ONLY
+# when constructed with ttl_seconds (OKF_CHAT_CHECKPOINT_TTL_SECONDS). Enable TTL
+# on `ttl` so expired conversations are reaped; a checkpoint with no `ttl` never
+# expires. A dedicated table (not registry) keeps this sweep off the durable rows.
+resource "aws_dynamodb_table" "chat_checkpoints" {
+  name         = "${var.name_prefix}-chat-checkpoints"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = local.dynamodb_kms_key_arn
+  }
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  tags = var.tags
+}
+
+# Chat conversation INDEX: the per-user list of conversations the UI shows
+# (title, model, effort, dataset scope, timestamps). The DynamoDBSaver table is
+# keyed by thread id and can't answer "list user X's conversations", so this
+# small index does. Isolation is STRUCTURAL, mirroring `annotations`: the
+# partition key embeds the author's Cognito sub (pk = "CHAT#<user_sub>"), so a
+# user's Query can only ever read their OWN threads — no cross-user read path.
+# The chat runtime writes rows (create-on-first-run, touch on each turn); the
+# Control API reads/renames/deletes them for the UI. TTL on `expires_at` (set
+# only when a conversation is deleted/expired) reaps terminal rows; an active
+# conversation carries no expires_at and never expires.
+resource "aws_dynamodb_table" "chat" {
+  name         = "${var.name_prefix}-chat"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = local.dynamodb_kms_key_arn
+  }
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  tags = var.tags
+}

@@ -71,6 +71,7 @@ import {
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
+import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
 import {
   MODEL_CATALOG,
@@ -123,6 +124,13 @@ export default function HarvestView({ api, selection }) {
   const [starting, setStarting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [startingAnnotations, setStartingAnnotations] = useState(false)
+  // Dataset guidance (shared authoring instructions). `guidance` is the saved
+  // server value + dirty flag; `guidanceDraft` is the editable buffer; `dirty`
+  // means the draft differs from what's saved (unsaved edits).
+  const [guidance, setGuidance] = useState(null)
+  const [guidanceDraft, setGuidanceDraft] = useState("")
+  const [guidanceLoading, setGuidanceLoading] = useState(false)
+  const [savingGuidance, setSavingGuidance] = useState(false)
   // Confirm modal before a full harvest OVERWRITES an existing bundle (a full
   // run wipes and re-authors every doc — clean_authored_output — so a misclick
   // is destructive). Only gated when a bundle already exists; see requestStartHarvest.
@@ -314,6 +322,44 @@ export default function HarvestView({ api, selection }) {
     intervalRef.current = setInterval(() => poll(), POLL_MS)
   }, [poll, stopPolling])
 
+  // Load the dataset's saved guidance (+ dirty flag) and seed the editable draft.
+  const loadGuidance = useCallback(async () => {
+    if (!api || !hasSelection) return
+    setGuidanceLoading(true)
+    try {
+      const g = await api.getDatasetGuidance(domain, dataset)
+      setGuidance(g)
+      setGuidanceDraft(g.guidance || "")
+    } catch {
+      // A brand-new mapping may 404 briefly; treat as empty guidance.
+      setGuidance({ guidance: "", guidance_dirty: false })
+      setGuidanceDraft("")
+    } finally {
+      setGuidanceLoading(false)
+    }
+  }, [api, domain, dataset, hasSelection])
+
+  // Persist the draft. Bumps the server version → guidance goes DIRTY until the
+  // next re-harvest applies it.
+  const saveGuidance = useCallback(async () => {
+    if (!api || !hasSelection) return
+    setSavingGuidance(true)
+    try {
+      const g = await api.setDatasetGuidance(domain, dataset, guidanceDraft)
+      setGuidance(g)
+      setGuidanceDraft(g.guidance || "")
+      toast.success(
+        g.guidance
+          ? "Guidance saved — run a re-harvest to apply it."
+          : "Guidance cleared."
+      )
+    } catch (e) {
+      toast.error(`Could not save guidance: ${e.message || e}`)
+    } finally {
+      setSavingGuidance(false)
+    }
+  }, [api, domain, dataset, hasSelection, guidanceDraft])
+
   useEffect(() => {
     setStatus(null)
     setError(null)
@@ -325,11 +371,12 @@ export default function HarvestView({ api, selection }) {
     startPolling()
     pollEvents()
     startFeed()
+    loadGuidance()
     return () => {
       stopPolling()
       stopFeed()
     }
-  }, [poll, startPolling, stopPolling, pollEvents, startFeed, stopFeed, resetFeed, hasSelection])
+  }, [poll, startPolling, stopPolling, pollEvents, startFeed, stopFeed, resetFeed, loadGuidance, hasSelection])
 
   const startHarvest = async () => {
     if (!hasSelection) return
@@ -364,15 +411,21 @@ export default function HarvestView({ api, selection }) {
         toast.info(
           res.orphaned
             ? `No live annotations — ${res.orphaned} auto-resolved as orphaned.`
-            : "No open annotations to apply. Select text in Browse to add some."
+            : "No open annotations or guidance changes to apply."
         )
         await poll()
         return
       }
+      // A run can carry annotations, a pending guidance change, or both.
+      const parts = []
+      if (res.annotations) parts.push(`${res.annotations} annotation(s)`)
+      if (res.guidance_applied) parts.push("updated guidance")
       toast.success(
-        `Annotation harvest queued for ${res.annotations} annotation(s)` +
+        `Re-harvest queued for ${parts.join(" + ") || "this dataset"}` +
           (res.orphaned ? ` (${res.orphaned} orphaned)` : "")
       )
+      // A guidance run just cleared its dirty flag on success — refresh it.
+      loadGuidance()
       resetFeed()
       await poll()
       startPolling()
@@ -523,14 +576,22 @@ export default function HarvestView({ api, selection }) {
                       {startingAnnotations ? <Spinner /> : <ChevronDownIcon />}
                     </Button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start" className="w-56">
+                  <DropdownMenuContent align="start" className="w-64">
                     <DropdownMenuLabel>Re-harvest</DropdownMenuLabel>
                     <DropdownMenuItem
                       onSelect={startAnnotationHarvest}
                       disabled={startingAnnotations}
+                      className="flex-col items-start gap-0.5"
                     >
-                      <MessageSquareTextIcon />
-                      Apply my annotations
+                      <span className="flex items-center gap-2">
+                        <MessageSquareTextIcon />
+                        Apply annotations{guidance?.guidance_dirty ? " + guidance" : ""}
+                      </span>
+                      <span className="pl-6 text-[11px] text-muted-foreground">
+                        {guidance?.guidance_dirty
+                          ? "In-place: your notes + the updated guidance."
+                          : "In-place: applies your open annotations."}
+                      </span>
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
@@ -619,53 +680,100 @@ export default function HarvestView({ api, selection }) {
                 )}
               </div>
 
+              {/* Dataset guidance — shared authoring instructions that steer every
+                  harvest. Edit + Save persists it (goes DIRTY); the next full
+                  harvest, or an "Apply annotations + guidance" re-harvest, applies
+                  it and clears dirty. */}
+              <div className="rounded-lg border bg-muted/20 p-3">
+                <div className="mb-1.5 flex items-center gap-2">
+                  <SparklesIcon className="size-4 text-muted-foreground" />
+                  <span className="text-sm font-medium">Dataset guidance</span>
+                  {guidance?.guidance_dirty ? (
+                    <Badge variant="outline" className="border-amber-500/50 text-amber-600 dark:text-amber-400">
+                      pending re-harvest
+                    </Badge>
+                  ) : guidance?.guidance ? (
+                    <Badge variant="outline">
+                      <CheckCircle2Icon />
+                      applied
+                    </Badge>
+                  ) : null}
+                </div>
+                {guidanceLoading ? (
+                  <Skeleton className="h-20 w-full" />
+                ) : (
+                  <>
+                    <Textarea
+                      value={guidanceDraft}
+                      onChange={(e) => setGuidanceDraft(e.target.value)}
+                      placeholder="Add dataset-specific authoring guidance…"
+                      className="min-h-20 resize-y text-sm"
+                      disabled={savingGuidance}
+                    />
+                    <div className="mt-2 flex items-center justify-end gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={saveGuidance}
+                        disabled={
+                          savingGuidance ||
+                          guidanceDraft === (guidance?.guidance || "")
+                        }
+                      >
+                        {savingGuidance ? <Spinner /> : null}
+                        Save guidance
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </div>
+
               {(inner.mode ||
                 inner.started_at ||
                 showUpdated ||
                 inner.detail ||
                 inner.model) && (
-                <dl className="grid grid-cols-[max-content_minmax(0,1fr)] gap-x-6 gap-y-1 text-sm">
+                // Parallel columns to save vertical space: each field is a small
+                // stacked (label over value) cell in a fixed 2-column grid (2×2 for
+                // the usual Mode/Model/Started/Updated set).
+                <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
                   {inner.mode && (
-                    <>
-                      <dt className="text-muted-foreground">Mode</dt>
-                      <dd className="min-w-0 break-words">{inner.mode}</dd>
-                    </>
+                    <div className="min-w-0">
+                      <dt className="text-xs text-muted-foreground">Mode</dt>
+                      <dd className="break-words">{inner.mode}</dd>
+                    </div>
                   )}
-                  {inner.model && (
-                    <>
-                      <dt className="text-muted-foreground">Model</dt>
-                      <dd className="min-w-0 break-words">
-                        {entryFor(inner.model)?.label || inner.model}
+                  {(inner.model || inner.effort) && (
+                    // Model + effort merged into one field: model_id / effort_level.
+                    <div className="min-w-0">
+                      <dt className="text-xs text-muted-foreground">Model</dt>
+                      <dd className="break-words">
+                        {entryFor(inner.model)?.label || inner.model || "—"}
+                        {inner.effort ? ` / ${inner.effort}` : ""}
                       </dd>
-                    </>
-                  )}
-                  {inner.effort && (
-                    <>
-                      <dt className="text-muted-foreground">Reasoning effort</dt>
-                      <dd className="min-w-0 break-words">{inner.effort}</dd>
-                    </>
+                    </div>
                   )}
                   {inner.started_at && (
-                    <>
-                      <dt className="text-muted-foreground">Started</dt>
-                      <dd className="min-w-0 break-words">
+                    <div className="min-w-0">
+                      <dt className="text-xs text-muted-foreground">Started</dt>
+                      <dd className="break-words">
                         {new Date(inner.started_at).toLocaleString()}
                       </dd>
-                    </>
+                    </div>
                   )}
                   {showUpdated && (
-                    <>
-                      <dt className="text-muted-foreground">Updated</dt>
-                      <dd className="min-w-0 break-words">
+                    <div className="min-w-0">
+                      <dt className="text-xs text-muted-foreground">Updated</dt>
+                      <dd className="break-words">
                         {new Date(inner.updated_at).toLocaleString()}
                       </dd>
-                    </>
+                    </div>
                   )}
                   {inner.detail && (
-                    <>
-                      <dt className="text-muted-foreground">Detail</dt>
-                      <dd className="min-w-0 break-words">{inner.detail}</dd>
-                    </>
+                    <div className="col-span-full min-w-0">
+                      <dt className="text-xs text-muted-foreground">Detail</dt>
+                      <dd className="break-words">{inner.detail}</dd>
+                    </div>
                   )}
                 </dl>
               )}

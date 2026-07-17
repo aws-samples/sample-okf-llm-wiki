@@ -14,10 +14,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# okf_core is a sibling package; the build context is the repo's services/ dir.
+# okf_core + okf_aws are sibling packages; the build context is the repo's
+# services/ dir. okf_aws carries the shared model factory harvest delegates to.
 COPY okf_core /app/okf_core
+COPY okf_aws /app/okf_aws
 COPY harvest/requirements.txt /app/harvest/requirements.txt
 RUN pip install --no-cache-dir -e /app/okf_core \
+    && pip install --no-cache-dir -e /app/okf_aws \
     && pip install --no-cache-dir -r /app/harvest/requirements.txt
 
 COPY harvest /app/harvest

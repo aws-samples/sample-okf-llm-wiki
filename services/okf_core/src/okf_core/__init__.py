@@ -23,6 +23,13 @@ from okf_core.annotations import (
     is_terminal_outcome,
     normalize_text,
 )
+from okf_core.chat_threads import (
+    DELETED_TTL_SECONDS,
+    TITLE_MAX,
+    derive_title,
+    thread_pk,
+    thread_sk,
+)
 from okf_core.document import (
     REQUIRED_FRONTMATTER_KEYS,
     OKFDocument,
@@ -86,6 +93,11 @@ __all__ = [
     "annotation_pk",
     "annotation_sk",
     "concept_sk_prefix",
+    "DELETED_TTL_SECONDS",
+    "TITLE_MAX",
+    "derive_title",
+    "thread_pk",
+    "thread_sk",
     "annotatable_text",
     "find_quote",
     "is_orphaned",

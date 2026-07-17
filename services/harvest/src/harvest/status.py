@@ -143,3 +143,48 @@ def report_status(
             dataset,
             exc_info=True,
         )
+
+
+def stamp_guidance_applied(
+    registry: tuple[Any, str] | None,
+    *,
+    data_domain: str,
+    dataset: str,
+    version: str | None,
+) -> None:
+    """Record that dataset guidance version ``version`` was applied by this harvest.
+
+    Writes ``guidance_applied_version`` onto the dataset's mapping row
+    (``pk="DOMAIN#<d>"``, ``sk="DATASET#<ds>"``) so the guidance clears its DIRTY
+    state (okf_core.guidance.is_dirty compares this to ``guidance_updated_at``).
+    Called ONLY after a successful ``finalize_bundle`` — a failed run never stamps,
+    so dirty guidance stays dirty until it actually lands. Stamps the VERSION that
+    ran (not "now"), so an edit made mid-run keeps the guidance dirty. No-op when
+    ``version`` is falsy (the run carried no guidance) or the registry is
+    unconfigured. Never raises — a stamp failure must not fail a finalized bundle.
+    """
+    if registry is None or not version:
+        return
+    client, table = registry
+    try:
+        client.update_item(
+            TableName=table,
+            Key={
+                "pk": {"S": f"DOMAIN#{data_domain}"},
+                "sk": {"S": f"DATASET#{dataset}"},
+            },
+            UpdateExpression="SET guidance_applied_version = :v",
+            # Only stamp a row that still exists (mapping not deleted mid-run).
+            ConditionExpression="attribute_exists(pk)",
+            ExpressionAttributeValues={":v": {"S": version}},
+        )
+        log.info(
+            "Stamped guidance_applied_version=%s (%s/%s)", version, data_domain, dataset
+        )
+    except Exception:  # noqa: BLE001 - best-effort; never break a finalized bundle
+        log.warning(
+            "Failed to stamp guidance_applied_version for %s/%s (continuing)",
+            data_domain,
+            dataset,
+            exc_info=True,
+        )

@@ -23,6 +23,8 @@ from datetime import timedelta
 
 from okf_aws import bundle_prefix, is_bundle_ready, parse_bundle_key, state_marker_key
 from okf_core import annotations as anno
+from okf_core import chat_threads as ct
+from okf_core import guidance as gd
 from okf_core.domain import DOMAIN_DATASET
 from okf_core.links import extract_links_with_headings
 from okf_core.paths import parse_concept_id
@@ -165,6 +167,10 @@ def list_domains(ddb, *, registry_table: str) -> list[dict[str, Any]]:
                     # Kept for back-compat with existing UI/readers.
                     "glue_database": _s(item.get("glue_database")),
                     "created_at": _s(item.get("created_at")),
+                    # Dataset-level authoring guidance (shared; steers every
+                    # harvest). Surfaced so the UI can show it + whether it's
+                    # pending a re-harvest (dirty).
+                    **_guidance_fields(item),
                 }
             )
         start = resp.get("LastEvaluatedKey")
@@ -398,6 +404,86 @@ def upsert_domain_mapping(
         "dataset": dataset,
         "source": source,
         "glue_database": glue_database,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Dataset guidance (shared authoring instructions on the DATASET# mapping row)
+# --------------------------------------------------------------------------- #
+
+
+def _guidance_fields(item: dict[str, Any]) -> dict[str, Any]:
+    """Extract the guidance attrs + derived ``guidance_dirty`` from a mapping item."""
+    text = _s(item.get(gd.ATTR_TEXT)) or ""
+    updated_at = _s(item.get(gd.ATTR_UPDATED_AT)) or ""
+    applied_version = _s(item.get(gd.ATTR_APPLIED_VERSION)) or ""
+    return {
+        "guidance": text,
+        "guidance_updated_at": updated_at,
+        "guidance_applied_version": applied_version,
+        # Pending a re-harvest to take effect (edited or never applied).
+        "guidance_dirty": gd.is_dirty(text, updated_at, applied_version),
+    }
+
+
+def get_dataset_guidance(
+    ddb, *, registry_table: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """Return the dataset's guidance + dirty state. 404 if the mapping is missing."""
+    resp = ddb.get_item(
+        TableName=registry_table,
+        Key={"pk": {"S": f"DOMAIN#{data_domain}"}, "sk": {"S": f"DATASET#{dataset}"}},
+    )
+    item = resp.get("Item")
+    if not item:
+        raise ApiError(404, f"no such dataset: {data_domain}/{dataset}")
+    return {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        **_guidance_fields(item),
+    }
+
+
+def set_dataset_guidance(
+    ddb, *, registry_table: str, data_domain: str, dataset: str, guidance: str
+) -> dict[str, Any]:
+    """Set/clear the dataset's guidance, bumping ``guidance_updated_at``.
+
+    Conditioned on the mapping existing (a stray dataset id is a clean 404). The
+    text is trimmed + capped (okf_core.guidance.normalize). ``updated_at`` always
+    moves forward, so the guidance goes DIRTY (``applied_version`` no longer
+    matches) — the next annotation-run/harvest picks it up. We do NOT touch
+    ``applied_version`` here; only a successful harvest advances that.
+    """
+    text = gd.normalize(guidance)
+    now = _now_iso()
+    try:
+        ddb.update_item(
+            TableName=registry_table,
+            Key={
+                "pk": {"S": f"DOMAIN#{data_domain}"},
+                "sk": {"S": f"DATASET#{dataset}"},
+            },
+            UpdateExpression="SET #g = :g, #gu = :now",
+            ConditionExpression="attribute_exists(pk)",
+            ExpressionAttributeNames={
+                "#g": gd.ATTR_TEXT,
+                "#gu": gd.ATTR_UPDATED_AT,
+            },
+            ExpressionAttributeValues={":g": {"S": text}, ":now": {"S": now}},
+        )
+    except Exception as e:  # noqa: BLE001 - map a missing mapping to 404
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            raise ApiError(404, f"no such dataset: {data_domain}/{dataset}") from e
+        raise
+    return {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "guidance": text,
+        "guidance_updated_at": now,
+        "guidance_applied_version": "",  # cleared relationship; recomputed on read
+        "guidance_dirty": gd.is_dirty(text, now, ""),
     }
 
 
@@ -1068,6 +1154,19 @@ def trigger_harvest(
             payload["domain_description"] = domain_meta["description"]
         if domain_meta.get("context"):
             payload["domain_context"] = domain_meta["context"]
+
+    # Dataset-level guidance (shared authoring instructions) — steers this harvest
+    # and, on success, the runner stamps guidance_applied_version so it clears
+    # dirty. Passed with its version so the stamp records exactly what was applied.
+    try:
+        g = get_dataset_guidance(
+            ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+        )
+        if g.get("guidance"):
+            payload["dataset_guidance"] = g["guidance"]
+            payload["dataset_guidance_version"] = g["guidance_updated_at"]
+    except ApiError:
+        pass  # no mapping row yet (shouldn't happen at harvest time) — omit guidance
 
     if mode == "incremental":
         if not changed_table:
@@ -2061,6 +2160,22 @@ def trigger_annotation_harvest(
     )
     flipped: list[tuple[str, str]] = []
     try:
+        # Dataset guidance (shared): a DIRTY guidance (edited since the last
+        # successful harvest) is on its own reason to run — even with zero live
+        # annotations. We load it here so both the short-circuit decision and the
+        # invoke payload see the same value/version. A missing mapping row (no
+        # guidance ever set) is not an error here — treat it as empty guidance.
+        try:
+            guidance = get_dataset_guidance(
+                ddb,
+                registry_table=registry_table,
+                data_domain=data_domain,
+                dataset=dataset,
+            )
+        except ApiError:
+            guidance = {"guidance": "", "guidance_updated_at": "", "guidance_dirty": False}
+        guidance_dirty = bool(guidance.get("guidance_dirty"))
+
         # We reclaim BOTH open and in_review notes. An in_review note here is a
         # straggler from a prior run that died between flipping it and finishing
         # (the lease we now hold proves no run is currently active), so it's safe —
@@ -2120,8 +2235,11 @@ def trigger_annotation_harvest(
             else:
                 survivors.append(it)
 
-        # Nothing live to act on: close the run out here, skip the agent entirely.
-        if not survivors:
+        # Nothing live to act on AND no pending guidance change: close the run out
+        # here, skip the agent entirely (the payoff of the pre-flight). But if the
+        # guidance is DIRTY, we DO run even with zero survivors — applying the
+        # updated instructions to the bundle is the whole point of this path now.
+        if not survivors and not guidance_dirty:
             detail = (
                 f"No live annotations to apply — {orphaned} auto-resolved as orphaned."
                 if orphaned
@@ -2207,6 +2325,12 @@ def trigger_annotation_harvest(
             if domain_meta.get("context"):
                 payload["domain_context"] = domain_meta["context"]
 
+        # Carry the dataset guidance + its version so the runner steers the apply
+        # AND, on success, stamps guidance_applied_version to clear dirty.
+        if guidance.get("guidance"):
+            payload["dataset_guidance"] = guidance["guidance"]
+            payload["dataset_guidance_version"] = guidance["guidance_updated_at"]
+
         agentcore.invoke_agent_runtime(
             agentRuntimeArn=runtime_arn,
             runtimeSessionId=session_id,
@@ -2244,6 +2368,9 @@ def trigger_annotation_harvest(
         "dataset": dataset,
         "annotations": len(survivors),
         "orphaned": orphaned,
+        # Whether this run was carrying a pending guidance change (so the UI can
+        # say "applying updated guidance" even on a zero-annotation run).
+        "guidance_applied": guidance_dirty,
     }
 
 
@@ -2273,3 +2400,211 @@ def _source_from_item(item: dict[str, Any]) -> dict[str, Any]:
         m = raw["M"]
         source_dict = {k: _s(v) for k, v in m.items() if _s(v) is not None}
     return normalize_source(source_dict, glue_database=_s(item.get("glue_database")))
+
+
+# --------------------------------------------------------------------------- #
+# Chat conversations (the per-user sidebar list) — okf-chat index table
+# --------------------------------------------------------------------------- #
+#
+# The chat RUNTIME writes these rows (create/touch per turn); the Control API
+# only reads/renames/deletes them for the UI. Isolation is structural: the pk
+# embeds the caller's Cognito sub (CHAT#<sub>), so a Query can only ever return
+# the caller's own conversations. Delete also PURGES the LangGraph checkpoint via
+# the DynamoDBSaver so a deleted conversation leaves no state behind.
+
+
+def _thread_to_dict(item: dict[str, Any]) -> dict[str, Any]:
+    """Deserialize an okf-chat index item to the UI/JSON shape.
+
+    ``thread_id`` is recovered from the sk (``THREAD#<thread_id>``) so the client
+    gets back the id it sends as the AG-UI threadId.
+    """
+    sk = _s(item.get("sk")) or ""
+    thread_id = sk[len("THREAD#") :] if sk.startswith("THREAD#") else sk
+    out = {
+        "thread_id": thread_id,
+        "title": _s(item.get("title")),
+        "model": _s(item.get("model")),
+        "effort": _s(item.get("effort")),
+        "created_at": _s(item.get("created_at")),
+        "updated_at": _s(item.get("updated_at")),
+    }
+    dd, ds = _s(item.get("data_domain")), _s(item.get("dataset"))
+    if dd and ds:
+        out["dataset_scope"] = {"data_domain": dd, "dataset": ds}
+    return out
+
+
+def list_chat_threads(
+    ddb,
+    *,
+    threads_table: str,
+    user_sub: str | None,
+) -> dict[str, Any]:
+    """The caller's conversations, newest-updated first.
+
+    Single-partition Query on ``CHAT#<sub>``; a missing sub is a 401 (never fall
+    through to an unscoped scan). Deleted rows carry an ``expires_at`` and are
+    reaped by TTL, but TTL is eventually-consistent, so we also skip any row whose
+    ``expires_at`` is already set (a just-deleted conversation shouldn't reappear).
+
+    Paginates on ``LastEvaluatedKey``: a Query returns at most 1 MB per page, so a
+    caller with a large history would otherwise silently get only the first page
+    (and the UI's client-side search would never see the rest). Loop to the end so
+    the returned list is always the complete conversation set.
+    """
+    user_sub = _require_user_sub(user_sub)
+    kwargs: dict[str, Any] = {
+        "TableName": threads_table,
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": ct.thread_pk(user_sub)}},
+    }
+    items: list[dict[str, Any]] = []
+    while True:
+        resp = ddb.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+    threads = [_thread_to_dict(it) for it in items if "expires_at" not in it]
+    # Newest activity first; rows without updated_at sort last.
+    threads.sort(key=lambda t: t.get("updated_at") or "", reverse=True)
+    return {"threads": threads}
+
+
+def rename_chat_thread(
+    ddb,
+    *,
+    threads_table: str,
+    user_sub: str | None,
+    thread_id: str,
+    title: str,
+) -> dict[str, Any]:
+    """Rename one of the caller's conversations.
+
+    Conditioned on the row existing (within the caller's partition), so renaming a
+    stale/foreign id is a clean 404. Empty title is a 400.
+    """
+    user_sub = _require_user_sub(user_sub)
+    title = (title or "").strip()
+    if not title:
+        raise ApiError(400, "missing required field: title")
+    key = {
+        "pk": {"S": ct.thread_pk(user_sub)},
+        "sk": {"S": ct.thread_sk(thread_id)},
+    }
+    try:
+        ddb.update_item(
+            TableName=threads_table,
+            Key=key,
+            UpdateExpression="SET #t = :t, updated_at = :u",
+            ConditionExpression="attribute_exists(pk)",
+            ExpressionAttributeNames={"#t": "title"},
+            ExpressionAttributeValues={
+                ":t": {"S": title[: ct.TITLE_MAX]},
+                ":u": {"S": _now_iso()},
+            },
+        )
+    except Exception as e:  # noqa: BLE001 - map a missing item to 404
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            raise ApiError(404, f"no such conversation: {thread_id}") from e
+        raise
+    return {"thread_id": thread_id, "title": title[: ct.TITLE_MAX]}
+
+
+def _purge_chat_checkpoints(
+    ddb, *, checkpoint_table: str, namespaced_thread_id: str
+) -> None:
+    """Best-effort delete of a conversation's LangGraph checkpoint items.
+
+    The DynamoDBSaver stores a conversation as items whose PK is
+    ``CHECKPOINT_<thread_id>`` (metadata) and ``WRITES_<thread_id>#<ns>#<ckpt>``
+    (pending writes), all sharing our sub-namespaced ``<sub>:<thread_id>`` as the
+    thread id. We Query each PK and BatchWrite the deletes. Done directly on
+    DynamoDB (not via the saver) so the Control API stays free of the langgraph
+    dependency. This is best-effort: an unreachable checkpoint (no index row) is
+    TTL-reaped anyway, so a purge failure must not fail the user-visible delete.
+    """
+    # (query?, PK-or-prefix) pairs. CHECKPOINT is an EXACT PK (the ckpt id lives in
+    # the SK) → a keyed Query. WRITES PKs carry a ``#<ns>#<ckpt>`` suffix, so match
+    # by prefix via a Scan — but the prefix MUST include the trailing ``#``
+    # delimiter, else deleting thread ``c1`` also matches ``c10#…`` and purges a
+    # DIFFERENT conversation's pending writes (thread ids are client-supplied, so
+    # one being a prefix of another is reachable).
+    targets = (
+        (True, f"CHECKPOINT_{namespaced_thread_id}"),
+        (False, f"WRITES_{namespaced_thread_id}#"),
+    )
+    for is_exact, pk in targets:
+        try:
+            if is_exact:
+                resp = ddb.query(
+                    TableName=checkpoint_table,
+                    KeyConditionExpression="PK = :pk",
+                    ExpressionAttributeValues={":pk": {"S": pk}},
+                    ProjectionExpression="PK, SK",
+                )
+                items = resp.get("Items", [])
+            else:
+                resp = ddb.scan(
+                    TableName=checkpoint_table,
+                    FilterExpression="begins_with(PK, :p)",
+                    ExpressionAttributeValues={":p": {"S": pk}},
+                    ProjectionExpression="PK, SK",
+                )
+                items = resp.get("Items", [])
+            for it in items:
+                ddb.delete_item(
+                    TableName=checkpoint_table,
+                    Key={"PK": it["PK"], "SK": it["SK"]},
+                )
+        except Exception:  # noqa: BLE001 - best-effort; index row already gone
+            import logging
+
+            logging.getLogger("control_api").warning(
+                "chat checkpoint purge failed for %s (non-fatal)",
+                namespaced_thread_id,
+                exc_info=True,
+            )
+
+
+def delete_chat_thread(
+    ddb,
+    *,
+    threads_table: str,
+    checkpoint_table: str,
+    user_sub: str | None,
+    thread_id: str,
+) -> dict[str, Any]:
+    """Delete one of the caller's conversations: index row + checkpoint state.
+
+    Removes the index row (conditioned on existence -> 404 for a stale/foreign
+    id), then PURGES the LangGraph checkpoint items for the sub-namespaced thread
+    id. The purge is best-effort — the index row is the user-visible source of
+    truth, and an orphaned checkpoint is unreachable + TTL-reaped anyway.
+    """
+    user_sub = _require_user_sub(user_sub)
+    key = {
+        "pk": {"S": ct.thread_pk(user_sub)},
+        "sk": {"S": ct.thread_sk(thread_id)},
+    }
+    try:
+        ddb.delete_item(
+            TableName=threads_table,
+            Key=key,
+            ConditionExpression="attribute_exists(pk)",
+        )
+    except Exception as e:  # noqa: BLE001 - map a missing item to 404
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            raise ApiError(404, f"no such conversation: {thread_id}") from e
+        raise
+    # The chat runtime namespaces the checkpoint thread id with the user's sub.
+    _purge_chat_checkpoints(
+        ddb,
+        checkpoint_table=checkpoint_table,
+        namespaced_thread_id=f"{user_sub}:{thread_id}",
+    )
+    return {"deleted": True, "thread_id": thread_id}

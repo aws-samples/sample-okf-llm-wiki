@@ -20,7 +20,9 @@ async function request(token, method, path, body) {
     } catch {
       detail = await res.text().catch(() => "")
     }
-    throw new Error(`${method} ${path} -> ${res.status}${detail ? `: ${detail}` : ""}`)
+    throw new Error(
+      `${method} ${path} -> ${res.status}${detail ? `: ${detail}` : ""}`
+    )
   }
   const ct = res.headers.get("content-type") || ""
   return ct.includes("application/json") ? res.json() : res.text()
@@ -153,7 +155,9 @@ export function makeApi(token) {
           quote: anchor.quote,
           ...(anchor.prefix ? { prefix: anchor.prefix } : {}),
           ...(anchor.suffix ? { suffix: anchor.suffix } : {}),
-          ...(anchor.block_line != null ? { block_line: anchor.block_line } : {}),
+          ...(anchor.block_line != null
+            ? { block_line: anchor.block_line }
+            : {}),
         }
       ),
     deleteAnnotation: (domain, dataset, conceptId, annotationId) =>
@@ -164,14 +168,45 @@ export function makeApi(token) {
           `${encodeURIComponent(annotationId)}?concept=${encodeURIComponent(conceptId)}`
       ),
     // Run the caller's open annotations through an annotation-mode re-harvest.
-    // The server takes the lease, sweeps orphans, and invokes only if some live
-    // annotations remain (else returns {status:"complete", skipped:true}).
+    // The server takes the lease, sweeps orphans, and invokes if some live
+    // annotations remain OR the dataset guidance is dirty (else returns
+    // {status:"complete", skipped:true}).
     runAnnotationHarvest: (domain, dataset) =>
       request(
         token,
         "POST",
         `/harvest/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/annotations/run`
       ),
+
+    // Dataset guidance: shared, persistent authoring instructions that steer every
+    // harvest of the dataset. GET returns {guidance, guidance_updated_at,
+    // guidance_applied_version, guidance_dirty}; PUT sets/clears it (bumps the
+    // version → dirty until the next successful harvest applies it).
+    getDatasetGuidance: (domain, dataset) =>
+      request(
+        token,
+        "GET",
+        `/guidance/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}`
+      ),
+    setDatasetGuidance: (domain, dataset, guidance) =>
+      request(
+        token,
+        "PUT",
+        `/guidance/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}`,
+        { guidance }
+      ),
+
+    // Chat conversations (the per-user sidebar list). The chat RUNTIME writes the
+    // index rows; the Control API serves this read/rename/delete side, scoped to
+    // the caller's Cognito sub. Rename is PUT (not PATCH) to match the API GW CORS
+    // allow_methods (see control_api.tf / docs/CHAT_AGENT.md §11).
+    listChatThreads: () => request(token, "GET", "/chat/threads"),
+    renameChatThread: (threadId, title) =>
+      request(token, "PUT", `/chat/threads/${encodeURIComponent(threadId)}`, {
+        title,
+      }),
+    deleteChatThread: (threadId) =>
+      request(token, "DELETE", `/chat/threads/${encodeURIComponent(threadId)}`),
   }
 }
 

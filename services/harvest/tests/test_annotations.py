@@ -41,6 +41,43 @@ def test_annotation_prompt_encodes_verify_apply_resolve_contract():
     assert "9 is chargebacks" in p
     assert "annotations.json" in p
 
+
+def test_annotation_prompt_threads_dataset_guidance():
+    p = prompts.build_annotation_prompt(
+        dataset="orders",
+        annotations=[
+            {"annotation_id": "a1", "concept_id": "tables/races",
+             "quote": "q", "note": "n"}
+        ],
+        results_rel=".harvest/annotation_results.json",
+        dataset_guidance="Decode the status column from the dictionary.",
+    )
+    assert "Operator guidance" in p
+    assert "Decode the status column from the dictionary." in p
+
+
+def test_annotation_prompt_guidance_only_run_has_no_annotations_task():
+    # Zero annotations + guidance → the prompt says it's guidance-only and asks for
+    # an EMPTY results array (nothing to reconcile per-annotation).
+    p = prompts.build_annotation_prompt(
+        dataset="orders",
+        annotations=[],
+        results_rel=".harvest/annotation_results.json",
+        dataset_guidance="Ignore the staging tables.",
+    )
+    assert "Ignore the staging tables." in p
+    assert "guidance-only" in p.lower()
+    assert "empty json array" in p.lower()
+
+
+def test_full_harvest_guidance_preamble():
+    # The shared preamble frames guidance as authoritative-but-verify.
+    block = runner._guidance_preamble("Focus on the results table.")
+    assert "Focus on the results table." in block
+    assert "authoritative" in block.lower()
+    assert runner._guidance_preamble("") == ""
+    assert runner._guidance_preamble(None) == ""
+
 REGION = "us-east-1"
 TABLE = "okf-annotations"
 
@@ -56,12 +93,32 @@ def test_annotated_mode_requires_user_sub():
     assert "user_sub" in r["error"]
 
 
-def test_annotated_mode_requires_nonempty_annotations():
+def test_annotated_mode_requires_annotations_or_guidance():
+    # Neither annotations nor guidance → nothing to do → rejected.
     r = ep.start_harvest(
         {"data_domain": "d", "dataset": "x", "mode": "annotated", "user_sub": "s"}
     )
     assert r["status"] == "rejected"
-    assert "annotations" in r["error"]
+    assert "annotations or dataset guidance" in r["error"]
+
+
+def test_annotated_mode_guidance_only_validates():
+    # A guidance-only re-harvest (zero annotations + dataset_guidance) passes
+    # validation — this is what lets an edited guidance re-harvest with no notes.
+    # Assert on _validate directly (pure; start_harvest would spawn a real thread).
+    assert (
+        ep._validate(
+            {
+                "data_domain": "d",
+                "dataset": "x",
+                "mode": "annotated",
+                "user_sub": "s",
+                "annotations": [],
+                "dataset_guidance": "decode the status column",
+            }
+        )
+        is None
+    )
 
 
 def test_safe_log_redacts_annotation_bodies():

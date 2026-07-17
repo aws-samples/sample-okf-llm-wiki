@@ -29,9 +29,9 @@ first — `SKILL.md` for the workflow, and its references on demand, especially:
   DML), type vocabulary, partitioning/cost, and gotchas. Use its rules for every
   SQL snippet you write.
 - `references/templates.md` — per-concept doc templates.
-- `references/fact-types.md` — the fact-extraction checklist: the ~18 fact types
+- `references/fact-types.md` — the fact-extraction checklist: the ~20 fact types
   worth capturing (business terms, metrics, joins, **code/enum legends**, filter
-  rules, caveats, units, named sets, …), the cue phrases to find each in a doc,
+  rules, caveats, units, named sets, canonical recipes, …), the cue phrases to find each in a doc,
   and WHERE each lands in the bundle. Use it whenever you read a `.context/` doc
   or mine the source for gotchas/enums.
 - `references/spec-condensed.md` — the normative OKF rules.
@@ -159,30 +159,78 @@ SUPERVISOR_PROMPT = (
     + """
 ## Your job (supervisor)
 
-You plan and coordinate; per-table sub-agents do the heavy per-table authoring.
+You plan and coordinate; sub-agents do the heavy authoring — `table-author` per
+table, `reference-author` per cross-cutting reference. You DISCOVER what to author
+and DISPATCH; you do not first-draft docs a sub-agent should own.
 
 1. Read the okf-authoring SKILL (SKILL.md + the athena-glue adapter).
 2. `read_file .metadata/index.md` to see the Glue database and all its tables
    (the manifest). `grep .metadata/columns.tsv` when you need cross-table column
    info (shared join keys, near-synonyms) while planning.
-3. `write_todos` to plan: one item per table, then the dataset overview, joins,
-   metrics, and known_issues.
+3. `write_todos` to plan: one item per table (table-author), then the cross-cutting
+   references (one reference-author each: metrics, named_sets, glossary,
+   known_issues, and the usage_guardrails contract), the dataset overview, and the
+   review pass.
+3a. **When there are uploaded `.context/` docs, extract their facts FIRST via
+   `context-extractor` sub-agents.** `ls .context/` — if it holds docs (especially
+   MANY, or large/binary ones like a multi-sheet dictionary or a long PDF spec),
+   do NOT read them all yourself and do NOT make every table-author re-read the
+   whole folder. Instead FAN OUT `context-extractor` sub-agents (via the task
+   tool, like the reviewer) to read them ONCE and return a compact, verified,
+   routed fact digest (enum legends, join conditions, metric formulas, grain,
+   caveats — each tagged with the concept id + section it lands in). Split the
+   `.context/` set across several extractors when it's large (one per doc or per
+   group) so no single agent drowns in it; collect their digests. Then, when you
+   dispatch each `table-author` (step 4), PASS ALONG the slice of the digest
+   relevant to that table (the enums, joins, and caveats for its columns) so it
+   grounds its doc in the uploaded facts without re-reading the raw docs. If
+   `.context/` is empty, skip this step. (For a SMALL `.context/` folder — a doc or
+   two of plain text — reading it inline is fine; reach for extractors when the
+   volume would bloat your or the authors' context.)
 4. For EACH table, dispatch a `table-author` sub-agent (via the task tool),
-   passing the table's concept id (e.g. `tables/races`). Each writes one file.
-   After the fan-out, confirm every table produced its `tables/<table>.md`
+   passing the table's concept id (e.g. `tables/races`) and, when you ran
+   context-extractors, the slice of the digest for that table. Each writes one
+   file. After the fan-out, confirm every table produced its `tables/<table>.md`
    (e.g. `ls tables/`); re-dispatch any table-author that errored or left its
    file missing. Do NOT advance to the overview/review or let the run finalize
    with a table doc still missing.
-5. After the tables exist, author `datasets/<dataset>.md` (table inventory with
-   verified grains and what each table is for — NOT row counts, which decay every
-   load; see the skill's "capture the essence, not the volatile numbers" — plus
-   how to query via Athena and a pointer to known issues), `references/known_issues/*`
-   (real gotchas you confirmed with run_sql — one doc per issue), and the important
-   `references/joins/*` (verify keys + cardinality, and include the shared-key joins
-   no context doc named) and `references/metrics/*`. Every standalone reference doc
-   goes under its canonical fact-typed folder (see the skill's fact-types.md).
+5. **Cross-cutting references — DISCOVER then FAN OUT `reference-author` sub-agents
+   (do NOT first-draft them yourself).** The table-authors already wrote each
+   table's own `references/enums/*` and `references/joins/*` (co-located with the
+   table they verified). YOU are responsible for the references that SPAN tables:
+   metrics, named_sets, glossary terms, known_issues, and the dataset's
+   `references/usage_guardrails.md`. Your job is to DISCOVER the fact instances
+   (from the `.context/` digest + `grep .metadata/columns.tsv` + what the
+   table-authors reported) and then DISPATCH one `reference-author` per instance —
+   the same fan-out pattern as the tables, so each reference gets dedicated
+   verify-against-live attention. Dispatch with the concept id (e.g.
+   `references/metrics/race_wins`), the fact type, and a short grounding brief
+   (what the fact is + where it was found). After the fan-out, `ls references/**`
+   to confirm each produced its file; re-dispatch any that errored or left it
+   missing. Cross-cutting reference docs go under their canonical fact-typed
+   folder (see the skill's fact-types.md); the guardrails doc is the single
+   `references/usage_guardrails.md`.
+5a. **Always author `references/usage_guardrails.md`** (dispatch a `reference-author`
+   with fact type DATASET_GUARDRAIL) — the ONE behavioural contract a consumer
+   reads before querying: measure additivity by type (what may be summed over time
+   vs geography), when to ASK (a required dimension — period/region/grain/scope —
+   is missing, or a term resolves to >1 thing), when to BLOCK (a well-formed but
+   semantically invalid computation, e.g. summing a snapshot across time; a metric
+   the source withholds), when to REFUSE (out-of-domain / unserved), default
+   readings, and filter/sentinel traps. Its content is DERIVED from what the
+   harvest verified (measure types, ambiguous terms, absent capabilities) plus any
+   rules stated in `.context/` — never invented.
+5b. Author `datasets/<dataset>.md` yourself (table inventory with verified grains
+   and what each table is for — NOT row counts, which decay every load; see the
+   skill's "capture the essence, not the volatile numbers" — plus how to query via
+   Athena). It MUST open with a prominent **"## Working with this data — read
+   first"** section that links `references/usage_guardrails.md` and names the top
+   2-3 traps, because the dataset overview is what a consuming agent lands on first
+   (progressive disclosure) — a guardrail a consumer never opens can't protect it.
 6. When you CHANGE a doc others reference, call `get_backlinks` on it and update
-   the referencing pages so nothing goes stale.
+   the referencing pages so nothing goes stale. Ensure every cross-cutting
+   reference is linked from where a consumer would look for it (metrics from the
+   tables that expose them; the guardrails doc from the dataset overview).
 7. **Adversarial review pass — MUST run in `reviewer` sub-agents, never in you.**
    After the bundle is authored, FAN OUT one `reviewer` sub-agent per authored
    concept doc to verify each doc's load-bearing claims against LIVE data, then
@@ -194,14 +242,29 @@ You plan and coordinate; per-table sub-agents do the heavy per-table authoring.
    independence is the whole point: routing review through separate sub-agents is
    what makes it adversarial rather than self-affirming. Your role in this pass is
    to DISPATCH reviewers, collect their findings, and APPLY confirmed fixes — not
-   to be the one scrutinizing claims. You have a code interpreter: write JS that
-   dispatches reviewers in parallel and collects their findings, e.g.
+   to be the one scrutinizing claims.
 
-       const docs = ["tables/races", "tables/results", "datasets/<ds>", /* … */];
+   **Review the WHOLE bundle, not a subset.** Build the review list by DISCOVERING
+   every authored doc on disk (`glob **/*.md`, or `ls` each of `tables/`,
+   `datasets/`, `references/**`), not from memory — a doc you forget to list is a
+   doc that ships unverified. Reviewing only the tables, only a "representative"
+   sample, or only the docs you think are risky is NOT a review pass; it is a spot
+   check, and the findings you miss are exactly the ones in the docs you skipped.
+   Dispatch one reviewer per doc for the COMPLETE set — every `tables/*`, every
+   `references/**/*` (joins, metrics, enums, named_sets, glossary, known_issues),
+   and the `datasets/*` overview. Exclude only the reserved generated files
+   (`index.md`, `log.md`). You have a code interpreter: write JS that enumerates
+   the docs and dispatches a reviewer for each in parallel, e.g.
+
+       // Enumerate the ACTUAL authored docs — do not hand-type a partial list.
+       const docs = (await glob({ pattern: "**/*.md" }))
+         .map((p) => p.replace(/\\.md$/, ""))
+         .filter((id) => !/(^|\\/)(index|log)$/.test(id));   // drop reserved files
        const reviews = await Promise.all(docs.map((id) =>
          task({ description: `Adversarially verify ${id} against live data.`,
                 subagentType: "reviewer" })));
        // reviews[i] = the reviewer's plain-text findings (or "no issues found").
+       // One reviewer per doc, for EVERY doc — no sampling, no skipping.
 
    **Do NOT pass `responseSchema` (or any structured-output option) to `task()`.**
    This runtime's model runs with thinking always on, and native structured
@@ -218,9 +281,11 @@ You plan and coordinate; per-table sub-agents do the heavy per-table authoring.
    then use `get_backlinks` to propagate the correction. Run the review pass
    ONCE — apply the confirmed fixes and then finish; do NOT re-review docs after
    fixing them (a single pass is sufficient and keeps the harvest bounded). In
-   your final summary, state how many docs you reviewed, how many reviewers
-   errored (if any), and how many findings you confirmed and fixed — so the
-   review outcome is visible in the trace, not silently dropped.
+   your final summary, state how many docs EXIST in the bundle and how many you
+   reviewed — these MUST match (every non-reserved doc reviewed); call out any gap
+   explicitly — plus how many reviewers errored (if any) and how many findings you
+   confirmed and fixed, so the review outcome is visible in the trace, not silently
+   dropped.
 
 Author clean markdown; no narration.
 """
@@ -277,6 +342,56 @@ load-bearing claims by checking them against LIVE data — do not trust the pros
 Default to skepticism, but don't invent problems — a finding you can't back with
 a query is not a finding. You write NOTHING to disk; the supervisor applies fixes.
 """  # nosec B608 - a natural-language prompt template, not a SQL query; the SELECT/COUNT text inside is example guidance shown to the model, never executed.
+)
+
+CONTEXT_EXTRACTOR_PROMPT = (
+    _RUNTIME
+    + """
+## Your job (context fact-extractor — READ-ONLY, you do NOT write bundle files)
+
+You mine the user-uploaded `.context/` source docs for the FACTS that make this
+data queryable, and return a COMPACT, ROUTED digest the supervisor and the
+table-authors build the bundle from. You exist so the heavy reading of a large
+`.context/` folder happens ONCE, in your context window — not repeated in every
+table-author and not stuffed whole into the supervisor. You are dispatched like
+the `reviewer`: the supervisor may fan out SEVERAL of you in parallel (one per
+context doc or per group of docs) when `.context/` is large; you handle exactly
+the scope named in your dispatch instruction.
+
+1. **Read your assigned `.context/` docs in full.** Plain-text formats (`.md`,
+   `.txt`, `.csv`, `.xml`, `.yaml`/`.yml`, `.json`, `.sql`) via `read_file`;
+   binary formats (PDF, `.docx`, `.pptx`, `.xlsx`) via the `run_code` sandbox
+   (files are at `/tmp/okf_context/<same rel name>`). Read the WHOLE doc — a data
+   dictionary's every code, a spec's every join — don't skim the first page.
+2. **Extract through the fact-type lens.** `references/fact-types.md` in the
+   okf-authoring skill is your checklist: the fact types (BUSINESS_TERM,
+   METRIC_DEFINITION, JOIN_CONDITION, **CODE_ENUM**, FILTER_RULE, GRAIN_STATEMENT,
+   CAVEAT, TEMPORAL_RULE, MEASURED_IN, NAMED_SET, …), the cue phrases that reveal
+   each, and WHERE each lands in the bundle. Read it first. The single most
+   common, highest-value find is **CODE_ENUM** — coded columns whose legend sits
+   in a dictionary/code-list; capture the FULL code→meaning mapping (and flag
+   sentinel/"unknown" codes), never a summary that points back at the file.
+3. **Verify, then route each fact.** Treat every context claim as a HYPOTHESIS,
+   not gospel: confirm join keys / grain / metric formulas / enum values against
+   LIVE data with `run_sql` / `sample_rows` (per the skill's Athena/Glue dialect)
+   before you assert it. Where the data contradicts the doc, the DATA wins and the
+   discrepancy is itself a fact to record (a `# Gotchas`-grade caveat). For each
+   fact, name: the fact type, the exact claim, which CONCEPT ID + section it lands
+   in (`tables/<t>` `# Schema` row, a `references/enums/<col>.md`, a
+   `references/joins/<a>__<b>.md`, the dataset `# Overview`, a `# Gotchas` note),
+   its verification status (confirmed / contradicted / unverifiable-here), and the
+   `.context/<file>` it came from (for the doc's `# Citations`).
+
+Return a COMPACT digest in plain markdown — grouped by target concept id, one
+bullet per fact with (type, claim, landing section, verification, source file).
+Include full enum legends verbatim under their target `references/enums/<col>` so
+a table-author can transcribe them directly. Do NOT emit JSON or attempt
+structured output; the supervisor reads your reply as plain text.
+
+You write NOTHING to disk — no bundle docs, no scratch files; the supervisor and
+table-authors do the writing from your digest. If your assigned docs yield no
+usable facts, say so plainly.
+"""  # nosec B608 - a natural-language prompt template; the run_sql/SELECT references are example guidance to the model, never executed.
 )
 
 ANNOTATION_PROMPT = (
@@ -342,6 +457,28 @@ supports; leave the rest of the bundle untouched.
 )
 
 
+def _dataset_guidance_block(dataset_guidance: str | None) -> str:
+    """Prompt block carrying the operator's dataset guidance for an annotation run.
+
+    Authoritative dataset-specific steering the agent applies while reconciling
+    annotations — and, on a guidance-only run (zero annotations), the SOLE task:
+    bring the bundle into line with these instructions. Verify factual claims
+    against live data (guidance is a lead, not gospel), but honour the intent.
+    """
+    text = (dataset_guidance or "").strip()
+    if not text:
+        return ""
+    return (
+        "## Operator guidance for THIS dataset (authoritative)\n"
+        "Apply this dataset-specific steering to the bundle as you work. Where it "
+        "asks you to reframe, decode, exclude, or emphasize something, edit the "
+        "affected docs to match (augmentation guard applies; verify factual claims "
+        "against live data and note any discrepancy). This guidance applies to the "
+        "WHOLE bundle, not just the annotated passages:\n\n"
+        f"{text}\n\n"
+    )
+
+
 def build_annotation_prompt(
     *,
     dataset: str,
@@ -349,12 +486,19 @@ def build_annotation_prompt(
     results_rel: str,
     domain_description: str | None = None,
     domain_context: str | None = None,
+    dataset_guidance: str | None = None,
 ) -> str:
     """The user prompt for an annotation-mode run.
 
     Combines the ANNOTATION_PROMPT job spec (the `{results_rel}` placeholder filled
-    in) with the domain preamble and the inlined annotation list, so the agent has
-    the feedback both on disk (`.harvest/annotations.json`) and in-context.
+    in) with the domain preamble, the operator's dataset guidance, and the inlined
+    annotation list, so the agent has the feedback both on disk
+    (`.harvest/annotations.json`) and in-context.
+
+    The run may carry ZERO annotations — a guidance-only re-harvest (the operator
+    edited the dataset guidance and re-ran). In that case the guidance block IS the
+    job: apply the updated instructions across the bundle. The results file is then
+    simply an empty array.
     """
     preamble = ""
     if domain_description or domain_context:
@@ -362,14 +506,25 @@ def build_annotation_prompt(
             f"**Domain context**: {domain_description or ''} "
             f"{domain_context or ''}\n\n"
         )
+    guidance_block = _dataset_guidance_block(dataset_guidance)
     job = ANNOTATION_PROMPT.replace("{results_rel}", results_rel)
     listing = json.dumps(annotations, indent=2)
-    return (
-        f"{preamble}{job}\n\n"
-        f"You have {len(annotations)} annotation(s) to assess for database "
-        f"`{dataset}`. They are in `.harvest/annotations.json` and inlined here:\n\n"
-        f"```json\n{listing}\n```\n"
-    )
+    if annotations:
+        task = (
+            f"You have {len(annotations)} annotation(s) to assess for database "
+            f"`{dataset}`. They are in `.harvest/annotations.json` and inlined here:\n\n"
+            f"```json\n{listing}\n```\n"
+        )
+    else:
+        # Guidance-only run: no annotations to reconcile — apply the guidance above,
+        # then write an EMPTY results array (nothing to report per-annotation).
+        task = (
+            f"There are NO annotations to assess this run for database `{dataset}` — "
+            f"this is a guidance-only re-harvest. Apply the operator guidance above "
+            f"to the bundle (edit the docs it implicates, verifying against live "
+            f"data), then write `{results_rel}` as an empty JSON array `[]`.\n"
+        )
+    return f"{preamble}{guidance_block}{job}\n\n{task}"
 
 
 TABLE_AUTHOR_PROMPT = (
@@ -416,5 +571,68 @@ Enrich EXACTLY ONE table and write EXACTLY ONE file: `tables/<table>.md`.
    any `references/enums/<column>.md` your table needs.
 
 Return a one-line summary (grain, joins verified, columns decoded, notable caveats).
+"""
+)
+
+
+REFERENCE_AUTHOR_PROMPT = (
+    _RUNTIME
+    + """
+## Your job (reference author)
+
+Author EXACTLY ONE cross-cutting reference doc and write EXACTLY ONE file — the
+concept id you were given, always under `references/<type>/<slug>` (or the single
+`references/usage_guardrails` doc). You author the CROSS-CUTTING references that
+span tables: `references/metrics/*`, `references/named_sets/*`,
+`references/glossary/*`, `references/known_issues/*`, and the dataset's
+`references/usage_guardrails.md`. (Per-table `references/enums/*` and
+`references/joins/*` are authored by the table-authors, co-located with the table
+they verified — do NOT re-author those.)
+
+You are dispatched with: the concept id, the fact type, and a grounding brief
+from the supervisor (what the fact is, where it was found — a `.context/` digest
+slice and/or the columns/tables involved). Treat that brief as a HYPOTHESIS to
+confirm against live data, never to transcribe on faith.
+
+1. First consult the okf-authoring SKILL — `references/fact-types.md` for this
+   fact type's rules and `references/templates.md` for its doc template.
+2. `read_file` the existing doc at your concept id if present — refine, don't
+   blindly overwrite (augmentation guard).
+3. **Ground it against the live source** with `run_sql`/`sample_rows`:
+   - METRIC_DEFINITION: run the metric's SQL; confirm it executes and returns a
+     sane shape in the source dialect. The metric doc OWNS the SQL.
+   - NAMED_SET / LIFECYCLE_STAGE: verify each member value/code actually exists in
+     the data (`SELECT DISTINCT`), so the governed `IN (…)` list is real.
+   - KNOWN_ISSUE: reproduce the issue with a query that demonstrates it.
+   - GLOSSARY term: confirm the column/usage it describes.
+   - DATASET_GUARDRAIL (`references/usage_guardrails.md`): see below.
+   Where the data contradicts the brief, the data wins and the discrepancy itself
+   becomes a documented caveat. Cite any `.context/` doc you used under
+   `# Citations`.
+4. Write the ONE file with `type: Reference` + `title`/`description`/`timestamp`
+   frontmatter (and `resource` where a template calls for it). Link it the way the
+   template prescribes.
+
+### If your concept is `references/usage_guardrails` (the behavioural contract)
+
+Author the ONE doc a consuming agent reads BEFORE it queries. Concentrate the
+cross-cutting behavioural rules that keep answers deterministic and
+hallucination-free. Source them TWO ways, never by invention:
+- **Derived from verified harvest facts** — additivity by measure type (which
+  measures may be summed over time vs geography — confirm the measure's type),
+  ambiguous terms (a name/scope that resolves to >1 thing), default readings the
+  data assumes, sentinel/reserved values that corrupt filters, and capabilities
+  the source does NOT serve.
+- **From `.context/` docs** that state working rules explicitly (a query-rules
+  doc, a methodology "do not" section) — cite them.
+Shape each rule so a consumer can act on it: name the concrete measure/column/
+term, state the rule, and give the correct alternative. Where it helps, group by
+disposition — what to answer directly, what to ASK to clarify (a required
+dimension is missing or a term is ambiguous), what to BLOCK (a well-formed but
+semantically invalid computation, e.g. summing a snapshot across time), what to
+REFUSE (out-of-domain / unserved). **Never assert a rule the data doesn't support
+and no doc states** — a wrong guardrail is a confidently-wrong refusal.
+
+Return a one-line summary (the concept id, fact type, and what you verified).
 """
 )

@@ -183,3 +183,100 @@ resource "aws_bedrockagentcore_agent_runtime" "consumption" {
   # validates it (IAM eventual consistency — see time_sleep.iam_propagation).
   depends_on = [time_sleep.iam_propagation]
 }
+
+# --- Chat agent runtime (HTTP protocol, port 8080) ---------------------------
+# A LangGraph agent that answers questions about the wiki, streamed to the UI as
+# an AG-UI event stream over SSE. HTTP protocol (the container emits AG-UI as the
+# /invocations SSE body via a raw FastAPI app it owns — so it controls CORS for
+# the browser-DIRECT call). Cognito JWT inbound auth on the dedicated okf-chat
+# scope; per-user conversation state lives in the DynamoDB checkpointer.
+resource "aws_bedrockagentcore_agent_runtime" "chat" {
+  count = var.chat_image_uri != "" ? 1 : 0
+
+  agent_runtime_name = "${var.name_prefix}_chat"
+  role_arn           = aws_iam_role.chat.arn
+
+  agent_runtime_artifact {
+    container_configuration {
+      container_uri = var.chat_image_uri
+    }
+  }
+
+  network_configuration {
+    network_mode = "PUBLIC"
+  }
+
+  protocol_configuration {
+    server_protocol = "HTTP"
+  }
+
+  # Scopes-based inbound auth on the DEDICATED chat scope (okf-chat/invoke). The
+  # SPA app client carries this scope, so a logged-in human's access token passes
+  # — the browser calls this runtime's data-plane URL directly (no proxy). The
+  # Authorization header must be forwarded to the container so it can decode the
+  # JWT `sub` for per-user checkpoint namespacing (AgentCore has already validated
+  # the token; the container decodes it WITHOUT re-verifying the signature).
+  authorizer_configuration {
+    custom_jwt_authorizer {
+      discovery_url  = local.d.oidc_discovery_url
+      allowed_scopes = [local.d.chat_scope]
+    }
+  }
+
+  request_header_configuration {
+    request_header_allowlist = ["Authorization"]
+  }
+
+  environment_variables = merge(local.common_env, local.otel_common_env, {
+    AWS_REGION = var.region
+
+    # Conversation memory + the per-user conversation index (see chat/config.py,
+    # chat/server.py). The checkpoint table's schema is dictated by DynamoDBSaver.
+    OKF_CHAT_CHECKPOINT_TABLE = local.d.chat_checkpoints_table
+    OKF_CHAT_THREADS_TABLE    = local.d.chat_table
+    OKF_CHAT_CHECKPOINT_TTL_SECONDS = (
+      var.chat_checkpoint_ttl_seconds > 0 ? tostring(var.chat_checkpoint_ttl_seconds) : ""
+    )
+
+    # Deploy-time DEFAULT model + the catalog the runtime validates a per-
+    # conversation (model, effort) against (RAW JSON — set directly by TF, never
+    # shell-eval'd; the UI gets base64 via VITE_CHAT_MODEL_CATALOG). An openai.* id
+    # routes to Bedrock Mantle in OKF_CHAT_MANTLE_REGION (inert for Converse).
+    OKF_CHAT_MODEL         = var.chat_model
+    OKF_CHAT_EFFORT        = var.chat_effort
+    OKF_CHAT_MAX_TOKENS    = tostring(var.chat_max_tokens)
+    OKF_CHAT_MANTLE_REGION = var.chat_mantle_region
+    OKF_CHAT_MODEL_CATALOG = jsonencode(var.chat_model_catalog)
+
+    # Optional read-only SQL tool (var.enable_chat_sql). When off, the flag is
+    # "false" and the IAM role carries no Glue/Athena grants, so run_sql is never
+    # offered. Athena workgroup/output mirror the harvest runtime's; the runtime
+    # only builds an Athena client + the tool when the flag is on AND a chat opts
+    # in via features:["sql"].
+    OKF_CHAT_SQL_ENABLED = tostring(var.enable_chat_sql)
+    OKF_ATHENA_WORKGROUP = var.enable_chat_sql ? var.athena_workgroup : ""
+    OKF_ATHENA_OUTPUT    = var.enable_chat_sql ? local.athena_output : ""
+    OKF_CHAT_SQL_MAX_ROWS = tostring(var.chat_sql_max_rows)
+
+    OTEL_RESOURCE_ATTRIBUTES = "service.name=${var.name_prefix}_chat"
+
+    # LangChain/LangGraph spans via the langsmith SDK's native OTEL bridge (same
+    # setup as harvest — this is a LangChain agent). See harvest runtime comments.
+    LANGSMITH_TRACING      = "true"
+    LANGSMITH_OTEL_ONLY    = "true"
+    LANGSMITH_PROJECT      = "${var.name_prefix}_chat"
+    LANGSMITH_HIDE_INPUTS  = var.capture_trace_content ? "false" : "true"
+    LANGSMITH_HIDE_OUTPUTS = var.capture_trace_content ? "false" : "true"
+  })
+
+  # A conversation resumes from the DynamoDB checkpointer after an idle stop, so a
+  # modest idle timeout only trades cold-start latency vs warm-session cost.
+  lifecycle_configuration {
+    idle_runtime_session_timeout = var.chat_idle_runtime_session_timeout
+    max_lifetime                 = 28800 # 8 h (AgentCore max)
+  }
+
+  tags = var.tags
+
+  depends_on = [time_sleep.iam_propagation]
+}

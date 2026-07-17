@@ -1,0 +1,302 @@
+/* UnifiedThinkingBlock.css — ported verbatim from Sparky, with the theme
+   variables remapped onto the app's existing shadcn/Tailwind oklch tokens
+   (--background/--muted/--border/--foreground/--muted-foreground) so it follows
+   the app's light/dark automatically. Layout/animation values are unchanged from
+   Sparky so the timeline looks identical. */
+
+.unified-thinking-block {
+  --unified-text-primary: var(--foreground);
+  --unified-text-secondary: var(--muted-foreground);
+  --unified-text-muted: var(--muted-foreground);
+  --unified-border-color: var(--border);
+  --unified-bg-hover: var(--accent);
+  --unified-line-color: var(--border);
+  --unified-source-bg: var(--muted);
+  --unified-source-bg-hover: var(--accent);
+  --unified-tool-text: var(--muted-foreground);
+  --unified-thinking-icon-color: var(--muted-foreground);
+  --unified-tool-icon-color: var(--muted-foreground);
+  --unified-raw-bg: var(--muted);
+  --unified-raw-border: var(--border);
+  --unified-page-bg: var(--background);
+
+  --marker-size: 24px;
+  --marker-offset: 36px;
+  --line-width: 2px;
+  --content-indent: 12px;
+  --content-gap: 6px;
+  position: relative;
+  width: 100%;
+  margin-bottom: 16px;
+}
+
+/* ============================================
+   Header
+   ============================================ */
+/* The header itself is now a shadcn <Marker> (see UnifiedThinkingBlock.jsx); this
+   wrapper only handles the spacing below it before the collapsible timeline. */
+.unified-block-header {
+  padding-bottom: 8px;
+}
+
+/* ============================================
+   Content Container (grid-rows collapse animation)
+   ============================================ */
+.unified-content-container {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition:
+    grid-template-rows 0.2s ease-out,
+    opacity 0.15s ease-out;
+  overflow: hidden;
+  opacity: 0;
+}
+
+.unified-content-container.collapsed {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+.unified-content-container.expanded {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.unified-content-container > .unified-content-wrapper {
+  overflow: hidden;
+  min-height: 0;
+}
+
+.unified-content-wrapper > .timeline {
+  padding: 8px 0 12px 0;
+}
+
+/* ============================================
+   Timeline
+   ============================================ */
+.timeline {
+  position: relative;
+  padding-bottom: 4px;
+  margin-left: -3px;
+}
+
+.timeline-line {
+  position: absolute;
+  left: calc((var(--marker-size) / 2) - (var(--line-width) / 2));
+  top: 4px;
+  bottom: 4px;
+  width: var(--line-width);
+  background-color: var(--unified-line-color);
+  border-radius: 1px;
+  z-index: 0;
+}
+
+.timeline.timeline-complete .timeline-line {
+  bottom: var(--marker-size);
+}
+
+.timeline-item {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  padding-bottom: 24px;
+  padding-left: 24px;
+  margin-left: 0;
+}
+
+.timeline-item.last {
+  padding-bottom: 0;
+}
+
+.timeline-marker {
+  position: absolute;
+  left: 0;
+  /* Center the icon on the header's FIRST TEXT LINE (~20px line box), and mask
+     the timeline line behind a page-bg pad above/below so the icon reads as a
+     node on the line. */
+  top: -4px;
+  width: var(--marker-size);
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--unified-page-bg);
+  border-radius: 6px;
+  z-index: 1;
+}
+
+.timeline-icon {
+  flex-shrink: 0;
+}
+
+.timeline-icon.thinking-icon {
+  color: var(--unified-thinking-icon-color);
+}
+
+.timeline-icon.tool-icon {
+  color: var(--unified-tool-icon-color);
+}
+
+.timeline-content {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ============================================
+   Thinking content
+   ============================================ */
+.timeline-thinking-content {
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--unified-text-muted);
+}
+
+.timeline-thinking-content p {
+  margin: 0 0 8px 0;
+}
+
+.timeline-thinking-content p:last-child {
+  margin-bottom: 0;
+}
+
+.thinking-segment {
+  margin-bottom: 8px;
+}
+
+.thinking-segment:last-child {
+  margin-bottom: 0;
+}
+
+/* ============================================
+   Completion step
+   ============================================ */
+.completion-step {
+  padding-bottom: 0;
+  min-height: var(--marker-size);
+}
+
+.completion-step .timeline-marker {
+  background-color: var(--unified-page-bg);
+}
+
+.completion-step .completion-icon {
+  color: #10b981; /* emerald-500 — the "done" check */
+}
+
+/* ============================================
+   Tool result
+   ============================================ */
+/* The tool header is now a shadcn <Marker> (per-tool icon + text-shimmer while
+   running); only the column wrapper remains here. */
+.tool-result-content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* ============================================
+   Raw content (tool args / result)
+   ============================================ */
+.tool-result-expand {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.tool-result-expand.expanded {
+  grid-template-rows: 1fr;
+}
+
+.tool-result-expand > div {
+  overflow: hidden;
+}
+
+.tool-result-raw {
+  margin-top: 8px;
+  max-width: 600px;
+  max-height: 260px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--unified-raw-bg);
+  border: 1px solid var(--unified-raw-border);
+  border-radius: 8px;
+}
+
+.tool-result-raw-header {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--unified-text-muted);
+  border-bottom: 1px solid var(--unified-raw-border);
+  flex-shrink: 0;
+}
+
+.tool-result-raw-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  max-height: 220px;
+}
+
+.tool-result-raw-content {
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+  font-family: ui-monospace, "Monaco", "Menlo", "Consolas", monospace;
+  color: var(--unified-text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+.tool-result-raw-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.tool-result-raw-scroll::-webkit-scrollbar-thumb {
+  background-color: var(--unified-border-color);
+  border-radius: 3px;
+}
+
+/* run_sql Data / Query tabs. The Data tab shows the result table (default); the
+   Query tab shows the executed SQL in a full-width read-only CodeView. Trim the
+   CodeView's default vertical margin since the tab panel already provides the gap
+   and it should sit flush to the tab strip. */
+.tool-result-sql-tabs .okf-codeview {
+  margin: 0;
+}
+/* Both tab panels sit flush to the tab strip — drop the result table's own top
+   margin (it's meant for the plain, tab-less layout). */
+.tool-result-sql-tabs .okf-label-grid {
+  margin-top: 0;
+}
+
+/* Tool-result tables use the shared `.okf-label-grid` class (index.css) — the
+   same label-grid look as chat markdown tables. Only the tool-specific chips
+   remain below. */
+
+/* Chips — for list_directory entries (dir/page mix, naturally pill-like). */
+.tool-result-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+  max-width: 560px;
+}
+
+.tool-result-chip {
+  padding: 2px 8px;
+  font-size: 12px;
+  font-family: ui-monospace, "Menlo", "Consolas", monospace;
+  color: var(--unified-text-secondary);
+  background-color: var(--unified-source-bg);
+  border-radius: 6px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
