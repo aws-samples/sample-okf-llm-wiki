@@ -50,6 +50,10 @@ Full methodology, per-database breakdown, and operational KPIs (tool usage, agen
 
 ## Architecture
 
+<p align="center">
+  <img alt="Data Wiki diagram" src="./assets/diagram.png" width="900">
+</p>
+
 ### Solution Architecture
 
 <p align="center">
