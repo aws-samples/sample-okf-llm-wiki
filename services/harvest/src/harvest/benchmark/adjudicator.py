@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
 
+from harvest.benchmark.extract import extract_json, message_text
 from harvest.benchmark.grader import QuestionResult
 from harvest.benchmark.tool import AdjudicationResult
 
@@ -52,7 +53,13 @@ exist and the divergence is not a wiki gap.
 For a GENUINE_ERROR, write a `gap` note describing the DOC-LEVEL fix, grounded in \
 what you verified in the data — e.g. "docs don't state `status` is an int code \
 (1=active); the agent filtered status='active' and got nothing." Do NOT mention \
-the specific question or gold — describe the wiki gap itself."""
+the specific question or gold — describe the wiki gap itself.
+
+When done investigating, output ONLY a fenced JSON object (nothing after it):
+```json
+{"category": "GENUINE_ERROR", "gap": "docs don't state ..."}
+```
+`gap` may be "" for NOISY_GOLD / AMBIGUOUS."""
 
 CONSOLIDATE_SYSTEM_PROMPT = """\
 You are consolidating a list of verified wiki gaps into a short, de-identified \
@@ -60,35 +67,12 @@ improvement list for the wiki author. Group gaps that share a root cause into ON
 item (e.g. several questions tripping on the same undocumented join → one item). \
 Each item names the concrete doc-level fix, phrased as guidance to the author. Do \
 NOT reference specific benchmark questions, gold queries, or counts — only what \
-the wiki should say. Return the deduped, grouped list of improvement strings."""
+the wiki should say.
 
-
-def _classification_model():
-    from pydantic import BaseModel, Field
-
-    class Classification(BaseModel):
-        category: str = Field(
-            description="one of GENUINE_ERROR, NOISY_GOLD, AMBIGUOUS"
-        )
-        gap: str = Field(
-            default="",
-            description="for GENUINE_ERROR only: the doc-level wiki gap, "
-            "grounded in verified data, with no reference to the question/gold",
-        )
-
-    return Classification
-
-
-def _consolidation_model():
-    from pydantic import BaseModel, Field
-
-    class Consolidation(BaseModel):
-        improvements: list[str] = Field(
-            default_factory=list,
-            description="deduped, grouped, anonymous doc-level improvement themes",
-        )
-
-    return Consolidation
+Output ONLY a fenced JSON object (nothing after it):
+```json
+{"improvements": ["document that ...", "state that ..."]}
+```"""
 
 
 def make_adjudicator(
@@ -105,7 +89,9 @@ def make_adjudicator(
     """
     # Built lazily on first use so session construction stays framework-light
     # (mirrors the solver): create_react_agent needs a real model, which we only
-    # have at run time, not necessarily at wiring time.
+    # have at run time. No response_format — the classifier emits a fenced JSON
+    # verdict we parse (structured-output prefill is rejected under adaptive
+    # thinking); the consolidator is a plain model call for the same reason.
     built: dict[str, Any] = {}
 
     def _ensure_built():
@@ -117,10 +103,6 @@ def make_adjudicator(
             chat_model,
             tools=raw_data_tools,
             prompt=CLASSIFY_SYSTEM_PROMPT,
-            response_format=_classification_model(),
-        )
-        built["consolidator"] = chat_model.with_structured_output(
-            _consolidation_model()
         )
         return built
 
@@ -128,9 +110,7 @@ def make_adjudicator(
         if not fails:
             return AdjudicationResult()
 
-        b = _ensure_built()
-        classifier = b["classifier"]
-        consolidator = b["consolidator"]
+        classifier = _ensure_built()["classifier"]
         genuine_gaps: list[str] = []
         noisy = 0
         for r in fails:
@@ -141,10 +121,12 @@ def make_adjudicator(
                 f"predicted sample (first rows): {r.pred_sample}"
             )
             out = await classifier.ainvoke({"messages": [("user", case)]})
-            verdict = out.get("structured_response")
-            category = getattr(verdict, "category", CATEGORY_AMBIGUOUS)
+            verdict = extract_json(_last_ai_text(out.get("messages", [])), default={})
+            category = (verdict.get("category") or CATEGORY_AMBIGUOUS) if isinstance(
+                verdict, dict
+            ) else CATEGORY_AMBIGUOUS
             if category in _GENUINE:
-                gap = (getattr(verdict, "gap", "") or "").strip()
+                gap = str((verdict or {}).get("gap") or "").strip()
                 if gap:
                     genuine_gaps.append(gap)
             else:
@@ -152,15 +134,15 @@ def make_adjudicator(
 
         improvements: list[str] = []
         if genuine_gaps:
-            folded = await consolidator.ainvoke(
+            folded = await chat_model.ainvoke(
                 [
                     ("system", CONSOLIDATE_SYSTEM_PROMPT),
                     ("user", "Verified wiki gaps:\n- " + "\n- ".join(genuine_gaps)),
                 ]
             )
-            improvements = [
-                s.strip() for s in getattr(folded, "improvements", []) if s.strip()
-            ]
+            parsed = extract_json(folded, default={})
+            raw = parsed.get("improvements") if isinstance(parsed, dict) else None
+            improvements = [str(s).strip() for s in (raw or []) if str(s).strip()]
 
         return AdjudicationResult(
             improvements=improvements,
@@ -169,3 +151,13 @@ def make_adjudicator(
         )
 
     return adjudicate
+
+
+def _last_ai_text(messages: list) -> str:
+    """Text of the last AI message (adaptive-thinking blocks stripped)."""
+    for msg in reversed(messages):
+        if getattr(msg, "type", "") in ("ai", "assistant"):
+            text = message_text(msg)
+            if text.strip():
+                return text
+    return ""

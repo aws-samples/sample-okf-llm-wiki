@@ -7,15 +7,20 @@ execute SQL (that's the grader's job — letting it run queries would let it ite
 empirically to the answer, measuring persistence not the wiki) and it has no raw
 schema (that would let it bypass the wiki).
 
-The SQL is extracted by a TERMINAL structured-output call after the ReAct loop
-settles, so a correct answer wrapped in prose still parses (a regex over free text
-would score it 0 — measuring the parser, not the wiki). Deferred agent-framework
-imports keep this module importable where deepagents/langchain aren't installed.
+The SQL is requested as a fenced ```sql block and extracted with a plain-text
+parser (see :mod:`.extract`), NOT via ``with_structured_output`` — the harvest
+model runs adaptive thinking, and Bedrock Converse rejects the assistant-message
+prefill that structured output uses ("conversation must end with a user message").
+A correct answer wrapped in a fence still parses, so a solver isn't scored 0 for
+formatting. Deferred agent-framework imports keep this module importable where
+deepagents/langchain aren't installed.
 """
 
 from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
+
+from harvest.benchmark.extract import extract_sql, message_text
 
 # Recursion budget for a single solver's explore loop — generous enough to read a
 # few pages + follow links, bounded so a confused solver can't spin.
@@ -41,20 +46,11 @@ values / units / filters the docs call out (e.g. "status is an int code, \
 3. Write ONE Athena/Trino SQL query that answers the question, using the exact \
 names and semantics the docs specify.
 
-Return the final SQL. Do not explain it — just the query."""
-
-# The terminal structured-output schema: one field. Built lazily (pydantic is
-# present in the runtime, but keep import local for symmetry with the rest).
-_SQL_FIELD_DESC = "The single SQL query that answers the question. SQL only, no prose."
-
-
-def _sql_answer_model():
-    from pydantic import BaseModel, Field
-
-    class SqlAnswer(BaseModel):
-        sql: str = Field(description=_SQL_FIELD_DESC)
-
-    return SqlAnswer
+When you have the answer, output the final query as a single fenced SQL block:
+```sql
+SELECT ...
+```
+Output nothing after the block."""
 
 
 def make_solver(chat_model: Any, snapshot_root: str) -> Callable[[str], Awaitable[str]]:
@@ -98,29 +94,16 @@ def make_solver(chat_model: Any, snapshot_root: str) -> Callable[[str], Awaitabl
         tools=[read_file, glob, grep, ls],
         prompt=SOLVER_SYSTEM_PROMPT,
     )
-    structured = chat_model.with_structured_output(_sql_answer_model())
 
     async def solve(question: str) -> str:
-        # Phase 1: explore the wiki with read-only tools (no schema binding yet).
+        # One ReAct run: the agent explores the wiki with the read tools and ends
+        # with a fenced ```sql block. We parse the SQL out of its final message —
+        # no structured-output prefill (rejected under adaptive thinking).
         out = await agent.ainvoke(
             {"messages": [("user", question)]},
             config={"recursion_limit": _SOLVER_RECURSION_LIMIT},
         )
-        messages = out.get("messages", [])
-        transcript = _last_ai_text(messages)
-        # Phase 2: terminal coercion to clean SQL — a separate call so the schema
-        # never competes with the read tools during exploration.
-        answer = await structured.ainvoke(
-            [
-                (
-                    "system",
-                    "Extract the final SQL query the assistant settled on. "
-                    "Return it verbatim as the `sql` field, nothing else.",
-                ),
-                ("user", f"Question: {question}\n\nAssistant's work:\n{transcript}"),
-            ]
-        )
-        return (getattr(answer, "sql", "") or "").strip()
+        return extract_sql(_last_ai_text(out.get("messages", [])))
 
     return solve
 
@@ -128,12 +111,8 @@ def make_solver(chat_model: Any, snapshot_root: str) -> Callable[[str], Awaitabl
 def _last_ai_text(messages: list) -> str:
     """The text content of the last AI message (the solver's settled answer)."""
     for msg in reversed(messages):
-        content = getattr(msg, "content", None)
-        if content and getattr(msg, "type", "") in ("ai", "assistant"):
-            if isinstance(content, str):
-                return content
-            # content may be a list of blocks
-            return "".join(
-                b.get("text", "") for b in content if isinstance(b, dict)
-            )
+        if getattr(msg, "type", "") in ("ai", "assistant"):
+            text = message_text(msg)
+            if text.strip():
+                return text
     return ""
