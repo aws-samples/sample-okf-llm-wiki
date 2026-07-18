@@ -11,6 +11,7 @@
 import { memo, useMemo } from "react"
 
 import { AgentAvatar } from "@/components/chat/AgentAvatar"
+import { ChartFrame } from "@/components/chat/ChartFrame"
 import { Markdown } from "@/components/chat/Markdown"
 import { ResponseActions } from "@/components/chat/ResponseActions"
 import { UnifiedThinkingBlock } from "@/components/chat/UnifiedThinkingBlock"
@@ -21,6 +22,11 @@ import { buildMessageBlocks } from "@/lib/buildMessageBlocks"
 // objects each flush, so a reference check alone never skips).
 function blockSig(block) {
   if (block.type === "text") return `t:${block.content?.length || 0}:${block.content}`
+  // chart: keyed by id + a code-length signature. The code arrives fully-assembled
+  // on the tool CALL (not token-streamed), so a length signature is stable; the id
+  // keeps two charts in one turn distinct so neither is skipped by the memo.
+  if (block.type === "chart")
+    return `c:${block.id || ""}:${block.code?.length || 0}`
   // think: signature over each segment. Include the segment INDEX and the tool
   // ID — otherwise two calls to the SAME tool (e.g. read_page twice) with no
   // reasoning text between them produce an identical signature, the memo skips
@@ -50,6 +56,12 @@ const Block = memo(
           isGroupComplete={complete}
         />
       )
+    }
+    // A chart the agent produced — rendered in a sandboxed iframe (ChartFrame owns
+    // all the confinement). Its code arrives whole on the tool call, so it renders
+    // as soon as the block appears, even mid-stream.
+    if (block.type === "chart") {
+      return <ChartFrame code={block.code} title={block.title} />
     }
     return <Markdown datasetScope={datasetScope}>{block.content}</Markdown>
   },
@@ -112,7 +124,9 @@ function ChatMessageImpl({ turn, streaming, datasetScope }) {
             const key =
               block.type === "think"
                 ? `think-${i}`
-                : `text-${i}`
+                : block.type === "chart"
+                  ? `chart-${block.id || i}`
+                  : `text-${i}`
             return (
               <Block
                 key={key}

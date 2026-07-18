@@ -14,6 +14,7 @@
 // nothing ever breaks — new tools just look plain until we teach this module.
 
 import {
+  BarChart3Icon,
   BookOpenIcon,
   DatabaseIcon,
   FolderTreeIcon,
@@ -39,6 +40,10 @@ const ICONS = {
   grep: TextSearchIcon,
   // run_sql = a live query against the catalog (terminal/prompt glyph)
   run_sql: TerminalIcon,
+  // render_chart is normally lifted into its own inline chart block (see
+  // buildMessageBlocks), so it rarely renders as a tool card — but keep an icon +
+  // label so an edge case (e.g. a raw tool listing) doesn't fall through to raw.
+  render_chart: BarChart3Icon,
 }
 
 export function toolIcon(toolName) {
@@ -97,6 +102,11 @@ export function toolLabel(toolName, args, running) {
       const short = q.length > 48 ? `${q.slice(0, 48)}…` : q
       const label = short ? `“${short}”` : ""
       return running ? `Querying ${label}`.trim() : `Queried ${label}`.trim()
+    }
+    case "render_chart": {
+      const t = s(a.title)
+      const label = t ? `“${t}”` : ""
+      return running ? `Charting ${label}`.trim() : `Charted ${label}`.trim()
     }
     default: {
       const name = prettyName(toolName)
@@ -257,6 +267,13 @@ export function parseToolResult(toolName, rawContent) {
           text: m.line,
         })),
       }
+    }
+    case "render_chart": {
+      // The chart itself renders as its own block below the reasoning; in the
+      // timeline it's a LABEL-ONLY step (no expandable body — the ack the tool
+      // returns is just "rendered", nothing worth disclosing). kind:"none" → the
+      // step shows its label with no chevron/detail.
+      return { summary: "", kind: "none" }
     }
     case "run_sql": {
       // { columns:[name], rows:[{name:value}], row_count, truncated }. Render as a
