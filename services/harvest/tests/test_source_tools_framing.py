@@ -52,6 +52,17 @@ def test_sample_rows_unknown_concept_notes_error():
     assert "Unknown concept" in out["note"]
 
 
+def test_sample_rows_invalid_concept_id_is_a_note_not_a_raise():
+    # A malformed id (e.g. a `.metadata/...` snapshot path the model mistakes for a
+    # concept) must return a recoverable note, NOT raise ValueError out of the tool
+    # (which crashed the run). Every dot-prefixed segment fails the concept grammar.
+    _src, tools = _tools(FakeGlue("db", {"races": _table("races", [])}))
+    for bad in (".metadata", ".metadata/tables/races", ".context/spec"):
+        out = tools["sample_rows"].invoke({"concept_id": bad})
+        assert out["rows"] == []
+        assert "Invalid concept id" in out["note"]
+
+
 def test_run_sql_returns_error_note_on_failure():
     _src, tools = _tools(
         FakeGlue("db", {"races": _table("races", [])}),

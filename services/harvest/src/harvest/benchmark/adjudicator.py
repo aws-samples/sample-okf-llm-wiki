@@ -1,10 +1,11 @@
 """The adjudicator — decides which FAILs are genuine wiki gaps, then de-identifies.
 
 Unlike the solver, the adjudicator is the wiki-gap *diagnostician*, so it gets
-FULL raw-data access (Athena ``run_sql``/``sample_rows`` + the ``.metadata/``
-schema snapshot) — it must see both what the wiki says and what the data actually
-is to explain a failure. Granting raw data is safe here because its output is
-de-identified themes, never SQL the score depends on.
+FULL live-data access via the source tools (Athena ``run_sql`` — which can also
+inspect the schema with ``DESCRIBE``/``SHOW COLUMNS`` — and ``sample_rows``) — it
+must see both what the wiki says and what the data actually is to explain a
+failure. Granting raw data is safe here because its output is de-identified
+themes, never SQL the score depends on.
 
 Two stages, both on the shared instrumented model (tokens meter for free):
 
@@ -36,10 +37,15 @@ _GENUINE = {CATEGORY_GENUINE}
 
 CLASSIFY_SYSTEM_PROMPT = """\
 You are adjudicating why a text-to-SQL agent (which had ONLY a data wiki, not the \
-raw schema) got a question wrong. For each case you see the question, the agent's \
-predicted SQL, and the divergence. You have FULL raw-data access: `run_sql`, \
-`sample_rows`, and the `.metadata/` Glue schema snapshot — use them to check what \
-the data actually is.
+raw schema) got a question wrong. For each case you see the agent's predicted SQL \
+and the divergence. You have FULL live-data access via two tools:
+- `run_sql(query)` — run any read-only Athena/Trino SQL against the real dataset. \
+Use it to inspect the schema (e.g. `DESCRIBE <table>`, `SHOW COLUMNS FROM <table>`, \
+`SELECT DISTINCT <col> ... LIMIT` for code legends) and to check what the data \
+actually contains.
+- `sample_rows(concept_id)` — a few sample rows for a table concept id like \
+`tables/races` (NOT a file path — do not pass `.metadata/...`).
+Use these to check what the data actually is before you judge.
 
 Classify the failure into exactly one category:
 - GENUINE_ERROR: the wiki is missing or wrong about something the agent needed \
@@ -83,9 +89,9 @@ def make_adjudicator(
 
     ``chat_model`` is the shared instrumented model. ``raw_data_tools`` are the
     source tools (``run_sql``/``sample_rows``) the classifier uses to verify claims
-    against live data; ``.metadata/`` is read via the harvest agent's own file
-    tools when present (the adjudicator runs against the real mount, not the
-    snapshot).
+    against live data — including schema inspection via ``DESCRIBE``/``SHOW
+    COLUMNS`` through ``run_sql`` (it has no filesystem tool, so it does not read
+    the ``.metadata/`` snapshot directly).
     """
     # Built lazily on first use so session construction stays framework-light
     # (mirrors the solver): create_react_agent needs a real model, which we only
