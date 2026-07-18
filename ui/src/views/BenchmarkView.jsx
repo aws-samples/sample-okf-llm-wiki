@@ -203,13 +203,15 @@ export default function BenchmarkView({ api, selection }) {
           )}
         </CardTitle>
         <CardDescription>
-          Benchmark-driven self-improvement for{" "}
+          Test how well the wiki for{" "}
           <span className="font-medium text-foreground">
             {domain}/{dataset}
-          </span>
-          . Upload a <code>question,gold_sql</code> CSV; when enabled, every
-          harvest runs the benchmark→revise loop and keeps the best-scoring
-          bundle.
+          </span>{" "}
+          actually answers real questions, and let the harvester keep improving
+          it until it does. Upload a set of questions with their correct SQL
+          answers; when this is on, each harvest scores the wiki against them,
+          fixes the gaps it finds, and re-tests — keeping whichever version
+          scored best.
         </CardDescription>
         <div className="col-start-2 row-span-2 row-start-1 flex items-center gap-2 self-start justify-self-end">
           <Button variant="outline" onClick={load} disabled={loading}>
