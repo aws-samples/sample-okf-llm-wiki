@@ -127,6 +127,82 @@ def test_set_ri_settings_404_for_missing_dataset(cfg):
     assert ei.value.status == 404
 
 
+# -- inspect uploaded questions (validation + count feedback) ----------------
+
+
+def _put_csv(cfg, text, domain="sales", dataset="orders"):
+    key = handlers.benchmark_questions_key(domain, dataset)
+    cfg.s3.put_object(Bucket=BUCKET, Key=key, Body=text.encode("utf-8"))
+
+
+def test_inspect_not_uploaded(cfg):
+    out = handlers.inspect_benchmark_questions(
+        cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
+    )
+    assert out == {"uploaded": False, "key": "benchmark/sales/orders/questions.csv"}
+
+
+def test_inspect_valid_counts_questions(cfg):
+    _put_csv(cfg, "question,gold_sql\nQ0,SELECT 0\nQ1,SELECT 1\nQ2,SELECT 2\n")
+    out = handlers.inspect_benchmark_questions(
+        cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
+    )
+    assert out["uploaded"] is True and out["valid"] is True
+    assert out["count"] == 3
+    assert out["total_in_csv"] == 3
+    assert out["dropped"] == 0
+    assert out["capped"] is False
+    assert out["max_questions"] == 100
+
+
+def test_inspect_skips_blank_rows_in_count(cfg):
+    _put_csv(cfg, "question,gold_sql\nQ0,SELECT 0\n,SELECT 1\nQ2,\nQ3,SELECT 3\n")
+    out = handlers.inspect_benchmark_questions(
+        cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
+    )
+    assert out["count"] == 2  # blank question and blank gold both skipped
+
+
+def test_inspect_reports_cap(cfg):
+    rows = "\n".join(f"Q{i},SELECT {i}" for i in range(130))
+    _put_csv(cfg, "question,gold_sql\n" + rows + "\n")
+    out = handlers.inspect_benchmark_questions(
+        cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
+    )
+    assert out["count"] == 100
+    assert out["total_in_csv"] == 130
+    assert out["dropped"] == 30
+    assert out["capped"] is True
+
+
+def test_inspect_bad_header_is_invalid(cfg):
+    _put_csv(cfg, "question,notes\nQ0,hello\n")
+    out = handlers.inspect_benchmark_questions(
+        cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
+    )
+    assert out["uploaded"] is True and out["valid"] is False
+    assert "gold" in out["error"].lower()
+
+
+def test_inspect_all_blank_is_invalid(cfg):
+    _put_csv(cfg, "question,gold_sql\n,\n,\n")
+    out = handlers.inspect_benchmark_questions(
+        cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
+    )
+    assert out["uploaded"] is True and out["valid"] is False
+    assert "no valid rows" in out["error"]
+
+
+def test_inspect_route(cfg):
+    _put_csv(cfg, "question,gold_sql\nQ0,SELECT 0\n")
+    resp = app.route(_event("GET", "/benchmark/sales/orders/questions"), cfg)
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["count"] == 1
+    # The /questions suffix must NOT be captured as the settings GET.
+    assert "recursive_improvement" not in body
+
+
 # -- payload population on trigger -------------------------------------------
 
 

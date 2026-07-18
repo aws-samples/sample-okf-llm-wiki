@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
-import { GaugeIcon, RefreshCwIcon, UploadIcon } from "lucide-react"
+import {
+  AlertTriangleIcon,
+  CheckCircle2Icon,
+  GaugeIcon,
+  RefreshCwIcon,
+  UploadIcon,
+} from "lucide-react"
 
 import { uploadToPresigned } from "@/lib/api"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -65,11 +71,24 @@ export default function BenchmarkView({ api, selection }) {
   const [saving, setSaving] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [error, setError] = useState(null)
+  // Parsed state of the uploaded question set (from the server, using the same
+  // parser the harvest runtime uses). null until inspected.
+  const [questions, setQuestions] = useState(null)
   const fileInputRef = useRef(null)
 
   const domain = selection?.data_domain
   const dataset = selection?.dataset
   const hasSelection = Boolean(domain && dataset)
+
+  const inspect = useCallback(async () => {
+    if (!api || !hasSelection) return
+    try {
+      setQuestions(await api.inspectBenchmarkQuestions(domain, dataset))
+    } catch (e) {
+      // A failure to inspect is shown inline, not as a hard page error.
+      setQuestions({ uploaded: false, inspectError: e.message || String(e) })
+    }
+  }, [api, domain, dataset, hasSelection])
 
   const load = useCallback(async () => {
     if (!api || !hasSelection) return
@@ -78,15 +97,17 @@ export default function BenchmarkView({ api, selection }) {
     try {
       const res = await api.getBenchmarkSettings(domain, dataset)
       setForm(toForm(res?.recursive_improvement))
+      await inspect()
     } catch (e) {
       setError(e.message || String(e))
     } finally {
       setLoading(false)
     }
-  }, [api, domain, dataset, hasSelection])
+  }, [api, domain, dataset, hasSelection, inspect])
 
   useEffect(() => {
     setForm(toForm(null))
+    setQuestions(null)
     load()
   }, [load])
 
@@ -135,7 +156,20 @@ export default function BenchmarkView({ api, selection }) {
         )
       }
       await uploadToPresigned({ url, fields }, file)
-      toast.success(`Uploaded ${file.name} as the question set`)
+      // Parse it server-side (same parser the runtime uses) so we can confirm the
+      // format and report the exact question count — not just "uploaded".
+      const parsed = await api.inspectBenchmarkQuestions(domain, dataset)
+      setQuestions(parsed)
+      if (parsed?.valid) {
+        toast.success(
+          `${parsed.count} question${parsed.count === 1 ? "" : "s"} extracted` +
+            (parsed.capped
+              ? ` (capped from ${parsed.total_in_csv} at ${parsed.max_questions})`
+              : "")
+        )
+      } else {
+        toast.error(`CSV format problem: ${parsed?.error || "could not parse"}`)
+      }
     } catch (err) {
       toast.error(`Upload failed: ${err.message || err}`)
     } finally {
@@ -225,9 +259,12 @@ export default function BenchmarkView({ api, selection }) {
                   ) : (
                     <UploadIcon data-icon="inline-start" />
                   )}
-                  Upload questions CSV
+                  {questions?.valid
+                    ? "Replace questions CSV"
+                    : "Upload questions CSV"}
                 </Button>
               </div>
+              <QuestionSetStatus questions={questions} />
             </div>
 
             {/* Loop settings. */}
@@ -332,5 +369,55 @@ export default function BenchmarkView({ api, selection }) {
         )}
       </CardContent>
     </Card>
+  )
+}
+
+// Inline feedback on the uploaded question set: nothing yet, a valid count (with
+// a cap note), or a format error. Mirrors the server's inspect response shape.
+function QuestionSetStatus({ questions }) {
+  if (!questions) return null
+
+  if (questions.inspectError) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Could not read the question set: {questions.inspectError}
+      </p>
+    )
+  }
+
+  if (!questions.uploaded) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No question set uploaded yet.
+      </p>
+    )
+  }
+
+  if (!questions.valid) {
+    return (
+      <Alert variant="destructive">
+        <AlertTriangleIcon />
+        <AlertTitle>Invalid question set</AlertTitle>
+        <AlertDescription>
+          {questions.error || "The CSV could not be parsed."} Expected a{" "}
+          <code>question</code> column and a <code>gold_sql</code> column.
+        </AlertDescription>
+      </Alert>
+    )
+  }
+
+  return (
+    <div className="flex items-start gap-2 text-sm">
+      <CheckCircle2Icon className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-500" />
+      <span className="text-muted-foreground">
+        <span className="font-medium text-foreground">
+          {questions.count} question{questions.count === 1 ? "" : "s"}
+        </span>{" "}
+        will be benchmarked.
+        {questions.capped
+          ? ` Capped from ${questions.total_in_csv} rows at the ${questions.max_questions}-question limit (first ${questions.max_questions} used).`
+          : ""}
+      </span>
+    </div>
   )
 }

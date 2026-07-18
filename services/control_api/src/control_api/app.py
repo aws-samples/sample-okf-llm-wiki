@@ -587,6 +587,15 @@ def _r_presign_benchmark(cfg, params, body, query, caller):
     )
 
 
+def _r_inspect_benchmark(cfg, params, body, query, caller):
+    return 200, handlers.inspect_benchmark_questions(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
 def _r_get_ri_settings(cfg, params, body, query, caller):
     return 200, handlers.get_dataset_ri_settings(
         cfg.ddb,
@@ -751,8 +760,10 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     # same API Gateway CORS reason as the chat rename above.
     ("GET", "/guidance/{domain}/{dataset}", _r_get_dataset_guidance),
     ("PUT", "/guidance/{domain}/{dataset}", _r_set_dataset_guidance),
-    # Recursive-improvement benchmark: off-mount CSV presign + saved settings.
+    # Recursive-improvement benchmark: off-mount CSV presign + saved settings +
+    # parsed question-count (fixed /questions suffix disambiguates from settings).
     ("POST", "/benchmark/{domain}/{dataset}/presign", _r_presign_benchmark),
+    ("GET", "/benchmark/{domain}/{dataset}/questions", _r_inspect_benchmark),
     ("GET", "/benchmark/{domain}/{dataset}", _r_get_ri_settings),
     ("PUT", "/benchmark/{domain}/{dataset}", _r_set_ri_settings),
     # Chat conversations (per-user sidebar list). thread_id is a single opaque

@@ -222,6 +222,16 @@ export function makeApi(token) {
         `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/presign`,
         { content_type: contentType }
       ),
+    // Parse the uploaded CSV with the SAME parser the harvest runtime uses and
+    // report {uploaded, valid, count, total_in_csv, dropped, capped, error} — so
+    // the UI shows the exact question count a harvest would benchmark, and flags a
+    // bad format before the user relies on it.
+    inspectBenchmarkQuestions: (domain, dataset) =>
+      request(
+        token,
+        "GET",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/questions`
+      ),
 
     // Chat conversations (the per-user sidebar list). The chat RUNTIME writes the
     // index rows; the Control API serves this read/rename/delete side, scoped to

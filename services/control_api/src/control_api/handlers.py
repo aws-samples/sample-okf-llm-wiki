@@ -1140,6 +1140,11 @@ def delete_context_doc(
     return {"deleted": True, "key": key}
 
 
+# The uploaded benchmark CSV can't be larger than the presign cap; guard the parse
+# so a malformed multi-MB upload can't be read fully into the Lambda for nothing.
+_BENCHMARK_CSV_MAX_BYTES = CONTEXT_UPLOAD_MAX_BYTES
+
+
 # --------------------------------------------------------------------------- #
 # Recursive-improvement benchmark CSV (S3, OFF the okf/ mount prefix)
 # --------------------------------------------------------------------------- #
@@ -1195,6 +1200,81 @@ def presign_benchmark_upload(
         "key": key,
         "max_bytes": CONTEXT_UPLOAD_MAX_BYTES,
         "expires_in": PRESIGN_EXPIRY_SECONDS,
+    }
+
+
+def inspect_benchmark_questions(
+    s3, *, bucket: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """Fetch + parse the uploaded question set and report the extracted count.
+
+    Uses the SAME parser the harvest runtime uses
+    (``okf_core.benchmark_questions.load_questions``), so the ``count`` reported
+    to the UI is exactly what a harvest would benchmark. Returns:
+
+    * ``{"uploaded": False}`` when no CSV has been uploaded yet (a clean "upload
+      one" state, not an error).
+    * ``{"uploaded": True, "valid": False, "error": "..."}`` when the CSV is
+      present but malformed (missing a required column, unparseable) — the
+      user-facing format-validation feedback.
+    * ``{"uploaded": True, "valid": True, "count", "total_in_csv", "dropped",
+      "capped", "max_questions"}`` when it parses — ``count`` is the number of
+      questions that will be benchmarked (after skipping blank rows and applying
+      the 100-row cap), ``capped`` true iff rows were dropped by the cap.
+    """
+    from okf_core.benchmark_questions import BenchmarkCSVError, load_questions
+    from okf_core.recursive_improvement import MAX_QUESTIONS
+
+    key = benchmark_questions_key(data_domain, dataset)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except Exception as e:  # noqa: BLE001 - a missing object is "not uploaded yet"
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return {"uploaded": False, "key": key}
+        # Other S3 errors are surfaced (misconfig, perms) rather than masked.
+        raise ApiError(502, f"could not read benchmark CSV: {e}") from e
+
+    raw = obj["Body"].read(_BENCHMARK_CSV_MAX_BYTES + 1)
+    if len(raw) > _BENCHMARK_CSV_MAX_BYTES:
+        return {
+            "uploaded": True,
+            "valid": False,
+            "key": key,
+            "error": f"CSV exceeds the {_BENCHMARK_CSV_MAX_BYTES // (1024 * 1024)} MiB limit",
+        }
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {
+            "uploaded": True,
+            "valid": False,
+            "key": key,
+            "error": "CSV is not valid UTF-8 text",
+        }
+
+    try:
+        loaded = load_questions(text)
+    except BenchmarkCSVError as e:
+        return {"uploaded": True, "valid": False, "key": key, "error": str(e)}
+
+    if not loaded.questions:
+        return {
+            "uploaded": True,
+            "valid": False,
+            "key": key,
+            "error": "no valid rows — every row is missing a question or gold_sql",
+        }
+
+    return {
+        "uploaded": True,
+        "valid": True,
+        "key": key,
+        "count": len(loaded.questions),
+        "total_in_csv": loaded.total_in_csv,
+        "dropped": loaded.dropped,
+        "capped": loaded.dropped > 0,
+        "max_questions": MAX_QUESTIONS,
     }
 
 
