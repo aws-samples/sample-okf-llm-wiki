@@ -28,6 +28,7 @@ Two caches make the loop affordable across rounds:
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -106,17 +107,26 @@ class Grader:
         self._gold_cache: dict[str, tuple[list[Row] | None, str]] = {}
         # (gold_sql, predicted_sql) -> QuestionResult verdict (q_id re-stamped).
         self._pred_cache: dict[tuple[str, str], QuestionResult] = {}
+        # Caches are shared across concurrent grade() calls (the round grades many
+        # questions in parallel). A lock guards the dict reads/writes; the actual
+        # Athena execution happens OUTSIDE the lock so queries still run concurrently
+        # — the lock only serializes the fast cache bookkeeping.
+        self._lock = threading.Lock()
 
     def _run_gold(self, gold_sql: str) -> tuple[list[Row] | None, str]:
-        """Execute gold once (memoized). Returns (rows, discard_reason)."""
-        if gold_sql in self._gold_cache:
-            return self._gold_cache[gold_sql]
+        """Execute gold once (memoized, concurrency-safe). Returns (rows, discard_reason)."""
+        with self._lock:
+            if gold_sql in self._gold_cache:
+                return self._gold_cache[gold_sql]
         try:
             rows = self._execute(gold_sql)
             verdict: tuple[list[Row] | None, str] = (rows, "")
         except Exception as e:  # noqa: BLE001 - gold that can't run is a DISCARD
             verdict = (None, f"{type(e).__name__}: {e}")
-        self._gold_cache[gold_sql] = verdict
+        with self._lock:
+            # Another thread may have filled it while we executed; last write wins
+            # (same gold → same verdict, so it's harmless).
+            self._gold_cache[gold_sql] = verdict
         return verdict
 
     def grade(self, q_id: int, gold_sql: str, predicted_sql: str) -> QuestionResult:
@@ -148,8 +158,9 @@ class Grader:
             )
 
         cache_key = (gold_sql, predicted_sql)
-        if cache_key in self._pred_cache:
-            cached = self._pred_cache[cache_key]
+        with self._lock:
+            cached = self._pred_cache.get(cache_key)
+        if cached is not None:
             # Re-stamp the q_id (same SQL can recur under a different question).
             return QuestionResult(
                 q_id=q_id,
@@ -171,7 +182,8 @@ class Grader:
                 reason=f"predicted SQL raised: {type(e).__name__}: {e}",
                 gold_rowcount=len(gold_rows),
             )
-            self._pred_cache[cache_key] = result
+            with self._lock:
+                self._pred_cache[cache_key] = result
             return result
 
         ok = _canonical(pred_rows) == _canonical(gold_rows)
@@ -184,5 +196,6 @@ class Grader:
             gold_rowcount=len(gold_rows),
             pred_sample=_sample(pred_rows),
         )
-        self._pred_cache[cache_key] = result
+        with self._lock:
+            self._pred_cache[cache_key] = result
         return result

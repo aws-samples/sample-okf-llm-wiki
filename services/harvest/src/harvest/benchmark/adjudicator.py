@@ -103,20 +103,34 @@ def make_adjudicator(
     tools when present (the adjudicator runs against the real mount, not the
     snapshot).
     """
-    from langgraph.prebuilt import create_react_agent
+    # Built lazily on first use so session construction stays framework-light
+    # (mirrors the solver): create_react_agent needs a real model, which we only
+    # have at run time, not necessarily at wiring time.
+    built: dict[str, Any] = {}
 
-    classifier = create_react_agent(
-        chat_model,
-        tools=raw_data_tools,
-        prompt=CLASSIFY_SYSTEM_PROMPT,
-        response_format=_classification_model(),
-    )
-    consolidator = chat_model.with_structured_output(_consolidation_model())
+    def _ensure_built():
+        if built:
+            return built
+        from langgraph.prebuilt import create_react_agent
+
+        built["classifier"] = create_react_agent(
+            chat_model,
+            tools=raw_data_tools,
+            prompt=CLASSIFY_SYSTEM_PROMPT,
+            response_format=_classification_model(),
+        )
+        built["consolidator"] = chat_model.with_structured_output(
+            _consolidation_model()
+        )
+        return built
 
     async def adjudicate(fails: list[QuestionResult]) -> AdjudicationResult:
         if not fails:
             return AdjudicationResult()
 
+        b = _ensure_built()
+        classifier = b["classifier"]
+        consolidator = b["consolidator"]
         genuine_gaps: list[str] = []
         noisy = 0
         for r in fails:

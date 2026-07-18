@@ -376,6 +376,10 @@ class HarvestAgent:
     source: GlueAthenaSource
     link_graph: LinkGraph
     dataset_root: Path
+    # Present only on a recursive-improvement run: the per-run benchmark session,
+    # so the runner can read best_round()/rounds after the crawl for checkpoint
+    # selection and the terminal KPI row. None on a normal harvest.
+    benchmark_session: Any = None
 
 
 def _make_read_current(dataset_root: Path):
@@ -405,6 +409,63 @@ def _make_read_current(dataset_root: Path):
     return read_current
 
 
+def _build_benchmark_session(
+    *,
+    ri_config: dict[str, Any],
+    run: dict[str, Any],
+    questions: Any,
+    chat_model: Any,
+    source: GlueAthenaSource,
+    source_tools: list[Any],
+    dataset_root: Path,
+    step_emitter: Any,
+    persist_kpi: Any,
+) -> Any:
+    """Construct the per-run BenchmarkSession behind the run_benchmark tool.
+
+    The solver reuses ``chat_model`` (bundle-blind, rooted per-round at a snapshot
+    the session builds); the adjudicator reuses ``chat_model`` + the source tools
+    (``run_sql``/``sample_rows``) so it can diagnose gaps against live data. Both
+    ride the shared instrumented model, so benchmark tokens meter into the run
+    total automatically. ``persist_kpi(iteration, attrs)`` and the step emitter are
+    wired so each round writes a BENCH# row and a live ``kind:"benchmark"`` event.
+    """
+    from harvest.benchmark.adjudicator import make_adjudicator
+    from harvest.benchmark.grader import Grader
+    from harvest.benchmark.runner import BenchmarkSession
+    from harvest.benchmark.solver import make_solver
+
+    grader = Grader(source.run_query)
+    adjudicate = make_adjudicator(chat_model, source_tools)
+
+    def emit_event(event: dict) -> None:
+        if step_emitter is not None:
+            # StepEmitter._emit is internal but stable; benchmark events reuse the
+            # same OKF_STEP sink the feed already ships to CloudWatch.
+            step_emitter._emit(event)
+
+    return BenchmarkSession(
+        data_domain=run.get("data_domain", ""),
+        dataset=run.get("dataset", ""),
+        dataset_root=str(dataset_root),
+        runtime_session_id=run.get("runtime_session_id", ""),
+        config=ri_config,
+        questions=list(questions),
+        make_solver=lambda snap_dir: make_solver(chat_model, snap_dir),
+        grader=grader,
+        adjudicate=adjudicate,
+        persist_kpi=persist_kpi,
+        emit_event=emit_event if step_emitter is not None else None,
+    )
+
+
+def _make_benchmark_tool(session: Any) -> Any:
+    """The run_benchmark LangChain tool bound to ``session`` (one round per call)."""
+    from harvest.benchmark.runner import make_run_benchmark_tool
+
+    return make_run_benchmark_tool(session)
+
+
 def build_harvest_agent(
     source: GlueAthenaSource,
     dataset_root: str | Path,
@@ -415,6 +476,10 @@ def build_harvest_agent(
     subagent_concurrency: int = DEFAULT_SUBAGENT_CONCURRENCY,
     sandbox: Any = None,
     step_emitter: Any = None,
+    ri_config: dict[str, Any] | None = None,
+    benchmark_questions: Any = None,
+    benchmark_run: dict[str, Any] | None = None,
+    persist_kpi: Any = None,
 ) -> HarvestAgent:
     from deepagents import create_deep_agent
     from deepagents.backends import (
@@ -466,11 +531,43 @@ def build_harvest_agent(
 
     link_graph = LinkGraph(dataset_root)
     engine = OKFGuardEngine(link_graph)
-    guard = OKFGuardMiddleware(engine, read_current=_make_read_current(dataset_root))
+
+    # Recursive improvement: when enabled, build the per-run benchmark session that
+    # backs the run_benchmark tool, and hand the guard a call budget so it refuses
+    # runaway looping past max_iterations (a backstop independent of the prompt).
+    from okf_core import recursive_improvement as ri
+
+    benchmark_session = None
+    benchmark_budget = None
+    if ri.is_enabled(ri_config):
+        benchmark_budget = ri_config.get(ri.FIELD_MAX_ITERATIONS, ri.MAX_ITERATIONS)
+
+    guard = OKFGuardMiddleware(
+        engine,
+        read_current=_make_read_current(dataset_root),
+        benchmark_budget=benchmark_budget,
+    )
 
     source_tools = make_source_tools(source)
     graph_tools = make_graph_tools(link_graph)
     all_tools = [*source_tools, *graph_tools]
+
+    # Build the benchmark session now that chat_model + source tools exist. The
+    # solver reuses chat_model (tokens meter for free); the adjudicator reuses
+    # chat_model + the source tools (run_sql/sample_rows) for raw-data diagnosis.
+    if ri.is_enabled(ri_config) and benchmark_questions:
+        benchmark_session = _build_benchmark_session(
+            ri_config=ri_config,
+            run=benchmark_run or {},
+            questions=benchmark_questions,
+            chat_model=chat_model,
+            source=source,
+            source_tools=source_tools,
+            dataset_root=dataset_root,
+            step_emitter=step_emitter,
+            persist_kpi=persist_kpi,
+        )
+        all_tools.append(_make_benchmark_tool(benchmark_session))
 
     # A code-execution tool for extracting text from binary .context/ docs
     # (PDF/DOCX/PPTX/XLSX) the built-in read_file only base64-encodes. Backed by a
@@ -619,4 +716,5 @@ def build_harvest_agent(
         source=source,
         link_graph=link_graph,
         dataset_root=dataset_root,
+        benchmark_session=benchmark_session,
     )

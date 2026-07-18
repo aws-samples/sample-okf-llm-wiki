@@ -20,12 +20,24 @@ Gold SQL, gold rows, question text, and per-``q_id`` failures never appear in it
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from harvest.benchmark.grader import Grader, Outcome, QuestionResult
 from harvest.benchmark.questions import BenchmarkQuestion
 from okf_core import recursive_improvement as ri
+
+# Grader (Athena) concurrency — separate from the solver-LLM semaphore, sized
+# under the Athena workgroup's concurrent-DML limit. See docs/CONVENTIONS.md.
+_DEFAULT_ATHENA_CONCURRENCY = 15
+
+
+def _athena_concurrency() -> int:
+    try:
+        return max(1, int(os.environ.get("OKF_BENCHMARK_ATHENA_CONCURRENCY", "")))
+    except (TypeError, ValueError):
+        return _DEFAULT_ATHENA_CONCURRENCY
 
 # Injected async callables (real impls in solver.py / adjudicator.py).
 Solve = Callable[[str], Awaitable[str]]
@@ -133,6 +145,27 @@ async def _solve_all(
     return await asyncio.gather(*[_one(q) for q in questions])
 
 
+async def _grade_all(
+    solved: list[tuple[BenchmarkQuestion, str]],
+    grader: Grader,
+) -> list[QuestionResult]:
+    """Grade all (question, sql) pairs concurrently on a bounded thread pool.
+
+    Grading is blocking Athena I/O, so it runs in threads (the Grader is
+    thread-safe). Bounded by ``OKF_BENCHMARK_ATHENA_CONCURRENCY`` to stay under the
+    workgroup's concurrent-DML limit. Order is preserved to match ``solved``.
+    """
+    if not solved:
+        return []
+    sem = asyncio.Semaphore(_athena_concurrency())
+
+    async def _grade(q: BenchmarkQuestion, sql: str) -> QuestionResult:
+        async with sem:
+            return await asyncio.to_thread(grader.grade, q.q_id, q.gold_sql, sql)
+
+    return await asyncio.gather(*[_grade(q, sql) for q, sql in solved])
+
+
 async def run_round(
     *,
     iteration: int,
@@ -151,7 +184,7 @@ async def run_round(
     consolidate into anonymous themes) → compute EX + judge KPIs + threshold.
     """
     solved = await _solve_all(questions, solve, concurrency)
-    graded = [grader.grade(q.q_id, q.gold_sql, sql) for q, sql in solved]
+    graded = await _grade_all(solved, grader)
 
     passed = sum(1 for r in graded if r.outcome is Outcome.PASS)
     failed = sum(1 for r in graded if r.outcome is Outcome.FAIL)
