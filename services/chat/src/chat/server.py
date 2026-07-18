@@ -397,6 +397,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     NOTE: this returns the RAW compiled LangGraph graph (no AG-UI wrapper) —
     ``stream_run`` drives ``.astream`` on it directly.
     """
+    from chat.charts import make_chart_tool
     from chat.config import build_chat_model
     from chat.graph import SYSTEM_PROMPT_WITH_SQL, build_graph
     from chat.sql import AthenaSQL, make_sql_tool
@@ -452,6 +453,12 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     ):
         chat_model = build_chat_model(chat_config, model, effort)
         agent_tools = make_agent_tools(tools_impl, dataset_scope=scope)
+        # render_chart is ALWAYS available (no deploy flag, no per-run opt-in): it
+        # does no server work — the model writes chart "script code" that the UI
+        # runs in a sandboxed frame — so there's nothing to gate. Its authoring
+        # contract lives in the tool description; the SYSTEM_PROMPT's <charts> block
+        # covers when to use it, so the base prompt (no SQL) already knows about it.
+        agent_tools = [*agent_tools, make_chart_tool()]
         # Optional read-only SQL: both the deploy flag (engine present) and the
         # per-run opt-in (features) are required. system_prompt gains a line so the
         # model knows the tool exists this turn.

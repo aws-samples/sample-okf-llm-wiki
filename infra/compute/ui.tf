@@ -159,10 +159,21 @@ resource "aws_wafv2_web_acl" "ui" {
 # 'unsafe-inline'. connect-src must reach Cognito (IdP + hosted UI) and the API
 # Gateway — allowed via the AWS API/Cognito wildcards (the SPA talks to standard
 # AWS domains). Override the whole CSP with var.csp_override for a custom domain.
+#
+# script-src includes 'unsafe-inline' because the chat renders agent-authored
+# charts inside a SANDBOXED <iframe srcdoc> (see ui .../ChartFrame.jsx): the frame
+# runs an inlined Chart.js + the model's small render script. A srcdoc (local-scheme)
+# iframe INHERITS this page's CSP and cannot carry its own looser policy, so the
+# frame's inline scripts are blocked unless 'unsafe-inline' is allowed here. The
+# frame is still confined by the sandbox (opaque origin, no allow-same-origin) plus
+# its own restrictive <meta> CSP (default-src 'none'; connect-src 'none'), so this
+# does not let the frame reach the app DOM, the network, or the Cognito token — it
+# only permits inline <script> execution. To keep a stricter app-wide script-src,
+# serve the chart frame from a separate origin with its own CSP header instead.
 locals {
   csp_default = join("; ", [
     "default-src 'self'",
-    "script-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data:",
     "font-src 'self' data:",

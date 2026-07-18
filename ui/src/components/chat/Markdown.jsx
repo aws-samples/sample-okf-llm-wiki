@@ -51,26 +51,55 @@ const CITE_KIND = {
 // This rides the existing markdown link path — no rehype-raw / HTML-in-markdown
 // dependency. A trailing INCOMPLETE tag (mid-stream, e.g. `<cite src="tab`) is
 // stripped so it never flashes as raw text while tokens arrive.
-const CITE_TAG_RE = /<cite\s+src="([^"]*)"\s*>\s*(?:<\/cite>)?/gi
-const CITE_PARTIAL_RE = /<cite\b[^>]*$/i
+//
+// The tag is SUPPOSED to be empty (`<cite src="…"></cite>`), but the model
+// sometimes wraps gloss text: `<cite src="…">titles counted from …</cite>`. We must
+// handle that: keep the chips (from `src`), DROP the inner gloss (attribution is the
+// chip, not prose), and — critically — consume the matching `</cite>` so it never
+// leaks as literal text (the old regex only ate a `</cite>` immediately adjacent to
+// the opener, so a content-bearing tag left a stray `</cite>` in the output). The
+// content form is matched first (non-greedy inner, so back-to-back cites don't merge),
+// then the empty/adjacent form, then any orphan `</cite>` with no opener.
+const CITE_TAG_CONTENT_RE = /<cite\s+src="([^"]*)"\s*>[\s\S]*?<\/cite\s*>/gi
+const CITE_TAG_EMPTY_RE = /<cite\s+src="([^"]*)"\s*>\s*(?:<\/cite\s*>)?/gi
+const CITE_ORPHAN_CLOSE_RE = /<\/cite\s*>/gi
+// A trailing PARTIAL tag at the very end of the (mid-stream) buffer — a partial
+// opener (`<cite src="tab`) OR a partial closer (`</cite` with no `>` yet). The
+// `\/?` is what makes it catch the closer too (the old version only stripped a
+// partial opener, so a streamed `…</cite` flashed as literal text before its `>`
+// arrived). Only matched once "cite" is fully present, so it can't clip legit
+// prose like a trailing "a <" at a frame boundary. Completed on the next frame.
+const CITE_PARTIAL_RE = /<\/?cite\b[^>]*$/i
 const CITE_SCHEME = "okf-cite:"
 
+// Turn a comma-separated `src` into clustered citation-chip markdown links (one per
+// concept id). Empty → "" (drops a src-less tag entirely).
+function citeChips(src) {
+  const ids = src
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (ids.length === 0) return ""
+  // One link per id; the label IS the id (the chip shows a compact form). No
+  // separators so the chips cluster tightly after the claim.
+  return ids.map((id) => `[${id}](${CITE_SCHEME}${encodeURIComponent(id)})`).join("")
+}
+
 function preprocessCitations(md) {
-  if (!md || md.indexOf("<cite") === -1) return md || ""
-  let out = md.replace(CITE_TAG_RE, (_m, src) => {
-    const ids = src
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)
-    if (ids.length === 0) return ""
-    // One link per id; the label IS the id (the chip shows a compact form). No
-    // separators so the chips cluster tightly after the claim.
-    return ids
-      .map((id) => `[${id}](${CITE_SCHEME}${encodeURIComponent(id)})`)
-      .join("")
-  })
-  // Drop a dangling partial tag at the very end (still streaming).
+  // Guard on any `cite` tag — opener OR orphan closer (`</cite>` contains `</cite`,
+  // NOT `<cite`, so an `indexOf("<cite")` alone would skip a stray closer).
+  if (!md || md.indexOf("cite") === -1) return md || ""
+  // 1) Content-bearing tags first: `<cite src="…">gloss</cite>` → chips (gloss dropped,
+  //    closer consumed). Non-greedy so adjacent cites aren't swallowed as one span.
+  let out = md.replace(CITE_TAG_CONTENT_RE, (_m, src) => citeChips(src))
+  // 2) Empty / self-adjacent tags: `<cite src="…"></cite>` or `<cite src="…">`.
+  out = out.replace(CITE_TAG_EMPTY_RE, (_m, src) => citeChips(src))
+  // 3) Drop a dangling partial OPENER/CLOSER at the very end (still streaming, e.g. `<cite src="tab`).
   out = out.replace(CITE_PARTIAL_RE, "")
+  // 4) Belt-and-suspenders: strip any orphan `</cite>` left with no matching opener
+  //    (e.g. a mid-stream frame that delivered the closer before the opener, or a
+  //    malformed tag) so a bare `</cite>` never renders as literal text.
+  out = out.replace(CITE_ORPHAN_CLOSE_RE, "")
   return out
 }
 

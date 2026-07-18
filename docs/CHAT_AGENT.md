@@ -563,6 +563,88 @@ flag, to bound a turn's token cost. New env: `OKF_CHAT_SQL_ENABLED`,
 `OKF_ATHENA_OUTPUT` (only meaningful when SQL is on). New UI env:
 `VITE_CHAT_SQL_ENABLED` (gates the composer's "+" → SQL affordance).
 
+## 14c. Inline charts (`render_chart`) — BUILT
+
+The agent can show a **chart inline** in its answer when a visual carries the point
+better than prose (comparisons, trends, parts-of-a-whole, distributions). Unlike
+every other tool, `render_chart` does **no server work** and is **always on** (no
+deploy flag, no per-run opt-in) — there's nothing to gate because the runtime never
+executes anything: the model writes chart **"script code"** and the *browser*
+renders it.
+
+> **Deliberate deviation — no interrupt round-trip.** An earlier design sketch had
+> a LangChain `interrupt` round-trip (a `before_tool`/`awrap_tool_call` middleware
+> pauses the graph on a `render_chart` call, the UI renders and returns ok/error via
+> `Command(resume=…)`, and the model learns whether the visual succeeded). This was
+> **intentionally dropped** for a simpler ack-only design: the chart model is
+> accurate enough that the added latency + middleware/streaming machinery isn't
+> worth it, and a render failure is surfaced to the *user* as a contained inline
+> error rather than fed back to the model. The interrupt mechanism was verified to
+> work on the installed langgraph/langchain (spikes during development), so it can
+> be added later if a use case needs the model to react to render outcomes; the tool
+> would move from returning an immediate ack to raising an interrupt. Recorded here
+> so the absence is understood as a choice, not an oversight.
+
+**Flow.** The model calls `render_chart(code, title)` where `code` is JavaScript
+that calls a helper the UI provides — `renderChart(el, spec)` — with a small
+declarative `spec` (`type`, `labels`, `series`, optional `title`/`stacked`/axis
+labels). The tool (`chat/charts.py`) validates the code is non-empty and returns an
+**ack** (`{"status":"rendered", …}`) — NOT a render result. The ack tells the model
+the visual was handed off so it keeps writing its answer; we do **not** round-trip
+the render outcome back to the model (no human-in-the-loop interrupt — the chart
+model is accurate enough that the latency + machinery isn't worth it). The full
+authoring contract (the `renderChart` API, the spec shape, the palette rules) lives
+in the **tool description**, not the system prompt, so `SYSTEM_PROMPT` stays a
+static, brace-free, cacheable prefix; the prompt's short `<charts>` block only
+covers *when* to chart and the "real numbers only / inherit the app palette"
+guardrails.
+
+**Rendering + confinement (UI).** A `render_chart` tool call rides the normal typed
+tool-chunk path, but `buildMessageBlocks` **lifts it out of the tool/think timeline
+into its own inline `chart` block** (in call order; the ack result is dropped).
+`ChatMessage` renders that block with `ChartFrame`, which runs the model's `code`
+inside a **sandboxed `<iframe>`** — `sandbox="allow-scripts"` with **no**
+`allow-same-origin`, so the frame is a unique opaque origin: model JS can't reach
+the app DOM, cookies, or the Cognito token in the parent. The frame carries its own
+strict **CSP** (`default-src 'none'; connect-src 'none'; …`) that denies all
+network — it only draws to a canvas and reports its height/status back via
+`postMessage`. This is the security AND crash boundary; three layers guard it: the
+sandbox + the frame's own CSP, a status→contained-error-card path, and a React
+error boundary around the whole component (so even a failure to *build* the frame
+can't crash the chat).
+
+**CSP trade-off (`srcdoc` + `'unsafe-inline'`).** The frame is loaded via the
+`srcdoc` attribute (like Sparky's canvas). A `srcdoc` (local-scheme) iframe
+**inherits the embedding page's CSP** and cannot carry its own *looser* policy — so
+under a strict app CSP its inline scripts (Chart.js + the render code) are blocked
+(`"Content-Security-Policy: blocked an inline script … about:srcdoc"`). Loading the
+same document from a `blob:`/`data:` URL does **not** help: those local-scheme
+documents inherit the initiator's CSP too. The only ways to run inline scripts in
+the frame are therefore (a) allow `'unsafe-inline'` in the app's `script-src`, or
+(b) serve the frame from a **separate origin** whose own CSP header is permissive.
+We take (a) — `infra/compute/ui.tf` sets `script-src 'self' 'unsafe-inline'` — for
+simplicity, accepting that it weakens the app-wide inline-script protection; the
+comment there documents the (b) alternative for a stricter deployment. The chart
+frame stays confined regardless of this choice: the sandbox (opaque origin, no
+`allow-same-origin`) + the frame's own `<meta>` CSP (`default-src 'none';
+connect-src 'none'`) keep it away from the app DOM, the network, and the Cognito
+token — `'unsafe-inline'` only lets *inline `<script>`* run, it does not re-grant
+same-origin access or network.
+
+**Charting library + theme.** Chart.js is **vendored** (`ui/src/vendor/chart.umd.min.js`,
+v4.5.1, MIT) and **inlined** into the iframe `srcdoc` via a `?raw` import — the
+sandboxed frame can't fetch it, and Chart.js's `exports` map blocks a deep
+`?raw` import straight from `node_modules` (hence the local vendored copy). The
+in-frame `renderChart` helper (`ui/src/lib/chartIframe.js`) maps the spec onto
+Chart.js and applies the **app palette + theme**: because the opaque-origin frame
+can't read the parent's computed styles, `resolveChartPalette` resolves the app's
+`--chart-1…5` + a few UI tokens (oklch) to concrete `rgb` triples in the parent
+(via a 1×1 canvas painter) and injects them, and the frame rebuilds on a light/dark
+switch. The model is told **not** to hard-code colors, so charts stay on-brand in
+both themes. Supported types: `bar`, `line`, `area`, `pie`, `doughnut`, `radar`,
+`scatter`. No new env, no infra change, no new runtime dependency (server-side the
+tool is pure `langchain_core`).
+
 ## 15. Open items / risks
 
 - **O1 — `DynamoDBSaver` table schema. RESOLVED** (§7.1): `PK`(HASH,S)+`SK`(RANGE,S),

@@ -37,3 +37,5 @@ benchmark/mini_dev/report.html
 
 # OS
 .DS_Store
+
+.mcp.json

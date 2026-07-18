@@ -67,11 +67,18 @@
     --border: oklch(0.925 0.005 214.3);
     --input: oklch(0.925 0.005 214.3);
     --ring: oklch(0.723 0.014 214.4);
-    --chart-1: oklch(0.855 0.138 181.071);
-    --chart-2: oklch(0.704 0.14 182.503);
-    --chart-3: oklch(0.6 0.118 184.704);
-    --chart-4: oklch(0.511 0.096 186.391);
-    --chart-5: oklch(0.437 0.078 188.216);
+    /* Chart palette for LIGHT mode — anchored on the app's BRAND CYAN (--primary,
+       hue ~223) and extending to the sidebar sky-blue (~237), so charts read as the
+       same color family as the rest of the UI (not the old teal/green/amber ramp).
+       Series are separated by a spread of lightness (~0.45→0.78) + chroma within
+       the cyan→sky hue band, tuned darker/more saturated to stand out on the near-
+       white page (~0.96). --chart-1 is the brand cyan. Consumed by the chat charts
+       AND GraphView node accents. Keep the .dark ramp (below) in the same family. */
+    --chart-1: oklch(0.55 0.12 223); /* brand cyan (matches --primary) */
+    --chart-2: oklch(0.7 0.13 218); /* bright cyan */
+    --chart-3: oklch(0.62 0.14 238); /* sky blue */
+    --chart-4: oklch(0.45 0.1 214); /* deep teal-cyan */
+    --chart-5: oklch(0.78 0.1 230); /* pale cyan */
     --radius: 0.625rem;
     /* Dark sidebar (#2E2E2E) against the light content area. Its sub-tokens are
        flipped to light-on-dark so nav text, hover/active states, and borders
@@ -105,11 +112,16 @@
     --border: oklch(1 0 0 / 10%);
     --input: oklch(1 0 0 / 15%);
     --ring: oklch(0.56 0.021 213.5);
-    --chart-1: oklch(0.855 0.138 181.071);
-    --chart-2: oklch(0.704 0.14 182.503);
-    --chart-3: oklch(0.6 0.118 184.704);
-    --chart-4: oklch(0.511 0.096 186.391);
-    --chart-5: oklch(0.437 0.078 188.216);
+    /* Chart palette for DARK mode — same BRAND CYAN→sky family as :root (hue
+       ~214-238), but brighter/lighter (lightness ~0.62→0.85) so each series reads
+       on the near-black page (~0.148). --chart-1 is the brand cyan, brightened for
+       dark. Mirrors the light ramp's ordering so a series keeps its identity across
+       themes. (Replaces the old teal/green ramp that clashed with the app cyan.) */
+    --chart-1: oklch(0.72 0.13 223); /* brand cyan, brightened for dark */
+    --chart-2: oklch(0.82 0.13 216); /* bright cyan */
+    --chart-3: oklch(0.7 0.14 238); /* sky blue */
+    --chart-4: oklch(0.6 0.11 212); /* deep cyan */
+    --chart-5: oklch(0.85 0.08 230); /* pale cyan */
     /* Darker sidebar (#161616) in dark mode — reads as a recessed panel against
        the lighter content bg. Hover accent is a lighter gray so it stays
        visible on the near-black surface. */
