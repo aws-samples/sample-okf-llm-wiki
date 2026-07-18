@@ -25,6 +25,7 @@ from okf_aws import bundle_prefix, is_bundle_ready, parse_bundle_key, state_mark
 from okf_core import annotations as anno
 from okf_core import chat_threads as ct
 from okf_core import guidance as gd
+from okf_core import recursive_improvement as ri
 from okf_core.domain import DOMAIN_DATASET
 from okf_core.links import extract_links_with_headings
 from okf_core.paths import parse_concept_id
@@ -50,6 +51,15 @@ CONTEXT_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 # ``.context/`` holds user-uploaded source docs (CONVENTIONS.md S3 layout). It is
 # a dot-prefixed dir so it is NOT a concept and is never embedded.
 _CONTEXT_DIRNAME = ".context"
+
+# The recursive-improvement benchmark CSV (question,gold_sql) lives OFF the okf/
+# mount prefix — under a sibling ``benchmark/<domain>/<dataset>/`` prefix in the
+# same bucket. This is deliberate and load-bearing: the harvest S3 Files mount is
+# rooted at ``okf/``, so anything there is readable by the supervisor/authoring
+# agents. Keeping gold under ``benchmark/`` (NOT ``okf/``) makes it invisible to
+# every LLM role's file tools — the runner fetches it via GetObject into the
+# benchmark tool's memory. See docs/RECURSIVE_IMPROVEMENT.md.
+_BENCHMARK_PREFIX = "benchmark/"
 
 
 # --------------------------------------------------------------------------- #
@@ -485,6 +495,113 @@ def set_dataset_guidance(
         "guidance_applied_version": "",  # cleared relationship; recomputed on read
         "guidance_dirty": gd.is_dirty(text, now, ""),
     }
+
+
+def get_dataset_ri_settings(
+    ddb, *, registry_table: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """Return the dataset's saved recursive_improvement settings (or a disabled default).
+
+    404 if the mapping is missing. When no RI settings are stored, returns
+    ``{enabled: False}`` so the UI can render an off toggle.
+    """
+    resp = ddb.get_item(
+        TableName=registry_table,
+        Key={"pk": {"S": f"DOMAIN#{data_domain}"}, "sk": {"S": f"DATASET#{dataset}"}},
+    )
+    item = resp.get("Item")
+    if not item:
+        raise ApiError(404, f"no such dataset: {data_domain}/{dataset}")
+    return {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "recursive_improvement": _ri_settings_from_item(item),
+    }
+
+
+def set_dataset_ri_settings(
+    ddb,
+    *,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    settings: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Persist the dataset's recursive_improvement settings on the DATASET# row.
+
+    ``settings`` is the caller's raw config; it is VALIDATED + clamped by
+    ``okf_core.recursive_improvement.validate`` at this trust boundary (bad values
+    → 400). Disabling (``enabled`` false / omitted) stores a minimal disabled
+    marker so the feature is inert without losing the ability to re-enable. When a
+    ``questions_key`` isn't supplied, the canonical off-mount key is used.
+    """
+    # Default the questions_key to the canonical off-mount location if absent, so a
+    # UI that just uploaded the CSV + flipped "enabled" needn't restate the key.
+    settings = dict(settings or {})
+    if settings.get(ri.FIELD_ENABLED) and not settings.get(ri.FIELD_QUESTIONS_KEY):
+        settings[ri.FIELD_QUESTIONS_KEY] = benchmark_questions_key(data_domain, dataset)
+    try:
+        validated = ri.validate(settings)
+    except ri.RecursiveImprovementConfigError as e:
+        raise ApiError(400, str(e)) from e
+
+    stored = validated or {ri.FIELD_ENABLED: False}
+    try:
+        ddb.update_item(
+            TableName=registry_table,
+            Key={
+                "pk": {"S": f"DOMAIN#{data_domain}"},
+                "sk": {"S": f"DATASET#{dataset}"},
+            },
+            UpdateExpression="SET #ri = :ri",
+            ConditionExpression="attribute_exists(pk)",
+            ExpressionAttributeNames={"#ri": ri.CONFIG_KEY},
+            ExpressionAttributeValues={":ri": {"M": _ri_to_ddb(stored)}},
+        )
+    except Exception as e:  # noqa: BLE001 - map a missing mapping to 404
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            raise ApiError(404, f"no such dataset: {data_domain}/{dataset}") from e
+        raise
+    return {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "recursive_improvement": stored,
+    }
+
+
+def _ri_to_ddb(settings: dict[str, Any]) -> dict[str, Any]:
+    """Marshal a validated RI settings map to a DynamoDB ``M`` value's contents."""
+    out: dict[str, Any] = {}
+    for key, value in settings.items():
+        if isinstance(value, bool):
+            out[key] = {"BOOL": value}
+        elif isinstance(value, (int, float)):
+            out[key] = {"N": str(value)}
+        elif isinstance(value, list):
+            out[key] = {"L": [{"S": str(v)} for v in value]}
+        else:
+            out[key] = {"S": str(value)}
+    return out
+
+
+def _ri_settings_from_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Read the recursive_improvement map off a DATASET# item (disabled if absent)."""
+    m = (item.get(ri.CONFIG_KEY) or {}).get("M")
+    if not m:
+        return {ri.FIELD_ENABLED: False}
+    out: dict[str, Any] = {}
+    for key, av in m.items():
+        if "BOOL" in av:
+            out[key] = av["BOOL"]
+        elif "N" in av:
+            n = av["N"]
+            out[key] = int(n) if "." not in n else float(n)
+        elif "L" in av:
+            out[key] = [e.get("S", "") for e in av["L"]]
+        else:
+            out[key] = av.get("S", "")
+    return out
 
 
 def provision_dataset_dirs(
@@ -1024,6 +1141,64 @@ def delete_context_doc(
 
 
 # --------------------------------------------------------------------------- #
+# Recursive-improvement benchmark CSV (S3, OFF the okf/ mount prefix)
+# --------------------------------------------------------------------------- #
+
+
+def _benchmark_prefix(data_domain: str, dataset: str) -> str:
+    """S3 prefix for a dataset's benchmark inputs — a sibling of ``okf/``.
+
+    Off the mount on purpose (see ``_BENCHMARK_PREFIX``): gold SQL must not be
+    reachable by any harvest LLM role's file tools.
+    """
+    return f"{_BENCHMARK_PREFIX}{data_domain}/{dataset}/"
+
+
+def benchmark_questions_key(data_domain: str, dataset: str) -> str:
+    """The canonical S3 key of a dataset's benchmark ``questions.csv``."""
+    return f"{_benchmark_prefix(data_domain, dataset)}questions.csv"
+
+
+def presign_benchmark_upload(
+    s3,
+    *,
+    bucket: str,
+    data_domain: str,
+    dataset: str,
+    content_type: str | None,
+) -> dict[str, Any]:
+    """Presigned POST for the ``question,gold_sql`` CSV, pinned OFF the okf/ mount.
+
+    Mirrors :func:`presign_context_upload` (20 MiB cap, server-enforced key) but
+    targets the off-mount ``benchmark/<domain>/<dataset>/questions.csv`` key. The
+    key is a single fixed filename (one active question set per dataset), so no
+    client-supplied filename is accepted — the gold set can't be scattered.
+    """
+    key = benchmark_questions_key(data_domain, dataset)
+    conditions: list[Any] = [
+        ["content-length-range", 0, CONTEXT_UPLOAD_MAX_BYTES],
+    ]
+    fields: dict[str, Any] = {}
+    if content_type:
+        fields["Content-Type"] = content_type
+        conditions.append({"Content-Type": content_type})
+    presigned = s3.generate_presigned_post(
+        Bucket=bucket,
+        Key=key,
+        Fields=fields,
+        Conditions=conditions,
+        ExpiresIn=PRESIGN_EXPIRY_SECONDS,
+    )
+    return {
+        "url": presigned["url"],
+        "fields": presigned["fields"],
+        "key": key,
+        "max_bytes": CONTEXT_UPLOAD_MAX_BYTES,
+        "expires_in": PRESIGN_EXPIRY_SECONDS,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Harvest control (AgentCore invoke + status row)
 # --------------------------------------------------------------------------- #
 
@@ -1092,6 +1267,43 @@ def acquire_harvest_lease(
         if code == "ConditionalCheckFailedException":
             return False
         raise
+
+
+def _apply_ri_settings(
+    payload: dict[str, Any],
+    ddb,
+    *,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+) -> None:
+    """Populate ``payload['recursive_improvement']`` from saved dataset settings.
+
+    Best-effort + re-validated at this trust boundary. When RI is disabled (or no
+    settings / missing mapping / invalid stored value), the block is simply omitted
+    so the run is a normal harvest. Shared by the full/incremental and annotation
+    trigger paths so the behavior is identical on every mode.
+    """
+    try:
+        saved = get_dataset_ri_settings(
+            ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+        )
+    except ApiError:
+        return  # no mapping row — nothing to apply
+    settings = saved.get(ri.CONFIG_KEY)
+    if not ri.is_enabled(settings):
+        return
+    try:
+        validated = ri.validate(settings)
+    except ri.RecursiveImprovementConfigError:
+        logging.getLogger("control_api").warning(
+            "Saved recursive_improvement for %s/%s is invalid; skipping.",
+            data_domain,
+            dataset,
+        )
+        return
+    if validated:
+        payload[ri.CONFIG_KEY] = validated
 
 
 def trigger_harvest(
@@ -1167,6 +1379,15 @@ def trigger_harvest(
             payload["dataset_guidance_version"] = g["guidance_updated_at"]
     except ApiError:
         pass  # no mapping row yet (shouldn't happen at harvest time) — omit guidance
+
+    # Recursive-improvement settings (saved per dataset). When enabled, the block's
+    # PRESENCE is the runtime enable signal — it rides on every mode (full/
+    # incremental/annotated). Re-validated here (the trust boundary) so a
+    # hand-edited row can't push an out-of-range value to the runtime.
+    _apply_ri_settings(
+        payload, ddb, registry_table=registry_table,
+        data_domain=data_domain, dataset=dataset,
+    )
 
     if mode == "incremental":
         if not changed_table:
@@ -2330,6 +2551,12 @@ def trigger_annotation_harvest(
         if guidance.get("guidance"):
             payload["dataset_guidance"] = guidance["guidance"]
             payload["dataset_guidance_version"] = guidance["guidance_updated_at"]
+
+        # Recursive improvement rides the annotation re-harvest too (all modes).
+        _apply_ri_settings(
+            payload, ddb, registry_table=registry_table,
+            data_domain=data_domain, dataset=dataset,
+        )
 
         agentcore.invoke_agent_runtime(
             agentRuntimeArn=runtime_arn,
