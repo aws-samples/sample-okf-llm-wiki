@@ -75,26 +75,37 @@ def make_solver(
     backend = FilesystemBackend(root_dir=snapshot_root, virtual_mode=True)
 
     # Read-only bundle tools over the snapshot. No run_sql, no sandbox, no write.
+    #
+    # IMPORTANT: deepagents' backend returns dataclass *containers* (GlobResult
+    # .matches / LsResult.entries / GrepResult.matches) whose ITEMS are TypedDicts
+    # (FileInfo: {"path",...}, GrepMatch: {"path","line","text"}), and read is
+    # `read(file_path) -> str` (cat -n text), NOT `read_file().content`. Getting
+    # this wrong crashed every solver on turn 0 with "'dict' object has no
+    # attribute 'path'" (EX 0). _field() below is dict-or-attr tolerant so a future
+    # backend shape change degrades gracefully instead of crashing the examiner.
     @tool
     def read_file(file_path: str) -> str:
         """Read a wiki markdown file by its bundle-relative path (e.g. 'tables/races.md')."""
-        return backend.read_file(file_path).content or ""
+        return backend.read(_vpath(file_path))
 
     @tool
     def glob(pattern: str) -> list[str]:
         """Find wiki files matching a glob (e.g. '**/*.md', 'tables/*')."""
-        return [m.path for m in backend.glob(pattern).matches]
+        return [_field(m, "path") for m in (backend.glob(pattern).matches or [])]
 
     @tool
     def grep(pattern: str) -> list[str]:
         """Search wiki file contents for a literal string; returns matching locations."""
         res = backend.grep(pattern)
-        return [f"{m.path}:{m.line_number}: {m.line}" for m in (res.matches or [])]
+        return [
+            f"{_field(m, 'path')}:{_field(m, 'line')}: {_field(m, 'text')}"
+            for m in (res.matches or [])
+        ]
 
     @tool
     def ls(path: str = "/") -> list[str]:
         """List entries in a wiki directory."""
-        return [e.path for e in (backend.ls(path).entries or [])]
+        return [_field(e, "path") for e in (backend.ls(_vpath(path)).entries or [])]
 
     agent = create_react_agent(
         chat_model,
@@ -121,6 +132,26 @@ def make_solver(
         return sql
 
     return solve
+
+
+def _field(item: Any, key: str) -> str:
+    """Read ``key`` off a backend result item, tolerating dict OR object shape.
+
+    deepagents backend items are TypedDicts (``item["path"]``); older/other
+    backends might expose attributes. Return "" if absent so a tool never crashes
+    the solver on a shape mismatch (the bug that turned EX to 0)."""
+    if isinstance(item, dict):
+        return str(item.get(key, ""))
+    return str(getattr(item, key, "") or "")
+
+
+def _vpath(path: str) -> str:
+    """Normalize a bundle-relative path to the leading-slash virtual path the
+    FilesystemBackend expects (its API requires paths to start with '/')."""
+    p = (path or "").strip()
+    if not p or p == "/":
+        return "/"
+    return p if p.startswith("/") else "/" + p
 
 
 def _emit_solver_debug(
