@@ -239,9 +239,16 @@ no-improvement — not a lowered tier.
 Reuse the existing presigned `.context/`-style upload path
 (`presign_context_upload`, `handlers.py:966-1013`) but pin the key under
 `.benchmark/` instead of `.context/`. The 20 MiB cap and flat-filename rule carry
-over. `.benchmark/` is dot-prefixed, so it is preserved by
-`clean_authored_output` and hidden from the consumption MCP — the same treatment
-`.context/` and `.metadata/` get.
+over. `.benchmark/` is dot-prefixed, so it is preserved by `clean_authored_output`
+and hidden from the consumption MCP — the same treatment `.context/` and
+`.metadata/` get.
+
+Crucially, the CSV lives on **S3 only** — the `run_benchmark` tool fetches it from
+`questions_key` into the tool process's memory at round start; it is **never
+materialized on the agent-visible mount**. So even though `.benchmark/` sits under
+the dataset prefix in S3, no `gold_sql` (nor question text) is ever a file an LLM
+role could read. This is what makes gold-blindness physical rather than
+policy-based (see *Blindness is structural*).
 
 ## The black-box benchmark tool
 
@@ -328,24 +335,21 @@ behavior, and would blow context on any real bundle.
   **fresh message state** — no authoring history. This fresh, isolated context is
   what makes the solver a *fair examiner*: **the solver is not the supervisor.** If
   the doc-author also produced the prediction, a memorized answer passes trivially.
-- Tools: bundle **read-only** tools (`read_file`/`glob`/`grep`) pointed **only at
-  the authored bundle** in the in-progress working tree (`datasets/`, `tables/`,
-  `references/`, `index.md`) — the consistent state mid-run. **Not**
-  `semantic_search` (vector index is stale mid-run). **Not** the gold dir (guard
-  read-denylist, below). **Not** `run_sql` — the solver only *writes* candidate
+- Tools: bundle **read-only** tools (`read_file`/`glob`/`grep`/`ls`) rooted at a
+  **bundle-only snapshot** (see *Blindness is structural*) — a temp copy of just
+  `datasets/`/`tables/`/`references/`/`index.md`. **Not** `semantic_search` (vector
+  index is stale mid-run). **Not** `run_sql` — the solver only *writes* candidate
   SQL as text; executing against Athena would let it iterate empirically to the
   right answer, measuring persistence, not the wiki.
-- **The solver is bundle-blind by design — it must NOT read `.metadata/`,
-  `.context/`, or run code.** It simulates the real consumer, whose only knowledge
-  source is the wiki. If the solver could read the raw Glue schema snapshot
-  (`.metadata/`) or the source docs (`.context/`), it would answer from the raw
-  data and bypass the wiki entirely — the score would then measure "can an agent
-  query this dataset with full schema access," not "is the wiki good," which is
-  the whole question. This is the opposite of the adjudicator (role 4), which
-  *does* get raw-data access precisely because its job is to find what the wiki is
-  missing *relative to* the raw data. Same read-denylist mechanism, mirror-image
-  intent: gold is denied to both; raw data is denied to the solver, granted to the
-  adjudicator.
+- **The solver is bundle-blind by design — `.metadata/`, `.context/`, and the
+  sandbox are physically absent from its snapshot.** It simulates the real
+  consumer, whose only knowledge source is the wiki. If it could read the raw Glue
+  schema snapshot (`.metadata/`) or the source docs (`.context/`), it would answer
+  from the raw data and bypass the wiki entirely — the score would then measure
+  "can an agent query this dataset with full schema access," not "is the wiki
+  good," which is the whole question. This is the opposite of the adjudicator
+  (role 4), which *does* get raw-data access precisely because its job is to find
+  what the wiki is missing *relative to* the raw data.
 
 **Structured output — terminal only.** The solver's SQL is extracted via a
 one-field `with_structured_output({sql: str})` **final** call, *after* the ReAct
@@ -440,48 +444,51 @@ the supervisor can then verify-and-write through the normal authoring path.
 Structured output throughout is exactly the classification/summarization job it's
 for (mirrors the skill's `adjudicate_workflow`).
 
-## Blindness is structural — a per-role access matrix
+## Blindness is structural — physical isolation, not a denylist
 
-Blindness is enforced by the middleware and the runtime, never by asking the
-prompt nicely. Each internal role runs under its **own** `OKFGuardMiddleware`
-read-denylist — the deny set differs by role, which is what lets the solver be
-bundle-blind while the adjudicator sees everything:
+Blindness is enforced by *physically removing* what a role may not see, not by a
+denylist the read tools must remember to honor. A denylist is fragile here:
+`grep`/`glob` scan the tree and can surface denied content in their *results*
+without ever naming the denied dir in an argument — and the authoring agent
+deliberately `grep`s `.metadata/columns.tsv`, so those dot-dirs are demonstrably
+reachable by the scan tools. Two mechanisms, by what each role may access:
 
-| Role | gold (`.benchmark/gold`) | questions | authored bundle | `.metadata/` + `.context/` + `run_code`/`run_sql` |
-|---|---|---|---|---|
-| **supervisor** | deny | deny | read/write | read (authoring already uses these) |
-| **solver** | deny | **read** | read | **deny** (bundle-blind — measures the wiki) |
-| **grader** | *direct file read, not a tool* | direct read | — | executes SQL (its job) |
-| **adjudicator** | internal | internal | read | **read** (diagnoses gaps vs raw data) |
+| Role | gold + questions | authored bundle | `.metadata/` + `.context/` + `run_sql`/sandbox |
+|---|---|---|---|
+| **supervisor** | never on disk / never in context | read/write | read (authoring already uses these) |
+| **solver** | question in prompt; gold never | read (**snapshot copy**) | **physically absent** (bundle-blind) |
+| **grader** | both in tool-process memory | — | executes SQL (its job) |
+| **adjudicator** | internal to the tool | read (real mount) | **read** (diagnoses gaps vs raw data) |
 
 Mechanics:
 
-- **Read-denylist extends the guard.** Today `OKFGuardMiddleware` refuses *writes*
-  into `.metadata/` (`okf_guard.py:36,43-47,106-115`). The benchmark needs it to
-  also refuse *reads* (`read_file`/`glob`/`grep`) of a per-role deny set — so the
-  read tools join the guarded set, not just `write_file`/`edit_file`
-  (`_GUARDED_TOOLS`, `okf_guard.py:30`). The deny set is a constructor param, so
-  each role's guard instance is built with the right list.
-- **Gold is denied to every LLM role** — solver, supervisor, adjudicator all run
-  under a guard whose deny set includes `.benchmark/gold`. Only the deterministic
-  grader reads it, via a *direct filesystem read inside the tool process* that
-  never passes through the agent tool layer, so the read-denylist doesn't obstruct
-  it.
-- **Raw data (`.metadata/`, `.context/`, sandbox) is denied to the solver only.**
-  The solver's guard adds these to its deny set; the adjudicator's does not. Same
-  mechanism, mirror-image intent (see roles 2 and 4).
-- **Attached to every subagent.** Subagent middleware *replaces* rather than
-  inherits (the repeated footgun in CLAUDE.md; `agent.py:539,561`), so each
-  in-tool role is constructed with its own guard explicitly. This is exactly what
-  guarantees a *solver* subagent cannot `grep` the gold dir or the schema snapshot.
+- **Gold + questions never touch the agent filesystem.** The runner loads the CSV
+  into the `run_benchmark` **tool process's memory**, not the mount. The question
+  text is passed to a solver as its prompt; the gold SQL stays in memory and is
+  read only by the deterministic grader (plain Python, in-process — no agent tool
+  layer to bypass). So there is no gold file for any LLM to read, by construction.
+  (The uploaded CSV lands in `.benchmark/` on S3 for the *runner* to fetch; it is
+  never materialized on the agent-visible mount.)
+- **The solver runs on a bundle-only snapshot.** Each round, the tool copies
+  **only** the authored bundle — `datasets/`, `tables/`, `references/`,
+  `index.md` (no dot-dirs) — into a fresh temp dir and roots the solver's
+  `FilesystemBackend(virtual_mode=True)` there. `.metadata/`, `.context/`, and
+  anything gold are *physically absent* from the solver's filesystem, so
+  `read_file`/`glob`/`grep`/`ls` cannot reach them however they're called — no
+  denylist to get right. The snapshot is markdown (KBs), so the copy is cheap;
+  it also pins the solver to a consistent view while the supervisor may still be
+  editing the live tree.
+- **The adjudicator uses the real mount + raw-data tools.** It is *not*
+  snapshot-isolated — it needs `.metadata/`/`.context/`/`run_sql`/sandbox to
+  diagnose gaps against the actual data. Safe because its output is de-identified
+  themes, never SQL the score depends on.
 - **Solver ≠ supervisor.** Enforced by construction: the solver is a fresh
   `create_react_agent` invocation with no authoring context, spawned inside the
-  tool.
-- **Layout.** The CSV holds `question,gold_sql`. On the mount, at tool start
-  separate it into a reader-visible `questions` file (questions only) and a
-  **read-denied** `gold` file (the `gold_sql` column). The supervisor never reads
-  *either* — even the question text is withheld from it (the aggregated-feedback
-  boundary); only the in-tool solver reads `questions`.
+  tool, rooted at the snapshot.
+
+The `.metadata/` write-guard (`okf_guard.py:36,43-47,106-115`) is unchanged and
+still applies to the supervisor/authoring roles; the benchmark adds no read-guard
+to it — physical isolation carries the solver's blindness instead.
 
 ## No data split — why the whole set is scored every round
 
@@ -549,27 +556,31 @@ Design choices and why:
 
 ## Middleware monitor
 
-`OKFGuardMiddleware` gains four responsibilities **for a recursive-improvement run
-only** — all keyed off the guard's `ri_enabled` flag, so a normal harvest's guard
-is unchanged. All at the tool boundary (same discipline as refusing a bad write —
-`okf_guard.py:_prepare`):
+Blindness is carried by *physical isolation* (above), not the guard — so the
+guard's RI responsibilities shrink to **behavioral** ones, keyed off an
+`ri_enabled` flag so a normal harvest's guard is byte-for-byte unchanged. All at
+the tool boundary (same discipline as refusing a bad write — `okf_guard.py:
+_prepare`):
 
-- **Blinds (per role, always on when the deny set is non-empty).** Read-denylist
-  applied per role: gold denied to every LLM role; raw data (`.metadata/`,
-  `.context/`, sandbox) denied to the *solver* only; questions denied to the
-  supervisor (see the access matrix above). Attached to every subagent.
-- **Caps (only if `ri_enabled`).** Count `run_benchmark` calls; **hard-refuse the
-  6th** (`max_iterations` clamped to 5). Refuse a config whose effective N exceeds
-  100 (the tool clamps first, but the guard is defense-in-depth). A run that is
-  *not* RI-enabled has no `run_benchmark` tool at all, so there's nothing to count.
-- **Compels (only if `ri_enabled`).** Block `finalize` until the loop has actually
-  run per the config (threshold met *or* max-iter reached). A normal harvest
-  finalizes with no such gate — the compel exists precisely so an *enabled* run
-  can't silently skip the loop.
-- **Gates the result payload** — defense in depth on the tool's return value:
-  scrub any gold, gold rows, question text, or per-`q_id` failure that somehow
-  reaches the payload, so only the score + anonymous `improvements` themes cross
-  to the supervisor (on top of the aggregated-by-construction adjudicator output).
+- **Caps (only if `ri_enabled`).** The guard **counts `run_benchmark` calls** (the
+  user-requested "middleware tracks benchmark calls when enabled") and
+  **hard-refuses past `max_iterations`** with a ToolMessage the supervisor sees —
+  a backstop against a runaway loop, independent of the prompt's own budget. A run
+  that is *not* RI-enabled has no `run_benchmark` tool at all, so the counter stays
+  at zero and the guard behaves exactly as today.
+- **Compel-the-loop lives in the RUNNER, not the guard.** `finalize_bundle` is
+  runner-driven (it runs after the agent stream returns, `runner.py:321`), not an
+  agent tool call — so "don't finalize until the loop ran" is enforced where
+  finalize actually happens: the runner checks the recorded benchmark-round count
+  and, for an RI-enabled run that produced zero rounds, marks the run failed rather
+  than shipping an unbenchmarked bundle as a success.
+
+(The `.metadata/` **write** read-only rule the guard already enforces is
+untouched and unconditional — it protects the schema snapshot from *writes* on
+every run, RI or not.) The result-payload never carries gold/questions in the
+first place (they live only in tool-process memory and never enter the payload),
+so there's no scrub step — the black-box tool simply returns the score + anonymous
+`improvements`.
 
 ## Token accounting
 
@@ -649,14 +660,14 @@ is the rollback signal:
 
 | Change | Location |
 |---|---|
-| Per-role read-denylist (deny set as ctor param); wrap read tools in guarded set | `harvest/okf_guard.py:30,36,43-47,106-115` |
-| Cap / compel / gate logic in `_prepare`, gated on `ri_enabled` | `harvest/okf_guard.py:92-136` |
+| Cap / compel logic in `_prepare`, gated on `ri_enabled` (behavioral only) | `harvest/okf_guard.py:92-136` |
+| Bundle-only snapshot of the solver's filesystem (temp dir, no dot-dirs) | new; `harvest/benchmark.py` |
 | Conditionally append `run_benchmark` to `all_tools` when RI-enabled | `harvest/agent.py:471-486` (mirrors `run_code` conditional-append) |
-| Solver / adjudicator on the SHARED `chat_model`; role-specific guard + tools | `harvest/agent.py:462, 531-601` |
+| Solver (snapshot-rooted) / adjudicator (real mount) on the SHARED `chat_model` | `harvest/agent.py:462`; new `harvest/benchmark.py` |
 | `SUPERVISOR_PROMPT` conditional RI section; skill guidance conditional | `harvest/prompts.py`; `services/harvest/skills/okf-authoring` |
-| Grader PASS/FAIL/DISCARDED + gold/discard result cache | new; `harvest/benchmark.py` |
+| Grader PASS/FAIL/DISCARDED; gold+questions in tool-process memory (not mount) | new; `harvest/benchmark.py` |
 | Adjudicator (raw-data access) → anonymous `improvements` themes | new; `harvest/benchmark.py` |
-| `recursive_improvement` payload block + validation; effort-tier derive | `docs/CONVENTIONS.md:279-361`, `control_api` `handlers.py`/`app.py:429-469` |
+| `recursive_improvement` config validation (`okf_core.recursive_improvement`) | `okf_core/recursive_improvement.py` (done), `control_api` `app.py:429-469` |
 | Dataset RI settings on `DATASET#` row; populate payload every trigger | `control_api/handlers.py` (dataset upsert + all trigger paths) |
 | CSV upload under `.benchmark/` | `control_api/handlers.py:966-1013` (presign) |
 | Athena grader (set-equality, ported from `ex_compare.py`) | new; reuse `okf-sql-benchmark` comparator logic |
@@ -688,10 +699,12 @@ Previously-open questions, now decided (see the sections above):
 - **Athena cost** → cache invariant gold results (+ discard verdicts) across
   rounds + workgroup result-reuse + per-query scan cutoff + own grader concurrency
   cap. (*Grading — deterministic*.)
-- **Solver bundle-blind, adjudicator raw-data-armed** → per-role read-denylist:
-  the solver is denied `.metadata/`/`.context/`/sandbox (it measures the wiki);
-  the adjudicator gets them (it diagnoses gaps vs raw data). Gold denied to both.
-  (*Prediction* / *Adjudication* / *access matrix*.)
+- **Solver bundle-blind via physical isolation, not a denylist** → the solver runs
+  on a temp snapshot of *only* the authored bundle (no `.metadata/`/`.context/`/
+  gold), so scan tools can't reach denied content however called. Gold + questions
+  live only in the tool process's memory, never on the agent mount. The adjudicator
+  uses the real mount + raw-data tools to diagnose gaps. (*Blindness is
+  structural* / *Prediction* / *Adjudication*.)
 - **Benchmark reuses the single harvest `chat_model` instance** → no second model,
   no separate effort (runs at full harvest effort); token metering rides the
   already-instrumented instance with zero extra wiring. (*Benchmark model* /
