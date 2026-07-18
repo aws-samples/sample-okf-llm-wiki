@@ -1815,6 +1815,12 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
         "discarded",
         "graded",
         "threshold_met",
+        # benchmark_solver observability (per-question): what each solver did.
+        "turns",
+        "tool_calls",
+        "sql_len",
+        "sql_preview",
+        "error",
     ):
         if k in rec:
             out[k] = rec.get(k)

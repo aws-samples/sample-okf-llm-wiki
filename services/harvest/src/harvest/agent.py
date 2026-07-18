@@ -444,6 +444,10 @@ def _build_benchmark_session(
             # same OKF_STEP sink the feed already ships to CloudWatch.
             step_emitter._emit(event)
 
+    # Per-question solver observability (a ReAct solver's turns don't reach the
+    # StepEmitter, so this is the only window into what each solver actually did).
+    solver_emit = emit_event if step_emitter is not None else None
+
     return BenchmarkSession(
         data_domain=run.get("data_domain", ""),
         dataset=run.get("dataset", ""),
@@ -451,7 +455,7 @@ def _build_benchmark_session(
         runtime_session_id=run.get("runtime_session_id", ""),
         config=ri_config,
         questions=list(questions),
-        make_solver=lambda snap_dir: make_solver(chat_model, snap_dir),
+        make_solver=lambda snap_dir: make_solver(chat_model, snap_dir, solver_emit),
         grader=grader,
         adjudicate=adjudicate,
         persist_kpi=persist_kpi,

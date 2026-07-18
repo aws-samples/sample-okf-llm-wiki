@@ -53,13 +53,20 @@ SELECT ...
 Output nothing after the block."""
 
 
-def make_solver(chat_model: Any, snapshot_root: str) -> Callable[[str], Awaitable[str]]:
+def make_solver(
+    chat_model: Any, snapshot_root: str, emit: Callable[[dict], None] | None = None
+) -> Callable[[str], Awaitable[str]]:
     """Build an async ``solve(question) -> sql`` bound to a bundle snapshot.
 
     ``chat_model`` is the shared instrumented harvest model (so solver tokens meter
     into the run total for free). ``snapshot_root`` is the bundle-only temp dir the
-    solver's read tools are confined to. Returns an async callable the round
-    orchestrator fans out under its concurrency semaphore.
+    solver's read tools are confined to. ``emit`` (best-effort) receives a compact
+    per-question observability event — a ReAct solver is an ISOLATED graph whose
+    turns don't reach the run's StepEmitter, so without this the solver is a black
+    box (exactly the gap that made "why is EX 0?" un-diagnosable from logs). We do
+    NOT log the question or the answer's meaning — just tool-call/read counts,
+    turn count, whether SQL came out, an error if any, and a short SQL preview.
+    Returns an async callable the round orchestrator fans out under its semaphore.
     """
     from deepagents.backends import FilesystemBackend
     from langchain_core.tools import tool
@@ -99,13 +106,51 @@ def make_solver(chat_model: Any, snapshot_root: str) -> Callable[[str], Awaitabl
         # One ReAct run: the agent explores the wiki with the read tools and ends
         # with a fenced ```sql block. We parse the SQL out of its final message —
         # no structured-output prefill (rejected under adaptive thinking).
-        out = await agent.ainvoke(
-            {"messages": [("user", question)]},
-            config={"recursion_limit": _SOLVER_RECURSION_LIMIT},
-        )
-        return extract_sql(_last_ai_text(out.get("messages", [])))
+        error = ""
+        messages: list = []
+        try:
+            out = await agent.ainvoke(
+                {"messages": [("user", question)]},
+                config={"recursion_limit": _SOLVER_RECURSION_LIMIT},
+            )
+            messages = out.get("messages", [])
+        except Exception as e:  # noqa: BLE001 - a stuck solver is a miss, captured here
+            error = f"{type(e).__name__}: {e}"
+        sql = extract_sql(_last_ai_text(messages)) if messages else ""
+        _emit_solver_debug(emit, messages=messages, sql=sql, error=error)
+        return sql
 
     return solve
+
+
+def _emit_solver_debug(
+    emit: Callable[[dict], None] | None,
+    *,
+    messages: list,
+    sql: str,
+    error: str,
+) -> None:
+    """Emit a compact benchmark_solver observability event (best-effort)."""
+    if emit is None:
+        return
+    tool_calls = 0
+    for m in messages:
+        tc = getattr(m, "tool_calls", None)
+        if tc:
+            tool_calls += len(tc)
+    try:
+        emit(
+            {
+                "kind": "benchmark_solver",
+                "turns": len(messages),
+                "tool_calls": tool_calls,
+                "sql_len": len(sql),
+                "sql_preview": (sql[:200] if sql else ""),
+                "error": error,
+            }
+        )
+    except Exception:  # noqa: BLE001 - observability must never break a solve
+        pass
 
 
 def _last_ai_text(messages: list) -> str:
