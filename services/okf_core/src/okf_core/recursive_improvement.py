@@ -237,9 +237,18 @@ def thresholds_met(
     must clear — an ``ex``-only gate ignores the judge score entirely. An empty
     gate set can never be satisfied (there's nothing to clear), so the loop would
     run to ``max_iterations``; :func:`validate` guarantees a non-empty set.
+
+    **EX is an implicit floor regardless of the gate.** A round with EX == 0 can
+    NEVER be "target met" — a wiki that answers *nothing* correctly is never done,
+    even if a (judge-only) gate would otherwise pass. This blocks the false success
+    where a broken/forgiving adjudicator pushes judge to 1.0 at EX 0.0. Judge only
+    ever *forgives* on top of real passes, so requiring at least one pass is a
+    minimal, always-correct sanity floor.
     """
     gate = config.get(FIELD_GATE_KPIS) or []
     if not gate:
+        return False
+    if ex <= 0.0:
         return False
     if GATE_KPI_EX in gate and ex < config.get(FIELD_EX_THRESHOLD, DEFAULT_EX_THRESHOLD):
         return False

@@ -98,12 +98,20 @@ def restore_authored(snapshot_root: str | Path, dataset_root: str | Path) -> Non
         else:
             entry.unlink(missing_ok=True)
 
-    # Copy the checkpoint's authored entries back in.
+    # Copy the checkpoint's authored files back in — CONTENT ONLY, via fsutil's
+    # mount-safe write. We must NOT use shutil.copy2/copytree here: they call
+    # copystat (utime/chmod), which the S3 Files NFS mount rejects with
+    # "[Errno 524] Unknown error" (ENOTSUPP) — the finalize-restore crash. Walking
+    # + write_text mirrors how the rest of the harvest writes to the mount.
+    from harvest.fsutil import write_text
+
     for entry in sorted(src.iterdir()):
         if not _is_authored(entry.name):
             continue
-        target = dst / entry.name
         if entry.is_dir():
-            shutil.copytree(entry, target, symlinks=False)
+            for f in sorted(entry.rglob("*")):
+                if f.is_file():
+                    rel = f.relative_to(src)
+                    write_text(dst / rel, f.read_text(encoding="utf-8"))
         elif entry.is_file():
-            shutil.copy2(entry, target)
+            write_text(dst / entry.name, entry.read_text(encoding="utf-8"))

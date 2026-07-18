@@ -191,3 +191,16 @@ def test_thresholds_met_empty_gate_never_satisfied():
     # Defensive: an empty gate can't be cleared (validate prevents this, but the
     # function must not vacuously return True).
     assert ri.thresholds_met({"gate_kpis": []}, ex=1.0, judge=1.0) is False
+
+
+def test_thresholds_met_ex_floor_blocks_zero_ex_false_success():
+    # THE FALSE-SUCCESS FIX: EX == 0 can NEVER be "target met", even under a
+    # judge-only gate that would otherwise pass at judge=1.0. Regression guard for
+    # the EX 0% / judge 100% / "Target met" screenshot.
+    judge_only = ri.validate(
+        {"enabled": True, "questions_key": "k", "judge_threshold": 0.9, "gate_kpis": ["judge"]}
+    )
+    assert ri.thresholds_met(judge_only, ex=0.0, judge=1.0) is False
+    # A single real pass lifts the floor; then the judge gate applies normally.
+    assert ri.thresholds_met(judge_only, ex=0.02, judge=0.95) is True
+    assert ri.thresholds_met(judge_only, ex=0.02, judge=0.85) is False

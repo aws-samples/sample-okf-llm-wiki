@@ -45,7 +45,14 @@ def _concurrency() -> int:
 CATEGORY_GENUINE = "GENUINE_ERROR"
 CATEGORY_NOISY_GOLD = "NOISY_GOLD"
 CATEGORY_AMBIGUOUS = "AMBIGUOUS"
+# Distinct sentinel for a classification that ERRORED or couldn't be parsed — it
+# is NOT a real verdict and must NOT be forgiven (that was the 100%-judge bug).
+CATEGORY_UNKNOWN = "UNKNOWN"
 _GENUINE = {CATEGORY_GENUINE}
+# The categories that positively mean "the wiki is not at fault" (forgiven in
+# judge accuracy). UNKNOWN is deliberately absent — an errored review is not
+# evidence the wiki is fine.
+_FORGIVEN = {CATEGORY_NOISY_GOLD, CATEGORY_AMBIGUOUS}
 
 CLASSIFY_SYSTEM_PROMPT = """\
 You are adjudicating why a text-to-SQL agent (which had ONLY a data wiki, not the \
@@ -125,8 +132,10 @@ def make_adjudicator(
         return built
 
     async def _classify_one(classifier: Any, r: QuestionResult) -> tuple[str, str]:
-        """Classify one failure → (category, gap). Never raises — a classifier
-        error degrades to AMBIGUOUS (treated as not-a-wiki-gap)."""
+        """Classify one failure → (category, gap). Never raises — but an error or an
+        unparseable reply returns CATEGORY_UNKNOWN, NOT a real verdict, so it is
+        never forgiven in judge accuracy (an errored review is not evidence the
+        wiki is fine — that was the 0%-EX / 100%-judge false-success bug)."""
         case = (
             f"Predicted SQL:\n{r.predicted_sql}\n\n"
             f"Divergence: {r.reason}\n"
@@ -135,12 +144,15 @@ def make_adjudicator(
         )
         try:
             out = await classifier.ainvoke({"messages": [("user", case)]})
-        except Exception:  # noqa: BLE001 - a stuck classifier is not a crash
-            return CATEGORY_AMBIGUOUS, ""
-        verdict = extract_json(_last_ai_text(out.get("messages", [])), default={})
-        if not isinstance(verdict, dict):
-            return CATEGORY_AMBIGUOUS, ""
-        category = verdict.get("category") or CATEGORY_AMBIGUOUS
+        except Exception:  # noqa: BLE001 - a stuck classifier is UNKNOWN, not a crash
+            return CATEGORY_UNKNOWN, ""
+        verdict = extract_json(_last_ai_text(out.get("messages", [])), default=None)
+        if not isinstance(verdict, dict) or not verdict.get("category"):
+            return CATEGORY_UNKNOWN, ""
+        category = verdict.get("category")
+        # An unrecognized category string is also UNKNOWN (don't silently forgive).
+        if category not in _GENUINE and category not in _FORGIVEN:
+            return CATEGORY_UNKNOWN, ""
         gap = str(verdict.get("gap") or "").strip()
         return category, gap
 
@@ -170,8 +182,12 @@ def make_adjudicator(
 
         verdicts = await asyncio.gather(*[_one(r) for r in fails])
 
+        # Three disjoint buckets. genuine = positively a wiki gap; forgiven =
+        # positively noisy/ambiguous gold; UNKNOWN (errored/unparseable) falls into
+        # neither — it is NOT forgiven, so it counts against the wiki in judge accuracy.
+        genuine_count = sum(1 for cat, _ in verdicts if cat in _GENUINE)
+        forgiven_count = sum(1 for cat, _ in verdicts if cat in _FORGIVEN)
         genuine_gaps = [gap for cat, gap in verdicts if cat in _GENUINE and gap]
-        noisy = sum(1 for cat, _ in verdicts if cat not in _GENUINE)
 
         improvements: list[str] = []
         if genuine_gaps:
@@ -187,8 +203,8 @@ def make_adjudicator(
 
         return AdjudicationResult(
             improvements=improvements,
-            genuine_error_count=len(genuine_gaps),
-            noisy_or_ambiguous=noisy,
+            genuine_error_count=genuine_count,
+            forgiven_count=forgiven_count,
         )
 
     return adjudicate

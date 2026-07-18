@@ -86,10 +86,10 @@ def test_judge_accuracy_forgives_noisy_gold():
     rows = {"GOLD0": [{"c": "0"}], "GOLD1": [{"c": "1"}], "WRONG": [{"c": "x"}]}
     grader = Grader(_fake_execute(rows))
 
-    # Both FAIL, but the adjudicator says neither is a genuine wiki error (noisy gold).
+    # Both FAIL, but the adjudicator POSITIVELY forgives both as noisy gold.
     async def forgiving(fails):
         return AdjudicationResult(
-            improvements=[], genuine_error_count=0, noisy_or_ambiguous=len(fails)
+            improvements=[], genuine_error_count=0, forgiven_count=len(fails)
         )
 
     r = _run(
@@ -97,8 +97,30 @@ def test_judge_accuracy_forgives_noisy_gold():
         adjudicate=forgiving, concurrency=5,
     )
     assert r.ex_score == 0.0  # raw EX: both fail
-    assert r.judge_accuracy == 1.0  # judge: neither was a real wiki gap
+    assert r.judge_accuracy == 1.0  # judge: both positively forgiven
     assert r.genuine_error_count == 0
+
+
+def test_judge_does_not_forgive_unadjudicated_fails():
+    # THE FALSE-SUCCESS FIX at the round level: if the adjudicator forgives NOTHING
+    # (e.g. it errored on every failure → forgiven_count 0), judge must equal EX,
+    # NOT jump to 100%. Regression guard for the EX 0% / judge 100% screenshot.
+    qs = _questions(2)
+    async def solve(question):
+        return "WRONG"
+    rows = {"GOLD0": [{"c": "0"}], "GOLD1": [{"c": "1"}], "WRONG": [{"c": "x"}]}
+    grader = Grader(_fake_execute(rows))
+
+    async def broken(fails):  # adjudicator produced no positive verdicts
+        return AdjudicationResult(genuine_error_count=0, forgiven_count=0)
+
+    r = _run(
+        iteration=0, questions=qs, config=_cfg(), solve=solve, grader=grader,
+        adjudicate=broken, concurrency=5,
+    )
+    assert r.ex_score == 0.0
+    assert r.judge_accuracy == 0.0  # NOT 1.0 — nothing was positively forgiven
+    assert r.threshold_met is False
 
 
 def test_public_dict_is_gold_and_question_free():

@@ -5,7 +5,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from harvest.benchmark.snapshot import snapshot_bundle
+from harvest.benchmark.snapshot import restore_authored, snapshot_bundle
 
 
 def _make_bundle(root: Path):
@@ -83,3 +83,46 @@ def test_missing_source_yields_empty_snapshot():
         assert out == dest
         assert dest.exists()
         assert list(dest.iterdir()) == []
+
+
+def test_restore_replaces_authored_content_without_copystat(monkeypatch):
+    # Restore must NOT use shutil.copy2/copytree — they call copystat, which the
+    # S3 Files NFS mount rejects with Errno 524. Guard: fail loudly if either is
+    # called during a restore, and assert the content still lands correctly.
+    import shutil as _shutil
+
+    def _boom(*a, **k):
+        raise AssertionError("restore must not use shutil.copy2/copytree (copystat → Errno 524)")
+
+    monkeypatch.setattr(_shutil, "copy2", _boom)
+    monkeypatch.setattr(_shutil, "copytree", _boom)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Best-round checkpoint (the good content).
+        snap = Path(tmp) / "best"
+        (snap / "tables").mkdir(parents=True)
+        (snap / "tables" / "races.md").write_text("GOOD")
+        (snap / "index.md").write_text("# index")
+        # Live mount tree: a regressed doc + a stale doc + dot-dirs to preserve.
+        dst = Path(tmp) / "mount"
+        (dst / "tables").mkdir(parents=True)
+        (dst / "tables" / "races.md").write_text("REGRESSED")
+        (dst / "tables" / "stale.md").write_text("should be removed")
+        (dst / ".harvest").mkdir()
+        (dst / ".harvest" / "state.json").write_text("{}")
+
+        restore_authored(snap, dst)
+
+        assert (dst / "tables" / "races.md").read_text() == "GOOD"
+        assert (dst / "index.md").read_text() == "# index"
+        assert not (dst / "tables" / "stale.md").exists()  # pruned
+        assert (dst / ".harvest" / "state.json").exists()  # dot-dir untouched
+
+
+def test_restore_missing_snapshot_is_noop():
+    with tempfile.TemporaryDirectory() as tmp:
+        dst = Path(tmp) / "mount"
+        dst.mkdir()
+        (dst / "index.md").write_text("keep")
+        restore_authored(Path(tmp) / "nope", dst)
+        assert (dst / "index.md").read_text() == "keep"

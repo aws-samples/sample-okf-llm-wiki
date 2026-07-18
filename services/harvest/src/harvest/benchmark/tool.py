@@ -47,15 +47,22 @@ Solve = Callable[[str], Awaitable[str]]
 class AdjudicationResult:
     """What the adjudicator returns for a round's FAILs.
 
-    ``genuine_error_count`` is the number of FAILs judged a real wiki gap;
-    ``noisy_or_ambiguous`` is the rest (broken/ambiguous gold — the wiki is
-    effectively correct). ``improvements`` is the de-identified theme list — the
+    Three disjoint buckets over the FAILs:
+    * ``genuine_error_count`` — POSITIVELY classified as a real wiki gap.
+    * ``forgiven_count`` — POSITIVELY classified as noisy/broken/ambiguous gold
+      (the wiki is not at fault). Only these are "forgiven" in judge accuracy.
+    * everything else (errored / unparseable classification) is UNKNOWN — NOT
+      forgiven. Counting an errored adjudication as "wiki is fine" is exactly how
+      a broken adjudicator inflated judge accuracy to 100% at EX 0%; forgiveness
+      must require positive evidence, so unknowns lower judge like genuine errors.
+
+    ``improvements`` is the de-identified theme list from the genuine gaps — the
     ONLY free text that crosses back to the supervisor.
     """
 
     improvements: list[str] = field(default_factory=list)
     genuine_error_count: int = 0
-    noisy_or_ambiguous: int = 0
+    forgiven_count: int = 0
 
 
 @dataclass
@@ -107,19 +114,19 @@ class RoundResult:
         }
 
 
-def _judge_accuracy(passed: int, graded: int, genuine_errors: int) -> float:
-    """Genuine-correctness rate: treat noisy-gold/ambiguous FAILs as correct.
+def _judge_accuracy(passed: int, graded: int, forgiven: int) -> float:
+    """Genuine-correctness rate: PASSes plus FAILs POSITIVELY forgiven as noisy gold.
 
-    Of the graded questions, the ones the wiki got *genuinely* wrong are the
-    genuine-error FAILs; everything else (PASS, or a FAIL blamed on broken/ambiguous
-    gold) counts as the wiki being effectively correct. So
-    ``judge = (graded - genuine_errors) / graded``. This is always >= raw EX
-    (it forgives noisy-gold), which is the point — raw EX rewards matching possibly
-    broken gold; judge accuracy is the honest quality signal.
+    ``judge = (passed + forgiven) / graded``, where ``forgiven`` is ONLY the FAILs
+    the adjudicator positively classified as broken/ambiguous gold. A FAIL whose
+    adjudication ERRORED or couldn't be parsed is NOT forgiven — it stays counted
+    against the wiki. This is the fix for the 0%-EX / 100%-judge false success: a
+    broken adjudicator forgives nothing, so judge can't exceed EX just because the
+    reviewer fell over. judge is always >= EX (forgiveness only helps) and <= 1.
     """
     if graded <= 0:
         return 0.0
-    return max(0.0, (graded - genuine_errors)) / graded
+    return min(1.0, (passed + max(0, forgiven)) / graded)
 
 
 # A progress callback: (phase, current, total) -> None. Best-effort — the caller
@@ -276,7 +283,9 @@ async def run_round(
         adj = AdjudicationResult()
 
     ex = ri.ex_score(passed, graded_n)
-    judge = _judge_accuracy(passed, graded_n, adj.genuine_error_count)
+    # Forgive ONLY positively-classified noisy gold — not errored/unknown
+    # adjudications (which stay counted against the wiki). See _judge_accuracy.
+    judge = _judge_accuracy(passed, graded_n, adj.forgiven_count)
     met = ri.thresholds_met(config, ex=ex, judge=judge)
 
     return RoundResult(

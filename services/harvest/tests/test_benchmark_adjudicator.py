@@ -71,7 +71,7 @@ def test_classifies_genuine_vs_noisy(monkeypatch):
     fails = [_fail(0, "SELECT 1"), _fail(1, "SELECT 2"), _fail(2, "SELECT 1")]
     res = asyncio.run(adjudicate(fails))
     assert res.genuine_error_count == 2  # the two "SELECT 1" cases
-    assert res.noisy_or_ambiguous == 1
+    assert res.forgiven_count == 1  # the NOISY_GOLD one
     assert res.improvements == ["document the status int code"]
 
 
@@ -105,7 +105,10 @@ def test_no_fails_is_empty(monkeypatch):
     assert res.genuine_error_count == 0 and res.improvements == []
 
 
-def test_classifier_error_degrades_to_ambiguous(monkeypatch):
+def test_classifier_error_is_unknown_not_forgiven(monkeypatch):
+    # THE FALSE-SUCCESS FIX: a crashing classifier must NOT be counted as forgiven
+    # (noisy gold). It's UNKNOWN → neither genuine nor forgiven → it still counts
+    # against the wiki in judge accuracy. Regression guard for EX 0% / judge 100%.
     class _BoomAgent:
         async def ainvoke(self, state):
             raise RuntimeError("model down")
@@ -119,6 +122,21 @@ def test_classifier_error_degrades_to_ambiguous(monkeypatch):
     )
     adjudicate = adj.make_adjudicator(_FakeModel(), raw_data_tools=[])
     res = asyncio.run(adjudicate([_fail(0), _fail(1)]))
-    # A crashing classifier is not a wiki gap and does not crash the round.
+    # Not a crash; but crucially forgiven_count == 0 (not 2).
     assert res.genuine_error_count == 0
-    assert res.noisy_or_ambiguous == 2
+    assert res.forgiven_count == 0
+
+
+def test_unparseable_verdict_is_unknown_not_forgiven(monkeypatch):
+    # A reply with no JSON / no category is UNKNOWN, not silently forgiven.
+    adjudicate = _make(lambda case: "I'm not sure, could be anything", {"now": 0, "max": 0}, monkeypatch)
+    res = asyncio.run(adjudicate([_fail(0), _fail(1)]))
+    assert res.forgiven_count == 0
+    assert res.genuine_error_count == 0
+
+
+def test_unrecognized_category_is_unknown(monkeypatch):
+    # A made-up category string doesn't get forgiven either.
+    adjudicate = _make(lambda case: '{"category": "WHATEVER", "gap": ""}', {"now": 0, "max": 0}, monkeypatch)
+    res = asyncio.run(adjudicate([_fail(0)]))
+    assert res.forgiven_count == 0 and res.genuine_error_count == 0
