@@ -196,6 +196,33 @@ export function makeApi(token) {
         { guidance }
       ),
 
+    // Recursive-improvement benchmark. GET/PUT the dataset's saved settings
+    // ({enabled, questions_key, max_iterations, ex_threshold, judge_threshold,
+    // gate_kpis}); the PUT is validated + clamped server-side (400 on a bad value).
+    // The CSV (question,gold_sql) uploads via a SEPARATE presign that pins an
+    // OFF-MOUNT key (benchmark/<d>/<ds>/questions.csv, NOT under okf/) so the gold
+    // is unreadable by the harvest agent — see docs/RECURSIVE_IMPROVEMENT.md.
+    getBenchmarkSettings: (domain, dataset) =>
+      request(
+        token,
+        "GET",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}`
+      ),
+    setBenchmarkSettings: (domain, dataset, settings) =>
+      request(
+        token,
+        "PUT",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}`,
+        settings
+      ),
+    presignBenchmarkUpload: (domain, dataset, contentType) =>
+      request(
+        token,
+        "POST",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/presign`,
+        { content_type: contentType }
+      ),
+
     // Chat conversations (the per-user sidebar list). The chat RUNTIME writes the
     // index rows; the Control API serves this read/rename/delete side, scoped to
     // the caller's Cognito sub. Rename is PUT (not PATCH) to match the API GW CORS
