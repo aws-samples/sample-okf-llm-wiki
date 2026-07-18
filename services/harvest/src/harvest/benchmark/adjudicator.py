@@ -23,11 +23,23 @@ callable returned matches the ``adjudicate`` contract the round orchestrator wan
 
 from __future__ import annotations
 
+import asyncio
+import os
 from typing import Any, Awaitable, Callable
 
 from harvest.benchmark.extract import extract_json, message_text
 from harvest.benchmark.grader import QuestionResult
 from harvest.benchmark.tool import AdjudicationResult
+
+_DEFAULT_CONCURRENCY = 10
+
+
+def _concurrency() -> int:
+    """Adjudicator fan-out width — the LLM knob, shared with the solver."""
+    try:
+        return max(1, int(os.environ.get("OKF_BENCHMARK_MAX_CONCURRENCY", "")))
+    except (TypeError, ValueError):
+        return _DEFAULT_CONCURRENCY
 
 # Categories mirror the okf-sql-benchmark adjudicator taxonomy.
 CATEGORY_GENUINE = "GENUINE_ERROR"
@@ -112,31 +124,54 @@ def make_adjudicator(
         )
         return built
 
-    async def adjudicate(fails: list[QuestionResult]) -> AdjudicationResult:
+    async def _classify_one(classifier: Any, r: QuestionResult) -> tuple[str, str]:
+        """Classify one failure → (category, gap). Never raises — a classifier
+        error degrades to AMBIGUOUS (treated as not-a-wiki-gap)."""
+        case = (
+            f"Predicted SQL:\n{r.predicted_sql}\n\n"
+            f"Divergence: {r.reason}\n"
+            f"predicted rowcount={r.pred_rowcount}, gold rowcount={r.gold_rowcount}\n"
+            f"predicted sample (first rows): {r.pred_sample}"
+        )
+        try:
+            out = await classifier.ainvoke({"messages": [("user", case)]})
+        except Exception:  # noqa: BLE001 - a stuck classifier is not a crash
+            return CATEGORY_AMBIGUOUS, ""
+        verdict = extract_json(_last_ai_text(out.get("messages", [])), default={})
+        if not isinstance(verdict, dict):
+            return CATEGORY_AMBIGUOUS, ""
+        category = verdict.get("category") or CATEGORY_AMBIGUOUS
+        gap = str(verdict.get("gap") or "").strip()
+        return category, gap
+
+    async def adjudicate(
+        fails: list[QuestionResult],
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> AdjudicationResult:
         if not fails:
             return AdjudicationResult()
 
         classifier = _ensure_built()["classifier"]
-        genuine_gaps: list[str] = []
-        noisy = 0
-        for r in fails:
-            case = (
-                f"Predicted SQL:\n{r.predicted_sql}\n\n"
-                f"Divergence: {r.reason}\n"
-                f"predicted rowcount={r.pred_rowcount}, gold rowcount={r.gold_rowcount}\n"
-                f"predicted sample (first rows): {r.pred_sample}"
-            )
-            out = await classifier.ainvoke({"messages": [("user", case)]})
-            verdict = extract_json(_last_ai_text(out.get("messages", [])), default={})
-            category = (verdict.get("category") or CATEGORY_AMBIGUOUS) if isinstance(
-                verdict, dict
-            ) else CATEGORY_AMBIGUOUS
-            if category in _GENUINE:
-                gap = str((verdict or {}).get("gap") or "").strip()
-                if gap:
-                    genuine_gaps.append(gap)
-            else:
-                noisy += 1
+        # Classify the failures CONCURRENTLY (bounded by the LLM concurrency knob) —
+        # each is an independent ReAct call, so a sequential loop over 48 failures
+        # is needlessly slow. Tick on_progress as each completes so the UI advances.
+        sem = asyncio.Semaphore(_concurrency())
+        total = len(fails)
+        done = 0
+
+        async def _one(r: QuestionResult) -> tuple[str, str]:
+            nonlocal done
+            async with sem:
+                verdict = await _classify_one(classifier, r)
+            done += 1
+            if on_progress:
+                on_progress(done, total)
+            return verdict
+
+        verdicts = await asyncio.gather(*[_one(r) for r in fails])
+
+        genuine_gaps = [gap for cat, gap in verdicts if cat in _GENUINE and gap]
+        noisy = sum(1 for cat, _ in verdicts if cat not in _GENUINE)
 
         improvements: list[str] = []
         if genuine_gaps:

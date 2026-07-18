@@ -199,6 +199,47 @@ async def _grade_all(
     return await asyncio.gather(*[_grade(q, sql) for q, sql in solved])
 
 
+def _accepts_on_progress(fn: Callable) -> bool:
+    """True iff ``fn`` accepts an ``on_progress`` keyword (the real adjudicator
+    does; an injected test fake taking only ``fails`` does not). Signature
+    inspection — NOT a TypeError catch — so a genuine TypeError inside the
+    adjudicator can't trigger a spurious double-call."""
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "on_progress" in params:
+        return True
+    # A **kwargs-accepting callable can take it too.
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+async def _adjudicate_with_progress(
+    adjudicate: Callable[..., Awaitable[AdjudicationResult]],
+    fails: list[QuestionResult],
+    progress: Progress | None,
+) -> AdjudicationResult:
+    """Call ``adjudicate(fails)``, forwarding a reviewing-progress hook if it
+    accepts one. The real adjudicator takes ``on_progress(done, total)`` and ticks
+    per classified failure; a plain ``adjudicate(fails)`` (e.g. a test fake) is
+    still supported — then we just emit the terminal reviewing tick."""
+    if _accepts_on_progress(adjudicate):
+        on_progress = None
+        if progress:
+
+            def on_progress(done: int, total: int) -> None:  # noqa: F811
+                progress("reviewing", done, total)
+
+        return await adjudicate(fails, on_progress=on_progress)
+
+    adj = await adjudicate(fails)
+    if progress:
+        progress("reviewing", len(fails), len(fails))
+    return adj
+
+
 async def run_round(
     *,
     iteration: int,
@@ -230,9 +271,7 @@ async def run_round(
     if fails:
         if progress:
             progress("reviewing", 0, len(fails))
-        adj = await adjudicate(fails)
-        if progress:
-            progress("reviewing", len(fails), len(fails))
+        adj = await _adjudicate_with_progress(adjudicate, fails, progress)
     else:
         adj = AdjudicationResult()
 
