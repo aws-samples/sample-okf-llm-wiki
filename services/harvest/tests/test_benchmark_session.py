@@ -96,53 +96,34 @@ def test_round_advances_and_persists():
         assert "G0" not in repr(r0) and "Q0" not in repr(r0)
 
 
-def test_best_round_picks_highest_ex_earliest_on_tie():
+def test_round_snapshots_are_always_deleted_no_checkpoint_retained():
+    # The benchmark keeps NO checkpoint: every round's throwaway snapshot dir is
+    # deleted, and the session exposes no best_snapshot/best_round/restore API.
     import asyncio
+    import glob as _glob
+
     with tempfile.TemporaryDirectory() as tmp:
         _bundle(Path(tmp))
         persisted, events = [], []
         sess = _session(
             tmp,
             predicted_by_round={
-                0: {"Q0": "P_right0", "Q1": "P_right1"},   # 1.0
-                1: {"Q0": "P_right0", "Q1": "P_wrong"},    # 0.5 (regression)
-                2: {"Q0": "P_right0", "Q1": "P_right1"},   # 1.0 again
-            },
-            persisted=persisted, events=events,
-        )
-        for _ in range(3):
-            asyncio.run(sess.run_next())
-        best = sess.best_round()
-        assert best.ex_score == 1.0
-        assert best.iteration == 0  # earliest of the tied-best rounds
-
-
-def test_best_snapshot_retained_and_points_at_best_bundle():
-    import asyncio
-    from pathlib import Path as P
-    with tempfile.TemporaryDirectory() as tmp:
-        _bundle(Path(tmp))
-        persisted, events = [], []
-        sess = _session(
-            tmp,
-            predicted_by_round={
-                0: {"Q0": "P_right0", "Q1": "P_right1"},   # 1.0 (best, earliest)
-                1: {"Q0": "P_right0", "Q1": "P_wrong"},    # 0.5
+                0: {"Q0": "P_right0", "Q1": "P_right1"},
+                1: {"Q0": "P_right0", "Q1": "P_wrong"},
             },
             persisted=persisted, events=events,
         )
         asyncio.run(sess.run_next())
         asyncio.run(sess.run_next())
-        # A checkpoint snapshot is retained and physically exists...
-        assert sess.best_snapshot is not None
-        assert P(sess.best_snapshot).exists()
-        # ...and it is the best round's bundle (round 0), not the regressed last one.
-        assert sess.best_round().iteration == 0
-        # It contains authored docs but no dot-dirs (bundle-only).
-        assert (P(sess.best_snapshot) / "tables" / "t.md").exists()
-        assert not (P(sess.best_snapshot) / ".metadata").exists()
-        sess.cleanup()
-        assert not P(sess.best_snapshot).exists() if sess.best_snapshot else True
+        # No leftover per-round snapshot dirs, and no checkpoint/restore surface.
+        assert _glob.glob("/tmp/okf-bench-*") == [] or all(
+            not Path(p).exists() for p in _glob.glob("/tmp/okf-bench-*")
+        )
+        assert not hasattr(sess, "best_snapshot")
+        assert not hasattr(sess, "best_round")
+        assert not hasattr(sess, "restore")
+        # The live bundle on the mount is UNTOUCHED by the benchmark.
+        assert (Path(tmp) / "tables" / "t.md").read_text() == "# t"
 
 
 def test_threshold_met_flag_in_public_dict():

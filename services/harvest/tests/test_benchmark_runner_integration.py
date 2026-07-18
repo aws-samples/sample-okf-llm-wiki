@@ -73,55 +73,36 @@ def test_build_kwargs_threads_session_pieces():
     assert callable(kw["persist_kpi"])
 
 
-# -- compel + best-restore ---------------------------------------------------
+# -- compel check (NO restore — the benchmark never touches the bundle) -------
 
 
 class _FakeSession:
-    def __init__(self, rounds, best, best_snapshot):
+    def __init__(self, rounds):
         self.rounds = rounds
-        self._best = best
-        self.best_snapshot = best_snapshot
-        self.finalized = []
-        self.cleaned = False
-
-    def best_round(self):
-        return self._best
-
-    def persist_final(self, shipped):
-        self.finalized.append(shipped)
-
-    def cleanup(self):
-        self.cleaned = True
 
 
 def test_finish_noop_when_no_benchmark():
-    runner._finish_benchmark(object(), None, dataset_root=Path("/tmp"))  # no raise
+    runner._finish_benchmark(object(), None)  # no raise
 
 
 def test_finish_raises_when_ri_enabled_but_no_round():
-    built = types.SimpleNamespace(benchmark_session=_FakeSession([], None, None))
-    bench = object()
+    built = types.SimpleNamespace(benchmark_session=_FakeSession([]))
     with pytest.raises(runner.BenchmarkNotRunError):
-        runner._finish_benchmark(built, bench, dataset_root=Path("/tmp"))
+        runner._finish_benchmark(built, object())
 
 
-def test_finish_restores_best_snapshot_and_persists_final():
+def test_finish_does_not_touch_the_bundle():
+    # Compel passes (a round ran) and the authored bundle is left EXACTLY as the
+    # agent authored it — no rollback, no delete, no restore. Regression guard for
+    # the data-loss bug.
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "bundle"
         (root / "tables").mkdir(parents=True)
-        (root / "tables" / "t.md").write_text("REGRESSED last-round content")
-        # The best round's checkpoint has the good content.
-        snap = Path(tmp) / "best"
-        (snap / "tables").mkdir(parents=True)
-        (snap / "tables" / "t.md").write_text("GOOD best-round content")
+        (root / "tables" / "t.md").write_text("AGENT-AUTHORED content")
 
-        best = types.SimpleNamespace(iteration=0, ex_score=0.9)
-        session = _FakeSession(rounds=[best, object()], best=best, best_snapshot=str(snap))
-        built = types.SimpleNamespace(benchmark_session=session)
+        built = types.SimpleNamespace(
+            benchmark_session=_FakeSession(rounds=[object(), object()])
+        )
+        runner._finish_benchmark(built, object())  # no raise, no mutation
 
-        runner._finish_benchmark(built, object(), dataset_root=root)
-
-        # Bundle rolled back to the best round's content.
-        assert (root / "tables" / "t.md").read_text() == "GOOD best-round content"
-        assert session.finalized == [best]  # final KPI row written
-        assert session.cleaned is True
+        assert (root / "tables" / "t.md").read_text() == "AGENT-AUTHORED content"

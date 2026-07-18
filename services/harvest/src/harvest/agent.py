@@ -377,8 +377,9 @@ class HarvestAgent:
     link_graph: LinkGraph
     dataset_root: Path
     # Present only on a recursive-improvement run: the per-run benchmark session,
-    # so the runner can read best_round()/rounds after the crawl for checkpoint
-    # selection and the terminal KPI row. None on a normal harvest.
+    # so the runner can confirm at least one round ran (compel check). The
+    # benchmark never mutates the bundle — the agent owns its shape. None on a
+    # normal harvest.
     benchmark_session: Any = None
 
 

@@ -193,13 +193,14 @@ def _recursion_limit_for(base_limit: int, bench: Any) -> int:
     return max(base_limit, 2000)
 
 
-def _finish_benchmark(built: Any, bench: Any, *, dataset_root: Path) -> None:
-    """Compel the loop + restore the best-scoring bundle before finalize.
+def _finish_benchmark(built: Any, bench: Any) -> None:
+    """Compel-the-loop check for an RI run — NO bundle restore/rollback.
 
-    For an RI run: require at least one benchmark round actually ran (else the
-    agent skipped the loop — raise so the run is reported failed rather than
-    shipping an unbenchmarked bundle as a success), then roll the authored bundle
-    back to the best-scoring iteration's checkpoint. No-op when RI is off.
+    Require that at least one benchmark round actually ran (else the agent skipped
+    the loop — raise so the run is reported failed rather than shipping an
+    unbenchmarked bundle as a success). The benchmark NEVER modifies or rolls back
+    the authored bundle: the agent owns the bundle's shape and whatever it authored
+    is what ships (see harvest/benchmark/snapshot.py). No-op when RI is off.
     """
     if bench is None:
         return
@@ -209,23 +210,10 @@ def _finish_benchmark(built: Any, bench: Any, *, dataset_root: Path) -> None:
             "recursive improvement was enabled but no benchmark round ran; "
             "refusing to finalize an unbenchmarked bundle"
         )
-
-    from harvest.benchmark.snapshot import restore_authored
-
-    best = session.best_round()
-    best_snapshot = session.best_snapshot
-    if best_snapshot and best is not None:
-        # Roll back to the best iteration's bundle (a later round may have
-        # regressed it). The KPI final row records which iteration shipped.
-        restore_authored(best_snapshot, dataset_root)
-        session.persist_final(best)
-        log.info(
-            "Recursive improvement: shipped iteration %d (EX=%.3f) of %d round(s)",
-            best.iteration,
-            best.ex_score,
-            len(session.rounds),
-        )
-    session.cleanup()
+    log.info(
+        "Recursive improvement: %d benchmark round(s) ran (agent owns final bundle).",
+        len(session.rounds),
+    )
 
 
 @contextlib.contextmanager
@@ -439,7 +427,7 @@ def run_full_harvest(
         # Compel-the-loop + best-checkpoint restore live HERE (finalize is runner-
         # driven, not an agent tool). For an RI run: require at least one benchmark
         # round ran, then roll the bundle back to the best-scoring iteration.
-        _finish_benchmark(built, bench, dataset_root=dataset_root)
+        _finish_benchmark(built, bench)
 
         state = finalize_bundle(
             dataset_root,
@@ -585,7 +573,7 @@ def run_incremental_harvest(
             config = _invoke_config(effective_limit, emitter)
             _run_agent(built.agent, prompt, config, emitter)
 
-        _finish_benchmark(built, bench, dataset_root=dataset_root)
+        _finish_benchmark(built, bench)
 
         state = finalize_bundle(
             dataset_root,
@@ -826,7 +814,7 @@ def run_annotation_harvest(
             config = _invoke_config(effective_limit, emitter)
             _run_agent(built.agent, prompt, config, emitter)
 
-        _finish_benchmark(built, bench, dataset_root=dataset_root)
+        _finish_benchmark(built, bench)
 
         state = finalize_bundle(
             dataset_root,

@@ -73,45 +73,9 @@ def snapshot_bundle(dataset_root: str | Path, dest_root: str | Path) -> Path:
     return dest
 
 
-def restore_authored(snapshot_root: str | Path, dataset_root: str | Path) -> None:
-    """Replace the authored bundle at ``dataset_root`` with ``snapshot_root``'s.
-
-    Used to roll a recursive-improvement run back to its best-scoring iteration:
-    a later round can regress the bundle, so before finalize we restore the
-    checkpoint (a retained bundle-only snapshot). Only the AUTHORED (non-dot) top-
-    level entries are replaced — the dataset's ``.harvest/``/``.metadata/``/
-    ``.context/`` are left intact (they're not in the snapshot and not authored
-    output). Idempotent-ish: existing authored entries are removed first so a doc
-    the best round didn't have doesn't linger.
-    """
-    src = Path(snapshot_root)
-    dst = Path(dataset_root)
-    if not src.exists():
-        return
-
-    # Remove current authored entries (non-dot) so the restore is exact.
-    for entry in list(dst.iterdir()) if dst.exists() else []:
-        if not _is_authored(entry.name):
-            continue
-        if entry.is_dir():
-            shutil.rmtree(entry, ignore_errors=True)
-        else:
-            entry.unlink(missing_ok=True)
-
-    # Copy the checkpoint's authored files back in — CONTENT ONLY, via fsutil's
-    # mount-safe write. We must NOT use shutil.copy2/copytree here: they call
-    # copystat (utime/chmod), which the S3 Files NFS mount rejects with
-    # "[Errno 524] Unknown error" (ENOTSUPP) — the finalize-restore crash. Walking
-    # + write_text mirrors how the rest of the harvest writes to the mount.
-    from harvest.fsutil import write_text
-
-    for entry in sorted(src.iterdir()):
-        if not _is_authored(entry.name):
-            continue
-        if entry.is_dir():
-            for f in sorted(entry.rglob("*")):
-                if f.is_file():
-                    rel = f.relative_to(src)
-                    write_text(dst / rel, f.read_text(encoding="utf-8"))
-        elif entry.is_file():
-            write_text(dst / entry.name, entry.read_text(encoding="utf-8"))
+# NOTE: there is deliberately NO restore/rollback of the authored bundle. The
+# benchmark reads the live bundle via the throwaway snapshot above and NEVER
+# writes to or rolls back the mount — the agent owns the bundle's shape. An
+# earlier `restore_authored` (delete-all-authored + copy a "best round" snapshot
+# back) caused a visible data-loss window and could discard the run's in-place
+# edits; it was removed on purpose. Don't reintroduce mount mutation here.

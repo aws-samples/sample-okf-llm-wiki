@@ -111,26 +111,32 @@ Inside one harvest run, after the initial blind authoring pass completes:
 
 ```
 author bundle (blind, iteration 0 — the normal harvest)
-best = { score: -1, checkpoint: none }
 loop (up to max_iterations, default & hard-cap 5):
     result = run_benchmark(config)     ← black-box tool; STATELESS, gold-free out
     persist KPIs (this iteration)
-    if result.score > best.score:  best = { result.score, checkpoint(working tree) }
     if gate_kpis all ≥ threshold:  break (success)
     if iteration == max:           break
     revise docs from result.improvements   ← aggregated, anonymous report
-finalize:  restore best checkpoint, commit
+finalize:  commit the bundle AS THE AGENT LEFT IT (no restore)
 ```
+
+**The AGENT owns the bundle. There is no checkpoint/restore.** The benchmark reads
+the live bundle (through a throwaway per-round snapshot) and NEVER writes to or
+rolls back the mount — whatever the agent authored is what ships. An earlier
+design kept the "best-scoring round" and restored it at finalize; that was removed
+after it caused a data-loss window (a delete-all-authored + copy-back on the live
+mount) and could discard the run's in-place edits. The agent decides when to stop
+improving and what the final bundle looks like.
 
 **Each `run_benchmark` call is stateless** — it re-measures the *current* wiki
 against the *whole* question set from scratch, with no memory of prior rounds. The
 benchmark is a pure function of `(current wiki, question set)`; a rising score
 across rounds is therefore real signal, not an artifact of carried-over state. The
-only thing that persists across rounds is the supervisor's loop bookkeeping
-(iteration count, best-so-far, stop decision) and the DISCARDED set (a data
-property, not an assessment — see above). The whole question set is scored every
-round (there is no held-back slice); the aggregated-feedback boundary is what
-prevents that from overfitting the number.
+only state that persists across rounds is the supervisor's loop bookkeeping
+(iteration count, stop decision) and the DISCARDED set (a data property, not an
+assessment — see above). The whole question set is scored every round (there is no
+held-back slice); the aggregated-feedback boundary is what prevents that from
+overfitting the number.
 
 The supervisor drives this loop from its prompt. The **middleware** enforces the
 caps and blindness so the loop cannot cheat or run away (see *Middleware
@@ -537,8 +543,9 @@ row under the same partition**, correlated to the run by `runtime_session_id`:
 - attrs: `{iteration, runtime_session_id, ex_score, judge_accuracy, passed,
   failed, discarded, graded, genuine_error_count, threshold_met, created_at}`
   (`graded = passed + failed`; `ex_score = passed / graded`; discards excluded).
-- a finalize row `sk = "BENCH#<runtime_session_id>#final"` carries the shipped
-  iteration's numbers + `shipped_iteration` (which checkpoint finalize restored).
+
+(There is one row per round. No `#final` row — the run ships the bundle as the
+agent left it, so the last round's row already reflects what shipped.)
 
 Design choices and why:
 
@@ -622,20 +629,22 @@ boto3 for a model inference here. Escape hatch: `StepEmitter.record_usage(msg)`
 (`steps.py:485`) with a `usage_metadata`-shaped object — but the clean path is
 "use the shared model," and it should be a hard build constraint.
 
-## Checkpoint and rollback
+## No checkpoint, no rollback — the agent owns the bundle
 
-Edits are cumulative and in-place, and there is **no per-edit attribution** — a
-fix for one theme can regress another (a revenue-metric edit that breaks a status
-filter). Because each round re-scores the whole set statelessly, the score itself
-is the rollback signal:
+The benchmark **never modifies or rolls back the authored bundle.** It reads the
+live bundle through a throwaway per-round snapshot (always deleted after the
+round) and writes nothing to the mount. At finalize the bundle ships **exactly as
+the agent authored it** via the normal `finalize_bundle` (`finalize.py:22-83`).
 
-- Snapshot the working tree at each iteration whose score is a **new best**.
-- Before `finalize`, **restore the best-scoring checkpoint** — do not necessarily
-  ship the last iteration (the last round can score *lower* than an earlier one).
-- Commit via the normal `finalize_bundle` (`finalize.py:22-83`, writes
-  `.harvest/state.json` last), then write the `#final` KPI row with
-  `shipped_iteration`. S3 versioning (`storage.tf`) is the durable backstop, but
-  the in-run checkpoint is what the restore uses.
+This is a deliberate reversal of an earlier design that kept the "best-scoring
+round" and restored it before finalize. That restore (delete-all-authored on the
+mount, then copy a snapshot back) caused a **visible data-loss window** and, on
+in-place modes (`annotated`/`incremental`), would discard the run's own edits.
+Rollback logic on a live mount is not worth the risk: the agent decides when to
+stop improving and what the final bundle is. If a late edit regresses the score,
+that is the agent's call to make (and the per-round KPI rows record the trajectory
+for a human to see). S3 versioning (`storage.tf`) remains the durable backstop for
+recovering any prior version out-of-band.
 
 ## Constraints and non-goals
 

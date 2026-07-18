@@ -317,8 +317,9 @@ wiki against the benchmark:
    or the tool refuses further calls (your iteration budget is spent) — either is
    a valid stopping point.
 
-You do not manage checkpoints — the best-scoring iteration's bundle is kept
-automatically at finalize, so it is always safe to keep improving. The
+The wiki ships EXACTLY as you leave it — there is NO automatic rollback to a
+higher-scoring earlier round. So if a revision lowers the score, fix or revert it
+before you finish; never end on a version worse than one you already had. The
 `improvements` are dataset-level facts (e.g. "document that `status` is an int
 code, 1=active"); write them as durable doc content, not as answers to specific
 questions (you can't see the questions anyway).

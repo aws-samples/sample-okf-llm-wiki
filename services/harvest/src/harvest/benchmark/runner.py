@@ -46,8 +46,12 @@ class BenchmarkSession:
 
     Holds the loaded questions, the config, the injected solver/grader/adjudicator
     factories, and the round counter. One instance per harvest run; ``run_next``
-    advances one round each call. Also records every round's :class:`RoundResult`
-    so the runner can pick the best-scoring checkpoint at finalize.
+    advances one round each call, recording each round's :class:`RoundResult`.
+
+    The AGENT owns the bundle: it revises docs between rounds and decides when to
+    stop. There is deliberately NO checkpoint/restore here — the benchmark reads
+    the live bundle (via a throwaway per-round snapshot) and NEVER writes to or
+    rolls back the mount. Whatever the agent authored is what ships.
     """
 
     def __init__(
@@ -80,23 +84,20 @@ class BenchmarkSession:
         self._concurrency = concurrency or _concurrency()
         self._iteration = 0
         self.rounds: list[RoundResult] = []
-        # The retained snapshot dir of the best-scoring round so far, for
-        # checkpoint restore before finalize. A later round can regress the bundle;
-        # keeping the best round's bundle-only snapshot lets the runner roll back to
-        # it. Non-best snapshots are deleted as we go.
-        self._best_snapshot: str | None = None
-        self._best_key: tuple[float, int] | None = None
 
     async def run_next(self) -> dict:
-        """Run one stateless round against the current bundle; return the public dict."""
+        """Run one stateless round against the CURRENT live bundle; return the dict.
+
+        Each round makes a throwaway bundle-only snapshot for the solver to read
+        (physically confined to the authored docs as they stand now — no dot-dirs),
+        and ALWAYS deletes it afterward. The snapshot is a read copy for the
+        examiner, never a checkpoint: the benchmark does not modify or roll back
+        the mount.
+        """
         iteration = self._iteration
         self._iteration += 1
 
-        # Fresh bundle-only snapshot each round: the solver is physically confined
-        # to the authored docs as they stand right now (no dot-dirs). The snapshot
-        # doubles as the round's checkpoint (the bundle that produced this score).
         snap_dir = tempfile.mkdtemp(prefix=f"okf-bench-{iteration}-")
-        keep_snapshot = False
         try:
             snapshot_bundle(self.dataset_root, snap_dir)
             solve = self._make_solver(snap_dir)
@@ -111,10 +112,8 @@ class BenchmarkSession:
                 runtime_session_id=self.runtime_session_id,
                 progress=self._make_progress(iteration),
             )
-            keep_snapshot = self._maybe_checkpoint(result, snap_dir)
         finally:
-            if not keep_snapshot:
-                _rmtree_quiet(snap_dir)
+            _rmtree_quiet(snap_dir)
 
         self.rounds.append(result)
         self._persist(result)
@@ -157,54 +156,6 @@ class BenchmarkSession:
                 pass
 
         return progress
-
-    def _maybe_checkpoint(self, result: RoundResult, snap_dir: str) -> bool:
-        """Retain ``snap_dir`` iff this round is the new best; free the prior best.
-
-        Best = highest EX, ties broken toward the EARLIEST round (a later tie
-        doesn't displace an equal earlier checkpoint). Returns True if the caller
-        should keep ``snap_dir`` (it became the checkpoint).
-        """
-        key = (result.ex_score, -result.iteration)
-        if self._best_key is None or key > self._best_key:
-            if self._best_snapshot:
-                _rmtree_quiet(self._best_snapshot)
-            self._best_snapshot = snap_dir
-            self._best_key = key
-            return True
-        return False
-
-    @property
-    def best_snapshot(self) -> str | None:
-        """The retained snapshot dir of the best round (for restore), or None."""
-        return self._best_snapshot
-
-    def best_round(self) -> RoundResult | None:
-        """The highest-EX round so far (ties → earliest), for checkpoint selection."""
-        if not self.rounds:
-            return None
-        return max(self.rounds, key=lambda r: (r.ex_score, -r.iteration))
-
-    def persist_final(self, shipped: RoundResult) -> None:
-        """Write the terminal BENCH#…#final KPI row for the shipped iteration.
-
-        Records the shipped round's KPIs plus ``shipped_iteration`` (which round's
-        checkpoint finalize restored), so the durable record shows both the
-        trajectory (per-round rows) and what actually shipped.
-        """
-        if self._persist_kpi is None:
-            return
-        from okf_core.recursive_improvement import FINAL_ITERATION
-
-        attrs = shipped.to_kpi_attrs(self.runtime_session_id)
-        attrs["shipped_iteration"] = shipped.iteration
-        self._persist_kpi(FINAL_ITERATION, attrs)
-
-    def cleanup(self) -> None:
-        """Delete any retained checkpoint snapshot (call after finalize/restore)."""
-        if self._best_snapshot:
-            _rmtree_quiet(self._best_snapshot)
-            self._best_snapshot = None
 
     def _persist(self, result: RoundResult) -> None:
         attrs = result.to_kpi_attrs(self.runtime_session_id)
@@ -256,8 +207,10 @@ def make_run_benchmark_tool(session: BenchmarkSession) -> Any:
         `threshold_met` is true or you've used your iteration budget. It returns:
         `{iteration, ex_score, judge_accuracy, passed, failed, discarded, graded,
         threshold_met, improvements}`. You never see the questions or the expected
-        answers — only the aggregated feedback. The best-scoring iteration is kept
-        automatically, so it is safe to keep improving.
+        answers — only the aggregated feedback. IMPORTANT: the wiki ships EXACTLY
+        as you leave it — there is no automatic rollback to a best round. If an
+        edit lowers the score, fix or revert it before you finish; don't end on a
+        worse version than you already had.
         """
         return asyncio.run(session.run_next())
 
