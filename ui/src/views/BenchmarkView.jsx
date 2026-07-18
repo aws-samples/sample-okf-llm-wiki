@@ -183,8 +183,8 @@ export default function BenchmarkView({ api, selection }) {
         <GaugeIcon />
         <AlertTitle>Select a dataset first</AlertTitle>
         <AlertDescription>
-          Pick a dataset from the sidebar to configure its recursive-improvement
-          benchmark.
+          Pick a dataset from the sidebar to set up its benchmark and
+          auto-improvement.
         </AlertDescription>
       </Alert>
     )
@@ -195,7 +195,7 @@ export default function BenchmarkView({ api, selection }) {
       <CardHeader className="border-b">
         <CardTitle className="flex items-center gap-2">
           <GaugeIcon className="size-4" />
-          Recursive improvement
+          Benchmark &amp; auto-improve
           {form.enabled ? (
             <Badge variant="secondary">Enabled</Badge>
           ) : (
