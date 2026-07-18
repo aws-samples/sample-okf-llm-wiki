@@ -71,3 +71,39 @@ def snapshot_bundle(dataset_root: str | Path, dest_root: str | Path) -> Path:
         elif entry.is_file():
             shutil.copy2(entry, target)
     return dest
+
+
+def restore_authored(snapshot_root: str | Path, dataset_root: str | Path) -> None:
+    """Replace the authored bundle at ``dataset_root`` with ``snapshot_root``'s.
+
+    Used to roll a recursive-improvement run back to its best-scoring iteration:
+    a later round can regress the bundle, so before finalize we restore the
+    checkpoint (a retained bundle-only snapshot). Only the AUTHORED (non-dot) top-
+    level entries are replaced — the dataset's ``.harvest/``/``.metadata/``/
+    ``.context/`` are left intact (they're not in the snapshot and not authored
+    output). Idempotent-ish: existing authored entries are removed first so a doc
+    the best round didn't have doesn't linger.
+    """
+    src = Path(snapshot_root)
+    dst = Path(dataset_root)
+    if not src.exists():
+        return
+
+    # Remove current authored entries (non-dot) so the restore is exact.
+    for entry in list(dst.iterdir()) if dst.exists() else []:
+        if not _is_authored(entry.name):
+            continue
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+
+    # Copy the checkpoint's authored entries back in.
+    for entry in sorted(src.iterdir()):
+        if not _is_authored(entry.name):
+            continue
+        target = dst / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, target, symlinks=False)
+        elif entry.is_file():
+            shutil.copy2(entry, target)

@@ -44,8 +44,8 @@ from harvest.prompts import (
     CONTEXT_EXTRACTOR_PROMPT,
     REFERENCE_AUTHOR_PROMPT,
     REVIEWER_PROMPT,
-    SUPERVISOR_PROMPT,
     TABLE_AUTHOR_PROMPT,
+    build_supervisor_prompt,
 )
 from harvest.source_tools import make_source_tools
 from okf_core.link_graph import LinkGraph
@@ -704,7 +704,9 @@ def build_harvest_agent(
     agent = create_deep_agent(
         model=chat_model,
         tools=all_tools,
-        system_prompt=SUPERVISOR_PROMPT,
+        system_prompt=build_supervisor_prompt(
+            recursive_improvement=benchmark_session is not None
+        ),
         middleware=main_middleware,
         subagents=[table_author, reference_author, reviewer, context_extractor],
         backend=backend,

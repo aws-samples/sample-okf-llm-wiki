@@ -110,6 +110,34 @@ def test_best_round_picks_highest_ex_earliest_on_tie():
         assert best.iteration == 0  # earliest of the tied-best rounds
 
 
+def test_best_snapshot_retained_and_points_at_best_bundle():
+    import asyncio
+    from pathlib import Path as P
+    with tempfile.TemporaryDirectory() as tmp:
+        _bundle(Path(tmp))
+        persisted, events = [], []
+        sess = _session(
+            tmp,
+            predicted_by_round={
+                0: {"Q0": "P_right0", "Q1": "P_right1"},   # 1.0 (best, earliest)
+                1: {"Q0": "P_right0", "Q1": "P_wrong"},    # 0.5
+            },
+            persisted=persisted, events=events,
+        )
+        asyncio.run(sess.run_next())
+        asyncio.run(sess.run_next())
+        # A checkpoint snapshot is retained and physically exists...
+        assert sess.best_snapshot is not None
+        assert P(sess.best_snapshot).exists()
+        # ...and it is the best round's bundle (round 0), not the regressed last one.
+        assert sess.best_round().iteration == 0
+        # It contains authored docs but no dot-dirs (bundle-only).
+        assert (P(sess.best_snapshot) / "tables" / "t.md").exists()
+        assert not (P(sess.best_snapshot) / ".metadata").exists()
+        sess.cleanup()
+        assert not P(sess.best_snapshot).exists() if sess.best_snapshot else True
+
+
 def test_threshold_met_flag_in_public_dict():
     import asyncio
     with tempfile.TemporaryDirectory() as tmp:

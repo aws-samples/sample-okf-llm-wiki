@@ -197,7 +197,7 @@ recursive improvement is enabled for this run:
 
 | Field | Meaning | Constraint |
 |---|---|---|
-| `questions_key` | S3 key of the uploaded `question,gold_sql` CSV | Under a `.benchmark/` prefix (dot-prefixed ⇒ survives `clean_authored_output`, hidden from consumers) |
+| `questions_key` | S3 key of the uploaded `question,gold_sql` CSV | Under the **off-mount** `benchmark/<domain>/<dataset>/` prefix (NOT `okf/`), so no LLM role can read gold via the mount |
 | `max_iterations` | benchmark→revise rounds after iteration 0 | 2–5; **clamped to 5** at the tool boundary |
 | `ex_threshold` / `judge_threshold` | target rates (over non-discarded questions) | 0.0–1.0 |
 | `gate_kpis` | which KPIs must clear their threshold to stop | subset of `["ex","judge"]` |
@@ -234,21 +234,30 @@ and now pays full harvest effort per solver. The levers that keep it bounded are
 the `K=10` semaphore, gold/predicted result caching, and early-stop on
 no-improvement — not a lowered tier.
 
-### CSV upload
+### CSV upload — off the mount, on purpose
 
-Reuse the existing presigned `.context/`-style upload path
-(`presign_context_upload`, `handlers.py:966-1013`) but pin the key under
-`.benchmark/` instead of `.context/`. The 20 MiB cap and flat-filename rule carry
-over. `.benchmark/` is dot-prefixed, so it is preserved by `clean_authored_output`
-and hidden from the consumption MCP — the same treatment `.context/` and
-`.metadata/` get.
+The gold SQL must be readable by **no** LLM role — not just the solver, but the
+supervisor and authoring subagents too (they author the docs; if they could read
+the answer key they'd write it in — teaching to the test). Snapshot isolation
+alone doesn't achieve that, because the supervisor/authors run on the **real
+mount**, not the solver's snapshot. The mount is rooted at the `okf/` S3 prefix
+(`s3files.tf`), so anything under `okf/<domain>/<dataset>/` — including a
+hypothetical `.benchmark/` there — would be a file their `read_file`/`grep` could
+open.
 
-Crucially, the CSV lives on **S3 only** — the `run_benchmark` tool fetches it from
-`questions_key` into the tool process's memory at round start; it is **never
-materialized on the agent-visible mount**. So even though `.benchmark/` sits under
-the dataset prefix in S3, no `gold_sql` (nor question text) is ever a file an LLM
-role could read. This is what makes gold-blindness physical rather than
-policy-based (see *Blindness is structural*).
+So the benchmark CSV is uploaded to a **sibling prefix that is NOT under `okf/`** —
+`benchmark/<domain>/<dataset>/questions.csv` in the same bundle bucket. Because the
+mount only exposes `okf/`, this key is **invisible to the agent filesystem
+entirely**. The presign path mirrors `presign_context_upload`
+(`handlers.py:966-1013`) — 20 MiB cap, flat filename — but targets the off-mount
+`benchmark/` prefix. `questions_key` in the payload is that full S3 key.
+
+The runner (not the agent) fetches the CSV via a boto3 S3 `GetObject` into the
+`run_benchmark` **tool process's memory** at session start; it is **never written
+to the mount**. So no `gold_sql` (nor question text) is ever a file any LLM role
+could read — gold-blindness is physical for every role, by keeping gold off the
+`okf/` tree. (This requires `s3:GetObject` on `<bundle-bucket>/benchmark/*` for the
+harvest runtime execution role — an infra grant; see *Integration points*.)
 
 ## The black-box benchmark tool
 
@@ -462,13 +471,14 @@ reachable by the scan tools. Two mechanisms, by what each role may access:
 
 Mechanics:
 
-- **Gold + questions never touch the agent filesystem.** The runner loads the CSV
-  into the `run_benchmark` **tool process's memory**, not the mount. The question
-  text is passed to a solver as its prompt; the gold SQL stays in memory and is
-  read only by the deterministic grader (plain Python, in-process — no agent tool
-  layer to bypass). So there is no gold file for any LLM to read, by construction.
-  (The uploaded CSV lands in `.benchmark/` on S3 for the *runner* to fetch; it is
-  never materialized on the agent-visible mount.)
+- **Gold + questions never touch the agent filesystem.** The uploaded CSV lives at
+  an **off-mount** S3 key (`benchmark/<domain>/<dataset>/…`, NOT under the `okf/`
+  prefix the mount exposes), so it is invisible to every role's file tools —
+  supervisor and authoring subagents included, not just the solver. The runner
+  fetches it via boto3 into the `run_benchmark` **tool process's memory**; the
+  question text is passed to a solver as its prompt, and the gold SQL stays in
+  memory read only by the deterministic grader (plain Python, in-process — no agent
+  tool layer to bypass). There is no gold file any LLM can read, by construction.
 - **The solver runs on a bundle-only snapshot.** Each round, the tool copies
   **only** the authored bundle — `datasets/`, `tables/`, `references/`,
   `index.md` (no dot-dirs) — into a fresh temp dir and roots the solver's

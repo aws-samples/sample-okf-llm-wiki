@@ -362,16 +362,21 @@ the benchmark-driven improvement loop for the run (see
 ```json
 { "data_domain": "sales", "dataset": "orders", "mode": "full",
   "recursive_improvement": {
-    "questions_key": "okf/sales/orders/.benchmark/questions.csv",
+    "questions_key": "benchmark/sales/orders/questions.csv",
     "max_iterations": 5,
     "ex_threshold": 0.80,
     "judge_threshold": 0.90,
     "gate_kpis": ["ex", "judge"] } }
 ```
 
-`questions_key` is the S3 key of the uploaded `question,gold_sql` CSV (under the
-dataset's `.benchmark/` prefix — dot-prefixed, so it survives
-`clean_authored_output` and is hidden from consumers). `max_iterations` is the
+`questions_key` is the S3 key of the uploaded `question,gold_sql` CSV. It lives
+under the **off-mount** `benchmark/<domain>/<dataset>/` prefix — deliberately NOT
+under `okf/` (which the harvest S3 Files mount is rooted at), so the gold SQL is
+invisible to every LLM role's file tools (supervisor + authoring subagents
+included, not just the solver). The runner fetches it via boto3 `GetObject` into
+the benchmark tool's process memory; it is never written to the mount. This
+requires `s3:GetObject` on `<bundle-bucket>/benchmark/*` for the harvest runtime
+role. `max_iterations` is the
 benchmark→revise round budget (2–5, **clamped to 5** by the Control API).
 `ex_threshold`/`judge_threshold` are the target rates (over non-discarded
 questions) and `gate_kpis` names which must clear to stop (subset of

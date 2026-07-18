@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -125,6 +126,108 @@ def _run_agent(agent, prompt: str, config: dict[str, Any], emitter) -> None:
             emitter.emit_subagent_event(chunk)
 
 
+# -- recursive improvement (in-run benchmark loop) helpers -------------------
+
+
+class BenchmarkNotRunError(RuntimeError):
+    """An RI-enabled run finished without any benchmark round (compel violation)."""
+
+
+def _prepare_benchmark(
+    *,
+    recursive_improvement: dict[str, Any] | None,
+    data_domain: str,
+    dataset: str,
+    session_id: str | None,
+    registry: Any,
+) -> Any:
+    """Fetch the off-mount question set + assemble RI wiring, or None if unusable.
+
+    Delegates to ``harvest.benchmark.setup.prepare`` (deferred import keeps the RI
+    package off the normal-harvest path). Returns a ``BenchmarkSetup`` or None.
+    """
+    from okf_core import recursive_improvement as ri
+
+    if not ri.is_enabled(recursive_improvement):
+        return None
+    from harvest.benchmark.setup import prepare
+
+    return prepare(
+        ri_config=recursive_improvement,
+        data_domain=data_domain,
+        dataset=dataset,
+        runtime_session_id=session_id,
+        registry=registry,
+    )
+
+
+def _benchmark_build_kwargs(bench: Any) -> dict[str, Any]:
+    """The build_harvest_agent RI kwargs for ``bench`` (empty when RI is off)."""
+    if bench is None:
+        return {}
+    return {
+        "ri_config": bench.ri_config,
+        "benchmark_questions": bench.questions,
+        "benchmark_run": bench.run,
+        "persist_kpi": bench.persist_kpi,
+    }
+
+
+def _recursion_limit_for(base_limit: int, bench: Any) -> int:
+    """Raise the recursion limit for an RI run (the in-run loop consumes steps).
+
+    Env override ``OKF_BENCHMARK_RECURSION_LIMIT`` wins; otherwise a benched run
+    gets a higher default so the benchmark→revise rounds don't exhaust the budget.
+    A normal harvest keeps ``base_limit`` unchanged.
+    """
+    if bench is None:
+        return base_limit
+    raw = os.environ.get("OKF_BENCHMARK_RECURSION_LIMIT")
+    if raw:
+        try:
+            return max(base_limit, int(raw))
+        except ValueError:
+            pass
+    # Default: give the loop generous headroom above the standard full-harvest
+    # budget (each round is a supervisor tool call + revision turns).
+    return max(base_limit, 2000)
+
+
+def _finish_benchmark(built: Any, bench: Any, *, dataset_root: Path) -> None:
+    """Compel the loop + restore the best-scoring bundle before finalize.
+
+    For an RI run: require at least one benchmark round actually ran (else the
+    agent skipped the loop — raise so the run is reported failed rather than
+    shipping an unbenchmarked bundle as a success), then roll the authored bundle
+    back to the best-scoring iteration's checkpoint. No-op when RI is off.
+    """
+    if bench is None:
+        return
+    session = getattr(built, "benchmark_session", None)
+    if session is None or not getattr(session, "rounds", None):
+        raise BenchmarkNotRunError(
+            "recursive improvement was enabled but no benchmark round ran; "
+            "refusing to finalize an unbenchmarked bundle"
+        )
+
+    from harvest.benchmark.snapshot import restore_authored
+
+    best = session.best_round()
+    best_snapshot = session.best_snapshot
+    if best_snapshot and best is not None:
+        # Roll back to the best iteration's bundle (a later round may have
+        # regressed it). The KPI final row records which iteration shipped.
+        restore_authored(best_snapshot, dataset_root)
+        session.persist_final(best)
+        log.info(
+            "Recursive improvement: shipped iteration %d (EX=%.3f) of %d round(s)",
+            best.iteration,
+            best.ex_score,
+            len(session.rounds),
+        )
+    session.cleanup()
+
+
 @contextlib.contextmanager
 def _sandbox_for(dataset_root: str | Path):
     """Yield a started CodeSandbox with .context/ uploaded, or None if unavailable.
@@ -207,6 +310,7 @@ def run_full_harvest(
     domain_context: str | None = None,
     dataset_guidance: str | None = None,
     dataset_guidance_version: str | None = None,
+    recursive_improvement: dict[str, Any] | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Author (or refresh) the entire dataset bundle end to end."""
@@ -307,16 +411,35 @@ def run_full_harvest(
         emitter = _build_emitter(
             data_domain=data_domain, dataset=dataset, session_id=session_id
         )
+        # Recursive improvement: fetch the off-mount question set + wire the
+        # run_benchmark tool. Best-effort — a benchmark misconfig disables the loop
+        # (returns None) and the harvest proceeds normally. When enabled, the
+        # supervisor gets a larger step budget (the in-run loop consumes steps).
+        bench = _prepare_benchmark(
+            recursive_improvement=recursive_improvement,
+            data_domain=data_domain,
+            dataset=dataset,
+            session_id=session_id,
+            registry=registry,
+        )
+        ri_kwargs = _benchmark_build_kwargs(bench)
+        effective_limit = _recursion_limit_for(recursion_limit, bench)
         with _sandbox_for(dataset_root) as sandbox:
             built = build_harvest_agent(
                 source,
                 dataset_root,
                 sandbox=sandbox,
                 step_emitter=emitter,
+                **ri_kwargs,
                 **resolved_config,
             )
-            config = _invoke_config(recursion_limit, emitter)
+            config = _invoke_config(effective_limit, emitter)
             _run_agent(built.agent, prompt, config, emitter)
+
+        # Compel-the-loop + best-checkpoint restore live HERE (finalize is runner-
+        # driven, not an agent tool). For an RI run: require at least one benchmark
+        # round ran, then roll the bundle back to the best-scoring iteration.
+        _finish_benchmark(built, bench, dataset_root=dataset_root)
 
         state = finalize_bundle(
             dataset_root,
@@ -371,6 +494,7 @@ def run_incremental_harvest(
     domain_context: str | None = None,
     dataset_guidance: str | None = None,
     dataset_guidance_version: str | None = None,
+    recursive_improvement: dict[str, Any] | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Re-review one changed table and the docs that reference it."""
@@ -440,16 +564,28 @@ def run_incremental_harvest(
         emitter = _build_emitter(
             data_domain=data_domain, dataset=dataset, session_id=session_id
         )
+        bench = _prepare_benchmark(
+            recursive_improvement=recursive_improvement,
+            data_domain=data_domain,
+            dataset=dataset,
+            session_id=session_id,
+            registry=registry,
+        )
+        ri_kwargs = _benchmark_build_kwargs(bench)
+        effective_limit = _recursion_limit_for(recursion_limit, bench)
         with _sandbox_for(dataset_root) as sandbox:
             built = build_harvest_agent(
                 source,
                 dataset_root,
                 sandbox=sandbox,
                 step_emitter=emitter,
+                **ri_kwargs,
                 **resolved_config,
             )
-            config = _invoke_config(recursion_limit, emitter)
+            config = _invoke_config(effective_limit, emitter)
             _run_agent(built.agent, prompt, config, emitter)
+
+        _finish_benchmark(built, bench, dataset_root=dataset_root)
 
         state = finalize_bundle(
             dataset_root,
@@ -587,6 +723,7 @@ def run_annotation_harvest(
     domain_context: str | None = None,
     dataset_guidance: str | None = None,
     dataset_guidance_version: str | None = None,
+    recursive_improvement: dict[str, Any] | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply a user's wiki annotations to the bundle, then reconcile verdicts.
@@ -668,16 +805,28 @@ def run_annotation_harvest(
         emitter = _build_emitter(
             data_domain=data_domain, dataset=dataset, session_id=session_id
         )
+        bench = _prepare_benchmark(
+            recursive_improvement=recursive_improvement,
+            data_domain=data_domain,
+            dataset=dataset,
+            session_id=session_id,
+            registry=registry,
+        )
+        ri_kwargs = _benchmark_build_kwargs(bench)
+        effective_limit = _recursion_limit_for(recursion_limit, bench)
         with _sandbox_for(dataset_root) as sandbox:
             built = build_harvest_agent(
                 source,
                 dataset_root,
                 sandbox=sandbox,
                 step_emitter=emitter,
+                **ri_kwargs,
                 **resolved_config,
             )
-            config = _invoke_config(recursion_limit, emitter)
+            config = _invoke_config(effective_limit, emitter)
             _run_agent(built.agent, prompt, config, emitter)
+
+        _finish_benchmark(built, bench, dataset_root=dataset_root)
 
         state = finalize_bundle(
             dataset_root,

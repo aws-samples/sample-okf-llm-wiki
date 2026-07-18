@@ -291,6 +291,51 @@ Author clean markdown; no narration.
 """
 )
 
+# Appended to the supervisor prompt ONLY when recursive improvement is enabled for
+# the run (the run_benchmark tool is registered). Describes the benchmark→revise
+# loop. Omitted otherwise so the agent is never told about a tool it doesn't have.
+_RECURSIVE_IMPROVEMENT_SECTION = """
+## Recursive improvement (benchmark-driven) — REQUIRED this run
+
+This run has a `run_benchmark` tool and a benchmark question set. AFTER the review
+pass, and BEFORE you consider the bundle done, you MUST measure and improve the
+wiki against the benchmark:
+
+1. Call `run_benchmark` (no arguments). It runs the whole question set through
+   independent solvers that may read ONLY your wiki, grades their SQL against the
+   real data, and returns `{iteration, ex_score, judge_accuracy, passed, failed,
+   discarded, graded, threshold_met, improvements}`. You NEVER see the questions
+   or the expected answers — only the aggregated `improvements` themes.
+2. If `threshold_met` is true, you are done — stop calling `run_benchmark`.
+3. Otherwise, treat each `improvements` item as a HYPOTHESIS about a wiki gap.
+   For each, VERIFY it against live data (`run_sql`/`sample_rows`, `.metadata/`)
+   the same way you author anything — then fix the relevant docs (respecting the
+   guard; `get_backlinks` to propagate). Do NOT invent content to chase a score;
+   only write what the data confirms. An improvement you can't reproduce against
+   live data, you leave alone.
+4. Call `run_benchmark` again to re-measure. Repeat until `threshold_met` is true
+   or the tool refuses further calls (your iteration budget is spent) — either is
+   a valid stopping point.
+
+You do not manage checkpoints — the best-scoring iteration's bundle is kept
+automatically at finalize, so it is always safe to keep improving. The
+`improvements` are dataset-level facts (e.g. "document that `status` is an int
+code, 1=active"); write them as durable doc content, not as answers to specific
+questions (you can't see the questions anyway).
+"""
+
+def build_supervisor_prompt(recursive_improvement: bool = False) -> str:
+    """The supervisor prompt, with the recursive-improvement section iff enabled.
+
+    A normal harvest gets ``SUPERVISOR_PROMPT`` unchanged (the agent has no
+    ``run_benchmark`` tool, so it must not be told to call it). An RI run gets the
+    loop instructions appended.
+    """
+    if recursive_improvement:
+        return SUPERVISOR_PROMPT + _RECURSIVE_IMPROVEMENT_SECTION
+    return SUPERVISOR_PROMPT
+
+
 REVIEWER_PROMPT = (
     _RUNTIME
     + """
