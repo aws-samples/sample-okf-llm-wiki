@@ -1534,6 +1534,71 @@ def test_get_harvest_events_preserves_usage_snapshot(cfg):
     assert res["events"][0]["usage"] == usage
 
 
+def test_get_harvest_events_preserves_benchmark_progress_fields(cfg):
+    """A kind=benchmark_progress event keeps its phase + current/total counters so
+    the UI can render a live progress row."""
+    sid = "sid-bench"
+    _seed_status(cfg, session_id=sid)
+    logs = FakeLogs(
+        {
+            HARVEST_LOG_GROUP: [
+                _step_line(
+                    sid,
+                    1,
+                    "benchmark_progress",
+                    label="Benchmark round 1/5 — solving 30/66",
+                    phase="solving",
+                    iteration=0,
+                    max_iterations=5,
+                    current=30,
+                    total=66,
+                ),
+            ]
+        }
+    )
+    res = handlers.get_harvest_events(
+        logs, cfg.ddb, registry_table=REGISTRY, log_group=HARVEST_LOG_GROUP,
+        data_domain="sales", dataset="orders", since=0,
+    )
+    ev = res["events"][0]
+    assert ev["kind"] == "benchmark_progress"
+    assert ev["phase"] == "solving"
+    assert ev["current"] == 30 and ev["total"] == 66
+    assert ev["iteration"] == 0 and ev["max_iterations"] == 5
+    assert ev["label"].startswith("Benchmark round 1/5")
+
+
+def test_get_harvest_events_preserves_benchmark_kpi_fields(cfg):
+    """A kind=benchmark round-summary keeps its KPI fields + improvements list."""
+    sid = "sid-bench-kpi"
+    _seed_status(cfg, session_id=sid)
+    logs = FakeLogs(
+        {
+            HARVEST_LOG_GROUP: [
+                _step_line(
+                    sid, 1, "benchmark",
+                    label="Benchmark round 2/5 done — EX 0.71",
+                    phase="done", iteration=1, max_iterations=5,
+                    ex_score=0.71, judge_accuracy=0.83,
+                    passed=34, failed=14, discarded=2, graded=48,
+                    threshold_met=False,
+                    improvements=["document that status is an int code"],
+                ),
+            ]
+        }
+    )
+    res = handlers.get_harvest_events(
+        logs, cfg.ddb, registry_table=REGISTRY, log_group=HARVEST_LOG_GROUP,
+        data_domain="sales", dataset="orders", since=0,
+    )
+    ev = res["events"][0]
+    assert ev["kind"] == "benchmark"
+    assert ev["ex_score"] == 0.71 and ev["judge_accuracy"] == 0.83
+    assert ev["passed"] == 34 and ev["graded"] == 48
+    assert ev["threshold_met"] is False
+    assert ev["improvements"] == ["document that status is an int code"]
+
+
 def test_get_harvest_events_returns_next_ts_high_water(cfg):
     """The response echoes the highest CloudWatch event ts as next_ts."""
     sid = "sid-ts"

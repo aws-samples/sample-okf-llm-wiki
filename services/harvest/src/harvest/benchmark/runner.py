@@ -109,6 +109,7 @@ class BenchmarkSession:
                 adjudicate=self._adjudicate,
                 concurrency=self._concurrency,
                 runtime_session_id=self.runtime_session_id,
+                progress=self._make_progress(iteration),
             )
             keep_snapshot = self._maybe_checkpoint(result, snap_dir)
         finally:
@@ -118,6 +119,44 @@ class BenchmarkSession:
         self.rounds.append(result)
         self._persist(result)
         return result.to_public_dict()
+
+    def _max_iterations(self) -> int:
+        from okf_core.recursive_improvement import FIELD_MAX_ITERATIONS, MAX_ITERATIONS
+
+        return int(self.config.get(FIELD_MAX_ITERATIONS, MAX_ITERATIONS))
+
+    def _make_progress(self, iteration: int):
+        """A (phase, current, total) callback that emits benchmark_progress events.
+
+        Best-effort: a feed emission must never break a round, so a failing
+        emit_event is swallowed. No emitter → a no-op callback. The event carries
+        an in-place-update key (iteration+phase) plus a human label the UI shows.
+        """
+        if self._emit_event is None:
+            return None
+        max_iter = self._max_iterations()
+
+        def progress(phase: str, current: int, total: int) -> None:
+            label = (
+                f"Benchmark round {iteration + 1}/{max_iter} — {phase} "
+                f"{current}/{total}"
+            )
+            try:
+                self._emit_event(
+                    {
+                        "kind": "benchmark_progress",
+                        "label": label,
+                        "phase": phase,
+                        "iteration": iteration,
+                        "max_iterations": max_iter,
+                        "current": current,
+                        "total": total,
+                    }
+                )
+            except Exception:  # noqa: BLE001 - progress is best-effort
+                pass
+
+        return progress
 
     def _maybe_checkpoint(self, result: RoundResult, snap_dir: str) -> bool:
         """Retain ``snap_dir`` iff this round is the new best; free the prior best.
@@ -172,7 +211,24 @@ class BenchmarkSession:
         if self._persist_kpi is not None:
             self._persist_kpi(result.iteration, attrs)
         if self._emit_event is not None:
-            self._emit_event({"kind": "benchmark", **result.to_public_dict()})
+            max_iter = self._max_iterations()
+            pub = result.to_public_dict()
+            met = "threshold met" if result.threshold_met else "below threshold"
+            label = (
+                f"Benchmark round {result.iteration + 1}/{max_iter} done — "
+                f"EX {pub['ex_score']:.2f}, judge {pub['judge_accuracy']:.2f} "
+                f"({result.passed}/{result.graded} passed, "
+                f"{result.discarded} discarded) — {met}"
+            )
+            self._emit_event(
+                {
+                    "kind": "benchmark",
+                    "label": label,
+                    "phase": "done",
+                    "max_iterations": max_iter,
+                    **pub,
+                }
+            )
 
 
 def _rmtree_quiet(path: str) -> None:

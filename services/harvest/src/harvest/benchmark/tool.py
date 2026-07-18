@@ -122,25 +122,49 @@ def _judge_accuracy(passed: int, graded: int, genuine_errors: int) -> float:
     return max(0.0, (graded - genuine_errors)) / graded
 
 
+# A progress callback: (phase, current, total) -> None. Best-effort — the caller
+# wraps it so a feed emission never breaks a round. No-op when not provided.
+Progress = Callable[[str, int, int], None]
+
+# Emit a solve/grade progress tick at most every this fraction of the set (plus
+# the final tick), so a 100-question round emits ~10 ticks per phase, not 100.
+_PROGRESS_STEP_FRACTION = 0.1
+
+
+def _tick_every(total: int) -> int:
+    """How many completions between progress ticks (>=1)."""
+    return max(1, int(total * _PROGRESS_STEP_FRACTION))
+
+
 async def _solve_all(
     questions: list[BenchmarkQuestion],
     solve: Solve,
     concurrency: int,
+    progress: Progress | None = None,
 ) -> list[tuple[BenchmarkQuestion, str]]:
     """Run all solvers concurrently under a semaphore; return (question, sql) pairs.
 
     A solver that raises (or times out) yields empty SQL for that question — a
-    scored-0 miss, never a crash of the whole round.
+    scored-0 miss, never a crash of the whole round. ``progress`` is ticked as
+    solvers COMPLETE (throttled), so the UI shows N/M solved.
     """
     sem = asyncio.Semaphore(max(1, concurrency))
+    total = len(questions)
+    step = _tick_every(total)
+    done = 0
 
     async def _one(q: BenchmarkQuestion) -> tuple[BenchmarkQuestion, str]:
+        nonlocal done
         async with sem:
             try:
                 sql = await solve(q.question)
             except Exception:  # noqa: BLE001 - a stuck solver is a miss, not a crash
                 sql = ""
-            return q, (sql or "")
+        # Count on completion (outside the sem) and tick on a step boundary / last.
+        done += 1
+        if progress and (done % step == 0 or done == total):
+            progress("solving", done, total)
+        return q, (sql or "")
 
     return await asyncio.gather(*[_one(q) for q in questions])
 
@@ -148,6 +172,7 @@ async def _solve_all(
 async def _grade_all(
     solved: list[tuple[BenchmarkQuestion, str]],
     grader: Grader,
+    progress: Progress | None = None,
 ) -> list[QuestionResult]:
     """Grade all (question, sql) pairs concurrently on a bounded thread pool.
 
@@ -158,10 +183,18 @@ async def _grade_all(
     if not solved:
         return []
     sem = asyncio.Semaphore(_athena_concurrency())
+    total = len(solved)
+    step = _tick_every(total)
+    done = 0
 
     async def _grade(q: BenchmarkQuestion, sql: str) -> QuestionResult:
+        nonlocal done
         async with sem:
-            return await asyncio.to_thread(grader.grade, q.q_id, q.gold_sql, sql)
+            res = await asyncio.to_thread(grader.grade, q.q_id, q.gold_sql, sql)
+        done += 1
+        if progress and (done % step == 0 or done == total):
+            progress("grading", done, total)
+        return res
 
     return await asyncio.gather(*[_grade(q, sql) for q, sql in solved])
 
@@ -176,15 +209,17 @@ async def run_round(
     adjudicate: Callable[[list[QuestionResult]], Awaitable[AdjudicationResult]],
     concurrency: int,
     runtime_session_id: str = "",
+    progress: Progress | None = None,
 ) -> RoundResult:
     """Score the whole question set once (stateless), then adjudicate the failures.
 
     Steps: solve all (concurrent, bundle-blind) → grade each (deterministic Athena
     set-equality, discards excluded) → adjudicate FAILs (genuine vs noisy-gold,
     consolidate into anonymous themes) → compute EX + judge KPIs + threshold.
+    ``progress(phase, current, total)`` is ticked through the phases for the UI.
     """
-    solved = await _solve_all(questions, solve, concurrency)
-    graded = await _grade_all(solved, grader)
+    solved = await _solve_all(questions, solve, concurrency, progress)
+    graded = await _grade_all(solved, grader, progress)
 
     passed = sum(1 for r in graded if r.outcome is Outcome.PASS)
     failed = sum(1 for r in graded if r.outcome is Outcome.FAIL)
@@ -192,7 +227,14 @@ async def run_round(
     graded_n = passed + failed
 
     fails = [r for r in graded if r.outcome is Outcome.FAIL]
-    adj = await adjudicate(fails) if fails else AdjudicationResult()
+    if fails:
+        if progress:
+            progress("reviewing", 0, len(fails))
+        adj = await adjudicate(fails)
+        if progress:
+            progress("reviewing", len(fails), len(fails))
+    else:
+        adj = AdjudicationResult()
 
     ex = ri.ex_score(passed, graded_n)
     judge = _judge_accuracy(passed, graded_n, adj.genuine_error_count)

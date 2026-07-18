@@ -1791,6 +1791,7 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
         out["call_id"] = rec.get("call_id")
     # Sub-agent fleet fields (KIND_SUBAGENT): phase = start|complete|error,
     # batch groups a fan-out (the eval id), sub_id is the per-square id.
+    # `phase` is ALSO reused by benchmark events (solving/grading/reviewing/done).
     for k in ("phase", "batch", "sub_id", "subagent_type"):
         if rec.get(k):
             out[k] = rec.get(k)
@@ -1798,6 +1799,27 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
     # run. Passed through verbatim as a dict so the UI can show a running total.
     if isinstance(rec.get("usage"), dict):
         out["usage"] = rec["usage"]
+    # Recursive-improvement benchmark fields (kind="benchmark_progress" live
+    # updates + kind="benchmark" per-round KPI summary). Copied through so the UI
+    # can render a progress row (current/total) and a KPI line. `improvements` is a
+    # list of anonymous theme strings; the numeric KPIs are 0..1 / counts.
+    for k in (
+        "iteration",
+        "max_iterations",
+        "current",
+        "total",
+        "ex_score",
+        "judge_accuracy",
+        "passed",
+        "failed",
+        "discarded",
+        "graded",
+        "threshold_met",
+    ):
+        if k in rec:
+            out[k] = rec.get(k)
+    if isinstance(rec.get("improvements"), list):
+        out["improvements"] = rec["improvements"]
     return out
 
 

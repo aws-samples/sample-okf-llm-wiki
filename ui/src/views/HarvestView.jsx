@@ -10,6 +10,7 @@ import {
   CoinsIcon,
   DatabaseIcon,
   FileTextIcon,
+  GaugeIcon,
   ListTreeIcon,
   MessageSquareTextIcon,
   PlayIcon,
@@ -159,7 +160,9 @@ export default function HarvestView({ api, selection }) {
   const onModelChange = useCallback((next) => {
     setModel(next)
     setEffortState((cur) => {
-      const resolved = effortsFor(next).includes(cur) ? cur : defaultEffortFor(next)
+      const resolved = effortsFor(next).includes(cur)
+        ? cur
+        : defaultEffortFor(next)
       savePreference(next, resolved)
       return resolved
     })
@@ -244,7 +247,8 @@ export default function HarvestView({ api, selection }) {
       if (gen !== feedGenRef.current) return
       // Advance the timestamp cursor regardless of whether new events parsed, so
       // the scan window keeps sliding forward and polls stay cheap.
-      if (typeof res?.next_ts === "number") feedTsCursorRef.current = res.next_ts
+      if (typeof res?.next_ts === "number")
+        feedTsCursorRef.current = res.next_ts
       const batch = Array.isArray(res?.events) ? res.events : []
       if (batch.length) {
         feedCursorRef.current = res.next ?? feedCursorRef.current
@@ -376,7 +380,17 @@ export default function HarvestView({ api, selection }) {
       stopPolling()
       stopFeed()
     }
-  }, [poll, startPolling, stopPolling, pollEvents, startFeed, stopFeed, resetFeed, loadGuidance, hasSelection])
+  }, [
+    poll,
+    startPolling,
+    stopPolling,
+    pollEvents,
+    startFeed,
+    stopFeed,
+    resetFeed,
+    loadGuidance,
+    hasSelection,
+  ])
 
   const startHarvest = async () => {
     if (!hasSelection) return
@@ -499,8 +513,7 @@ export default function HarvestView({ api, selection }) {
   // Started and Updated only differ once the run reaches a terminal state
   // (report_status writes updated_at on transitions). While running they mirror
   // each other, so show Updated only when terminal to avoid a redundant row.
-  const showUpdated =
-    inner.updated_at && TERMINAL_STATUSES.has(currentStatus)
+  const showUpdated = inner.updated_at && TERMINAL_STATUSES.has(currentStatus)
 
   // Full harvest is destructive when a bundle already exists (it wipes + rebuilds
   // every doc, discarding any prior authoring incl. applied annotations). Confirm
@@ -585,7 +598,8 @@ export default function HarvestView({ api, selection }) {
                     >
                       <span className="flex items-center gap-2">
                         <MessageSquareTextIcon />
-                        Apply annotations{guidance?.guidance_dirty ? " + guidance" : ""}
+                        Apply annotations
+                        {guidance?.guidance_dirty ? " + guidance" : ""}
                       </span>
                       <span className="pl-6 text-[11px] text-muted-foreground">
                         {guidance?.guidance_dirty
@@ -602,7 +616,11 @@ export default function HarvestView({ api, selection }) {
                   // dark ring in dark mode); the left edge is the divider seam.
                   className="border-primary border-l-primary-foreground/30"
                 >
-                  {starting ? <Spinner /> : <PlayIcon data-icon="inline-start" />}
+                  {starting ? (
+                    <Spinner />
+                  ) : (
+                    <PlayIcon data-icon="inline-start" />
+                  )}
                   Start full harvest
                 </Button>
               </ButtonGroup>
@@ -624,11 +642,13 @@ export default function HarvestView({ api, selection }) {
                   <span className="font-medium text-foreground">
                     {domain}/{dataset}
                   </span>{" "}
-                  already has a knowledge bundle. A full harvest rebuilds it from
-                  scratch — every existing doc is discarded and re-authored,
-                  including any applied annotations and manual edits. This can't be
-                  undone. To apply new feedback without a rebuild, use{" "}
-                  <span className="font-medium">Apply my annotations</span> instead.
+                  already has a knowledge bundle. A full harvest rebuilds it
+                  from scratch — every existing doc is discarded and
+                  re-authored, including any applied annotations and manual
+                  edits. This can't be undone. To apply new feedback without a
+                  rebuild, use{" "}
+                  <span className="font-medium">Apply my annotations</span>{" "}
+                  instead.
                 </DialogDescription>
               </DialogHeader>
               <DialogFooter>
@@ -689,7 +709,10 @@ export default function HarvestView({ api, selection }) {
                   <SparklesIcon className="size-4 text-muted-foreground" />
                   <span className="text-sm font-medium">Dataset guidance</span>
                   {guidance?.guidance_dirty ? (
-                    <Badge variant="outline" className="border-amber-500/50 text-amber-600 dark:text-amber-400">
+                    <Badge
+                      variant="outline"
+                      className="border-amber-500/50 text-amber-600 dark:text-amber-400"
+                    >
                       pending re-harvest
                     </Badge>
                   ) : guidance?.guidance ? (
@@ -876,7 +899,12 @@ function mergeRows(events, aborted) {
       const sq = row.squares.get(e.sub_id)
       if (e.phase === "start") {
         if (sq) sq.state = "active"
-        else row.squares.set(e.sub_id, { id: e.sub_id, state: "active", label: e.label })
+        else
+          row.squares.set(e.sub_id, {
+            id: e.sub_id,
+            state: "active",
+            label: e.label,
+          })
       } else if (e.phase === "complete" || e.phase === "error") {
         const state = e.phase === "complete" ? "done" : "error"
         if (sq) sq.state = state
@@ -896,7 +924,11 @@ function mergeRows(events, aborted) {
           openTaskWave = `task:${taskWaveSeq}`
         }
         const row = fleetRowFor(openTaskWave, e.seq)
-        row.squares.set(e.call_id, { id: e.call_id, state: "active", label: e.label })
+        row.squares.set(e.call_id, {
+          id: e.call_id,
+          state: "active",
+          label: e.label,
+        })
         callIndex.set(e.call_id, { kind: "task", batch: openTaskWave })
         continue
       }
@@ -909,7 +941,10 @@ function mergeRows(events, aborted) {
       const target = e.call_id != null ? callIndex.get(e.call_id) : undefined
       if (!target) continue
       if (target.kind === "tool") {
-        rows[target.idx] = { ...rows[target.idx], state: e.ok ? "ok" : "failed" }
+        rows[target.idx] = {
+          ...rows[target.idx],
+          state: e.ok ? "ok" : "failed",
+        }
       } else {
         // A task dispatch finished — flip its square done/error.
         const idx = batchIndex.get(target.batch)
@@ -921,6 +956,26 @@ function mergeRows(events, aborted) {
     } else if (e.kind === "agent") {
       openTaskWave = null
       rows.push({ ...e, kind: "agent" })
+    } else if (e.kind === "benchmark_progress" || e.kind === "benchmark") {
+      // One row PER benchmark iteration, updated in place as phase/counters
+      // advance (progress ticks) and finalized by the round-done "benchmark"
+      // event (which carries the KPIs). Keyed by iteration so a round's many
+      // ticks collapse into a single advancing row rather than N feed rows.
+      const iter = e.iteration ?? 0
+      const key = `bench:${iter}`
+      let idx = batchIndex.get(key)
+      if (idx == null) {
+        idx = rows.length
+        batchIndex.set(key, idx)
+        rows.push({ kind: "benchmark", iteration: iter, seq: e.seq })
+      }
+      const done = e.kind === "benchmark"
+      rows[idx] = {
+        ...rows[idx],
+        ...e,
+        kind: "benchmark", // keep the row kind regardless of event kind
+        done,
+      }
     }
   }
 
@@ -1002,6 +1057,98 @@ function FleetRow({ row }) {
   )
 }
 
+// A recursive-improvement benchmark row: one per iteration, updated in place as
+// the round advances through phases (solving → grading → reviewing → done). Shows
+// a phase label, an N/M counter + progress bar while running, and the KPI summary
+// once the round is done.
+const BENCH_PHASE_LABEL = {
+  solving: "Solving",
+  grading: "Grading",
+  reviewing: "Reviewing",
+  done: "Done",
+}
+
+function BenchmarkRow({ row }) {
+  const iterLabel = `Round ${(row.iteration ?? 0) + 1}${
+    row.max_iterations ? `/${row.max_iterations}` : ""
+  }`
+  const phase = row.phase || "solving"
+  const total = row.total || 0
+  const current = row.current || 0
+  const pct =
+    total > 0 ? Math.round((current / total) * 100) : row.done ? 100 : 0
+
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border px-2 py-1.5 text-sm">
+      <div className="flex items-center gap-2">
+        <GaugeIcon className="size-3.5 shrink-0 text-muted-foreground" />
+        <Badge variant="secondary" className="shrink-0">
+          Benchmark
+        </Badge>
+        <span className="min-w-0 flex-1 truncate text-muted-foreground">
+          {iterLabel} — {BENCH_PHASE_LABEL[phase] || phase}
+          {!row.done && total > 0 ? (
+            <span className="tabular-nums">
+              {" "}
+              {current}/{total}
+            </span>
+          ) : null}
+        </span>
+        {row.done ? (
+          <Badge
+            variant={row.threshold_met ? "default" : "outline"}
+            className="shrink-0"
+          >
+            {row.threshold_met ? "Target met" : "Below target"}
+          </Badge>
+        ) : (
+          <span className="shrink-0 text-[10px] text-muted-foreground tabular-nums">
+            {pct}%
+          </span>
+        )}
+      </div>
+
+      {/* Progress bar while running. */}
+      {!row.done ? (
+        <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+          <div
+            className="h-full rounded-full bg-primary transition-[width] duration-500"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      ) : (
+        // Round-done KPI summary line.
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 pl-6 text-xs text-muted-foreground tabular-nums">
+          <span>
+            EX{" "}
+            <span className="font-medium text-foreground">
+              {fmtPct(row.ex_score)}
+            </span>
+          </span>
+          <span>
+            Judge{" "}
+            <span className="font-medium text-foreground">
+              {fmtPct(row.judge_accuracy)}
+            </span>
+          </span>
+          <span>
+            {row.passed}/{row.graded} passed
+          </span>
+          {row.discarded ? <span>{row.discarded} discarded</span> : null}
+          {Array.isArray(row.improvements) && row.improvements.length ? (
+            <span>{row.improvements.length} improvement(s) fed back</span>
+          ) : null}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function fmtPct(v) {
+  if (typeof v !== "number") return "—"
+  return `${Math.round(v * 100)}%`
+}
+
 // Render an agent one-liner as INLINE markdown: GFM formatting (bold, code,
 // links) but flattened to a single line — block elements render as inline spans
 // (see the `.okf-inline-md` CSS) so it stays on the feed row and truncates.
@@ -1013,7 +1160,10 @@ const INLINE_MD_COMPONENTS = {
 function InlineMarkdown({ text }) {
   return (
     <span className="okf-inline-md">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={INLINE_MD_COMPONENTS}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={INLINE_MD_COMPONENTS}
+      >
         {text}
       </ReactMarkdown>
     </span>
@@ -1036,7 +1186,9 @@ function AgentMessageDialog({ open, onOpenChange, text }) {
           <div className="okf-prose pr-3">
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
-              rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+              rehypePlugins={[
+                [rehypeHighlight, { detect: true, ignoreMissing: true }],
+              ]}
             >
               {text}
             </ReactMarkdown>
@@ -1218,7 +1370,11 @@ function StepRow({ step }) {
           component tree even from a portal, so nesting it inside the clickable
           row made the close button re-trigger the row's onClick and reopen it. */}
       {expandable ? (
-        <AgentMessageDialog open={open} onOpenChange={setOpen} text={modalText} />
+        <AgentMessageDialog
+          open={open}
+          onOpenChange={setOpen}
+          text={modalText}
+        />
       ) : null}
     </>
   )
@@ -1286,8 +1442,12 @@ function UsagePill({ usage }) {
         <div className="flex flex-col gap-1.5">
           <UsageRow label="Input" value={input} />
           {/* Cache lines are a breakdown of Input (indented), not additive. */}
-          {cacheRead ? <UsageRow sub label="from cache" value={cacheRead} /> : null}
-          {cacheWrite ? <UsageRow sub label="cache writes" value={cacheWrite} /> : null}
+          {cacheRead ? (
+            <UsageRow sub label="from cache" value={cacheRead} />
+          ) : null}
+          {cacheWrite ? (
+            <UsageRow sub label="cache writes" value={cacheWrite} />
+          ) : null}
           {cacheRead || cacheWrite ? (
             <UsageRow sub label="fresh" value={freshInput} />
           ) : null}
@@ -1342,11 +1502,13 @@ function HarvestFeed({ events, running, aborted, draining = false }) {
         // bottom via the viewport-height shell) instead of a fixed max-h cap.
         // py-6: buffer so the first/last rows clear the scroll-fade mask (which
         // dissolves the top/bottom edges) instead of sitting under it at rest.
-        className="okf-thin-scroll scroll-fade-y flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto py-6 pr-1"
+        className="okf-thin-scroll flex min-h-0 flex-1 scroll-fade-y flex-col gap-1 overflow-y-auto py-6 pr-1"
       >
         {rows.map((r) =>
           r.kind === "fleet" ? (
             <FleetRow key={`fleet-${r.batch}`} row={r} />
+          ) : r.kind === "benchmark" ? (
+            <BenchmarkRow key={`bench-${r.iteration}`} row={r} />
           ) : (
             <StepRow key={r.seq} step={r} />
           )

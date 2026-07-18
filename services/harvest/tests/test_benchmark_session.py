@@ -82,9 +82,16 @@ def test_round_advances_and_persists():
 
         assert r0["iteration"] == 0 and r0["ex_score"] == 0.5
         assert r1["iteration"] == 1 and r1["ex_score"] == 1.0
-        # KPI persisted + live event emitted per round.
+        # KPI persisted per round.
         assert [it for it, _ in persisted] == [0, 1]
-        assert [e["kind"] for e in events] == ["benchmark", "benchmark"]
+        # One round-done "benchmark" KPI event per round...
+        done = [e for e in events if e["kind"] == "benchmark"]
+        assert len(done) == 2
+        # ...plus live "benchmark_progress" ticks (solving/grading phases).
+        progress = [e for e in events if e["kind"] == "benchmark_progress"]
+        assert progress, "expected progress ticks"
+        assert {e["phase"] for e in progress} <= {"solving", "grading", "reviewing"}
+        assert all("current" in e and "total" in e for e in progress)
         # Public dict carries no gold/question text.
         assert "G0" not in repr(r0) and "Q0" not in repr(r0)
 
