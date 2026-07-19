@@ -18,6 +18,7 @@ import {
 } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 
+import { AskHumanForm } from "@/components/chat/AskHumanForm"
 import { Button } from "@/components/ui/button"
 import {
   Command,
@@ -264,6 +265,8 @@ export function ChatInput({
   datasets = [],
   datasetScope = null,
   onScopeChange,
+  pendingAsk = null,
+  onAnswer,
 }) {
   const [text, setText] = useState("")
   const ref = useRef(null)
@@ -444,8 +447,21 @@ export function ChatInput({
 
   const canSend = text.trim().length > 0 && !disabled && !isStreaming
 
+  // When the agent has paused to ask clarifying questions, the composer becomes
+  // the QA form (a natural vertical expansion of the input) — the textarea/toolbar
+  // are hidden until the user submits, which resumes the agent.
+  const asking = Boolean(pendingAsk && pendingAsk.questions?.length && onAnswer)
+
   return (
     <div className="flex flex-col gap-2 rounded-3xl border bg-card px-4 py-3 shadow-sm">
+      {asking ? (
+        <AskHumanForm
+          questions={pendingAsk.questions}
+          onSubmit={onAnswer}
+          disabled={isStreaming}
+        />
+      ) : (
+        <>
       {leftSlot ? (
         <div className="flex flex-wrap items-center gap-1.5">{leftSlot}</div>
       ) : null}
@@ -547,6 +563,8 @@ export function ChatInput({
           )}
         </div>
       </div>
+        </>
+      )}
     </div>
   )
 }

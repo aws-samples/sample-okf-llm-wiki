@@ -97,3 +97,50 @@ def test_scoped_tool_description_lifted_from_method_docstring():
     )
     # docstring-derived description survives the wrapper.
     assert "concept" in tools["read_page"].description.lower()
+
+
+# --- tool errors come back as a RESULT, not a crash --------------------------
+
+
+class _BoomTools(FakeConsumptionTools):
+    """A tools double whose read_page raises a NoSuchKey-style error, and whose
+    grep raises a ValueError (bad input) — to prove both degrade to a result."""
+
+    def read_page(self, *a, **k):
+        raise Exception(
+            "An error occurred (NoSuchKey) when calling the GetObject operation: "
+            "The specified key does not exist."
+        )
+
+    def grep(self, *a, **k):
+        raise ValueError("invalid regex pattern: unbalanced parenthesis")
+
+
+def test_tool_error_is_returned_as_result_not_raised():
+    tools = _by_name(make_agent_tools(_BoomTools()))
+    # The wrapper must NOT propagate — it returns the error text so the agent loop
+    # gets a ToolMessage and keeps going (regression for the NoSuchKey crash).
+    out = tools["read_page"].invoke(
+        {"concept_id": "tables/x", "data_domain": "bird", "dataset": "formula_1"}
+    )
+    assert isinstance(out, str)
+    assert out.startswith("Error:")
+    assert "NoSuchKey" in out
+
+
+def test_tool_valueerror_is_returned_concisely():
+    tools = _by_name(make_agent_tools(_BoomTools()))
+    out = tools["grep"].invoke(
+        {"pattern": "(", "data_domain": "bird", "dataset": "formula_1"}
+    )
+    assert out == "Error: invalid regex pattern: unbalanced parenthesis"
+
+
+def test_tool_error_handling_works_scoped_too():
+    tools = _by_name(
+        make_agent_tools(
+            _BoomTools(), dataset_scope={"data_domain": "bird", "dataset": "formula_1"}
+        )
+    )
+    out = tools["read_page"].invoke({"concept_id": "tables/x"})
+    assert isinstance(out, str) and out.startswith("Error:")

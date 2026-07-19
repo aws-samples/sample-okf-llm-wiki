@@ -234,7 +234,7 @@ def test_write_benchmark_kpi_puts_bench_row():
             "passed": 6,
             "failed": 2,
             "discarded": 1,
-            "threshold_met": False,
+            "target_met": False,
         },
     )
     assert len(ddb.puts) == 1
@@ -246,7 +246,7 @@ def test_write_benchmark_kpi_puts_bench_row():
     # Numbers marshalled as N, bools as BOOL, created_at stamped.
     assert item["ex_score"] == {"N": "0.75"}
     assert item["passed"] == {"N": "6"}
-    assert item["threshold_met"] == {"BOOL": False}
+    assert item["target_met"] == {"BOOL": False}
     assert "created_at" in item
 
 
@@ -269,9 +269,9 @@ def test_write_benchmark_kpi_bool_before_int():
     ddb = _PutDDB()
     status.write_benchmark_kpi(
         (ddb, "t"), data_domain="d", dataset="ds",
-        runtime_session_id="s", iteration=0, attrs={"threshold_met": True},
+        runtime_session_id="s", iteration=0, attrs={"target_met": True},
     )
-    assert ddb.puts[0]["Item"]["threshold_met"] == {"BOOL": True}
+    assert ddb.puts[0]["Item"]["target_met"] == {"BOOL": True}
 
 
 def test_write_benchmark_kpi_best_effort_on_error():

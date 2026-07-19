@@ -94,9 +94,11 @@ pre-existing `META` row for the same `pk` (enforced by `assert_domain_declared`
 in the upsert adapter).
 
 Optionally also carries **recursive-improvement settings** under a single nested
-`recursive_improvement` map: `{enabled, questions_key, max_iterations,
-ex_threshold, judge_threshold, gate_kpis}` (see `docs/RECURSIVE_IMPROVEMENT.md`
-and the harvest payload's `recursive_improvement` block below). These are the
+`recursive_improvement` map: `{enabled, questions_key, max_iterations}` (see
+`docs/BENCHMARK_GUIDE.md` and the harvest payload's `recursive_improvement`
+block below). The stop target is **fixed** (judge accuracy ≥ 90%), so it is NOT a
+setting — legacy `ex_threshold`/`judge_threshold`/`gate_kpis` keys are ignored by
+the validator. These are the
 dataset's saved benchmark config: when `enabled` is true the Control API copies
 this map (validated) into the harvest invocation payload on **every** trigger for
 the dataset — `full`, `incremental`, and `annotated` alike — so a dataset once
@@ -212,12 +214,14 @@ shared by `harvest.steps` and `control_api.handlers`.
 **Benchmark KPI (recursive improvement).** `pk = "HARVEST#<data_domain>#<dataset>"`,
 `sk = "BENCH#<runtime_session_id>#<iteration>"`, attrs `{iteration,
 runtime_session_id, ex_score, judge_accuracy, passed, failed, discarded, graded,
-genuine_error_count, threshold_met, created_at}`. One row per benchmark round of a
-recursive-improvement run (see `docs/RECURSIVE_IMPROVEMENT.md`); `graded = passed
+genuine_error_count, target_met, created_at}`. One row per benchmark round of a
+recursive-improvement run (see `docs/BENCHMARK_GUIDE.md`); `graded = passed
 + failed`, `ex_score = passed / graded` (DISCARDED questions — gold that can't
-bind to the schema — are excluded from both). A terminal
+bind to the schema — are excluded from both). `target_met` is true once judge
+accuracy ≥ 0.9 (the fixed target) with EX > 0. A terminal
 `sk = "BENCH#<runtime_session_id>#final"` row carries the shipped iteration's
-numbers plus `shipped_iteration` (which checkpoint `finalize` restored). Written
+numbers. (No checkpoint/restore — the agent owns the final bundle; whatever it
+authored is what ships.) Written
 **append-only** (`PutItem`, never read-modify-write) best-effort by the harvest
 runtime — a KPI write must never crash a harvest, same discipline as
 `report_status`. The `runtime_session_id` in the `sk` scopes rows to one run: a
@@ -356,17 +360,14 @@ re-running applies it even with zero annotations (a guidance-only re-harvest,
 
 `recursive_improvement` (optional, on `full`/`incremental`/`annotated`) enables
 the benchmark-driven improvement loop for the run (see
-`docs/RECURSIVE_IMPROVEMENT.md`). Its **presence is the enable signal** — absent
+`docs/BENCHMARK_GUIDE.md`). Its **presence is the enable signal** — absent
 ⇒ the feature is entirely inert and the harvest is unchanged. The block:
 
 ```json
 { "data_domain": "sales", "dataset": "orders", "mode": "full",
   "recursive_improvement": {
     "questions_key": "benchmark/sales/orders/questions.csv",
-    "max_iterations": 5,
-    "ex_threshold": 0.80,
-    "judge_threshold": 0.90,
-    "gate_kpis": ["ex", "judge"] } }
+    "max_iterations": 5 } }
 ```
 
 `questions_key` is the S3 key of the uploaded `question,gold_sql` CSV. It lives
@@ -377,17 +378,31 @@ included, not just the solver). The runner fetches it via boto3 `GetObject` into
 the benchmark tool's process memory; it is never written to the mount. This
 requires `s3:GetObject` on `<bundle-bucket>/benchmark/*` for the harvest runtime
 role. `max_iterations` is the
-benchmark→revise round budget (2–5, **clamped to 5** by the Control API).
-`ex_threshold`/`judge_threshold` are the target rates (over non-discarded
-questions) and `gate_kpis` names which must clear to stop (subset of
-`["ex","judge"]`). The Control API validates this block at the trust boundary —
-clamps `max_iterations`, range-checks thresholds, checks `gate_kpis` — and sources
-it from the dataset's saved `recursive_improvement` settings on the `DATASET#` row
+benchmark→revise round budget (2–5, **clamped to 5** by the Control API). The stop
+**target is fixed** — judge (adjudicated) accuracy ≥ 90% with EX > 0 — and is not
+configurable (the point is to improve the wiki, not to tune a benchmark score).
+The Control API validates this block at the trust boundary — clamps
+`max_iterations`, requires `questions_key` when enabled — and ignores any legacy
+`ex_threshold`/`judge_threshold`/`gate_kpis` keys. It sources the block
+from the dataset's saved `recursive_improvement` settings on the `DATASET#` row
 (so it rides along on every trigger for a configured dataset). Question count is
 inferred from the CSV and **hard-capped at 100** (first 100 in CSV order) inside
-the harvest tool. All benchmark LLM roles reuse the run's single `chat_model`
-instance (no separate model/effort), so benchmark token usage folds into the run's
-cumulative total automatically.
+the harvest tool. Questions the reviewer classifies as noisy/ambiguous gold are
+**pruned** from later rounds (they're not wiki defects). All benchmark LLM roles
+reuse the run's single `chat_model` instance (no separate model/effort), so
+benchmark token usage folds into the run's cumulative total automatically.
+
+**Per-round review artifact (off-mount, human-facing).** Each round the harvest
+runtime writes one JSON to `benchmark/<domain>/<dataset>/reviews/<runtime_session_id>/<iteration>.json`
+(same off-mount prefix as the CSV — it carries gold SQL, so no LLM role may read
+it). Shape: `{iteration, counts: {<bucket>: n}, questions: [{q_id, bucket,
+question, gold_sql, predicted_sql, note, reason}]}`, where `bucket` ∈ `passed`,
+`genuine_error`, `noisy_gold`, `ambiguous`, `unknown`, `discarded`. It is served
+ONLY to the UI via the Cognito-authed Control API route `GET
+/benchmark/{domain}/{dataset}/reviews/{session}/{iteration}` (the round-done
+`kind:"benchmark"` feed event sets `has_review` + `runtime_session_id` so the UI
+knows to offer it). It is NEVER part of the `run_benchmark` tool return — the agent
+still sees only aggregate KPIs + anonymous `improvements`.
 
 or, for writing/refreshing a domain's concept doc through the mount:
 

@@ -304,18 +304,21 @@ wiki against the benchmark:
 1. Call `run_benchmark` (no arguments). It runs the whole question set through
    independent solvers that may read ONLY your wiki, grades their SQL against the
    real data, and returns `{iteration, ex_score, judge_accuracy, passed, failed,
-   discarded, graded, threshold_met, improvements}`. You NEVER see the questions
-   or the expected answers — only the aggregated `improvements` themes.
-2. If `threshold_met` is true, you are done — stop calling `run_benchmark`.
+   discarded, graded, target_met, improvements}`. You NEVER see the questions
+   or the expected answers — only the aggregated `improvements` themes. `target_met`
+   is true once adjudicated (judge) accuracy reaches the fixed 90% bar.
+2. If `target_met` is true, you are done — stop calling `run_benchmark`.
 3. Otherwise, treat each `improvements` item as a HYPOTHESIS about a wiki gap.
    For each, VERIFY it against live data (`run_sql`/`sample_rows`, `.metadata/`)
    the same way you author anything — then fix the relevant docs (respecting the
    guard; `get_backlinks` to propagate). Do NOT invent content to chase a score;
    only write what the data confirms. An improvement you can't reproduce against
    live data, you leave alone.
-4. Call `run_benchmark` again to re-measure. Repeat until `threshold_met` is true
+4. Call `run_benchmark` again to re-measure. Repeat until `target_met` is true
    or the tool refuses further calls (your iteration budget is spent) — either is
-   a valid stopping point.
+   a valid stopping point. Questions the review deems noisy or ambiguous are
+   dropped from later rounds automatically, so the graded set may shrink between
+   calls — focus on the `improvements`, not the raw pass counts.
 
 The wiki ships EXACTLY as you leave it — there is NO automatic rollback to a
 higher-scoring earlier round. So if a revision lowers the score, fix or revert it

@@ -83,12 +83,48 @@ export async function sendMessageAPI({
   return res
 }
 
-// Fetch a conversation's persisted history as { history: [chatTurns] }.
+// Answer a paused ask_human interrupt: resume the agent with the user's answers.
+// Returns the raw streaming Response (SSE) like sendMessageAPI — the server drives
+// the graph forward with Command(resume=…) from its checkpoint. `answers` is a list
+// of { id, answer, interrupt_id? } where answer is a string (single/text) or
+// string[] (multi). model/effort/features/datasetScope MUST be sent so the server
+// rebuilds the SAME graph the interrupt was raised on (the model is pinned per
+// conversation and its checkpoint isn't portable across models).
+export async function answerHumanAPI({
+  threadId,
+  getToken,
+  answers,
+  model,
+  effort,
+  features = null,
+  datasetScope = null,
+  signal,
+}) {
+  const input = { type: "answer_human", answers }
+  if (model) input.model_id = model
+  if (effort) input.effort = effort
+  if (Array.isArray(features) && features.length > 0) input.features = features
+  if (datasetScope) input.dataset_scope = datasetScope
+  const res = await post(threadId, getToken, input, { signal })
+  if (!res.ok) {
+    const text = await res.text().catch(() => "")
+    throw new Error(`answer request failed (${res.status}): ${text || "unknown error"}`)
+  }
+  return res
+}
+
+// Fetch a conversation's persisted history as { history: [chatTurns], pendingAsk? }.
+// pendingAsk is set when the conversation is PAUSED at an ask_human interrupt (the
+// graph checkpoint is durable), so a page reload can re-render the QA form and let
+// the user still answer.
 export async function fetchHistoryAPI({ threadId, getToken }) {
   const res = await post(threadId, getToken, { type: "get_session_history" })
   if (!res.ok) throw new Error(`failed to load history: ${res.status}`)
   const data = await res.json()
-  return { history: Array.isArray(data?.history) ? data.history : [] }
+  return {
+    history: Array.isArray(data?.history) ? data.history : [],
+    pendingAsk: data?.pending_ask || null,
+  }
 }
 
 // Delete a conversation's checkpoints on the runtime (the per-user thread index

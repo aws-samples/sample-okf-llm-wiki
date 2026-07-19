@@ -41,6 +41,14 @@ Discover with list_domains / list_declared_domains / search_domains. Navigate a 
 If the wiki does not cover something, say so plainly instead of guessing. Column and join semantics are frequently wrong to assume from names alone — the wiki's known-issues sections exist because catalog metadata lies, so prefer what a doc states over what a name implies. If docs conflict or look stale, note the discrepancy rather than silently picking one.
 </grounding>
 
+<asking_the_user>
+When a request is genuinely ambiguous — or hinges on a preference or decision only the user can make — ask them with the ask_human tool instead of guessing or picking silently. Typical cases: two documented things share a name and you can't tell which they mean ("which 'revenue' metric?"), a scope choice materially changes the answer ("include cancelled orders?"), or you need a target/format/grain the request didn't state.
+
+First try to resolve it yourself from the wiki; only ask about what the docs genuinely can't settle. When you do ask, batch every clarification you need into ONE ask_human call, keep each question short and concrete, and offer the likely options (the user can always type their own). Then use the answers to continue — don't re-ask what they've told you.
+
+Use this sparingly. Most questions don't need it: if you can give a good answer with a brief note about an assumption you made, prefer that over interrupting the user. Never use ask_human for something the wiki already answers, and never use it to avoid doing the reading.
+</asking_the_user>
+
 <thinking_usage>
 When extended thinking is enabled and you need tools, use your thinking as a private workspace: plan which docs to read, reflect on what they say, spot gaps, and structure your answer — all inside thinking. Do not narrate to the user during this process. Make independent tool calls in parallel when you can, and think between result batches to decide what to read next.
 
@@ -91,14 +99,17 @@ def build_graph(
     checkpointer: Any,
     *,
     system_prompt: str = SYSTEM_PROMPT,
+    middleware: list[Any] | None = None,
 ):
     """Compile the react agent graph.
 
     ``chat_model`` is a built ``BaseChatModel`` (Converse or Mantle GPT) with
     reasoning configured; ``tools`` are the (optionally dataset-scoped)
     consumption tools; ``checkpointer`` is a ``DynamoDBSaver`` (or any
-    ``BaseCheckpointSaver`` — tests pass an in-memory one). Returns a
-    ``CompiledStateGraph`` that ``chat.server`` streams directly.
+    ``BaseCheckpointSaver`` — tests pass an in-memory one). ``middleware`` is the
+    agent-middleware list (e.g. ``AskHumanMiddleware`` for the human-in-the-loop
+    interrupt). Returns a ``CompiledStateGraph`` that ``chat.server`` streams
+    directly.
     """
     from langchain.agents import create_agent
 
@@ -106,5 +117,6 @@ def build_graph(
         model=chat_model,
         tools=tools,
         system_prompt=system_prompt,
+        middleware=middleware or [],
         checkpointer=checkpointer,
     )

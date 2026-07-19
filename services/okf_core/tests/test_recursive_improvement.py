@@ -31,14 +31,13 @@ def test_validate_disabled_returns_none():
 
 
 def test_validate_fills_defaults():
+    # The validated block carries ONLY enablement, key, and iteration budget — the
+    # stop target is fixed (JUDGE_TARGET), so there are no threshold/gate fields.
     out = ri.validate({"enabled": True, "questions_key": "okf/d/ds/.benchmark/q.csv"})
     assert out == {
         "enabled": True,
         "questions_key": "okf/d/ds/.benchmark/q.csv",
         "max_iterations": ri.MAX_ITERATIONS,
-        "ex_threshold": ri.DEFAULT_EX_THRESHOLD,
-        "judge_threshold": ri.DEFAULT_JUDGE_THRESHOLD,
-        "gate_kpis": list(ri.DEFAULT_GATE_KPIS),
     }
 
 
@@ -48,16 +47,28 @@ def test_validate_passes_through_valid_values():
             "enabled": True,
             "questions_key": " k ",  # trimmed
             "max_iterations": 3,
-            "ex_threshold": 0.7,
-            "judge_threshold": 0.95,
-            "gate_kpis": ["ex", "judge"],
         }
     )
     assert out["questions_key"] == "k"
     assert out["max_iterations"] == 3
-    assert out["ex_threshold"] == 0.7
-    assert out["judge_threshold"] == 0.95
-    assert out["gate_kpis"] == ["ex", "judge"]
+
+
+def test_validate_ignores_legacy_threshold_fields():
+    # Old configs / callers may still send threshold + gate keys; they are IGNORED,
+    # not persisted, and never cause a 400 (the target is fixed now).
+    out = ri.validate(
+        {
+            "enabled": True,
+            "questions_key": "k",
+            "ex_threshold": 0.7,
+            "judge_threshold": 0.5,
+            "gate_kpis": ["ex", "judge"],
+        }
+    )
+    assert set(out) == {"enabled", "questions_key", "max_iterations"}
+    assert "ex_threshold" not in out
+    assert "judge_threshold" not in out
+    assert "gate_kpis" not in out
 
 
 # -- validate: questions_key is required when enabled ------------------------
@@ -92,44 +103,6 @@ def test_validate_non_integer_iterations_raises():
         ri.validate({"enabled": True, "questions_key": "k", "max_iterations": "lots"})
 
 
-# -- validate: thresholds clamp to [0,1], reject non-numeric -----------------
-
-
-@pytest.mark.parametrize(
-    "given,expected",
-    [(1.2, 1.0), (-0.5, 0.0), (0.0, 0.0), (1.0, 1.0), (0.42, 0.42)],
-)
-def test_validate_clamps_thresholds(given, expected):
-    out = ri.validate({"enabled": True, "questions_key": "k", "ex_threshold": given})
-    assert out["ex_threshold"] == expected
-
-
-def test_validate_non_numeric_threshold_raises():
-    with pytest.raises(ri.RecursiveImprovementConfigError):
-        ri.validate({"enabled": True, "questions_key": "k", "judge_threshold": "high"})
-
-
-# -- validate: gate_kpis subset check ----------------------------------------
-
-
-def test_validate_gate_kpis_default_when_omitted():
-    out = ri.validate({"enabled": True, "questions_key": "k"})
-    assert out["gate_kpis"] == list(ri.DEFAULT_GATE_KPIS)
-
-
-def test_validate_gate_kpis_dedupes_preserving_order():
-    out = ri.validate(
-        {"enabled": True, "questions_key": "k", "gate_kpis": ["judge", "ex", "judge"]}
-    )
-    assert out["gate_kpis"] == ["judge", "ex"]
-
-
-@pytest.mark.parametrize("bad", [[], "ex", ["ex", "bogus"], ["nope"]])
-def test_validate_bad_gate_kpis_raises(bad):
-    with pytest.raises(ri.RecursiveImprovementConfigError):
-        ri.validate({"enabled": True, "questions_key": "k", "gate_kpis": bad})
-
-
 # -- bench_sk (KPI row sort key) ---------------------------------------------
 
 
@@ -160,47 +133,27 @@ def test_ex_score():
     assert ri.ex_score(0, 5) == 0.0
 
 
-# -- thresholds_met (only gated KPIs must clear) -----------------------------
+# -- target_met (fixed judge >= JUDGE_TARGET, with an EX > 0 floor) -----------
 
 
-def test_thresholds_met_ex_only_gate_ignores_judge():
-    cfg = ri.validate(
-        {"enabled": True, "questions_key": "k", "ex_threshold": 0.8, "gate_kpis": ["ex"]}
-    )
-    # judge is terrible but not gated → still passes on EX alone.
-    assert ri.thresholds_met(cfg, ex=0.85, judge=0.1) is True
-    assert ri.thresholds_met(cfg, ex=0.79, judge=1.0) is False
+def test_target_is_fixed_at_90_percent():
+    assert ri.JUDGE_TARGET == 0.9
 
 
-def test_thresholds_met_both_gated():
-    cfg = ri.validate(
-        {
-            "enabled": True,
-            "questions_key": "k",
-            "ex_threshold": 0.8,
-            "judge_threshold": 0.9,
-            "gate_kpis": ["ex", "judge"],
-        }
-    )
-    assert ri.thresholds_met(cfg, ex=0.8, judge=0.9) is True
-    assert ri.thresholds_met(cfg, ex=0.8, judge=0.89) is False
-    assert ri.thresholds_met(cfg, ex=0.79, judge=0.9) is False
+def test_target_met_gates_on_judge():
+    # Judge (adjudicated) accuracy is the bar; raw EX doesn't gate (beyond the > 0
+    # floor) because the feature measures wiki quality, not the raw solver score.
+    assert ri.target_met(ex=0.2, judge=0.9) is True   # judge clears, ex > 0
+    assert ri.target_met(ex=0.2, judge=0.95) is True
+    assert ri.target_met(ex=0.85, judge=0.89) is False  # judge below bar
+    # Boundary: exactly the target passes.
+    assert ri.target_met(ex=0.5, judge=ri.JUDGE_TARGET) is True
 
 
-def test_thresholds_met_empty_gate_never_satisfied():
-    # Defensive: an empty gate can't be cleared (validate prevents this, but the
-    # function must not vacuously return True).
-    assert ri.thresholds_met({"gate_kpis": []}, ex=1.0, judge=1.0) is False
-
-
-def test_thresholds_met_ex_floor_blocks_zero_ex_false_success():
-    # THE FALSE-SUCCESS FIX: EX == 0 can NEVER be "target met", even under a
-    # judge-only gate that would otherwise pass at judge=1.0. Regression guard for
-    # the EX 0% / judge 100% / "Target met" screenshot.
-    judge_only = ri.validate(
-        {"enabled": True, "questions_key": "k", "judge_threshold": 0.9, "gate_kpis": ["judge"]}
-    )
-    assert ri.thresholds_met(judge_only, ex=0.0, judge=1.0) is False
-    # A single real pass lifts the floor; then the judge gate applies normally.
-    assert ri.thresholds_met(judge_only, ex=0.02, judge=0.95) is True
-    assert ri.thresholds_met(judge_only, ex=0.02, judge=0.85) is False
+def test_target_met_ex_floor_blocks_zero_ex_false_success():
+    # THE FALSE-SUCCESS FIX: EX == 0 can NEVER be "target met", even at judge 1.0.
+    # Regression guard for the EX 0% / judge 100% / "Target met" screenshot.
+    assert ri.target_met(ex=0.0, judge=1.0) is False
+    # A single real pass lifts the floor; then the judge bar applies normally.
+    assert ri.target_met(ex=0.02, judge=0.95) is True
+    assert ri.target_met(ex=0.02, judge=0.85) is False

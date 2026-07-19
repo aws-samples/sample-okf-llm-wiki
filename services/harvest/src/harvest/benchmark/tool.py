@@ -43,6 +43,28 @@ def _athena_concurrency() -> int:
 Solve = Callable[[str], Awaitable[str]]
 
 
+# Adjudicator classification categories — canonical here (the lowest benchmark
+# module) so both tool.py and adjudicator.py agree without a circular import.
+# Mirrors the okf-sql-benchmark adjudicator taxonomy.
+CATEGORY_GENUINE = "GENUINE_ERROR"
+CATEGORY_NOISY_GOLD = "NOISY_GOLD"
+CATEGORY_AMBIGUOUS = "AMBIGUOUS"
+# Distinct sentinel for a classification that ERRORED or couldn't be parsed — it is
+# NOT a real verdict and must NOT be forgiven (that was the 100%-judge bug).
+CATEGORY_UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class Verdict:
+    """The adjudicator's per-FAIL classification. ``category`` is one of the
+    ``CATEGORY_*`` values (GENUINE_ERROR / NOISY_GOLD / AMBIGUOUS / UNKNOWN);
+    ``note`` is the gold-free gap note (empty for non-genuine)."""
+
+    q_id: int
+    category: str
+    note: str = ""
+
+
 @dataclass
 class AdjudicationResult:
     """What the adjudicator returns for a round's FAILs.
@@ -57,18 +79,52 @@ class AdjudicationResult:
       must require positive evidence, so unknowns lower judge like genuine errors.
 
     ``improvements`` is the de-identified theme list from the genuine gaps — the
-    ONLY free text that crosses back to the supervisor.
+    ONLY free text that crosses back to the supervisor. ``verdicts`` is the
+    per-question detail (q_id → category/note) used to (a) prune forgiven questions
+    from later rounds and (b) build the human-facing review; it NEVER crosses the
+    tool boundary to the agent.
     """
 
     improvements: list[str] = field(default_factory=list)
     genuine_error_count: int = 0
     forgiven_count: int = 0
+    verdicts: list[Verdict] = field(default_factory=list)
+
+
+# Human-facing review bucket names (a superset of the adjudicator categories — it
+# also covers PASS and DISCARDED, which aren't adjudicated). Stable strings: the
+# persisted review JSON and the UI tabs key off these.
+BUCKET_PASSED = "passed"
+BUCKET_GENUINE = "genuine_error"
+BUCKET_NOISY = "noisy_gold"
+BUCKET_AMBIGUOUS = "ambiguous"
+BUCKET_UNKNOWN = "unknown"
+BUCKET_DISCARDED = "discarded"
+
+
+@dataclass
+class QuestionReview:
+    """One question's human-facing review row (persisted off-mount, shown in the UI).
+
+    Carries gold + predicted SQL deliberately — this is the transparency artifact a
+    HUMAN inspects to verify each verdict. It is written to an off-mount S3 key and
+    served only via the Cognito-authed Control API; it NEVER enters the agent's
+    result payload or filesystem (same trust boundary as the questions CSV)."""
+
+    q_id: int
+    bucket: str
+    question: str
+    gold_sql: str
+    predicted_sql: str = ""
+    note: str = ""
+    reason: str = ""
 
 
 @dataclass
 class RoundResult:
     """One benchmark round's outcome. ``to_public_dict`` is what the tool returns
-    to the supervisor (gold-free/question-free)."""
+    to the supervisor (gold-free/question-free); ``review`` is the human-facing
+    per-question detail (with gold) that is persisted off-mount, never returned."""
 
     iteration: int
     passed: int
@@ -78,14 +134,23 @@ class RoundResult:
     judge_accuracy: float
     genuine_error_count: int
     improvements: list[str]
-    threshold_met: bool
+    target_met: bool
+    # q_ids the adjudicator POSITIVELY forgave (NOISY_GOLD / AMBIGUOUS) this round —
+    # dropped from the set for all later rounds (they aren't wiki defects, so
+    # re-benchmarking them just wastes solver/grader budget).
+    forgiven_q_ids: list[int] = field(default_factory=list)
+    # Full per-question review (gold + predicted SQL). Human-facing ONLY.
+    review: list["QuestionReview"] = field(default_factory=list)
 
     @property
     def graded(self) -> int:
         return self.passed + self.failed
 
     def to_public_dict(self) -> dict:
-        """The gold-free payload the supervisor sees (aggregated-feedback boundary)."""
+        """The gold-free payload the supervisor sees (aggregated-feedback boundary).
+
+        Deliberately omits ``review``/``forgiven_q_ids`` — the agent gets only the
+        aggregate KPIs + anonymous ``improvements``, never per-question / gold data."""
         return {
             "iteration": self.iteration,
             "ex_score": round(self.ex_score, 4),
@@ -94,7 +159,7 @@ class RoundResult:
             "failed": self.failed,
             "discarded": self.discarded,
             "graded": self.graded,
-            "threshold_met": self.threshold_met,
+            "target_met": self.target_met,
             "improvements": list(self.improvements),
         }
 
@@ -110,7 +175,7 @@ class RoundResult:
             "discarded": self.discarded,
             "graded": self.graded,
             "genuine_error_count": self.genuine_error_count,
-            "threshold_met": self.threshold_met,
+            "target_met": self.target_met,
         }
 
 
@@ -251,7 +316,6 @@ async def run_round(
     *,
     iteration: int,
     questions: list[BenchmarkQuestion],
-    config: dict,
     solve: Solve,
     grader: Grader,
     adjudicate: Callable[[list[QuestionResult]], Awaitable[AdjudicationResult]],
@@ -263,8 +327,9 @@ async def run_round(
 
     Steps: solve all (concurrent, bundle-blind) → grade each (deterministic Athena
     set-equality, discards excluded) → adjudicate FAILs (genuine vs noisy-gold,
-    consolidate into anonymous themes) → compute EX + judge KPIs + threshold.
-    ``progress(phase, current, total)`` is ticked through the phases for the UI.
+    consolidate into anonymous themes) → compute EX + judge KPIs + the FIXED target
+    → build the per-question review + forgiven-q_id list. ``progress(phase, current,
+    total)`` is ticked through the phases for the UI.
     """
     solved = await _solve_all(questions, solve, concurrency, progress)
     graded = await _grade_all(solved, grader, progress)
@@ -286,7 +351,12 @@ async def run_round(
     # Forgive ONLY positively-classified noisy gold — not errored/unknown
     # adjudications (which stay counted against the wiki). See _judge_accuracy.
     judge = _judge_accuracy(passed, graded_n, adj.forgiven_count)
-    met = ri.thresholds_met(config, ex=ex, judge=judge)
+    met = ri.target_met(ex=ex, judge=judge)
+
+    review = _build_review(questions, graded, adj.verdicts)
+    forgiven_q_ids = [
+        v.q_id for v in adj.verdicts if v.category in (CATEGORY_NOISY_GOLD, CATEGORY_AMBIGUOUS)
+    ]
 
     return RoundResult(
         iteration=iteration,
@@ -297,5 +367,60 @@ async def run_round(
         judge_accuracy=judge,
         genuine_error_count=adj.genuine_error_count,
         improvements=list(adj.improvements),
-        threshold_met=met,
+        target_met=met,
+        forgiven_q_ids=forgiven_q_ids,
+        review=review,
     )
+
+
+# Map each adjudicator category to its human-facing review bucket.
+_CATEGORY_TO_BUCKET = {
+    CATEGORY_GENUINE: BUCKET_GENUINE,
+    CATEGORY_NOISY_GOLD: BUCKET_NOISY,
+    CATEGORY_AMBIGUOUS: BUCKET_AMBIGUOUS,
+    CATEGORY_UNKNOWN: BUCKET_UNKNOWN,
+}
+
+
+def _build_review(
+    questions: list[BenchmarkQuestion],
+    graded: list[QuestionResult],
+    verdicts: list["Verdict"],
+) -> list[QuestionReview]:
+    """Assemble the per-question human-facing review (gold + predicted + verdict).
+
+    This is the ONLY place all three sources meet: the question text + gold SQL
+    (from ``questions``), the graded outcome + predicted SQL (from ``graded``), and
+    the adjudicator verdict (from ``verdicts``). PASS/DISCARDED aren't adjudicated,
+    so they get their outcome-derived bucket; FAILs get their verdict's bucket
+    (UNKNOWN if the adjudicator didn't return one for that q_id)."""
+    q_by_id = {q.q_id: q for q in questions}
+    verdict_by_id = {v.q_id: v for v in verdicts}
+    reviews: list[QuestionReview] = []
+    for r in graded:
+        q = q_by_id.get(r.q_id)
+        # Only FAILs are adjudicated, so ONLY a FAIL takes its verdict's bucket +
+        # note. PASS/DISCARDED get their outcome bucket and NO note — a stray verdict
+        # for a non-FAIL q_id (shouldn't happen, but don't trust it) must not attach a
+        # mismatched note to a passed/discarded row.
+        note = ""
+        if r.outcome is Outcome.PASS:
+            bucket = BUCKET_PASSED
+        elif r.outcome is Outcome.DISCARDED:
+            bucket = BUCKET_DISCARDED
+        else:  # FAIL → its adjudicator verdict bucket (UNKNOWN if unreviewed)
+            v = verdict_by_id.get(r.q_id)
+            bucket = _CATEGORY_TO_BUCKET.get(v.category if v else "", BUCKET_UNKNOWN)
+            note = v.note if v else ""
+        reviews.append(
+            QuestionReview(
+                q_id=r.q_id,
+                bucket=bucket,
+                question=q.question if q else "",
+                gold_sql=q.gold_sql if q else "",
+                predicted_sql=r.predicted_sql,
+                note=note,
+                reason=r.discard_reason or r.reason,
+            )
+        )
+    return reviews

@@ -51,6 +51,8 @@ export function ChatThread({
   emptyGreeting = "How can I help with the wiki?",
   emptyHint,
   onSend,
+  onAnswer,
+  pendingAsk = null,
   onStop,
   onPrepare,
   effort,
@@ -171,6 +173,8 @@ export function ChatThread({
           <div className="w-full">
             <ChatInput
               onSend={onSend}
+              onAnswer={onAnswer}
+              pendingAsk={pendingAsk}
               onStop={onStop}
               onPrepare={onPrepare}
               isStreaming={isStreaming}
@@ -261,6 +265,8 @@ export function ChatThread({
 
         <ChatInput
           onSend={onSend}
+          onAnswer={onAnswer}
+          pendingAsk={pendingAsk}
           onStop={onStop}
           onPrepare={onPrepare}
           isStreaming={isStreaming}

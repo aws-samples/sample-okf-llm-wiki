@@ -27,7 +27,7 @@ def test_supervisor_prompt_includes_ri_section_when_enabled():
     assert "Recursive improvement" in p
     # Must tell the agent to verify improvements against live data (not chase score).
     assert "HYPOTHESIS" in p or "hypothesis" in p
-    assert "threshold_met" in p
+    assert "target_met" in p
     # Must NOT claim the agent sees questions/answers.
     assert "never see" in p.lower() or "NEVER see" in p
 
@@ -64,13 +64,14 @@ def test_build_kwargs_empty_without_benchmark():
 def test_build_kwargs_threads_session_pieces():
     bench = types.SimpleNamespace(
         ri_config={"enabled": True}, questions=[1, 2], run={"dataset": "ds"},
-        persist_kpi=lambda *a: None,
+        persist_kpi=lambda *a: None, persist_review=lambda *a: None,
     )
     kw = runner._benchmark_build_kwargs(bench)
     assert kw["ri_config"] == {"enabled": True}
     assert kw["benchmark_questions"] == [1, 2]
     assert kw["benchmark_run"] == {"dataset": "ds"}
     assert callable(kw["persist_kpi"])
+    assert callable(kw["persist_review"])
 
 
 # -- compel check (NO restore — the benchmark never touches the bundle) -------

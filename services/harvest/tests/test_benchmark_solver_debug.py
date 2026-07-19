@@ -100,10 +100,63 @@ def test_vpath_adds_leading_slash():
 # -- real-backend smoke test (only where deepagents is installed) -------------
 
 import importlib.util  # noqa: E402
+import sys  # noqa: E402
+import types  # noqa: E402
 
 import pytest  # noqa: E402
 
 _HAVE_DEEPAGENTS = importlib.util.find_spec("deepagents") is not None
+_HAVE_LANGCHAIN_TOOLS = importlib.util.find_spec("langchain_core.tools") is not None
+
+
+class _StubBackend:
+    """A minimal FilesystemBackend stand-in so make_readonly_file_tools can build
+    its @tool functions WITHOUT deepagents — this exercises the langchain @tool
+    decoration path (which requires a docstring/description) offline. Regression
+    guard for 'Function must have a docstring if description not provided'."""
+
+    def __init__(self, **_kw):
+        pass
+
+    def read(self, _p):
+        return ""
+
+    def glob(self, _p):
+        return types.SimpleNamespace(matches=[])
+
+    def grep(self, _p):
+        return types.SimpleNamespace(matches=[])
+
+    def ls(self, _p):
+        return types.SimpleNamespace(entries=[])
+
+
+@pytest.mark.skipif(
+    not _HAVE_LANGCHAIN_TOOLS,
+    reason="langchain_core.tools not installed here",
+)
+def test_readonly_file_tools_build_without_raising(monkeypatch):
+    # The @tool decorator runs at BUILD time and raises if a tool function lacks a
+    # docstring/description. This test builds the tools through REAL langchain
+    # (stubbing only the deepagents backend), so a docstring-less tool fails HERE
+    # offline instead of only in the deployed image. Both scopes must build and
+    # produce non-empty, scope-specific descriptions.
+    stub = types.ModuleType("deepagents.backends")
+    stub.FilesystemBackend = _StubBackend
+    pkg = sys.modules.get("deepagents") or types.ModuleType("deepagents")
+    pkg.backends = stub
+    monkeypatch.setitem(sys.modules, "deepagents", pkg)
+    monkeypatch.setitem(sys.modules, "deepagents.backends", stub)
+
+    from harvest.benchmark.solver import make_readonly_file_tools
+
+    for scope, noun in (("wiki", "wiki"), ("dataset", "dataset")):
+        tools = make_readonly_file_tools("/tmp", scope=scope)
+        names = {t.name for t in tools}
+        assert names == {"read_file", "glob", "grep", "ls"}
+        for t in tools:
+            assert t.description  # non-empty (the decoration invariant)
+            assert noun in t.description
 
 
 @pytest.mark.skipif(
@@ -136,3 +189,38 @@ def test_solver_read_tools_work_against_real_backend(tmp_path):
         for m in (b.grep("race").matches or [])
     ]
     assert any("races.md" in h for h in hits)
+
+
+@pytest.mark.skipif(
+    not _HAVE_DEEPAGENTS,
+    reason="deepagents not installed here (offline test venv is --no-deps)",
+)
+def test_readonly_file_tools_factory_reads_wiki_and_dotdirs(tmp_path):
+    # The shared factory backs BOTH the solver (wiki-only snapshot) and the
+    # adjudicator (real mount). Rooted at the real mount, its file tools must reach
+    # the authored wiki AND the dot-dir inputs (.metadata/, .context/) — that access
+    # is the whole point of giving the adjudicator the real mount.
+    from harvest.benchmark.solver import make_readonly_file_tools
+
+    (tmp_path / "tables").mkdir()
+    (tmp_path / "tables" / "results.md").write_text("# results\nstatus is a string\n")
+    (tmp_path / ".metadata").mkdir()
+    (tmp_path / ".metadata" / "columns.tsv").write_text("results\tstatus\tint\n")
+    (tmp_path / ".context").mkdir()
+    (tmp_path / ".context" / "spec.md").write_text("status: 1=active, 2=inactive\n")
+
+    tools = {t.name: t for t in make_readonly_file_tools(str(tmp_path), scope="dataset")}
+    read_file, glob, grep = tools["read_file"], tools["glob"], tools["grep"]
+
+    # The wiki doc the solver had.
+    assert "status is a string" in read_file.invoke({"file_path": "tables/results.md"})
+    # The .metadata/ schema snapshot — reachable on the real mount (NOT on the
+    # solver's snapshot, which omits dot-dirs by construction).
+    assert "int" in read_file.invoke({"file_path": ".metadata/columns.tsv"})
+    # The .context/ source doc — also reachable.
+    assert "1=active" in read_file.invoke({"file_path": ".context/spec.md"})
+    # glob/grep span the tree, including the dot-dirs.
+    all_md = glob.invoke({"pattern": "**/*.md"})
+    assert any("results.md" in p for p in all_md)
+    status_hits = grep.invoke({"pattern": "status"})
+    assert any(".context/spec.md" in h for h in status_hits)

@@ -53,7 +53,7 @@ def _make(verdict_for, tracker, monkeypatch):
     monkeypatch.setattr(
         "langgraph.prebuilt.create_react_agent", lambda *a, **k: fake, raising=False
     )
-    return adj.make_adjudicator(_FakeModel(), raw_data_tools=[])
+    return adj.make_adjudicator(_FakeModel(), tools=[])
 
 
 def test_classifies_genuine_vs_noisy(monkeypatch):
@@ -120,7 +120,7 @@ def test_classifier_error_is_unknown_not_forgiven(monkeypatch):
         lambda *a, **k: _BoomAgent(),
         raising=False,
     )
-    adjudicate = adj.make_adjudicator(_FakeModel(), raw_data_tools=[])
+    adjudicate = adj.make_adjudicator(_FakeModel(), tools=[])
     res = asyncio.run(adjudicate([_fail(0), _fail(1)]))
     # Not a crash; but crucially forgiven_count == 0 (not 2).
     assert res.genuine_error_count == 0
@@ -140,3 +140,30 @@ def test_unrecognized_category_is_unknown(monkeypatch):
     adjudicate = _make(lambda case: '{"category": "WHATEVER", "gap": ""}', {"now": 0, "max": 0}, monkeypatch)
     res = asyncio.run(adjudicate([_fail(0)]))
     assert res.forgiven_count == 0 and res.genuine_error_count == 0
+
+
+def test_tools_factory_is_deferred_until_first_adjudication(monkeypatch):
+    # The adjudicator's file tools import deepagents, so make_adjudicator must NOT
+    # build them at construction (session build stays importable in the offline
+    # venv) — the factory is called lazily, once, on the first adjudicate() with
+    # fails, and never for an empty round.
+    calls = {"n": 0}
+
+    def factory():
+        calls["n"] += 1
+        return []
+
+    import harvest.benchmark.adjudicator as adj
+
+    fake = _FakeReActAgent(lambda case: '{"category": "NOISY_GOLD", "gap": ""}', {"now": 0, "max": 0})
+    monkeypatch.setattr(
+        "langgraph.prebuilt.create_react_agent", lambda *a, **k: fake, raising=False
+    )
+    adjudicate = adj.make_adjudicator(_FakeModel(), tools=factory)
+    assert calls["n"] == 0  # not built at construction
+    asyncio.run(adjudicate([]))  # empty round: nothing to classify
+    assert calls["n"] == 0  # still not built
+    asyncio.run(adjudicate([_fail(0)]))
+    assert calls["n"] == 1  # built on first real use
+    asyncio.run(adjudicate([_fail(1)]))
+    assert calls["n"] == 1  # reused, not rebuilt

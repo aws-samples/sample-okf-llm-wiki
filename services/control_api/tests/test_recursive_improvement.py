@@ -76,16 +76,16 @@ def test_set_and_get_ri_settings_roundtrip(cfg):
     _dataset(cfg)
     handlers.set_dataset_ri_settings(
         cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders",
-        settings={"enabled": True, "max_iterations": 4, "ex_threshold": 0.7,
-                  "gate_kpis": ["ex", "judge"]},
+        settings={"enabled": True, "max_iterations": 4},
     )
     out = handlers.get_dataset_ri_settings(
         cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders"
     )["recursive_improvement"]
     assert out["enabled"] is True
     assert out["max_iterations"] == 4
-    assert out["ex_threshold"] == 0.7
-    assert out["gate_kpis"] == ["ex", "judge"]
+    # The fixed target means no threshold/gate fields are stored.
+    assert "ex_threshold" not in out
+    assert "gate_kpis" not in out
     # A questions_key was defaulted to the off-mount canonical location.
     assert out["questions_key"] == "benchmark/sales/orders/questions.csv"
 
@@ -99,14 +99,16 @@ def test_set_ri_settings_clamps_max_iterations(cfg):
     assert out["max_iterations"] == 5  # clamped to MAX_ITERATIONS
 
 
-def test_set_ri_settings_rejects_bad_gate_kpi(cfg):
+def test_set_ri_settings_ignores_legacy_threshold_fields(cfg):
+    # Old clients may still POST threshold/gate keys; they're ignored, not 400, and
+    # not persisted (the target is fixed now).
     _dataset(cfg)
-    with pytest.raises(ApiError) as ei:
-        handlers.set_dataset_ri_settings(
-            cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders",
-            settings={"enabled": True, "gate_kpis": ["bogus"]},
-        )
-    assert ei.value.status == 400
+    out = handlers.set_dataset_ri_settings(
+        cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders",
+        settings={"enabled": True, "ex_threshold": 0.7, "gate_kpis": ["bogus"]},
+    )["recursive_improvement"]
+    assert "ex_threshold" not in out and "gate_kpis" not in out
+    assert out["enabled"] is True
 
 
 def test_set_ri_settings_disabled_stores_marker(cfg):
@@ -210,7 +212,7 @@ def test_trigger_harvest_includes_ri_block_when_enabled(cfg):
     _dataset(cfg)
     handlers.set_dataset_ri_settings(
         cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders",
-        settings={"enabled": True, "ex_threshold": 0.8},
+        settings={"enabled": True, "max_iterations": 4},
     )
     handlers.trigger_harvest(
         cfg.agentcore, cfg.ddb, registry_table=REGISTRY,
@@ -265,9 +267,46 @@ def test_benchmark_settings_routes_roundtrip(cfg):
 
 def test_benchmark_settings_route_validation_400(cfg):
     _dataset(cfg)
+    # A non-integer max_iterations can't be coerced → 400 (the one remaining
+    # validation error now that the target is fixed).
     resp = app.route(
         _event("PUT", "/benchmark/sales/orders",
-               body={"enabled": True, "gate_kpis": ["nope"]}),
+               body={"enabled": True, "max_iterations": "lots"}),
         cfg,
     )
     assert resp["statusCode"] == 400
+
+
+def test_benchmark_review_route_reads_off_mount_json(cfg):
+    # The review endpoint reads the off-mount per-round JSON the harvest runtime
+    # wrote (gold-carrying, human-facing) and returns it verbatim.
+    import json as _json
+
+    key = handlers.benchmark_review_key("sales", "orders", "sess-1", 0)
+    doc = {
+        "iteration": 0,
+        "counts": {"passed": 1, "genuine_error": 1},
+        "questions": [
+            {"q_id": 0, "bucket": "passed", "question": "Q0", "gold_sql": "G0",
+             "predicted_sql": "P0", "note": "", "reason": "match"},
+            {"q_id": 1, "bucket": "genuine_error", "question": "Q1", "gold_sql": "G1",
+             "predicted_sql": "W1", "note": "docs miss X", "reason": "differ"},
+        ],
+    }
+    cfg.s3.put_object(Bucket=cfg.bucket, Key=key, Body=_json.dumps(doc).encode())
+    resp = app.route(
+        _event("GET", "/benchmark/sales/orders/reviews/sess-1/0"), cfg
+    )
+    assert resp["statusCode"] == 200
+    body = _json.loads(resp["body"])
+    assert body["counts"]["passed"] == 1
+    assert {q["q_id"] for q in body["questions"]} == {0, 1}
+    # The gold IS present here — this endpoint is human-facing, off the agent path.
+    assert any(q["gold_sql"] == "G1" for q in body["questions"])
+
+
+def test_benchmark_review_route_404_when_absent(cfg):
+    resp = app.route(
+        _event("GET", "/benchmark/sales/orders/reviews/sess-x/9"), cfg
+    )
+    assert resp["statusCode"] == 404

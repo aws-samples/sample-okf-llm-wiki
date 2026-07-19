@@ -35,6 +35,7 @@ class BenchmarkSetup:
         questions: list[BenchmarkQuestion],
         run: dict[str, Any],
         persist_kpi: Any,
+        persist_review: Any,
         total_in_csv: int,
         dropped: int,
     ):
@@ -42,6 +43,7 @@ class BenchmarkSetup:
         self.questions = questions
         self.run = run
         self.persist_kpi = persist_kpi
+        self.persist_review = persist_review
         self.total_in_csv = total_in_csv
         self.dropped = dropped
 
@@ -128,6 +130,14 @@ def prepare(
             attrs=attrs,
         )
 
+    # Off-mount review persister (gold-carrying, human-facing — never on the agent
+    # mount, served only via the Control API). See review_store.
+    from harvest.benchmark.review_store import make_review_persister
+
+    persist_review = make_review_persister(
+        data_domain=data_domain, dataset=dataset, session_id=session_id
+    )
+
     return BenchmarkSetup(
         ri_config=ri_config,
         questions=loaded.questions,
@@ -137,6 +147,7 @@ def prepare(
             "runtime_session_id": session_id,
         },
         persist_kpi=persist_kpi,
+        persist_review=persist_review,
         total_in_csv=loaded.total_in_csv,
         dropped=loaded.dropped,
     )

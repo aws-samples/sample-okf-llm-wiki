@@ -81,8 +81,12 @@ export function toolLabel(toolName, args, running) {
       return running ? `Searching ${quoted}`.trim() : `Searched ${quoted}`.trim()
     }
     case "list_directory": {
-      const loc = a.path ? `${a.data_domain}/${a.dataset}/${a.path}` : `${a.data_domain}/${a.dataset}`
-      return running ? `Browsing ${loc}` : `Browsed ${loc}`
+      // Server folds the conversation scope into args (chat.server), but guard
+      // against missing location so the label never reads "undefined/undefined".
+      const base = [s(a.data_domain), s(a.dataset)].filter(Boolean).join("/")
+      const loc = a.path ? [base, s(a.path)].filter(Boolean).join("/") : base
+      const label = loc || "wiki"
+      return running ? `Browsing ${label}` : `Browsed ${label}`
     }
     case "read_page":
       return running ? `Reading ${s(a.concept_id)}` : `Read ${s(a.concept_id)}`

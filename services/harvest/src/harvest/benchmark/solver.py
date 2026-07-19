@@ -68,48 +68,11 @@ def make_solver(
     turn count, whether SQL came out, an error if any, and a short SQL preview.
     Returns an async callable the round orchestrator fans out under its semaphore.
     """
-    from deepagents.backends import FilesystemBackend
-    from langchain_core.tools import tool
     from langgraph.prebuilt import create_react_agent
-
-    backend = FilesystemBackend(root_dir=snapshot_root, virtual_mode=True)
-
-    # Read-only bundle tools over the snapshot. No run_sql, no sandbox, no write.
-    #
-    # IMPORTANT: deepagents' backend returns dataclass *containers* (GlobResult
-    # .matches / LsResult.entries / GrepResult.matches) whose ITEMS are TypedDicts
-    # (FileInfo: {"path",...}, GrepMatch: {"path","line","text"}), and read is
-    # `read(file_path) -> str` (cat -n text), NOT `read_file().content`. Getting
-    # this wrong crashed every solver on turn 0 with "'dict' object has no
-    # attribute 'path'" (EX 0). _field() below is dict-or-attr tolerant so a future
-    # backend shape change degrades gracefully instead of crashing the examiner.
-    @tool
-    def read_file(file_path: str) -> str:
-        """Read a wiki markdown file by its bundle-relative path (e.g. 'tables/races.md')."""
-        return backend.read(_vpath(file_path))
-
-    @tool
-    def glob(pattern: str) -> list[str]:
-        """Find wiki files matching a glob (e.g. '**/*.md', 'tables/*')."""
-        return [_field(m, "path") for m in (backend.glob(pattern).matches or [])]
-
-    @tool
-    def grep(pattern: str) -> list[str]:
-        """Search wiki file contents for a literal string; returns matching locations."""
-        res = backend.grep(pattern)
-        return [
-            f"{_field(m, 'path')}:{_field(m, 'line')}: {_field(m, 'text')}"
-            for m in (res.matches or [])
-        ]
-
-    @tool
-    def ls(path: str = "/") -> list[str]:
-        """List entries in a wiki directory."""
-        return [_field(e, "path") for e in (backend.ls(_vpath(path)).entries or [])]
 
     agent = create_react_agent(
         chat_model,
-        tools=[read_file, glob, grep, ls],
+        tools=make_readonly_file_tools(snapshot_root),
         prompt=SOLVER_SYSTEM_PROMPT,
     )
 
@@ -132,6 +95,71 @@ def make_solver(
         return sql
 
     return solve
+
+
+def make_readonly_file_tools(root: str, *, scope: str = "wiki") -> list[Any]:
+    """Read-only ``read_file``/``glob``/``grep``/``ls`` tools over a filesystem root.
+
+    Shared by the bundle-blind SOLVER (rooted at a wiki-only snapshot) and the
+    ADJUDICATOR (rooted at the real dataset mount, so its file tools additionally
+    reach ``.metadata/`` and ``.context/``). ``scope`` only tunes the docstrings'
+    wording ("wiki" vs "dataset") — the CONFINEMENT is physical: the
+    ``FilesystemBackend`` is rooted at ``root`` and cannot reach outside it however
+    the tools are called (see :mod:`.snapshot` for why the solver's root omits the
+    dot-dirs). No write tool, no ``run_sql``, no sandbox here — those are added
+    separately for the roles that get them.
+
+    IMPORTANT: deepagents' backend returns dataclass *containers* (GlobResult
+    ``.matches`` / LsResult ``.entries`` / GrepResult ``.matches``) whose ITEMS are
+    TypedDicts (FileInfo ``{"path",...}``, GrepMatch ``{"path","line","text"}``),
+    and read is ``read(file_path) -> str`` (cat -n text), NOT
+    ``read_file().content``. Getting this wrong crashed every solver on turn 0 with
+    "'dict' object has no attribute 'path'" (EX 0). :func:`_field` is dict-or-attr
+    tolerant so a backend shape change degrades gracefully instead of crashing.
+    """
+    from deepagents.backends import FilesystemBackend
+    from langchain_core.tools import tool
+
+    backend = FilesystemBackend(root_dir=root, virtual_mode=True)
+    noun = "dataset" if scope == "dataset" else "wiki"
+
+    # NOTE: each tool MUST carry a docstring — @tool raises at decoration time
+    # ("Function must have a docstring if description not provided") without one.
+    # We then refine the wording per-scope by overriding `.description` below.
+    @tool
+    def read_file(file_path: str) -> str:
+        """Read a file by its path (e.g. 'tables/races.md')."""
+        return backend.read(_vpath(file_path))
+
+    @tool
+    def glob(pattern: str) -> list[str]:
+        """Find files matching a glob (e.g. '**/*.md', 'tables/*')."""
+        return [_field(m, "path") for m in (backend.glob(pattern).matches or [])]
+
+    @tool
+    def grep(pattern: str) -> list[str]:
+        """Search file contents for a literal string; returns matching locations."""
+        res = backend.grep(pattern)
+        return [
+            f"{_field(m, 'path')}:{_field(m, 'line')}: {_field(m, 'text')}"
+            for m in (res.matches or [])
+        ]
+
+    @tool
+    def ls(path: str = "/") -> list[str]:
+        """List entries in a directory."""
+        return [_field(e, "path") for e in (backend.ls(_vpath(path)).entries or [])]
+
+    # Refine the description per-scope so the same mechanics read correctly for the
+    # wiki-only solver and the whole-dataset adjudicator (the docstrings above are
+    # the scope-neutral fallback that satisfies the @tool decorator).
+    read_file.description = f"Read a {noun} file by its path (e.g. 'tables/races.md')."
+    glob.description = f"Find {noun} files matching a glob (e.g. '**/*.md', 'tables/*')."
+    grep.description = (
+        f"Search {noun} file contents for a literal string; returns matching locations."
+    )
+    ls.description = f"List entries in a {noun} directory."
+    return [read_file, glob, grep, ls]
 
 
 def _field(item: Any, key: str) -> str:

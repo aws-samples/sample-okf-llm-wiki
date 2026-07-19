@@ -1581,7 +1581,7 @@ def test_get_harvest_events_preserves_benchmark_kpi_fields(cfg):
                     phase="done", iteration=1, max_iterations=5,
                     ex_score=0.71, judge_accuracy=0.83,
                     passed=34, failed=14, discarded=2, graded=48,
-                    threshold_met=False,
+                    target_met=False, has_review=True,
                     improvements=["document that status is an int code"],
                 ),
             ]
@@ -1595,7 +1595,8 @@ def test_get_harvest_events_preserves_benchmark_kpi_fields(cfg):
     assert ev["kind"] == "benchmark"
     assert ev["ex_score"] == 0.71 and ev["judge_accuracy"] == 0.83
     assert ev["passed"] == 34 and ev["graded"] == 48
-    assert ev["threshold_met"] is False
+    assert ev["target_met"] is False
+    assert ev["has_review"] is True
     assert ev["improvements"] == ["document that status is an int code"]
 
 

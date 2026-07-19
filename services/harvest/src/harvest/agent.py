@@ -421,23 +421,46 @@ def _build_benchmark_session(
     dataset_root: Path,
     step_emitter: Any,
     persist_kpi: Any,
+    persist_review: Any = None,
+    run_code_tool: Any = None,
 ) -> Any:
     """Construct the per-run BenchmarkSession behind the run_benchmark tool.
 
-    The solver reuses ``chat_model`` (bundle-blind, rooted per-round at a snapshot
-    the session builds); the adjudicator reuses ``chat_model`` + the source tools
-    (``run_sql``/``sample_rows``) so it can diagnose gaps against live data. Both
-    ride the shared instrumented model, so benchmark tokens meter into the run
-    total automatically. ``persist_kpi(iteration, attrs)`` and the step emitter are
-    wired so each round writes a BENCH# row and a live ``kind:"benchmark"`` event.
+    The solver reuses ``chat_model``, bundle-blind (rooted per-round at a wiki-only
+    snapshot the session builds). The adjudicator reuses ``chat_model`` and gets the
+    FULL read-only diagnostician toolset over the REAL dataset mount: read-only file
+    tools (``read_file``/``glob``/``grep``/``ls`` — reaching the authored wiki plus
+    the ``.metadata/`` schema snapshot and ``.context/`` source docs), the source
+    tools (``run_sql``/``sample_rows``), and ``run_code`` (binary ``.context/``
+    extraction) when the sandbox is available. It gets NO Glue catalog tool and no
+    write tools. This lets it CONFIRM a wiki gap by reading the docs the solver had,
+    not merely infer one from the solver's SQL. Both ride the shared instrumented
+    model, so benchmark tokens meter into the run total automatically.
+    ``persist_kpi(iteration, attrs)`` and the step emitter are wired so each round
+    writes a BENCH# row and a live ``kind:"benchmark"`` event.
     """
     from harvest.benchmark.adjudicator import make_adjudicator
     from harvest.benchmark.grader import Grader
     from harvest.benchmark.runner import BenchmarkSession
-    from harvest.benchmark.solver import make_solver
+    from harvest.benchmark.solver import make_readonly_file_tools, make_solver
 
     grader = Grader(source.run_query)
-    adjudicate = make_adjudicator(chat_model, source_tools)
+
+    # The adjudicator reads the REAL mount (not the solver's wiki-only snapshot), so
+    # its file tools reach the wiki AND .metadata/ AND .context/. Plus live-data
+    # tools, plus run_code for binary .context/ when the sandbox exists. Passed as a
+    # FACTORY so make_readonly_file_tools' deepagents import is deferred to first
+    # adjudication — keeps session construction importable in the offline test venv.
+    def _adjudicator_tools() -> list[Any]:
+        tools = [
+            *make_readonly_file_tools(str(dataset_root), scope="dataset"),
+            *source_tools,
+        ]
+        if run_code_tool is not None:
+            tools.append(run_code_tool)
+        return tools
+
+    adjudicate = make_adjudicator(chat_model, _adjudicator_tools)
 
     def emit_event(event: dict) -> None:
         if step_emitter is not None:
@@ -460,6 +483,7 @@ def _build_benchmark_session(
         grader=grader,
         adjudicate=adjudicate,
         persist_kpi=persist_kpi,
+        persist_review=persist_review,
         emit_event=emit_event if step_emitter is not None else None,
     )
 
@@ -485,6 +509,7 @@ def build_harvest_agent(
     benchmark_questions: Any = None,
     benchmark_run: dict[str, Any] | None = None,
     persist_kpi: Any = None,
+    persist_review: Any = None,
 ) -> HarvestAgent:
     from deepagents import create_deep_agent
     from deepagents.backends import (
@@ -557,9 +582,27 @@ def build_harvest_agent(
     graph_tools = make_graph_tools(link_graph)
     all_tools = [*source_tools, *graph_tools]
 
-    # Build the benchmark session now that chat_model + source tools exist. The
-    # solver reuses chat_model (tokens meter for free); the adjudicator reuses
-    # chat_model + the source tools (run_sql/sample_rows) for raw-data diagnosis.
+    # A code-execution tool for extracting text from binary .context/ docs
+    # (PDF/DOCX/PPTX/XLSX) the built-in read_file only base64-encodes. Backed by a
+    # network-isolated AgentCore Code Interpreter sandbox with NO Glue/Athena/
+    # bundle creds (credential isolation). Appended to all_tools so it reaches the
+    # main agent AND both sub-agents (whose tool lists REPLACE, not inherit). It is
+    # NOT the default backend: deepagents only wires its built-in execute tool to
+    # the default backend, and the bundle must stay on the FilesystemBackend mount
+    # (finalize/reindex read from there) — so the sandbox is a separate tool only.
+    # Built BEFORE the benchmark session so the adjudicator can reuse the SAME tool
+    # for binary .context/ extraction.
+    run_code_tool = None
+    if sandbox is not None:
+        from harvest.code_interpreter import make_run_code_tool
+
+        run_code_tool = make_run_code_tool(sandbox)
+        all_tools.append(run_code_tool)
+
+    # Build the benchmark session now that chat_model + tools exist. The solver
+    # reuses chat_model (tokens meter for free) bundle-blind; the adjudicator reuses
+    # chat_model + read-only mount file tools (wiki/.metadata/.context) + the source
+    # tools (run_sql/sample_rows) + run_code for raw-data-vs-wiki gap diagnosis.
     if ri.is_enabled(ri_config) and benchmark_questions:
         benchmark_session = _build_benchmark_session(
             ri_config=ri_config,
@@ -571,21 +614,10 @@ def build_harvest_agent(
             dataset_root=dataset_root,
             step_emitter=step_emitter,
             persist_kpi=persist_kpi,
+            persist_review=persist_review,
+            run_code_tool=run_code_tool,
         )
         all_tools.append(_make_benchmark_tool(benchmark_session))
-
-    # A code-execution tool for extracting text from binary .context/ docs
-    # (PDF/DOCX/PPTX/XLSX) the built-in read_file only base64-encodes. Backed by a
-    # network-isolated AgentCore Code Interpreter sandbox with NO Glue/Athena/
-    # bundle creds (credential isolation). Appended to all_tools so it reaches the
-    # main agent AND both sub-agents (whose tool lists REPLACE, not inherit). It is
-    # NOT the default backend: deepagents only wires its built-in execute tool to
-    # the default backend, and the bundle must stay on the FilesystemBackend mount
-    # (finalize/reindex read from there) — so the sandbox is a separate tool only.
-    if sandbox is not None:
-        from harvest.code_interpreter import make_run_code_tool
-
-        all_tools.append(make_run_code_tool(sandbox))
 
     # Containment: bundle files (bare paths like tables/races.md) go to the
     # dataset root on disk via the DEFAULT FilesystemBackend; deepagents'
@@ -705,6 +737,25 @@ def build_harvest_agent(
     main_middleware = [guard]
     if interpreter_mw is not None:
         main_middleware.append(interpreter_mw)
+    # Compel the in-run benchmark loop: if RI is enabled, hook after_model on the
+    # MAIN supervisor only (never subagents — the supervisor owns the run's end) so
+    # the agent can't finish before the benchmark requirements are met. Gated on an
+    # actual session, so a normal harvest is completely untouched.
+    if benchmark_session is not None:
+        from harvest.benchmark.completion import (
+            BenchmarkCompletionMiddleware,
+            BenchmarkCompletionPolicy,
+        )
+
+        policy = BenchmarkCompletionPolicy(
+            enabled=True,
+            max_iterations=int(
+                ri_config.get(ri.FIELD_MAX_ITERATIONS, ri.MAX_ITERATIONS)
+            ),
+        )
+        main_middleware.append(
+            BenchmarkCompletionMiddleware(policy, benchmark_session)
+        )
 
     agent = create_deep_agent(
         model=chat_model,

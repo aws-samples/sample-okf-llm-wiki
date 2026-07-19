@@ -31,40 +31,25 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 
-// Gate-KPI options the loop can threshold on (must match okf_core VALID_GATE_KPIS).
-const GATE_OPTIONS = [
-  { value: "ex", label: "Exact match only" },
-  { value: "judge", label: "Judge accuracy only" },
-  { value: "ex,judge", label: "Both (EX + judge)" },
-]
-
 const DEFAULTS = {
   enabled: false,
   max_iterations: 5,
-  ex_threshold: 0.8,
-  judge_threshold: 0.9,
-  gate_kpis: ["ex"],
 }
 
 // Normalize a server settings object into the local editable form state.
 function toForm(s) {
-  const g =
-    Array.isArray(s?.gate_kpis) && s.gate_kpis.length
-      ? s.gate_kpis
-      : DEFAULTS.gate_kpis
   return {
     enabled: Boolean(s?.enabled),
     max_iterations: s?.max_iterations ?? DEFAULTS.max_iterations,
-    ex_threshold: s?.ex_threshold ?? DEFAULTS.ex_threshold,
-    judge_threshold: s?.judge_threshold ?? DEFAULTS.judge_threshold,
-    gate_kpis: [...g].sort().join(","), // canonical string for the Select
   }
 }
 
 // Configure the recursive-improvement benchmark for a dataset: upload the
 // question,gold_sql CSV (to an OFF-MOUNT key so the gold is unreadable by the
-// harvest agent) and set the loop's thresholds. When enabled, every harvest of
-// this dataset runs the benchmark→revise loop and keeps the best-scoring bundle.
+// harvest agent) and set the iteration budget. The stop TARGET is fixed (the
+// harvester keeps improving until the reviewed answers are ~90% good), because
+// the point is to improve the wiki, not to tune a benchmark score. When enabled,
+// every harvest of this dataset runs the benchmark→revise loop.
 export default function BenchmarkView({ api, selection }) {
   const [form, setForm] = useState(toForm(null))
   const [loading, setLoading] = useState(false)
@@ -117,9 +102,6 @@ export default function BenchmarkView({ api, selection }) {
       const settings = {
         enabled: form.enabled,
         max_iterations: Number(form.max_iterations),
-        ex_threshold: Number(form.ex_threshold),
-        judge_threshold: Number(form.judge_threshold),
-        gate_kpis: form.gate_kpis.split(","),
       }
       const res = await api.setBenchmarkSettings(domain, dataset, settings)
       setForm(toForm(res?.recursive_improvement))
@@ -210,8 +192,8 @@ export default function BenchmarkView({ api, selection }) {
           actually answers real questions, and let the harvester keep improving
           it until it does. Upload a set of questions with their correct SQL
           answers; when this is on, each harvest scores the wiki against them,
-          fixes the gaps it finds, and re-tests — keeping whichever version
-          scored best.
+          fixes the gaps it finds, and re-tests — repeating until the reviewed
+          answers are about 90% good or it runs out of iterations.
         </CardDescription>
         <div className="col-start-2 row-span-2 row-start-1 flex items-center gap-2 self-start justify-self-end">
           <Button variant="outline" onClick={load} disabled={loading}>
@@ -301,59 +283,10 @@ export default function BenchmarkView({ api, selection }) {
                     setForm((f) => ({ ...f, max_iterations: e.target.value }))
                   }
                 />
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="bench-ex">Exact-match target (0–1)</Label>
-                <Input
-                  id="bench-ex"
-                  type="number"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={form.ex_threshold}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, ex_threshold: e.target.value }))
-                  }
-                />
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="bench-judge">Judge-accuracy target (0–1)</Label>
-                <Input
-                  id="bench-judge"
-                  type="number"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={form.judge_threshold}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, judge_threshold: e.target.value }))
-                  }
-                />
-              </div>
-
-              <div className="flex flex-col gap-2 sm:col-span-2">
-                <Label htmlFor="bench-gate">
-                  Stop when these clear their target
-                </Label>
-                <Select
-                  value={form.gate_kpis}
-                  onValueChange={(v) =>
-                    setForm((f) => ({ ...f, gate_kpis: v }))
-                  }
-                >
-                  <SelectTrigger id="bench-gate" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {GATE_OPTIONS.map((o) => (
-                      <SelectItem key={o.value} value={o.value}>
-                        {o.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <p className="text-xs text-muted-foreground">
+                  How many benchmark→improve rounds the harvester may run before it
+                  has to stop.
+                </p>
               </div>
             </div>
 
@@ -362,10 +295,6 @@ export default function BenchmarkView({ api, selection }) {
                 {saving ? <Spinner data-icon="inline-start" /> : null}
                 Save settings
               </Button>
-              <p className="text-sm text-muted-foreground">
-                Applies to the next harvest, incremental re-harvest, and
-                annotation run of this dataset.
-              </p>
             </div>
           </>
         )}

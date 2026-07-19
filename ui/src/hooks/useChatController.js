@@ -57,12 +57,20 @@ export function useChatController({ urlThreadId, onThreadChange }) {
     }
   }, [started, conv.threadId, urlThreadId, onThreadChange])
 
-  // First turn landed: refresh the history list (the turn wrote the index row).
+  // First turn landed: lock the conversation as started (binds the URL, locks the
+  // model). We do NOT refresh the history list here — at turn-OPEN the server's
+  // index-row write (touch_thread, best-effort, async) may not have committed yet,
+  // so a fetch now can miss the new row. The refresh happens on turn COMPLETE
+  // (onTurnComplete), by which point the row is written.
   const onStarted = useCallback(() => {
-    setStarted((s) => {
-      if (!s) setHistoryReloadKey((k) => k + 1)
-      return true
-    })
+    setStarted(true)
+  }, [])
+
+  // A turn finished streaming: the index row is committed, so refresh the sidebar
+  // list. This is what makes a NEW conversation appear in history without a full
+  // page reload (and picks up an auto-generated/renamed title on later turns).
+  const onTurnComplete = useCallback(() => {
+    setHistoryReloadKey((k) => k + 1)
   }, [])
 
   const startNewChat = useCallback(() => {
@@ -129,6 +137,7 @@ export function useChatController({ urlThreadId, onThreadChange }) {
     historyReloadKey,
     efforts: CHAT_EFFORTS,
     onStarted,
+    onTurnComplete,
     startNewChat,
     resumeThread,
     onThreadDeleted,

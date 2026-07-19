@@ -596,6 +596,23 @@ def _r_inspect_benchmark(cfg, params, body, query, caller):
     )
 
 
+def _r_get_benchmark_review(cfg, params, body, query, caller):
+    # One round's per-question review (all buckets, incl. gold). Off-mount S3 read;
+    # 404 if the round hasn't persisted (or is an older run). iteration is 0-based.
+    try:
+        iteration = int(params["iteration"])
+    except (TypeError, ValueError) as e:
+        raise handlers.ApiError(400, "iteration must be an integer") from e
+    return 200, handlers.get_benchmark_review(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        session_id=params["session"],
+        iteration=iteration,
+    )
+
+
 def _r_get_ri_settings(cfg, params, body, query, caller):
     return 200, handlers.get_dataset_ri_settings(
         cfg.ddb,
@@ -764,6 +781,12 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     # parsed question-count (fixed /questions suffix disambiguates from settings).
     ("POST", "/benchmark/{domain}/{dataset}/presign", _r_presign_benchmark),
     ("GET", "/benchmark/{domain}/{dataset}/questions", _r_inspect_benchmark),
+    # Per-round review (all buckets, gold-carrying); session + 0-based iteration.
+    (
+        "GET",
+        "/benchmark/{domain}/{dataset}/reviews/{session}/{iteration}",
+        _r_get_benchmark_review,
+    ),
     ("GET", "/benchmark/{domain}/{dataset}", _r_get_ri_settings),
     ("PUT", "/benchmark/{domain}/{dataset}", _r_set_ri_settings),
     # Chat conversations (per-user sidebar list). thread_id is a single opaque

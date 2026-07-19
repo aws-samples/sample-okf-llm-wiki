@@ -5,7 +5,7 @@ ex_compare.py``) from SQLite to Athena: execute the gold SQL and the predicted
 SQL, compare their result sets as **unordered sets of rows**
 (``set(pred) == set(gold)``). No LLM, no agent tool layer — the gold SQL lives in
 the tool-process memory here and never touches the agent-visible mount, which is
-what makes gold-blindness physical (see ``docs/RECURSIVE_IMPROVEMENT.md``).
+what makes gold-blindness physical (see ``docs/CONVENTIONS.md``).
 
 Three outcomes per question (``PASS`` / ``FAIL`` / ``DISCARDED``):
 

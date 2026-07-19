@@ -121,7 +121,9 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
                     request,
                     f"Refused: the recursive-improvement benchmark budget of "
                     f"{self._benchmark_budget} iteration(s) is spent. Stop looping "
-                    f"and let the run finalize — the best-scoring iteration is kept.",
+                    f"and let the run finalize — the wiki ships exactly as you have "
+                    f"left it (there is no rollback), so make sure it's in your best "
+                    f"state before you finish.",
                 )
             self._benchmark_calls += 1
             return None

@@ -197,11 +197,12 @@ export function makeApi(token) {
       ),
 
     // Recursive-improvement benchmark. GET/PUT the dataset's saved settings
-    // ({enabled, questions_key, max_iterations, ex_threshold, judge_threshold,
-    // gate_kpis}); the PUT is validated + clamped server-side (400 on a bad value).
-    // The CSV (question,gold_sql) uploads via a SEPARATE presign that pins an
-    // OFF-MOUNT key (benchmark/<d>/<ds>/questions.csv, NOT under okf/) so the gold
-    // is unreadable by the harvest agent — see docs/RECURSIVE_IMPROVEMENT.md.
+    // ({enabled, questions_key, max_iterations}); the PUT is validated + clamped
+    // server-side (400 on a bad value). The stop target is FIXED (judge accuracy
+    // >= 90%), so it is not a setting. The CSV (question,gold_sql) uploads via a
+    // SEPARATE presign that pins an OFF-MOUNT key (benchmark/<d>/<ds>/questions.csv,
+    // NOT under okf/) so the gold is unreadable by the harvest agent — see
+    // docs/CONVENTIONS.md and docs/BENCHMARK_GUIDE.md.
     getBenchmarkSettings: (domain, dataset) =>
       request(
         token,
@@ -231,6 +232,17 @@ export function makeApi(token) {
         token,
         "GET",
         `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/questions`
+      ),
+    // One benchmark round's per-question review (all buckets, with gold + predicted
+    // SQL). Off-mount S3 read behind the Cognito-authed API — this gold-carrying
+    // detail is NEVER exposed to the harvest agent, only to the human here. 404 if
+    // the round hasn't persisted a review. session = runtime_session_id from the
+    // harvest feed; iteration = 0-based round index.
+    getBenchmarkReview: (domain, dataset, session, iteration) =>
+      request(
+        token,
+        "GET",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/reviews/${encodeURIComponent(session)}/${encodeURIComponent(iteration)}`
       ),
 
     // Chat conversations (the per-user sidebar list). The chat RUNTIME writes the

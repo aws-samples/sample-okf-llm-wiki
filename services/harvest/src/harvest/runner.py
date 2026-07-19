@@ -170,6 +170,7 @@ def _benchmark_build_kwargs(bench: Any) -> dict[str, Any]:
         "benchmark_questions": bench.questions,
         "benchmark_run": bench.run,
         "persist_kpi": bench.persist_kpi,
+        "persist_review": bench.persist_review,
     }
 
 
@@ -194,13 +195,18 @@ def _recursion_limit_for(base_limit: int, bench: Any) -> int:
 
 
 def _finish_benchmark(built: Any, bench: Any) -> None:
-    """Compel-the-loop check for an RI run — NO bundle restore/rollback.
+    """Post-hoc compel BACKSTOP for an RI run — NO bundle restore/rollback.
 
-    Require that at least one benchmark round actually ran (else the agent skipped
-    the loop — raise so the run is reported failed rather than shipping an
-    unbenchmarked bundle as a success). The benchmark NEVER modifies or rolls back
-    the authored bundle: the agent owns the bundle's shape and whatever it authored
-    is what ships (see harvest/benchmark/snapshot.py). No-op when RI is off.
+    The primary compel lives INSIDE the graph: ``BenchmarkCompletionMiddleware``
+    hooks ``after_model`` on the supervisor and re-prompts the agent if it tries to
+    end before the benchmark requirements are met (see harvest/benchmark/
+    completion.py). This check is the final safety net for the case that survives
+    the middleware's loop-safety cap: require that at least one benchmark round
+    actually ran (else the agent skipped the loop entirely — raise so the run is
+    reported failed rather than shipping an unbenchmarked bundle as a success). The
+    benchmark NEVER modifies or rolls back the authored bundle: the agent owns the
+    bundle's shape and whatever it authored is what ships (see
+    harvest/benchmark/snapshot.py). No-op when RI is off.
     """
     if bench is None:
         return
@@ -424,9 +430,9 @@ def run_full_harvest(
             config = _invoke_config(effective_limit, emitter)
             _run_agent(built.agent, prompt, config, emitter)
 
-        # Compel-the-loop + best-checkpoint restore live HERE (finalize is runner-
-        # driven, not an agent tool). For an RI run: require at least one benchmark
-        # round ran, then roll the bundle back to the best-scoring iteration.
+        # Compel-the-loop check lives HERE (finalize is runner-driven, not an agent
+        # tool). For an RI run: require at least one benchmark round ran. There is NO
+        # rollback — the agent owns the bundle and whatever it authored is what ships.
         _finish_benchmark(built, bench)
 
         state = finalize_bundle(

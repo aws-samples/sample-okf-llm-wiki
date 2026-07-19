@@ -58,7 +58,7 @@ _CONTEXT_DIRNAME = ".context"
 # rooted at ``okf/``, so anything there is readable by the supervisor/authoring
 # agents. Keeping gold under ``benchmark/`` (NOT ``okf/``) makes it invisible to
 # every LLM role's file tools — the runner fetches it via GetObject into the
-# benchmark tool's memory. See docs/RECURSIVE_IMPROVEMENT.md.
+# benchmark tool's memory. See docs/CONVENTIONS.md.
 _BENCHMARK_PREFIX = "benchmark/"
 
 
@@ -1144,6 +1144,11 @@ def delete_context_doc(
 # so a malformed multi-MB upload can't be read fully into the Lambda for nothing.
 _BENCHMARK_CSV_MAX_BYTES = CONTEXT_UPLOAD_MAX_BYTES
 
+# A per-round review JSON is bounded: <=100 questions, each with two SQL strings +
+# a short note. 8 MiB is generous headroom; the cap just stops a corrupt/huge object
+# from being read wholesale into the Lambda.
+_BENCHMARK_REVIEW_MAX_BYTES = 8 * 1024 * 1024
+
 
 # --------------------------------------------------------------------------- #
 # Recursive-improvement benchmark CSV (S3, OFF the okf/ mount prefix)
@@ -1276,6 +1281,53 @@ def inspect_benchmark_questions(
         "capped": loaded.dropped > 0,
         "max_questions": MAX_QUESTIONS,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Recursive-improvement per-round REVIEW (off-mount, gold-carrying, human-facing)
+# --------------------------------------------------------------------------- #
+#
+# The harvest runtime writes one JSON per round under this prefix (see
+# harvest/benchmark/review_store.py). It carries gold + predicted SQL, so it lives
+# OFF the okf/ mount (no LLM role can read it) and is served ONLY here, to the
+# Cognito-authed UI. The key shape MUST match review_store.review_key verbatim.
+
+
+def benchmark_review_prefix(data_domain: str, dataset: str) -> str:
+    """Off-mount S3 prefix for a dataset's benchmark review artifacts."""
+    return f"{_benchmark_prefix(data_domain, dataset)}reviews/"
+
+
+def benchmark_review_key(
+    data_domain: str, dataset: str, session_id: str, iteration: int
+) -> str:
+    """The S3 key for one round's review JSON."""
+    return f"{benchmark_review_prefix(data_domain, dataset)}{session_id}/{iteration}.json"
+
+
+def get_benchmark_review(
+    s3, *, bucket: str, data_domain: str, dataset: str, session_id: str, iteration: int
+) -> dict[str, Any]:
+    """Return one round's persisted review JSON (all buckets, per-question, w/ gold).
+
+    404 if the round's artifact doesn't exist (older run, or the round hasn't
+    persisted yet). Other S3 errors surface as 502. The session_id + iteration come
+    from the harvest feed's ``benchmark`` event (which set ``has_review`` true)."""
+    key = benchmark_review_key(data_domain, dataset, session_id, iteration)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except Exception as e:  # noqa: BLE001 - a missing object is a clean 404
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            raise ApiError(404, "no review for that round") from e
+        raise ApiError(502, f"could not read benchmark review: {e}") from e
+    raw = obj["Body"].read(_BENCHMARK_REVIEW_MAX_BYTES + 1)
+    if len(raw) > _BENCHMARK_REVIEW_MAX_BYTES:
+        raise ApiError(502, "benchmark review artifact is unexpectedly large")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise ApiError(502, f"benchmark review is not valid JSON: {e}") from e
 
 
 # --------------------------------------------------------------------------- #
@@ -1814,7 +1866,9 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
         "failed",
         "discarded",
         "graded",
-        "threshold_met",
+        "target_met",
+        "has_review",
+        "runtime_session_id",
         # benchmark_solver observability (per-question): what each solver did.
         "turns",
         "tool_calls",

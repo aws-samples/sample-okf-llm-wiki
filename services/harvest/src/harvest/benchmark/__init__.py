@@ -11,8 +11,8 @@ Layered so the deterministic, LLM-free core is unit-testable offline:
 * :mod:`harvest.benchmark.tool` — assemble solver fan-out → grader → adjudicator
   into the single opaque ``run_benchmark`` tool the supervisor calls.
 
-See ``docs/RECURSIVE_IMPROVEMENT.md`` for the design and ``docs/CONVENTIONS.md``
-for the payload + KPI contract.
+See ``docs/CONVENTIONS.md`` for the payload + KPI contract and
+``docs/BENCHMARK_GUIDE.md`` for how the feature is used.
 """
 
 from __future__ import annotations

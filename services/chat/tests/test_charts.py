@@ -105,7 +105,7 @@ def test_chart_tool_is_always_in_the_agent_toolset():
 
     captured = {}
 
-    def fake_build_graph(model, tools, checkpointer, *, system_prompt=None):
+    def fake_build_graph(model, tools, checkpointer, *, system_prompt=None, middleware=None):
         captured["names"] = [t.name for t in tools]
         return object()
 

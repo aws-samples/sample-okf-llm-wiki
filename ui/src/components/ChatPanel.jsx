@@ -8,7 +8,7 @@
 // the inner Conversation, keyed by threadId so a new-chat/model-switch/resume
 // remounts with clean state.
 
-import { useEffect } from "react"
+import { useEffect, useRef } from "react"
 
 import { ChatHistory } from "@/components/ChatHistory"
 import { ChatThread } from "@/components/ChatThread"
@@ -21,6 +21,7 @@ function Conversation({
   conv,
   getToken,
   onStarted,
+  onTurnComplete,
   historyResume,
   efforts,
   onEffortChange,
@@ -33,7 +34,9 @@ function Conversation({
     isStreaming,
     error,
     loadingHistory,
+    pendingAsk,
     send,
+    answerHuman,
     stop,
     resume,
     prepare,
@@ -65,11 +68,21 @@ function Conversation({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Tell the controller once the first turn lands (locks the model, binds the
-  // URL, refreshes the history list).
+  // Tell the controller once the first turn lands (locks the model, binds the URL).
   useEffect(() => {
     if (chatTurns.length > 0) onStarted()
   }, [chatTurns.length, onStarted])
+
+  // Refresh the sidebar history list on each turn-COMPLETE (isStreaming true→false)
+  // — by then the runtime has committed the thread's index row, so a NEW chat shows
+  // up (and a later turn's title/scope update is reflected) without a page reload.
+  const wasStreamingRef = useRef(false)
+  useEffect(() => {
+    if (wasStreamingRef.current && !isStreaming && chatTurns.length > 0) {
+      onTurnComplete?.()
+    }
+    wasStreamingRef.current = isStreaming
+  }, [isStreaming, chatTurns.length, onTurnComplete])
 
   return (
     <ChatThread
@@ -80,6 +93,8 @@ function Conversation({
       emptyGreeting="Ask the Data Wiki"
       emptyHint="Questions about any dataset — tables, columns, joins, metrics, known issues."
       onSend={send}
+      onAnswer={answerHuman}
+      pendingAsk={pendingAsk}
       onStop={stop}
       onPrepare={prepare}
       effort={conv.effort}
@@ -103,6 +118,7 @@ export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
     setHistoryOpen,
     historyReloadKey,
     onStarted,
+    onTurnComplete,
     onEffortChange,
     onFeaturesChange,
     onScopeChange,
@@ -130,6 +146,7 @@ export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
           conv={conv}
           getToken={getToken}
           onStarted={onStarted}
+          onTurnComplete={onTurnComplete}
           historyResume={resumed}
           efforts={efforts}
           onEffortChange={onEffortChange}
