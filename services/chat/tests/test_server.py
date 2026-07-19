@@ -115,6 +115,71 @@ def test_process_stream_data_tool_start_from_updates():
     ]
 
 
+def test_tool_start_folds_scope_into_location_tool_args():
+    # Scoped conversation: data_domain/dataset are dropped from the model's schema
+    # and injected server-side, so the streamed args lack them → the UI showed
+    # "undefined/undefined". process_stream_data folds the scope back in.
+    mode, data = _updates_with_tool_call()
+    scope = {"data_domain": "bird", "dataset": "formula_1"}
+    out = server.process_stream_data(mode, data, scope)
+    assert out[0]["content"] == {
+        "concept_id": "orders",
+        "data_domain": "bird",
+        "dataset": "formula_1",
+    }
+
+
+def test_tool_start_does_not_fold_scope_into_non_location_tool():
+    # list_domains takes no location; scope must NOT be stamped onto it.
+    from langchain_core.messages import AIMessage
+
+    msg = AIMessage(
+        content="",
+        tool_calls=[{"name": "list_domains", "args": {}, "id": "c1", "type": "tool_call"}],
+    )
+    out = server.process_stream_data(
+        "updates", {"model": {"messages": [msg]}},
+        {"data_domain": "bird", "dataset": "formula_1"},
+    )
+    assert out[0]["content"] == {}  # untouched
+
+
+def test_tool_start_scope_does_not_overwrite_model_supplied_location():
+    # If the model DID pass a location (unscoped conversation, or cross-dataset
+    # lookup), we never clobber it with the conversation scope.
+    from langchain_core.messages import AIMessage
+
+    msg = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "read_page",
+                "args": {"concept_id": "x", "data_domain": "other", "dataset": "ds2"},
+                "id": "c1",
+                "type": "tool_call",
+            }
+        ],
+    )
+    out = server.process_stream_data(
+        "updates", {"model": {"messages": [msg]}},
+        {"data_domain": "bird", "dataset": "formula_1"},
+    )
+    assert out[0]["content"]["data_domain"] == "other"
+    assert out[0]["content"]["dataset"] == "ds2"
+
+
+def test_parse_scope_prefix_roundtrips_with_scoped_prompt():
+    scoped = server.scoped_prompt(
+        "how many races?", {"data_domain": "bird", "dataset": "formula_1"}
+    )
+    assert server.parse_scope_prefix(scoped) == {
+        "data_domain": "bird",
+        "dataset": "formula_1",
+    }
+    # No prefix → None.
+    assert server.parse_scope_prefix("plain question") is None
+
+
 def test_process_stream_data_text_chunk():
     from langchain_core.messages import AIMessageChunk
 
@@ -585,6 +650,36 @@ def test_read_history_empty_for_unknown_thread():
     assert data == {"history": []}
 
 
+def test_read_history_surfaces_pending_ask_when_paused():
+    # A conversation PAUSED at an ask_human interrupt (durable in the checkpoint)
+    # must surface pending_ask on reload so a page refresh re-renders the QA form.
+    import types
+
+    class _Intr:
+        id = "i1"
+        value = {"type": "ask_human", "questions": [{"id": "grain", "prompt": "Which?"}]}
+
+    class _PausedGraph:
+        def get_state(self, _cfg):
+            return types.SimpleNamespace(
+                values={"messages": []}, tasks=[types.SimpleNamespace(interrupts=[_Intr()])]
+            )
+
+    data = server.read_history(lambda *a, **k: _PausedGraph(), object(), "alice:paused")
+    assert "pending_ask" in data
+    assert data["pending_ask"]["type"] == "ask_human"
+    assert data["pending_ask"]["interrupt_ids"] == ["i1"]
+    assert data["pending_ask"]["questions"][0]["interrupt_id"] == "i1"
+
+
+def test_read_history_no_pending_ask_when_not_paused():
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    cp = InMemorySaver()
+    data = server.read_history(lambda *a, **k: _scripted_graph(cp), cp, "alice:nope")
+    assert "pending_ask" not in data
+
+
 def test_delete_history_calls_checkpointer():
     calls = []
 
@@ -757,9 +852,10 @@ def _factory_tool_names(monkeypatch, *, sql_enabled, features, has_athena=True):
         lambda impl, dataset_scope=None: [_T("read_page"), _T("grep")],
     )
 
-    def _fake_build_graph(model, tools, cp, system_prompt=None):
+    def _fake_build_graph(model, tools, cp, system_prompt=None, middleware=None):
         captured["tools"] = [t.name for t in tools]
         captured["prompt"] = system_prompt
+        captured["middleware"] = [type(m).__name__ for m in (middleware or [])]
         return object()
 
     monkeypatch.setattr(chat_graph_mod, "build_graph", _fake_build_graph)
@@ -794,3 +890,11 @@ def test_sql_tool_absent_when_deploy_disabled(monkeypatch):
     )
     assert "run_sql" not in cap["tools"]
     assert cap["prompt"] is None
+
+
+def test_ask_human_tool_and_middleware_always_wired(monkeypatch):
+    # ask_human is unconditional (like render_chart), and AskHumanMiddleware — which
+    # OWNS the interrupt — must be attached to the graph regardless of features.
+    cap = _factory_tool_names(monkeypatch, sql_enabled=False, features=set())
+    assert "ask_human" in cap["tools"]
+    assert "AskHumanMiddleware" in cap["middleware"]

@@ -80,6 +80,11 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
     dataset_guidance = payload.get("dataset_guidance")
     dataset_guidance_version = payload.get("dataset_guidance_version")
 
+    # Recursive-improvement config (optional). Presence of the validated block is
+    # the enable signal; the Control API already validated/clamped it. Absent ⇒ a
+    # normal harvest. Threaded into full/incremental/annotated identically.
+    recursive_improvement = payload.get("recursive_improvement")
+
     # Per-harvest model/effort override (chosen in the UI, validated by the
     # Control API against the TF catalog). When absent, resolve_model_config
     # falls back to the deploy-time OKF_HARVEST_* env vars — so this is fully
@@ -103,6 +108,7 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
             dataset_guidance_version=dataset_guidance_version,
+            recursive_improvement=recursive_improvement,
             session_id=session_id,
         )
     elif mode == "annotated":
@@ -118,6 +124,7 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
             dataset_guidance_version=dataset_guidance_version,
+            recursive_improvement=recursive_improvement,
             session_id=session_id,
         )
     else:
@@ -131,6 +138,7 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
             dataset_guidance_version=dataset_guidance_version,
+            recursive_improvement=recursive_improvement,
             session_id=session_id,
         )
 

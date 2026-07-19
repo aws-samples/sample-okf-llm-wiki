@@ -18,9 +18,12 @@ context, NOT a security boundary (the IAM role can read any bundle). Unscoped
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import Any, Callable
 
 from langchain_core.tools import StructuredTool
+
+log = logging.getLogger("chat.tools")
 
 # The reused pure tool logic (installed via the okf-consumption-mcp package).
 from consumption_mcp.tools import ConsumptionConfig, ConsumptionTools
@@ -64,7 +67,20 @@ def _make_tool(
     def wrapper(**kwargs: Any) -> Any:
         for p in dropped:
             kwargs[p] = scope[p]  # type: ignore[index]  # scope is set when dropped is non-empty
-        return method(**kwargs)
+        # A tool failure (a missing bundle key, a bad regex, an S3/registry blip)
+        # must come back to the model as a tool RESULT it can react to — read a
+        # different doc, fix the arg, tell the user — NOT propagate out and crash
+        # the whole run (which surfaced to the user as a raw NoSuchKey trace). We
+        # return the error text as the tool's result; LangChain wraps it in a
+        # ToolMessage and the agent loop continues. ValueError (bad tool input) is
+        # kept concise; anything else is logged server-side with its type.
+        try:
+            return method(**kwargs)
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:  # noqa: BLE001 - a tool error is feedback, not a crash
+            log.warning("chat tool %s failed", method.__name__, exc_info=True)
+            return f"Error: {method.__name__} failed: {type(e).__name__}: {e}"
 
     wrapper.__signature__ = new_sig  # type: ignore[attr-defined]
     wrapper.__name__ = method.__name__

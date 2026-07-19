@@ -25,6 +25,7 @@ from okf_aws import bundle_prefix, is_bundle_ready, parse_bundle_key, state_mark
 from okf_core import annotations as anno
 from okf_core import chat_threads as ct
 from okf_core import guidance as gd
+from okf_core import recursive_improvement as ri
 from okf_core.domain import DOMAIN_DATASET
 from okf_core.links import extract_links_with_headings
 from okf_core.paths import parse_concept_id
@@ -50,6 +51,15 @@ CONTEXT_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 # ``.context/`` holds user-uploaded source docs (CONVENTIONS.md S3 layout). It is
 # a dot-prefixed dir so it is NOT a concept and is never embedded.
 _CONTEXT_DIRNAME = ".context"
+
+# The recursive-improvement benchmark CSV (question,gold_sql) lives OFF the okf/
+# mount prefix — under a sibling ``benchmark/<domain>/<dataset>/`` prefix in the
+# same bucket. This is deliberate and load-bearing: the harvest S3 Files mount is
+# rooted at ``okf/``, so anything there is readable by the supervisor/authoring
+# agents. Keeping gold under ``benchmark/`` (NOT ``okf/``) makes it invisible to
+# every LLM role's file tools — the runner fetches it via GetObject into the
+# benchmark tool's memory. See docs/CONVENTIONS.md.
+_BENCHMARK_PREFIX = "benchmark/"
 
 
 # --------------------------------------------------------------------------- #
@@ -485,6 +495,113 @@ def set_dataset_guidance(
         "guidance_applied_version": "",  # cleared relationship; recomputed on read
         "guidance_dirty": gd.is_dirty(text, now, ""),
     }
+
+
+def get_dataset_ri_settings(
+    ddb, *, registry_table: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """Return the dataset's saved recursive_improvement settings (or a disabled default).
+
+    404 if the mapping is missing. When no RI settings are stored, returns
+    ``{enabled: False}`` so the UI can render an off toggle.
+    """
+    resp = ddb.get_item(
+        TableName=registry_table,
+        Key={"pk": {"S": f"DOMAIN#{data_domain}"}, "sk": {"S": f"DATASET#{dataset}"}},
+    )
+    item = resp.get("Item")
+    if not item:
+        raise ApiError(404, f"no such dataset: {data_domain}/{dataset}")
+    return {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "recursive_improvement": _ri_settings_from_item(item),
+    }
+
+
+def set_dataset_ri_settings(
+    ddb,
+    *,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    settings: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Persist the dataset's recursive_improvement settings on the DATASET# row.
+
+    ``settings`` is the caller's raw config; it is VALIDATED + clamped by
+    ``okf_core.recursive_improvement.validate`` at this trust boundary (bad values
+    → 400). Disabling (``enabled`` false / omitted) stores a minimal disabled
+    marker so the feature is inert without losing the ability to re-enable. When a
+    ``questions_key`` isn't supplied, the canonical off-mount key is used.
+    """
+    # Default the questions_key to the canonical off-mount location if absent, so a
+    # UI that just uploaded the CSV + flipped "enabled" needn't restate the key.
+    settings = dict(settings or {})
+    if settings.get(ri.FIELD_ENABLED) and not settings.get(ri.FIELD_QUESTIONS_KEY):
+        settings[ri.FIELD_QUESTIONS_KEY] = benchmark_questions_key(data_domain, dataset)
+    try:
+        validated = ri.validate(settings)
+    except ri.RecursiveImprovementConfigError as e:
+        raise ApiError(400, str(e)) from e
+
+    stored = validated or {ri.FIELD_ENABLED: False}
+    try:
+        ddb.update_item(
+            TableName=registry_table,
+            Key={
+                "pk": {"S": f"DOMAIN#{data_domain}"},
+                "sk": {"S": f"DATASET#{dataset}"},
+            },
+            UpdateExpression="SET #ri = :ri",
+            ConditionExpression="attribute_exists(pk)",
+            ExpressionAttributeNames={"#ri": ri.CONFIG_KEY},
+            ExpressionAttributeValues={":ri": {"M": _ri_to_ddb(stored)}},
+        )
+    except Exception as e:  # noqa: BLE001 - map a missing mapping to 404
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            raise ApiError(404, f"no such dataset: {data_domain}/{dataset}") from e
+        raise
+    return {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "recursive_improvement": stored,
+    }
+
+
+def _ri_to_ddb(settings: dict[str, Any]) -> dict[str, Any]:
+    """Marshal a validated RI settings map to a DynamoDB ``M`` value's contents."""
+    out: dict[str, Any] = {}
+    for key, value in settings.items():
+        if isinstance(value, bool):
+            out[key] = {"BOOL": value}
+        elif isinstance(value, (int, float)):
+            out[key] = {"N": str(value)}
+        elif isinstance(value, list):
+            out[key] = {"L": [{"S": str(v)} for v in value]}
+        else:
+            out[key] = {"S": str(value)}
+    return out
+
+
+def _ri_settings_from_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Read the recursive_improvement map off a DATASET# item (disabled if absent)."""
+    m = (item.get(ri.CONFIG_KEY) or {}).get("M")
+    if not m:
+        return {ri.FIELD_ENABLED: False}
+    out: dict[str, Any] = {}
+    for key, av in m.items():
+        if "BOOL" in av:
+            out[key] = av["BOOL"]
+        elif "N" in av:
+            n = av["N"]
+            out[key] = int(n) if "." not in n else float(n)
+        elif "L" in av:
+            out[key] = [e.get("S", "") for e in av["L"]]
+        else:
+            out[key] = av.get("S", "")
+    return out
 
 
 def provision_dataset_dirs(
@@ -1023,6 +1140,196 @@ def delete_context_doc(
     return {"deleted": True, "key": key}
 
 
+# The uploaded benchmark CSV can't be larger than the presign cap; guard the parse
+# so a malformed multi-MB upload can't be read fully into the Lambda for nothing.
+_BENCHMARK_CSV_MAX_BYTES = CONTEXT_UPLOAD_MAX_BYTES
+
+# A per-round review JSON is bounded: <=100 questions, each with two SQL strings +
+# a short note. 8 MiB is generous headroom; the cap just stops a corrupt/huge object
+# from being read wholesale into the Lambda.
+_BENCHMARK_REVIEW_MAX_BYTES = 8 * 1024 * 1024
+
+
+# --------------------------------------------------------------------------- #
+# Recursive-improvement benchmark CSV (S3, OFF the okf/ mount prefix)
+# --------------------------------------------------------------------------- #
+
+
+def _benchmark_prefix(data_domain: str, dataset: str) -> str:
+    """S3 prefix for a dataset's benchmark inputs — a sibling of ``okf/``.
+
+    Off the mount on purpose (see ``_BENCHMARK_PREFIX``): gold SQL must not be
+    reachable by any harvest LLM role's file tools.
+    """
+    return f"{_BENCHMARK_PREFIX}{data_domain}/{dataset}/"
+
+
+def benchmark_questions_key(data_domain: str, dataset: str) -> str:
+    """The canonical S3 key of a dataset's benchmark ``questions.csv``."""
+    return f"{_benchmark_prefix(data_domain, dataset)}questions.csv"
+
+
+def presign_benchmark_upload(
+    s3,
+    *,
+    bucket: str,
+    data_domain: str,
+    dataset: str,
+    content_type: str | None,
+) -> dict[str, Any]:
+    """Presigned POST for the ``question,gold_sql`` CSV, pinned OFF the okf/ mount.
+
+    Mirrors :func:`presign_context_upload` (20 MiB cap, server-enforced key) but
+    targets the off-mount ``benchmark/<domain>/<dataset>/questions.csv`` key. The
+    key is a single fixed filename (one active question set per dataset), so no
+    client-supplied filename is accepted — the gold set can't be scattered.
+    """
+    key = benchmark_questions_key(data_domain, dataset)
+    conditions: list[Any] = [
+        ["content-length-range", 0, CONTEXT_UPLOAD_MAX_BYTES],
+    ]
+    fields: dict[str, Any] = {}
+    if content_type:
+        fields["Content-Type"] = content_type
+        conditions.append({"Content-Type": content_type})
+    presigned = s3.generate_presigned_post(
+        Bucket=bucket,
+        Key=key,
+        Fields=fields,
+        Conditions=conditions,
+        ExpiresIn=PRESIGN_EXPIRY_SECONDS,
+    )
+    return {
+        "url": presigned["url"],
+        "fields": presigned["fields"],
+        "key": key,
+        "max_bytes": CONTEXT_UPLOAD_MAX_BYTES,
+        "expires_in": PRESIGN_EXPIRY_SECONDS,
+    }
+
+
+def inspect_benchmark_questions(
+    s3, *, bucket: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """Fetch + parse the uploaded question set and report the extracted count.
+
+    Uses the SAME parser the harvest runtime uses
+    (``okf_core.benchmark_questions.load_questions``), so the ``count`` reported
+    to the UI is exactly what a harvest would benchmark. Returns:
+
+    * ``{"uploaded": False}`` when no CSV has been uploaded yet (a clean "upload
+      one" state, not an error).
+    * ``{"uploaded": True, "valid": False, "error": "..."}`` when the CSV is
+      present but malformed (missing a required column, unparseable) — the
+      user-facing format-validation feedback.
+    * ``{"uploaded": True, "valid": True, "count", "total_in_csv", "dropped",
+      "capped", "max_questions"}`` when it parses — ``count`` is the number of
+      questions that will be benchmarked (after skipping blank rows and applying
+      the 100-row cap), ``capped`` true iff rows were dropped by the cap.
+    """
+    from okf_core.benchmark_questions import BenchmarkCSVError, load_questions
+    from okf_core.recursive_improvement import MAX_QUESTIONS
+
+    key = benchmark_questions_key(data_domain, dataset)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except Exception as e:  # noqa: BLE001 - a missing object is "not uploaded yet"
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return {"uploaded": False, "key": key}
+        # Other S3 errors are surfaced (misconfig, perms) rather than masked.
+        raise ApiError(502, f"could not read benchmark CSV: {e}") from e
+
+    raw = obj["Body"].read(_BENCHMARK_CSV_MAX_BYTES + 1)
+    if len(raw) > _BENCHMARK_CSV_MAX_BYTES:
+        return {
+            "uploaded": True,
+            "valid": False,
+            "key": key,
+            "error": f"CSV exceeds the {_BENCHMARK_CSV_MAX_BYTES // (1024 * 1024)} MiB limit",
+        }
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {
+            "uploaded": True,
+            "valid": False,
+            "key": key,
+            "error": "CSV is not valid UTF-8 text",
+        }
+
+    try:
+        loaded = load_questions(text)
+    except BenchmarkCSVError as e:
+        return {"uploaded": True, "valid": False, "key": key, "error": str(e)}
+
+    if not loaded.questions:
+        return {
+            "uploaded": True,
+            "valid": False,
+            "key": key,
+            "error": "no valid rows — every row is missing a question or gold_sql",
+        }
+
+    return {
+        "uploaded": True,
+        "valid": True,
+        "key": key,
+        "count": len(loaded.questions),
+        "total_in_csv": loaded.total_in_csv,
+        "dropped": loaded.dropped,
+        "capped": loaded.dropped > 0,
+        "max_questions": MAX_QUESTIONS,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Recursive-improvement per-round REVIEW (off-mount, gold-carrying, human-facing)
+# --------------------------------------------------------------------------- #
+#
+# The harvest runtime writes one JSON per round under this prefix (see
+# harvest/benchmark/review_store.py). It carries gold + predicted SQL, so it lives
+# OFF the okf/ mount (no LLM role can read it) and is served ONLY here, to the
+# Cognito-authed UI. The key shape MUST match review_store.review_key verbatim.
+
+
+def benchmark_review_prefix(data_domain: str, dataset: str) -> str:
+    """Off-mount S3 prefix for a dataset's benchmark review artifacts."""
+    return f"{_benchmark_prefix(data_domain, dataset)}reviews/"
+
+
+def benchmark_review_key(
+    data_domain: str, dataset: str, session_id: str, iteration: int
+) -> str:
+    """The S3 key for one round's review JSON."""
+    return f"{benchmark_review_prefix(data_domain, dataset)}{session_id}/{iteration}.json"
+
+
+def get_benchmark_review(
+    s3, *, bucket: str, data_domain: str, dataset: str, session_id: str, iteration: int
+) -> dict[str, Any]:
+    """Return one round's persisted review JSON (all buckets, per-question, w/ gold).
+
+    404 if the round's artifact doesn't exist (older run, or the round hasn't
+    persisted yet). Other S3 errors surface as 502. The session_id + iteration come
+    from the harvest feed's ``benchmark`` event (which set ``has_review`` true)."""
+    key = benchmark_review_key(data_domain, dataset, session_id, iteration)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except Exception as e:  # noqa: BLE001 - a missing object is a clean 404
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            raise ApiError(404, "no review for that round") from e
+        raise ApiError(502, f"could not read benchmark review: {e}") from e
+    raw = obj["Body"].read(_BENCHMARK_REVIEW_MAX_BYTES + 1)
+    if len(raw) > _BENCHMARK_REVIEW_MAX_BYTES:
+        raise ApiError(502, "benchmark review artifact is unexpectedly large")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise ApiError(502, f"benchmark review is not valid JSON: {e}") from e
+
+
 # --------------------------------------------------------------------------- #
 # Harvest control (AgentCore invoke + status row)
 # --------------------------------------------------------------------------- #
@@ -1092,6 +1399,43 @@ def acquire_harvest_lease(
         if code == "ConditionalCheckFailedException":
             return False
         raise
+
+
+def _apply_ri_settings(
+    payload: dict[str, Any],
+    ddb,
+    *,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+) -> None:
+    """Populate ``payload['recursive_improvement']`` from saved dataset settings.
+
+    Best-effort + re-validated at this trust boundary. When RI is disabled (or no
+    settings / missing mapping / invalid stored value), the block is simply omitted
+    so the run is a normal harvest. Shared by the full/incremental and annotation
+    trigger paths so the behavior is identical on every mode.
+    """
+    try:
+        saved = get_dataset_ri_settings(
+            ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+        )
+    except ApiError:
+        return  # no mapping row — nothing to apply
+    settings = saved.get(ri.CONFIG_KEY)
+    if not ri.is_enabled(settings):
+        return
+    try:
+        validated = ri.validate(settings)
+    except ri.RecursiveImprovementConfigError:
+        logging.getLogger("control_api").warning(
+            "Saved recursive_improvement for %s/%s is invalid; skipping.",
+            data_domain,
+            dataset,
+        )
+        return
+    if validated:
+        payload[ri.CONFIG_KEY] = validated
 
 
 def trigger_harvest(
@@ -1167,6 +1511,15 @@ def trigger_harvest(
             payload["dataset_guidance_version"] = g["guidance_updated_at"]
     except ApiError:
         pass  # no mapping row yet (shouldn't happen at harvest time) — omit guidance
+
+    # Recursive-improvement settings (saved per dataset). When enabled, the block's
+    # PRESENCE is the runtime enable signal — it rides on every mode (full/
+    # incremental/annotated). Re-validated here (the trust boundary) so a
+    # hand-edited row can't push an out-of-range value to the runtime.
+    _apply_ri_settings(
+        payload, ddb, registry_table=registry_table,
+        data_domain=data_domain, dataset=dataset,
+    )
 
     if mode == "incremental":
         if not changed_table:
@@ -1490,6 +1843,7 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
         out["call_id"] = rec.get("call_id")
     # Sub-agent fleet fields (KIND_SUBAGENT): phase = start|complete|error,
     # batch groups a fan-out (the eval id), sub_id is the per-square id.
+    # `phase` is ALSO reused by benchmark events (solving/grading/reviewing/done).
     for k in ("phase", "batch", "sub_id", "subagent_type"):
         if rec.get(k):
             out[k] = rec.get(k)
@@ -1497,6 +1851,35 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
     # run. Passed through verbatim as a dict so the UI can show a running total.
     if isinstance(rec.get("usage"), dict):
         out["usage"] = rec["usage"]
+    # Recursive-improvement benchmark fields (kind="benchmark_progress" live
+    # updates + kind="benchmark" per-round KPI summary). Copied through so the UI
+    # can render a progress row (current/total) and a KPI line. `improvements` is a
+    # list of anonymous theme strings; the numeric KPIs are 0..1 / counts.
+    for k in (
+        "iteration",
+        "max_iterations",
+        "current",
+        "total",
+        "ex_score",
+        "judge_accuracy",
+        "passed",
+        "failed",
+        "discarded",
+        "graded",
+        "target_met",
+        "has_review",
+        "runtime_session_id",
+        # benchmark_solver observability (per-question): what each solver did.
+        "turns",
+        "tool_calls",
+        "sql_len",
+        "sql_preview",
+        "error",
+    ):
+        if k in rec:
+            out[k] = rec.get(k)
+    if isinstance(rec.get("improvements"), list):
+        out["improvements"] = rec["improvements"]
     return out
 
 
@@ -2330,6 +2713,12 @@ def trigger_annotation_harvest(
         if guidance.get("guidance"):
             payload["dataset_guidance"] = guidance["guidance"]
             payload["dataset_guidance_version"] = guidance["guidance_updated_at"]
+
+        # Recursive improvement rides the annotation re-harvest too (all modes).
+        _apply_ri_settings(
+            payload, ddb, registry_table=registry_table,
+            data_domain=data_domain, dataset=dataset,
+        )
 
         agentcore.invoke_agent_runtime(
             agentRuntimeArn=runtime_arn,

@@ -39,7 +39,14 @@ def make_source_tools(source: GlueAthenaSource) -> list[Any]:
         are DIFFERENT — document `NULL`/`IS NULL` for missing values and reserve
         `= ''` / `<> ''` for genuinely empty strings.
         """
-        ref = source.find(parse_concept_id(concept_id))
+        # A malformed id (e.g. a `.metadata/...` snapshot path, or any segment the
+        # concept-id grammar rejects) is recoverable model input, not a crash:
+        # return a note so the agent self-corrects, mirroring run_sql below.
+        try:
+            parsed = parse_concept_id(concept_id)
+        except ValueError as e:
+            return {"rows": [], "note": f"Invalid concept id {concept_id!r}: {e}"}
+        ref = source.find(parsed)
         if ref is None:
             return {"rows": [], "note": f"Unknown concept: {concept_id}"}
         try:

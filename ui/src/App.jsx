@@ -6,6 +6,7 @@ import {
   ChevronsUpDownIcon,
   DatabaseIcon,
   FileTextIcon,
+  GaugeIcon,
   GlobeIcon,
   HistoryIcon,
   KeyRoundIcon,
@@ -84,6 +85,7 @@ import MappingsView from "@/views/MappingsView.jsx"
 import ContextView from "@/views/ContextView.jsx"
 import CredentialsView from "@/views/CredentialsView.jsx"
 import HarvestView from "@/views/HarvestView.jsx"
+import BenchmarkView from "@/views/BenchmarkView.jsx"
 import BrowseView from "@/views/BrowseView.jsx"
 import GraphView from "@/views/GraphView.jsx"
 
@@ -104,6 +106,12 @@ const NAV = [
     needsSelection: true,
   },
   { key: "harvest", label: "Harvest", icon: PlayIcon, needsSelection: true },
+  {
+    key: "benchmark",
+    label: "Benchmark",
+    icon: GaugeIcon,
+    needsSelection: true,
+  },
   { key: "browse", label: "Browse", icon: BoxesIcon, needsSelection: true },
   { key: "graph", label: "Graph", icon: NetworkIcon, needsSelection: true },
   // Chat spans the whole wiki (the "@" picker narrows it), so it needs no
@@ -669,48 +677,51 @@ function Console({ auth, api }) {
                 the other views stay centered (max-w-6xl) and scroll as a block.
                 pb-2 (8px) lines the bottom edge up with the sidebar's p-2 gap. */}
             <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pt-4 pb-2">
-            {section === "browse" ? (
-              // Full-width views still cap + center (max-w-7xl) so they leave a
-              // margin on both sides and line up under the top-bar toggle/picker.
-              // px-1 gives the cards' ring/shadow room like the centered column.
-              <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-1">
-                <BrowseView
-                  api={api}
-                  selection={selection}
-                  concept={routeConcept}
-                  onConceptChange={onBrowseConcept}
-                />
-              </div>
-            ) : section === "graph" ? (
-              <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-1">
-                <GraphView
-                  api={api}
-                  selection={selection}
-                  onOpenConcept={openConceptInBrowse}
-                />
-              </div>
-            ) : (
-              // p-1 gives the cards' ring/shadow room so the vertical scroll
-              // container doesn't clip them — including the first card's top edge,
-              // which otherwise sits flush against the scroll container's top.
-              <div className="mx-auto min-h-0 w-full max-w-6xl flex-1 overflow-y-auto p-1">
-                {section === "domains" && (
-                  <DomainsView api={api} onChanged={loadDatasets} />
-                )}
-                {section === "mappings" && (
-                  <MappingsView api={api} onChanged={loadDatasets} />
-                )}
-                {section === "context" && (
-                  <ContextView api={api} selection={selection} />
-                )}
-                {section === "harvest" && (
-                  <HarvestView api={api} selection={selection} />
-                )}
-                {section === "credentials" && (
-                  <CredentialsView api={api} email={email} />
-                )}
-              </div>
-            )}
+              {section === "browse" ? (
+                // Full-width views still cap + center (max-w-7xl) so they leave a
+                // margin on both sides and line up under the top-bar toggle/picker.
+                // px-1 gives the cards' ring/shadow room like the centered column.
+                <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-1">
+                  <BrowseView
+                    api={api}
+                    selection={selection}
+                    concept={routeConcept}
+                    onConceptChange={onBrowseConcept}
+                  />
+                </div>
+              ) : section === "graph" ? (
+                <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-1">
+                  <GraphView
+                    api={api}
+                    selection={selection}
+                    onOpenConcept={openConceptInBrowse}
+                  />
+                </div>
+              ) : (
+                // p-1 gives the cards' ring/shadow room so the vertical scroll
+                // container doesn't clip them — including the first card's top edge,
+                // which otherwise sits flush against the scroll container's top.
+                <div className="mx-auto min-h-0 w-full max-w-6xl flex-1 overflow-y-auto p-1">
+                  {section === "domains" && (
+                    <DomainsView api={api} onChanged={loadDatasets} />
+                  )}
+                  {section === "mappings" && (
+                    <MappingsView api={api} onChanged={loadDatasets} />
+                  )}
+                  {section === "context" && (
+                    <ContextView api={api} selection={selection} />
+                  )}
+                  {section === "harvest" && (
+                    <HarvestView api={api} selection={selection} />
+                  )}
+                  {section === "benchmark" && (
+                    <BenchmarkView api={api} selection={selection} />
+                  )}
+                  {section === "credentials" && (
+                    <CredentialsView api={api} email={email} />
+                  )}
+                </div>
+              )}
             </div>
           </>
         )}

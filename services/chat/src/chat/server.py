@@ -163,6 +163,108 @@ def strip_scope_prefix(text: str) -> str:
     return _SCOPE_PREFIX_RE.sub("", text) if isinstance(text, str) else text
 
 
+# Recover ``{data_domain, dataset}`` from a stored user message's scope prefix
+# (``scoped_prompt`` writes "[Scope: the dataset <dd>/<ds>. …]"). Used on history
+# reload to re-fold the scope into that turn's tool events (see _with_scope).
+_SCOPE_DATASET_RE = re.compile(r"^\[Scope: the dataset ([^/]+)/([^.\]]+)")
+
+
+def parse_scope_prefix(text: str) -> dict[str, str] | None:
+    """Extract the dataset scope from a stored user message's ``[Scope: …]`` line."""
+    if not isinstance(text, str):
+        return None
+    m = _SCOPE_DATASET_RE.match(text)
+    if not m:
+        return None
+    return {"data_domain": m.group(1).strip(), "dataset": m.group(2).strip()}
+
+
+def _pending_interrupts(graph: Any, cfg: dict) -> list[Any]:
+    """Every interrupt the graph is currently paused on (across all pending tasks).
+
+    Reads the checkpoint state, not the stream: the stream emits one
+    ``__interrupt__`` per interrupt with no stable id, but the state carries each
+    ``Interrupt`` object WITH its ``id`` — which is what
+    ``Command(resume={id: ...})`` needs (langgraph REQUIRES the id-keyed map form
+    when more than one interrupt is pending; a bare resume value raises). Returns []
+    when the graph isn't paused."""
+    try:
+        state = graph.get_state(cfg)
+    except Exception:  # noqa: BLE001 - no state / transient read error → not paused
+        return []
+    out: list[Any] = []
+    for task in getattr(state, "tasks", None) or []:
+        out.extend(getattr(task, "interrupts", None) or [])
+    return out
+
+
+def _ask_human_chunk_from_state(graph: Any, cfg: dict) -> dict[str, Any] | None:
+    """Build the ``ask_human`` chunk from the graph's pending interrupts, or None.
+
+    Consolidates ALL pending ask_human interrupts into one chunk so the UI renders a
+    single QA form even if the model (against instructions) emitted several
+    ``ask_human`` calls in one turn. Each group carries its ``interrupt_id`` so the
+    answer round can resume every interrupt by id. Non-ask_human interrupts (none
+    expected) are ignored."""
+    groups: list[dict[str, Any]] = []
+    for intr in _pending_interrupts(graph, cfg):
+        value = getattr(intr, "value", None)
+        if isinstance(value, dict) and value.get("type") == "ask_human":
+            groups.append(
+                {
+                    "interrupt_id": getattr(intr, "id", None),
+                    "questions": value.get("questions") or [],
+                }
+            )
+    if not groups:
+        return None
+    # Flat questions list (what the form renders) + the per-group id mapping the
+    # answer round needs. Each question is tagged with its owning interrupt_id so
+    # answers can be split back per interrupt on resume.
+    questions: list[dict[str, Any]] = []
+    for g in groups:
+        for q in g["questions"]:
+            questions.append({**q, "interrupt_id": g["interrupt_id"]})
+    return {
+        "type": "ask_human",
+        "questions": questions,
+        "interrupt_ids": [g["interrupt_id"] for g in groups],
+    }
+
+
+def _build_resume_map(graph: Any, cfg: dict, answers: Any) -> dict[str, Any] | None:
+    """Map each pending interrupt id → the answers destined for it, or None.
+
+    ``answers`` is the UI's list of ``{id, answer, interrupt_id}``. langgraph resumes
+    multiple interrupts via ``Command(resume={interrupt_id: value})``; each value is
+    what THAT interrupt's ``interrupt(...)`` returns (here, the answer records for its
+    questions). We route each answer to its ``interrupt_id`` when present; answers
+    with no interrupt_id (single-interrupt case, or an older client) all go to the
+    sole pending interrupt. Returns None when the graph has NO pending interrupt (so
+    the caller ends cleanly instead of injecting a phantom turn)."""
+    pending_ids = [
+        getattr(i, "id", None) for i in _pending_interrupts(graph, cfg)
+    ]
+    pending_ids = [i for i in pending_ids if i]
+    if not pending_ids:
+        return None
+
+    answer_list = answers if isinstance(answers, (list, tuple)) else []
+    by_interrupt: dict[str, list[Any]] = {iid: [] for iid in pending_ids}
+    unrouted: list[Any] = []
+    for a in answer_list:
+        iid = a.get("interrupt_id") if isinstance(a, dict) else None
+        if iid in by_interrupt:
+            by_interrupt[iid].append(a)
+        else:
+            unrouted.append(a)
+    # Answers with no (or unknown) interrupt_id go to the first pending interrupt —
+    # the common single-interrupt path where the UI needn't tag them.
+    if unrouted:
+        by_interrupt[pending_ids[0]].extend(unrouted)
+    return by_interrupt
+
+
 # --- stream chunk translation (the crux) -------------------------------------
 
 
@@ -172,8 +274,38 @@ def _tool_call_id(tc: Any) -> str | None:
     return getattr(tc, "id", None)
 
 
+# The scope keys a scoped conversation injects server-side (mirrors chat.tools).
+_SCOPE_ARG_KEYS = ("data_domain", "dataset")
+
+# Consumption tools that ACCEPT a (data_domain, dataset) location — the ones from
+# which chat.tools drops + injects the scope. The domain-discovery tools
+# (list_domains / list_declared_domains / search_domains) do NOT take a location,
+# so scope must NOT be stamped onto them (their labels would then read wrongly).
+_LOCATION_TAKING_TOOLS = frozenset(
+    {"list_directory", "read_page", "get_backlinks", "glob", "grep", "semantic_search"}
+)
+
+
+def _with_scope(tool_name: Any, args: Any, scope: dict[str, str] | None) -> Any:
+    """Fold the conversation's dataset scope back into a location-taking tool's args.
+
+    In a scoped conversation, ``data_domain``/``dataset`` are dropped from the
+    model's tool schema and injected server-side (chat.tools), so the streamed args
+    lack them and the UI rendered ``undefined/undefined``. Restore them here — only
+    for tools that take a location, and only for keys the model didn't itself pass
+    (never overwrite). No scope / non-dict args / non-location tool ⇒ unchanged.
+    """
+    if not scope or not isinstance(args, dict) or tool_name not in _LOCATION_TAKING_TOOLS:
+        return args
+    merged = dict(args)
+    for k in _SCOPE_ARG_KEYS:
+        if not merged.get(k):
+            merged[k] = scope.get(k)
+    return merged
+
+
 def process_stream_data(
-    mode: str, data: Any
+    mode: str, data: Any, scope: dict[str, str] | None = None
 ) -> dict[str, Any] | list[dict[str, Any]] | None:
     """Translate one LangGraph ``astream`` part into Sparky typed chunk(s).
 
@@ -188,11 +320,26 @@ def process_stream_data(
     - ``messages`` → live tokens: ``AIMessageChunk`` string content is answer
       ``text``; ``reasoning_content`` blocks are ``think``; a ``ToolMessage`` is
       the tool RESULT.
+
+    ``scope`` (the conversation's dataset scope, when set) is folded BACK into each
+    tool-start's args: in a scoped conversation ``data_domain``/``dataset`` are
+    dropped from the model's tool schema and injected server-side (see chat.tools),
+    so the streamed args lack them and the UI rendered ``undefined/undefined``. We
+    restore them here (without overwriting any the model did pass) so the emitted
+    event — live and in stored history — names the real dataset.
     """
     from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
     if mode == "updates":
         if not isinstance(data, dict):
+            return None
+        # A LangGraph interrupt (AskHumanMiddleware raised one) surfaces as a
+        # top-level ``__interrupt__`` in the updates payload — but ONE per interrupt,
+        # and without a reliable interrupt-id here. We DROP it and instead build the
+        # ``ask_human`` chunk once, AFTER the stream, from the graph's checkpoint
+        # state (which carries every pending interrupt AND its id — required to
+        # resume with Command(resume={id: ...}); see ``_ask_human_chunk_from_state``).
+        if "__interrupt__" in data:
             return None
         node = data.get("model") or data.get("agent")
         if not isinstance(node, dict):
@@ -201,17 +348,19 @@ def process_stream_data(
         for msg in node.get("messages", []) or []:
             if isinstance(msg, AIMessage):
                 for tc in msg.tool_calls or []:
+                    name = (
+                        tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                    )
+                    args = (
+                        tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+                    )
                     out.append(
                         {
                             "type": "tool",
                             "id": _tool_call_id(tc),
-                            "tool_name": tc.get("name")
-                            if isinstance(tc, dict)
-                            else getattr(tc, "name", None),
+                            "tool_name": name,
                             "tool_start": True,
-                            "content": tc.get("args")
-                            if isinstance(tc, dict)
-                            else getattr(tc, "args", None),
+                            "content": _with_scope(name, args, scope),
                             "error": False,
                         }
                     )
@@ -397,6 +546,8 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     NOTE: this returns the RAW compiled LangGraph graph (no AG-UI wrapper) —
     ``stream_run`` drives ``.astream`` on it directly.
     """
+    from chat.ask_human import make_ask_human_tool
+    from chat.ask_human_middleware import AskHumanMiddleware
     from chat.charts import make_chart_tool
     from chat.config import build_chat_model
     from chat.graph import SYSTEM_PROMPT_WITH_SQL, build_graph
@@ -459,6 +610,10 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # contract lives in the tool description; the SYSTEM_PROMPT's <charts> block
         # covers when to use it, so the base prompt (no SQL) already knows about it.
         agent_tools = [*agent_tools, make_chart_tool()]
+        # ask_human is ALWAYS available (like render_chart, no deploy flag / opt-in):
+        # the tool is inert and AskHumanMiddleware owns the interrupt. The <asking_the_user>
+        # prompt block covers when to use it, so the base prompt already knows about it.
+        agent_tools = [*agent_tools, make_ask_human_tool()]
         # Optional read-only SQL: both the deploy flag (engine present) and the
         # per-run opt-in (features) are required. system_prompt gains a line so the
         # model knows the tool exists this turn.
@@ -471,9 +626,16 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                     make_sql_tool(engine, dataset_scope=_sql_scope(scope)),
                 ]
                 prompt = SYSTEM_PROMPT_WITH_SQL
+        # AskHumanMiddleware owns the human-in-the-loop interrupt for ask_human.
+        middleware = [AskHumanMiddleware()]
         if prompt is not None:
-            return build_graph(chat_model, agent_tools, checkpointer, system_prompt=prompt)
-        return build_graph(chat_model, agent_tools, checkpointer)
+            return build_graph(
+                chat_model, agent_tools, checkpointer,
+                system_prompt=prompt, middleware=middleware,
+            )
+        return build_graph(
+            chat_model, agent_tools, checkpointer, middleware=middleware
+        )
 
     return build_agent
 
@@ -541,11 +703,16 @@ def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
 
     turns: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
+    turn_scope: dict[str, str] | None = None
     for msg in messages:
         if isinstance(msg, HumanMessage):
             if current:
                 current["aiMessage"].append({"end": True})
                 turns.append(current)
+            # Recover the turn's dataset scope from the stored [Scope: …] preamble
+            # BEFORE stripping it, so this turn's tool events can name the dataset
+            # (the stored tool_call args lack it — see _with_scope).
+            turn_scope = parse_scope_prefix(_text(msg.content))
             current = {
                 "id": f"turn_{len(turns)}",
                 # Strip the injected [Scope: …] preamble so the bubble shows the
@@ -559,17 +726,19 @@ def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
             # reloaded turn renders identically (reasoning included).
             current["aiMessage"].extend(_ai_events(msg.content))
             for tc in msg.tool_calls or []:
+                name = (
+                    tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                )
+                args = (
+                    tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+                )
                 current["aiMessage"].append(
                     {
                         "type": "tool",
                         "id": _tool_call_id(tc),
-                        "tool_name": tc.get("name")
-                        if isinstance(tc, dict)
-                        else getattr(tc, "name", None),
+                        "tool_name": name,
                         "tool_start": True,
-                        "content": tc.get("args")
-                        if isinstance(tc, dict)
-                        else getattr(tc, "args", None),
+                        "content": _with_scope(name, args, turn_scope),
                     }
                 )
         elif isinstance(msg, ToolMessage) and current is not None:
@@ -627,7 +796,15 @@ def read_history(
         )
         if not has_answer_text:
             turns = turns[:-1]
-    return {"history": turns}
+    out: dict[str, Any] = {"history": turns}
+    # If the graph is PAUSED at an ask_human interrupt, surface it so a page reload
+    # re-renders the QA form and the user can still answer (the interrupt is durable
+    # in the checkpoint; nothing was lost). Not dropped by drop_inflight: the paused
+    # turn IS the one awaiting input, and answer_human resumes it in place.
+    pending_ask = _ask_human_chunk_from_state(graph, cfg)
+    if pending_ask is not None:
+        out["pending_ask"] = pending_ask
+    return out
 
 
 def delete_history(checkpointer: Any, internal_thread_id: str) -> dict[str, Any]:
@@ -651,6 +828,7 @@ async def _produce_run_chunks(
     client_thread_id: str,
     prompt: str,
     on_graph: Callable[[Any], None],
+    resume_answers: Any = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Drive one agent turn and YIELD raw typed chunk dicts (no SSE framing).
 
@@ -661,6 +839,14 @@ async def _produce_run_chunks(
     runner catches that and invokes the checkpoint reconcile (via ``on_cancel``).
     ``on_graph(graph)`` is called once the graph is built, so the caller can wire the
     reconcile against it.
+
+    ``resume_answers`` (set on the ``answer_human`` path) makes this RESUME a graph
+    paused at an ``ask_human`` interrupt instead of starting a fresh turn: the graph
+    input becomes ``Command(resume={interrupt_id: answers})`` (built by
+    :func:`_build_resume_map` from the pending interrupts) rather than a new user
+    message, and the run continues from the checkpoint. If the graph is NOT paused on
+    any interrupt, the run ends cleanly instead (no phantom turn). The prompt is
+    ignored in that case.
     """
     from langchain_core.messages import AIMessageChunk
 
@@ -683,9 +869,13 @@ async def _produce_run_chunks(
         # flag, so an unknown/forbidden feature string is simply ignored here.
         features = normalize_features(input_data.get("features"))
 
-        # Best-effort conversation-index upsert (sidebar). After validation so a
-        # rejected (model, effort) never seeds an index row; never fatal.
-        if index_writer is not None:
+        # Best-effort conversation-index upsert (sidebar). Only on a fresh turn — a
+        # RESUME must NOT touch the index: its (model, effort) are the defaults (the
+        # answer_human request doesn't carry them), and touch_thread writes those
+        # every turn (SET, not if_not_exists), so writing here would overwrite the
+        # conversation's real pinned model/effort with defaults. After validation so
+        # a rejected (model, effort) never seeds an index row; never fatal.
+        if index_writer is not None and resume_answers is None:
             index_writer(
                 user_sub=user_sub,
                 thread_id=client_thread_id,
@@ -698,13 +888,34 @@ async def _produce_run_chunks(
         graph = build_agent(model, effort, scope, checkpointer, features=features)
         on_graph(graph)
 
-        # Inject the dataset scope on the USER message (keeps the system prompt a
-        # static, cacheable prefix — see scoped_prompt). No-op when unscoped.
-        user_content = scoped_prompt(prompt, scope)
+        # Resume a paused ask_human interrupt with the user's answers, OR start a
+        # fresh turn from the user message. Command(resume=…) continues the graph
+        # from its checkpoint; a message dict starts a new turn (scope injected on
+        # the user message, keeping the system prompt a cacheable prefix).
+        if resume_answers is not None:
+            from langgraph.types import Command
+
+            # Build the id-keyed resume map from the graph's CURRENTLY pending
+            # interrupts. langgraph REQUIRES the {interrupt_id: value} map form when
+            # >1 interrupt is pending (a bare value raises RuntimeError); the map
+            # form also works for the single case. If the graph is NOT paused on any
+            # interrupt (double-submit, stale UI, already-resumed run), do NOT feed a
+            # resume — that would inject a phantom fresh turn — just end cleanly.
+            resume_map = _build_resume_map(graph, cfg, resume_answers)
+            if resume_map is None:
+                yield {"end": True}
+                return
+            graph_input: Any = Command(resume=resume_map)
+        else:
+            graph_input = {
+                "messages": [
+                    {"role": "user", "content": scoped_prompt(prompt, scope)}
+                ]
+            }
 
         seen_text = False
         async for mode, data in graph.astream(
-            {"messages": [{"role": "user", "content": user_content}]},
+            graph_input,
             cfg,
             stream_mode=["messages", "updates"],
         ):
@@ -727,7 +938,7 @@ async def _produce_run_chunks(
                         "cache_creation_input_tokens", 0
                     ) + (details.get("cache_creation") or 0)
 
-            produced = process_stream_data(mode, data)
+            produced = process_stream_data(mode, data, scope)
             if not produced:
                 continue
             for chunk in produced if isinstance(produced, list) else [produced]:
@@ -741,6 +952,16 @@ async def _produce_run_chunks(
                 elif chunk.get("type") in ("text", "think"):
                     seen_text = True
                 yield chunk
+
+        # If the stream ended because the graph PAUSED on ask_human interrupt(s),
+        # emit the consolidated QA chunk (built from checkpoint state so it carries
+        # every pending interrupt + its id). Done here — after the loop, before the
+        # end marker — so the UI gets the form and the run cleanly ends (a later
+        # answer_human resumes from the checkpoint).
+        if graph is not None:
+            ask = _ask_human_chunk_from_state(graph, cfg)
+            if ask is not None:
+                yield ask
     except asyncio.CancelledError:
         # Explicit stop — let the live-stream runner's on_cancel do the checkpoint
         # repair + cancelled end marker; just propagate.
@@ -831,6 +1052,69 @@ async def stream_run(
         on_graph=lambda g: graph_holder.__setitem__("graph", g),
     )
     live_streams.start(internal_id, source, user_message=prompt, on_cancel=_on_cancel)
+
+    async for chunk in live_streams.subscribe(internal_id):
+        yield _sse(chunk)
+
+
+async def answer_run(
+    input_data: dict[str, Any],
+    user_sub: str,
+    client_thread_id: str,
+    *,
+    chat_config: Any,
+    build_agent: Callable,
+    checkpointer: Any,
+    index_writer: Callable | None = None,
+) -> AsyncGenerator[str, None]:
+    """SSE frames for an ``answer_human`` turn — resume a paused ask_human interrupt.
+
+    The client sends the user's answers (``{answers: [...], model_id, effort,
+    features, dataset_scope}``); this drives the graph forward with
+    ``Command(resume={interrupt_id: answers})`` from its checkpoint. It carries the
+    conversation's model/effort/features/scope so ``build_agent`` rebuilds the SAME
+    graph the interrupt paused on (the model is pinned + its checkpoint isn't
+    portable across models). Runs as a detached live-stream run exactly like
+    :func:`stream_run` (same subscribe / stop / disconnect semantics), differing only
+    in that it feeds resume answers instead of a fresh user message. The ``answers``
+    are validated + normalized downstream (chat.ask_human.normalize_answers).
+    """
+    from chat.cancellation import reconcile_cancelled_turn
+
+    internal_id = namespaced_thread_id(user_sub, client_thread_id)
+    answers = input_data.get("answers")
+    # Nothing to resume with → clean end (mirrors the empty-prompt guard on send).
+    if answers is None:
+        yield _sse({"end": True})
+        return
+
+    graph_holder: dict[str, Any] = {"graph": None}
+    cfg = {"configurable": {"thread_id": internal_id}, "recursion_limit": RECURSION_LIMIT}
+
+    def _on_cancel() -> list[dict[str, Any]]:
+        graph = graph_holder["graph"]
+        out: list[dict[str, Any]] = []
+        if graph is not None:
+            out.extend(reconcile_cancelled_turn(graph, cfg))
+        out.append(_cancel_end_marker())
+        return out
+
+    source = _produce_run_chunks(
+        input_data,
+        internal_id,
+        chat_config=chat_config,
+        build_agent=build_agent,
+        checkpointer=checkpointer,
+        index_writer=index_writer,
+        user_sub=user_sub,
+        client_thread_id=client_thread_id,
+        prompt="",
+        on_graph=lambda g: graph_holder.__setitem__("graph", g),
+        resume_answers=answers,
+    )
+    # user_message stays empty: this turn's question bubble already rendered on the
+    # original send; resume only continues the assistant's answer.
+    live_streams.start(internal_id, source, user_message="", on_cancel=_on_cancel)
 
     async for chunk in live_streams.subscribe(internal_id):
         yield _sse(chunk)
@@ -990,6 +1274,21 @@ def build_app(
                 media_type="text/event-stream",
                 headers=sse_headers,
             )
+
+        # Answer a paused ask_human interrupt: resume the graph with the user's
+        # answers (Command(resume=…)). Distinct from ``resume`` above, which merely
+        # re-subscribes to a still-streaming run — this ADVANCES a paused graph.
+        if req_type == "answer_human":
+            gen = answer_run(
+                input_data,
+                user_sub,
+                client_thread_id,
+                chat_config=chat_config,
+                build_agent=build_agent,
+                checkpointer=checkpointer,
+                index_writer=index_writer,
+            )
+            return StreamingResponse(gen, media_type="text/event-stream", headers=sse_headers)
 
         # Stop: explicitly cancel the thread's in-flight run (the ONLY thing that
         # cancels — a dropped connection no longer does). Triggers the checkpoint

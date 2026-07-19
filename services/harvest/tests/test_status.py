@@ -204,3 +204,87 @@ def test_stamp_guidance_applied_swallows_ddb_error():
 
 def test_stamp_guidance_applied_noop_when_registry_none():
     status.stamp_guidance_applied(None, data_domain="d", dataset="ds", version="v1")
+
+
+# --- write_benchmark_kpi (recursive-improvement KPI rows) -------------------
+
+
+class _PutDDB:
+    def __init__(self, raise_on_put: bool = False):
+        self.puts: list[dict] = []
+        self._raise = raise_on_put
+
+    def put_item(self, **kwargs):
+        if self._raise:
+            raise RuntimeError("ddb down")
+        self.puts.append(kwargs)
+
+
+def test_write_benchmark_kpi_puts_bench_row():
+    ddb = _PutDDB()
+    status.write_benchmark_kpi(
+        (ddb, "okf-registry"),
+        data_domain="sport",
+        dataset="formula_1",
+        runtime_session_id="okf-sport-f1-abc",
+        iteration=2,
+        attrs={
+            "iteration": 2,
+            "ex_score": 0.75,
+            "passed": 6,
+            "failed": 2,
+            "discarded": 1,
+            "target_met": False,
+        },
+    )
+    assert len(ddb.puts) == 1
+    item = ddb.puts[0]["Item"]
+    assert ddb.puts[0]["TableName"] == "okf-registry"
+    # On the HARVEST# partition, session-scoped BENCH# sort key.
+    assert item["pk"] == {"S": "HARVEST#sport#formula_1"}
+    assert item["sk"] == {"S": "BENCH#okf-sport-f1-abc#2"}
+    # Numbers marshalled as N, bools as BOOL, created_at stamped.
+    assert item["ex_score"] == {"N": "0.75"}
+    assert item["passed"] == {"N": "6"}
+    assert item["target_met"] == {"BOOL": False}
+    assert "created_at" in item
+
+
+def test_write_benchmark_kpi_final_row():
+    ddb = _PutDDB()
+    status.write_benchmark_kpi(
+        (ddb, "t"),
+        data_domain="d",
+        dataset="ds",
+        runtime_session_id="sess",
+        iteration="final",
+        attrs={"shipped_iteration": 3, "ex_score": 0.9},
+    )
+    assert ddb.puts[0]["Item"]["sk"] == {"S": "BENCH#sess#final"}
+    assert ddb.puts[0]["Item"]["shipped_iteration"] == {"N": "3"}
+
+
+def test_write_benchmark_kpi_bool_before_int():
+    # bool is an int subclass — must marshal to BOOL, not N.
+    ddb = _PutDDB()
+    status.write_benchmark_kpi(
+        (ddb, "t"), data_domain="d", dataset="ds",
+        runtime_session_id="s", iteration=0, attrs={"target_met": True},
+    )
+    assert ddb.puts[0]["Item"]["target_met"] == {"BOOL": True}
+
+
+def test_write_benchmark_kpi_best_effort_on_error():
+    # A DynamoDB failure must never break a harvest.
+    status.write_benchmark_kpi(
+        (_PutDDB(raise_on_put=True), "t"),
+        data_domain="d", dataset="ds",
+        runtime_session_id="s", iteration=0, attrs={"ex_score": 1.0},
+    )  # no exception
+
+
+def test_write_benchmark_kpi_noop_when_registry_none():
+    status.write_benchmark_kpi(
+        None, data_domain="d", dataset="ds",
+        runtime_session_id="s", iteration=0, attrs={"ex_score": 1.0},
+    )  # no crash

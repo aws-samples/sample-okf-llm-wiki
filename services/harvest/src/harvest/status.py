@@ -145,6 +145,68 @@ def report_status(
         )
 
 
+def write_benchmark_kpi(
+    registry: tuple[Any, str] | None,
+    *,
+    data_domain: str,
+    dataset: str,
+    runtime_session_id: str,
+    iteration: int | str,
+    attrs: dict[str, Any],
+) -> None:
+    """Append a benchmark KPI row for one recursive-improvement round (best-effort).
+
+    Writes ``pk="HARVEST#<domain>#<dataset>"``, ``sk="BENCH#<session>#<iteration>"``
+    (see ``okf_core.recursive_improvement.bench_sk`` and docs/CONVENTIONS.md). Uses
+    ``PutItem`` (append-only — each round is its own row, never a read-modify-write)
+    and never raises: a KPI write must not crash a harvest, same discipline as
+    :func:`report_status`. ``iteration`` is the 0-based round number or the literal
+    ``"final"`` for the terminal summary row. ``attrs`` is the KPI dict (numbers +
+    booleans); values are marshalled to DynamoDB attribute types here.
+    """
+    if registry is None:
+        return
+    from okf_core.recursive_improvement import bench_sk
+
+    client, table = registry
+    try:
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        item: dict[str, Any] = {
+            "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+            "sk": {"S": bench_sk(runtime_session_id, iteration)},
+            "created_at": {"S": now},
+        }
+        for key, value in attrs.items():
+            item[key] = _marshal(value)
+        client.put_item(TableName=table, Item=item)
+        log.info(
+            "Wrote benchmark KPI row iter=%s (%s/%s)", iteration, data_domain, dataset
+        )
+    except Exception:  # noqa: BLE001 - a KPI write must never break a harvest
+        log.warning(
+            "Failed to write benchmark KPI iter=%s for %s/%s (continuing)",
+            iteration,
+            data_domain,
+            dataset,
+            exc_info=True,
+        )
+
+
+def _marshal(value: Any) -> dict[str, Any]:
+    """Marshal a scalar KPI value to a DynamoDB attribute-value map.
+
+    Handles the KPI shapes: bool (BOOL), int/float (N), str (S). ``bool`` MUST be
+    checked before ``int`` (bool is an int subclass in Python).
+    """
+    if isinstance(value, bool):
+        return {"BOOL": value}
+    if isinstance(value, (int, float)):
+        return {"N": str(value)}
+    return {"S": str(value)}
+
+
 def stamp_guidance_applied(
     registry: tuple[Any, str] | None,
     *,

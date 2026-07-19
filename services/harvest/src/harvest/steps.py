@@ -82,6 +82,20 @@ KIND_SUBAGENT = "subagent"
 # {input, output, cache_read, cache_write, total}. `cache_write` is LangChain's
 # `cache_creation` (Anthropic prompt-cache WRITE); `cache_read` is a cache HIT.
 KIND_USAGE = "usage"
+# Recursive-improvement benchmark events. KIND_BENCHMARK_PROGRESS is a live
+# in-round update (phase + an N/M counter) the UI renders as a progress row that
+# updates in place, keyed by (iteration, phase). KIND_BENCHMARK is the per-round
+# KPI summary emitted when a round finishes. Both carry benchmark-specific fields
+# (phase/iteration/current/total + the KPI fields) that the Control API
+# _parse_step_line must whitelist to reach the UI.
+KIND_BENCHMARK = "benchmark"
+KIND_BENCHMARK_PROGRESS = "benchmark_progress"
+
+# Benchmark phases (the label the progress row shows).
+BENCH_PHASE_SOLVE = "solving"
+BENCH_PHASE_GRADE = "grading"
+BENCH_PHASE_ADJUDICATE = "reviewing"
+BENCH_PHASE_DONE = "done"
 
 # Sub-agent lifecycle phases (mirror langchain_quickjs SubagentStreamEvent).
 PHASE_START = "start"  # dispatched and running

@@ -573,6 +573,69 @@ def _r_set_dataset_guidance(cfg, params, body, query, caller):
     )
 
 
+# -- Recursive-improvement benchmark (settings + off-mount CSV upload) -------
+
+
+def _r_presign_benchmark(cfg, params, body, query, caller):
+    content_type = (body or {}).get("content_type")
+    return 200, handlers.presign_benchmark_upload(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        content_type=content_type,
+    )
+
+
+def _r_inspect_benchmark(cfg, params, body, query, caller):
+    return 200, handlers.inspect_benchmark_questions(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_get_benchmark_review(cfg, params, body, query, caller):
+    # One round's per-question review (all buckets, incl. gold). Off-mount S3 read;
+    # 404 if the round hasn't persisted (or is an older run). iteration is 0-based.
+    try:
+        iteration = int(params["iteration"])
+    except (TypeError, ValueError) as e:
+        raise handlers.ApiError(400, "iteration must be an integer") from e
+    return 200, handlers.get_benchmark_review(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        session_id=params["session"],
+        iteration=iteration,
+    )
+
+
+def _r_get_ri_settings(cfg, params, body, query, caller):
+    return 200, handlers.get_dataset_ri_settings(
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_set_ri_settings(cfg, params, body, query, caller):
+    body = body or {}
+    # The whole recursive_improvement block is validated/clamped in the handler
+    # (the trust boundary). Accept it under either the nested key or the bare body.
+    settings = body.get("recursive_improvement", body)
+    return 200, handlers.set_dataset_ri_settings(
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        settings=settings,
+    )
+
+
 # -- Chat conversations (per-user sidebar list) -----------------------------
 
 
@@ -714,6 +777,18 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     # same API Gateway CORS reason as the chat rename above.
     ("GET", "/guidance/{domain}/{dataset}", _r_get_dataset_guidance),
     ("PUT", "/guidance/{domain}/{dataset}", _r_set_dataset_guidance),
+    # Recursive-improvement benchmark: off-mount CSV presign + saved settings +
+    # parsed question-count (fixed /questions suffix disambiguates from settings).
+    ("POST", "/benchmark/{domain}/{dataset}/presign", _r_presign_benchmark),
+    ("GET", "/benchmark/{domain}/{dataset}/questions", _r_inspect_benchmark),
+    # Per-round review (all buckets, gold-carrying); session + 0-based iteration.
+    (
+        "GET",
+        "/benchmark/{domain}/{dataset}/reviews/{session}/{iteration}",
+        _r_get_benchmark_review,
+    ),
+    ("GET", "/benchmark/{domain}/{dataset}", _r_get_ri_settings),
+    ("PUT", "/benchmark/{domain}/{dataset}", _r_set_ri_settings),
     # Chat conversations (per-user sidebar list). thread_id is a single opaque
     # segment (a UUID the SPA generates), so it's a clean path param. Rename is
     # PUT (not PATCH) because the API Gateway CORS allow_methods + the CORS_HEADERS

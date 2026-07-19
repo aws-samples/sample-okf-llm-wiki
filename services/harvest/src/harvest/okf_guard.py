@@ -29,6 +29,12 @@ except Exception:  # pragma: no cover - exercised only when langchain is absent
 
 _GUARDED_TOOLS = {"write_file", "edit_file"}
 
+# The recursive-improvement benchmark tool. When RI is enabled the guard counts
+# calls to it and refuses once the per-run iteration budget is spent — a backstop
+# against a runaway loop, independent of the supervisor prompt's own budget. When
+# RI is disabled this tool isn't even registered, so the counter never moves.
+_BENCHMARK_TOOL = "run_benchmark"
+
 # The read-only Glue metadata snapshot (see metadata_export.py). Any write/edit
 # whose path lands in this dir is refused: the snapshot is an INPUT the agent
 # reads (like .context/), never authors. Matched on a path segment so a leading
@@ -62,10 +68,16 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         engine: OKFGuardEngine,
         *,
         read_current: Callable[[str], str | None],
+        benchmark_budget: int | None = None,
     ):
         super().__init__()
         self.engine = engine
         self._read_current = read_current
+        # Recursive-improvement backstop. When set (RI enabled), the guard allows
+        # at most this many run_benchmark calls per run and refuses the rest. None
+        # (a normal harvest) means the tool isn't registered, so this is inert.
+        self._benchmark_budget = benchmark_budget
+        self._benchmark_calls = 0
 
     def wrap_tool_call(self, request, handler):  # type: ignore[override]
         """Sync path (invoke/stream)."""
@@ -99,6 +111,22 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         name = request.tool_call["name"]
         args = request.tool_call["args"]
         file_path = args.get("file_path")
+
+        # Recursive-improvement iteration backstop: count run_benchmark calls and
+        # refuse once the budget is spent. Checked before the write-tool gate
+        # because run_benchmark is not a write tool. Inert when budget is None.
+        if name == _BENCHMARK_TOOL and self._benchmark_budget is not None:
+            if self._benchmark_calls >= self._benchmark_budget:
+                return self._refuse(
+                    request,
+                    f"Refused: the recursive-improvement benchmark budget of "
+                    f"{self._benchmark_budget} iteration(s) is spent. Stop looping "
+                    f"and let the run finalize — the wiki ships exactly as you have "
+                    f"left it (there is no rollback), so make sure it's in your best "
+                    f"state before you finish.",
+                )
+            self._benchmark_calls += 1
+            return None
 
         if name not in _GUARDED_TOOLS:
             return None

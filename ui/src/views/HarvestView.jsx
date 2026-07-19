@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
+import hljs from "highlight.js/lib/common"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import rehypeHighlight from "rehype-highlight"
@@ -10,6 +11,7 @@ import {
   CoinsIcon,
   DatabaseIcon,
   FileTextIcon,
+  GaugeIcon,
   ListTreeIcon,
   MessageSquareTextIcon,
   PlayIcon,
@@ -60,6 +62,7 @@ import {
   PopoverTitle,
   PopoverTrigger,
 } from "@/components/ui/popover"
+import { CopyButton } from "@/components/ui/copy-button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Card,
@@ -71,6 +74,12 @@ import {
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
 import {
@@ -159,7 +168,9 @@ export default function HarvestView({ api, selection }) {
   const onModelChange = useCallback((next) => {
     setModel(next)
     setEffortState((cur) => {
-      const resolved = effortsFor(next).includes(cur) ? cur : defaultEffortFor(next)
+      const resolved = effortsFor(next).includes(cur)
+        ? cur
+        : defaultEffortFor(next)
       savePreference(next, resolved)
       return resolved
     })
@@ -244,7 +255,8 @@ export default function HarvestView({ api, selection }) {
       if (gen !== feedGenRef.current) return
       // Advance the timestamp cursor regardless of whether new events parsed, so
       // the scan window keeps sliding forward and polls stay cheap.
-      if (typeof res?.next_ts === "number") feedTsCursorRef.current = res.next_ts
+      if (typeof res?.next_ts === "number")
+        feedTsCursorRef.current = res.next_ts
       const batch = Array.isArray(res?.events) ? res.events : []
       if (batch.length) {
         feedCursorRef.current = res.next ?? feedCursorRef.current
@@ -376,7 +388,17 @@ export default function HarvestView({ api, selection }) {
       stopPolling()
       stopFeed()
     }
-  }, [poll, startPolling, stopPolling, pollEvents, startFeed, stopFeed, resetFeed, loadGuidance, hasSelection])
+  }, [
+    poll,
+    startPolling,
+    stopPolling,
+    pollEvents,
+    startFeed,
+    stopFeed,
+    resetFeed,
+    loadGuidance,
+    hasSelection,
+  ])
 
   const startHarvest = async () => {
     if (!hasSelection) return
@@ -499,8 +521,7 @@ export default function HarvestView({ api, selection }) {
   // Started and Updated only differ once the run reaches a terminal state
   // (report_status writes updated_at on transitions). While running they mirror
   // each other, so show Updated only when terminal to avoid a redundant row.
-  const showUpdated =
-    inner.updated_at && TERMINAL_STATUSES.has(currentStatus)
+  const showUpdated = inner.updated_at && TERMINAL_STATUSES.has(currentStatus)
 
   // Full harvest is destructive when a bundle already exists (it wipes + rebuilds
   // every doc, discarding any prior authoring incl. applied annotations). Confirm
@@ -585,7 +606,8 @@ export default function HarvestView({ api, selection }) {
                     >
                       <span className="flex items-center gap-2">
                         <MessageSquareTextIcon />
-                        Apply annotations{guidance?.guidance_dirty ? " + guidance" : ""}
+                        Apply annotations
+                        {guidance?.guidance_dirty ? " + guidance" : ""}
                       </span>
                       <span className="pl-6 text-[11px] text-muted-foreground">
                         {guidance?.guidance_dirty
@@ -602,7 +624,11 @@ export default function HarvestView({ api, selection }) {
                   // dark ring in dark mode); the left edge is the divider seam.
                   className="border-primary border-l-primary-foreground/30"
                 >
-                  {starting ? <Spinner /> : <PlayIcon data-icon="inline-start" />}
+                  {starting ? (
+                    <Spinner />
+                  ) : (
+                    <PlayIcon data-icon="inline-start" />
+                  )}
                   Start full harvest
                 </Button>
               </ButtonGroup>
@@ -624,11 +650,13 @@ export default function HarvestView({ api, selection }) {
                   <span className="font-medium text-foreground">
                     {domain}/{dataset}
                   </span>{" "}
-                  already has a knowledge bundle. A full harvest rebuilds it from
-                  scratch — every existing doc is discarded and re-authored,
-                  including any applied annotations and manual edits. This can't be
-                  undone. To apply new feedback without a rebuild, use{" "}
-                  <span className="font-medium">Apply my annotations</span> instead.
+                  already has a knowledge bundle. A full harvest rebuilds it
+                  from scratch — every existing doc is discarded and
+                  re-authored, including any applied annotations and manual
+                  edits. This can't be undone. To apply new feedback without a
+                  rebuild, use{" "}
+                  <span className="font-medium">Apply my annotations</span>{" "}
+                  instead.
                 </DialogDescription>
               </DialogHeader>
               <DialogFooter>
@@ -689,7 +717,10 @@ export default function HarvestView({ api, selection }) {
                   <SparklesIcon className="size-4 text-muted-foreground" />
                   <span className="text-sm font-medium">Dataset guidance</span>
                   {guidance?.guidance_dirty ? (
-                    <Badge variant="outline" className="border-amber-500/50 text-amber-600 dark:text-amber-400">
+                    <Badge
+                      variant="outline"
+                      className="border-amber-500/50 text-amber-600 dark:text-amber-400"
+                    >
                       pending re-harvest
                     </Badge>
                   ) : guidance?.guidance ? (
@@ -791,6 +822,9 @@ export default function HarvestView({ api, selection }) {
                     running={running}
                     aborted={aborted}
                     draining={draining}
+                    api={api}
+                    domain={domain}
+                    dataset={dataset}
                   />
                 </>
               )}
@@ -876,7 +910,12 @@ function mergeRows(events, aborted) {
       const sq = row.squares.get(e.sub_id)
       if (e.phase === "start") {
         if (sq) sq.state = "active"
-        else row.squares.set(e.sub_id, { id: e.sub_id, state: "active", label: e.label })
+        else
+          row.squares.set(e.sub_id, {
+            id: e.sub_id,
+            state: "active",
+            label: e.label,
+          })
       } else if (e.phase === "complete" || e.phase === "error") {
         const state = e.phase === "complete" ? "done" : "error"
         if (sq) sq.state = state
@@ -896,7 +935,11 @@ function mergeRows(events, aborted) {
           openTaskWave = `task:${taskWaveSeq}`
         }
         const row = fleetRowFor(openTaskWave, e.seq)
-        row.squares.set(e.call_id, { id: e.call_id, state: "active", label: e.label })
+        row.squares.set(e.call_id, {
+          id: e.call_id,
+          state: "active",
+          label: e.label,
+        })
         callIndex.set(e.call_id, { kind: "task", batch: openTaskWave })
         continue
       }
@@ -909,7 +952,10 @@ function mergeRows(events, aborted) {
       const target = e.call_id != null ? callIndex.get(e.call_id) : undefined
       if (!target) continue
       if (target.kind === "tool") {
-        rows[target.idx] = { ...rows[target.idx], state: e.ok ? "ok" : "failed" }
+        rows[target.idx] = {
+          ...rows[target.idx],
+          state: e.ok ? "ok" : "failed",
+        }
       } else {
         // A task dispatch finished — flip its square done/error.
         const idx = batchIndex.get(target.batch)
@@ -921,6 +967,26 @@ function mergeRows(events, aborted) {
     } else if (e.kind === "agent") {
       openTaskWave = null
       rows.push({ ...e, kind: "agent" })
+    } else if (e.kind === "benchmark_progress" || e.kind === "benchmark") {
+      // One row PER benchmark iteration, updated in place as phase/counters
+      // advance (progress ticks) and finalized by the round-done "benchmark"
+      // event (which carries the KPIs). Keyed by iteration so a round's many
+      // ticks collapse into a single advancing row rather than N feed rows.
+      const iter = e.iteration ?? 0
+      const key = `bench:${iter}`
+      let idx = batchIndex.get(key)
+      if (idx == null) {
+        idx = rows.length
+        batchIndex.set(key, idx)
+        rows.push({ kind: "benchmark", iteration: iter, seq: e.seq })
+      }
+      const done = e.kind === "benchmark"
+      rows[idx] = {
+        ...rows[idx],
+        ...e,
+        kind: "benchmark", // keep the row kind regardless of event kind
+        done,
+      }
     }
   }
 
@@ -1002,6 +1068,341 @@ function FleetRow({ row }) {
   )
 }
 
+// A recursive-improvement benchmark row: one per iteration, updated in place as
+// the round advances through phases (solving → grading → reviewing → done). Shows
+// a phase label, an N/M counter + progress bar while running, and the KPI summary
+// once the round is done.
+const BENCH_PHASE_LABEL = {
+  solving: "Solving",
+  grading: "Grading",
+  reviewing: "Reviewing",
+  done: "Done",
+}
+
+function BenchmarkRow({ row, api, domain, dataset }) {
+  const [open, setOpen] = useState(false)
+  const iterLabel = `Round ${(row.iteration ?? 0) + 1}${
+    row.max_iterations ? `/${row.max_iterations}` : ""
+  }`
+  const phase = row.phase || "solving"
+  const total = row.total || 0
+  const current = row.current || 0
+  const pct =
+    total > 0 ? Math.round((current / total) * 100) : row.done ? 100 : 0
+  // A completed round is clickable iff the runtime persisted a review artifact
+  // (has_review) and we know the session id + which round to fetch.
+  const canReview =
+    row.done &&
+    Boolean(row.has_review) &&
+    Boolean(api && domain && dataset && row.runtime_session_id)
+
+  return (
+    <>
+      <div
+        className={cn(
+          "flex flex-col gap-1.5 rounded-md border px-2 py-1.5 text-sm",
+          canReview && "cursor-pointer hover:bg-muted/50"
+        )}
+        {...(canReview
+          ? {
+              role: "button",
+              tabIndex: 0,
+              onClick: () => setOpen(true),
+              onKeyDown: (e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault()
+                  setOpen(true)
+                }
+              },
+            }
+          : {})}
+      >
+        <div className="flex items-center gap-2">
+        <GaugeIcon className="size-3.5 shrink-0 text-muted-foreground" />
+        <Badge variant="secondary" className="shrink-0">
+          Benchmark
+        </Badge>
+        <span className="min-w-0 flex-1 truncate text-muted-foreground">
+          {iterLabel} — {BENCH_PHASE_LABEL[phase] || phase}
+          {!row.done && total > 0 ? (
+            <span className="tabular-nums">
+              {" "}
+              {current}/{total}
+            </span>
+          ) : null}
+        </span>
+        {row.done ? (
+          <Badge
+            variant={row.target_met ? "default" : "outline"}
+            className="shrink-0"
+          >
+            {row.target_met ? "Target met" : "Below target"}
+          </Badge>
+        ) : (
+          <span className="shrink-0 text-[10px] text-muted-foreground tabular-nums">
+            {pct}%
+          </span>
+        )}
+      </div>
+
+      {/* Progress bar while running. */}
+      {!row.done ? (
+        <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+          <div
+            className="h-full rounded-full bg-primary transition-[width] duration-500"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      ) : (
+        // Round-done KPI summary line.
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 pl-6 text-xs text-muted-foreground tabular-nums">
+          <span>
+            EX{" "}
+            <span className="font-medium text-foreground">
+              {fmtPct(row.ex_score)}
+            </span>
+          </span>
+          <span>
+            Judge{" "}
+            <span className="font-medium text-foreground">
+              {fmtPct(row.judge_accuracy)}
+            </span>
+          </span>
+          <span>
+            {row.passed}/{row.graded} passed
+          </span>
+          {row.discarded ? <span>{row.discarded} discarded</span> : null}
+          {Array.isArray(row.improvements) && row.improvements.length ? (
+            <span>{row.improvements.length} improvement(s) fed back</span>
+          ) : null}
+          {canReview ? (
+            <span className="text-primary">· click to review answers</span>
+          ) : null}
+        </div>
+      )}
+      </div>
+      {/* Dialog is a SIBLING of the clickable row (not a child): React events
+          bubble up the component tree even from a portal, so nesting it inside the
+          row made the X-button click re-trigger the row's onClick and reopen it. */}
+      {canReview ? (
+        <BenchmarkReviewDialog
+          open={open}
+          onOpenChange={setOpen}
+          api={api}
+          domain={domain}
+          dataset={dataset}
+          session={row.runtime_session_id}
+          iteration={row.iteration ?? 0}
+          iterLabel={iterLabel}
+        />
+      ) : null}
+    </>
+  )
+}
+
+// The classification tabs shown in the review modal, in reading order. Keys match
+// the persisted review buckets (harvest tool.py BUCKET_* / adjudicator categories).
+const REVIEW_TABS = [
+  { key: "passed", label: "Passed" },
+  { key: "genuine_error", label: "Genuine gaps" },
+  { key: "noisy_gold", label: "Noisy gold" },
+  { key: "ambiguous", label: "Ambiguous" },
+  { key: "unknown", label: "Unclassified" },
+  { key: "discarded", label: "Discarded" },
+]
+
+const REVIEW_TAB_HELP = {
+  passed: "The wiki led to SQL that matched the expected answer.",
+  genuine_error:
+    "A real wiki gap: the reviewer confirmed the docs were missing or wrong about something the answer needed. These drive the improvements.",
+  noisy_gold:
+    "The expected answer itself looks wrong against the data, so the wiki isn't at fault. Dropped from later rounds.",
+  ambiguous:
+    "The question is under-specified (or the fact was already documented) — not a wiki gap. Dropped from later rounds.",
+  unknown:
+    "The reviewer couldn't reach a verdict (errored or unparseable). Counts against the wiki until resolved.",
+  discarded:
+    "The expected SQL couldn't run against the data, so the question is unanswerable and excluded from the score.",
+}
+
+// The full per-question review for one round, grouped into classification tabs.
+// Fetches the off-mount review JSON (gold-carrying, human-facing) on open — this
+// detail never reaches the harvest agent, only the human here.
+function BenchmarkReviewDialog({
+  open,
+  onOpenChange,
+  api,
+  domain,
+  dataset,
+  session,
+  iteration,
+  iterLabel,
+}) {
+  const [state, setState] = useState({ status: "idle", doc: null, error: null })
+
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    setState({ status: "loading", doc: null, error: null })
+    api
+      .getBenchmarkReview(domain, dataset, session, iteration)
+      .then((doc) => {
+        if (!cancelled) setState({ status: "ok", doc, error: null })
+      })
+      .catch((e) => {
+        if (!cancelled)
+          setState({ status: "error", doc: null, error: e.message || String(e) })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, api, domain, dataset, session, iteration])
+
+  const doc = state.doc
+  const counts = doc?.counts || {}
+  const questions = Array.isArray(doc?.questions) ? doc.questions : []
+  // Default to the first tab that has any questions (so the modal doesn't open on
+  // an empty tab); fall back to "passed".
+  const firstNonEmpty =
+    REVIEW_TABS.find((t) => (counts[t.key] || 0) > 0)?.key || "passed"
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <GaugeIcon className="size-4" />
+            Benchmark review — {iterLabel}
+          </DialogTitle>
+          <DialogDescription>
+            Every question this round, grouped by what the reviewer decided. This
+            detail (including the expected SQL) is shown only here — the harvester
+            never sees it.
+          </DialogDescription>
+        </DialogHeader>
+
+        {state.status === "loading" ? (
+          <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground">
+            <Spinner className="size-4" /> Loading review…
+          </div>
+        ) : state.status === "error" ? (
+          <Alert variant="destructive">
+            <AlertTitle>Couldn’t load the review</AlertTitle>
+            <AlertDescription>{state.error}</AlertDescription>
+          </Alert>
+        ) : (
+          <Tabs defaultValue={firstNonEmpty} className="min-w-0">
+            <TabsList className="flex-wrap">
+              {REVIEW_TABS.map((t) => (
+                <TabsTrigger key={t.key} value={t.key} className="gap-1.5">
+                  {t.label}
+                  <span className="rounded bg-muted px-1 text-xs tabular-nums text-muted-foreground">
+                    {counts[t.key] || 0}
+                  </span>
+                </TabsTrigger>
+              ))}
+            </TabsList>
+            {REVIEW_TABS.map((t) => (
+              <TabsContent key={t.key} value={t.key} className="min-w-0">
+                <p className="mb-2 text-xs text-muted-foreground">
+                  {REVIEW_TAB_HELP[t.key]}
+                </p>
+                {/* Native max-height + overflow scroll (NOT Radix ScrollArea): its
+                    viewport's height:100% needs a definite parent height, which a
+                    TabsContent block doesn't give — so it grows to full content
+                    height and overflows the dialog instead of scrolling. */}
+                <div className="okf-thin-scroll flex max-h-[60vh] min-w-0 flex-col gap-3 overflow-y-auto pr-3">
+                  {questions.filter((q) => q.bucket === t.key).length ? (
+                    questions
+                      .filter((q) => q.bucket === t.key)
+                      .map((q) => <ReviewQuestion key={q.q_id} q={q} />)
+                  ) : (
+                    <p className="py-6 text-center text-sm text-muted-foreground">
+                      No questions in this category.
+                    </p>
+                  )}
+                </div>
+              </TabsContent>
+            ))}
+          </Tabs>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// One question card in the review modal: the question, the reviewer's note (if
+// any), and the predicted vs expected SQL.
+function ReviewQuestion({ q }) {
+  return (
+    <div className="min-w-0 rounded-md border p-3">
+      <p className="text-sm font-medium break-words">{q.question || "—"}</p>
+      {q.note ? (
+        <p className="mt-1 text-xs text-muted-foreground break-words">
+          Reviewer: {q.note}
+        </p>
+      ) : q.reason ? (
+        <p className="mt-1 text-xs text-muted-foreground break-words">
+          {q.reason}
+        </p>
+      ) : null}
+      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+        <ReviewSql label="Wiki-derived answer" sql={q.predicted_sql} />
+        <ReviewSql label="Expected answer" sql={q.gold_sql} />
+      </div>
+    </div>
+  )
+}
+
+function ReviewSql({ label, sql }) {
+  const source = typeof sql === "string" ? sql.trim() : ""
+  // Highlight with the SAME highlight.js + `.okf-prose .hljs-*` theme the chat
+  // CodeView and concept docs use, so SQL colors are consistent app-wide. Force
+  // the `sql` grammar (these are always SQL); fall back to escaped text on error.
+  const html = useMemo(() => {
+    if (!source) return ""
+    try {
+      return hljs.highlight(source, { language: "sql" }).value
+    } catch {
+      const div = document.createElement("div")
+      div.textContent = source
+      return div.innerHTML
+    }
+  }, [source])
+
+  return (
+    <div className="min-w-0">
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+          {label}
+        </span>
+        {source ? (
+          <CopyButton
+            text={source}
+            label={`Copy ${label}`}
+            className="size-6 shrink-0"
+          />
+        ) : null}
+      </div>
+      <pre className="min-w-0 overflow-x-auto rounded border bg-muted p-2 text-xs whitespace-pre-wrap break-words">
+        {source ? (
+          <code
+            className="hljs okf-prose bg-transparent p-0"
+            dangerouslySetInnerHTML={{ __html: html }}
+          />
+        ) : (
+          "—"
+        )}
+      </pre>
+    </div>
+  )
+}
+
+function fmtPct(v) {
+  if (typeof v !== "number") return "—"
+  return `${Math.round(v * 100)}%`
+}
+
 // Render an agent one-liner as INLINE markdown: GFM formatting (bold, code,
 // links) but flattened to a single line — block elements render as inline spans
 // (see the `.okf-inline-md` CSS) so it stays on the feed row and truncates.
@@ -1013,34 +1414,111 @@ const INLINE_MD_COMPONENTS = {
 function InlineMarkdown({ text }) {
   return (
     <span className="okf-inline-md">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={INLINE_MD_COMPONENTS}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={INLINE_MD_COMPONENTS}
+      >
         {text}
       </ReactMarkdown>
     </span>
   )
 }
 
-// The full agent message, rendered as GFM markdown in a modal. Opened by
-// clicking an agent row whose text was trimmed to fit one line.
-function AgentMessageDialog({ open, onOpenChange, text }) {
+// Parse a benchmark-feedback agent message: the `run_benchmark` tool returns an
+// `improvements` list and the agent echoes it back as JSON (raw, or in a ```json
+// fence, possibly wrapped in prose). Returns the improvement strings when the
+// message IS that feedback, else null so a normal agent message renders as-is.
+// This is what lets us show a readable list + a "Benchmark feedback" title
+// instead of dumping raw JSON in the modal.
+function parseBenchmarkImprovements(text) {
+  if (!text || typeof text !== "string" || !text.includes("improvements")) {
+    return null
+  }
+  // Try, in order: a ```json fence's body, the whole string, and the span from
+  // the first "{" to the last "}" (JSON embedded in surrounding prose).
+  const candidates = []
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  if (fenced) candidates.push(fenced[1])
+  candidates.push(text)
+  const first = text.indexOf("{")
+  const last = text.lastIndexOf("}")
+  if (first !== -1 && last > first) candidates.push(text.slice(first, last + 1))
+  for (const c of candidates) {
+    try {
+      const obj = JSON.parse(c.trim())
+      if (obj && Array.isArray(obj.improvements)) {
+        return obj.improvements.map((s) => String(s).trim()).filter(Boolean)
+      }
+    } catch {
+      // not valid JSON — try the next candidate
+    }
+  }
+  return null
+}
+
+// The full agent message in a modal. For benchmark feedback (an `improvements`
+// list) it renders a readable, numbered list titled "Benchmark feedback"; any
+// other agent message renders as GFM markdown titled "Agent message". Opened by
+// clicking a feed row whose text was trimmed to fit one line.
+function AgentMessageDialog({ open, onOpenChange, text, improvements }) {
+  const isBench = Array.isArray(improvements)
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <SparklesIcon className="size-4" />
-            Agent message
+            {isBench ? (
+              <GaugeIcon className="size-4" />
+            ) : (
+              <SparklesIcon className="size-4" />
+            )}
+            {isBench ? "Benchmark feedback" : "Agent message"}
           </DialogTitle>
+          {isBench ? (
+            <DialogDescription>
+              {improvements.length
+                ? "Wiki gaps this benchmark round surfaced. The agent revises the docs to address these, then re-benchmarks."
+                : "This benchmark round found no wiki gaps to address."}
+            </DialogDescription>
+          ) : null}
         </DialogHeader>
-        <ScrollArea className="max-h-[70vh]">
-          <div className="okf-prose pr-3">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
-            >
-              {text}
-            </ReactMarkdown>
-          </div>
+        <ScrollArea className="max-h-[70vh] min-w-0">
+          {isBench ? (
+            improvements.length ? (
+              <ol className="min-w-0 space-y-2.5 pr-3">
+                {improvements.map((item, i) => (
+                  <li key={i} className="flex gap-3">
+                    <span className="mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-medium text-primary tabular-nums">
+                      {i + 1}
+                    </span>
+                    <span className="min-w-0 flex-1 text-sm leading-relaxed break-words">
+                      {item}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <p className="pr-3 text-sm text-muted-foreground">
+                No improvements — the wiki answered this round without gaps.
+              </p>
+            )
+          ) : (
+            // Long fenced code/JSON a plain agent message emits would blow past
+            // the modal: a <pre> inside Radix's ScrollArea (a display:table
+            // viewport child) in a grid DialogContent never engages
+            // overflow-x-auto — its intrinsic width just grows. Wrap code lines
+            // instead so content always stays within the modal.
+            <div className="okf-prose min-w-0 pr-3 [&_code]:break-words [&_pre]:break-words [&_pre]:whitespace-pre-wrap">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                rehypePlugins={[
+                  [rehypeHighlight, { detect: true, ignoreMissing: true }],
+                ]}
+              >
+                {text}
+              </ReactMarkdown>
+            </div>
+          )}
         </ScrollArea>
       </DialogContent>
     </Dialog>
@@ -1153,13 +1631,23 @@ function StepRow({ step }) {
     return () => ro.disconnect()
   }, [isAgent, step.label])
 
-  const expandable = isAgent && (Boolean(step.full) || overflowing)
   const modalText = step.full || step.label
+  // Benchmark feedback arrives as an agent message whose body is the
+  // `run_benchmark` tool's `improvements` JSON. Detect it so we can tag the row
+  // "Benchmark feedback", show a readable inline summary (not raw JSON), and
+  // render a clean list in the modal.
+  const improvements = isAgent ? parseBenchmarkImprovements(modalText) : null
+  const isBench = Array.isArray(improvements)
+  // A benchmark-feedback row is ALWAYS clickable (the readable list lives in the
+  // modal); a plain agent row is clickable only when trimmed/overflowing.
+  const expandable = isBench || (isAgent && (Boolean(step.full) || overflowing))
 
-  // Icon: agent -> sparkles; tool -> tool-specific, swapping to a check/cross
-  // once the result lands so completion reads at a glance.
+  // Icon: benchmark feedback -> gauge; agent -> sparkles; tool -> tool-specific,
+  // swapping to a check/cross once the result lands so completion reads at a glance.
   let Icon
-  if (isAgent) {
+  if (isBench) {
+    Icon = GaugeIcon
+  } else if (isAgent) {
     Icon = SparklesIcon
   } else if (step.state === "ok") {
     Icon = CheckCircle2Icon
@@ -1168,6 +1656,16 @@ function StepRow({ step }) {
   } else {
     Icon = toolIcon(step.tool)
   }
+
+  // The inline row text: benchmark feedback gets a plain-language summary instead
+  // of the raw JSON blob; other agent/tool rows show their label as before.
+  const benchSummary = isBench
+    ? improvements.length
+      ? `Benchmark feedback — ${improvements.length} wiki improvement${
+          improvements.length === 1 ? "" : "s"
+        } to address`
+      : "Benchmark feedback — no wiki gaps found"
+    : null
 
   return (
     <>
@@ -1191,14 +1689,29 @@ function StepRow({ step }) {
           : {})}
       >
         <Icon className="size-3.5 shrink-0 text-muted-foreground" />
-        <Badge
-          variant={isAgent ? "secondary" : "outline"}
-          className={cn(LABEL_CELL, "justify-center")}
-        >
-          {isAgent ? "Agent" : "Tool"}
-        </Badge>
+        {isBench ? (
+          <Badge
+            variant="secondary"
+            className="shrink-0 justify-center whitespace-nowrap"
+          >
+            Benchmark
+          </Badge>
+        ) : (
+          <Badge
+            variant={isAgent ? "secondary" : "outline"}
+            className={cn(LABEL_CELL, "justify-center")}
+          >
+            {isAgent ? "Agent" : "Tool"}
+          </Badge>
+        )}
         <span ref={labelRef} className="min-w-0 flex-1 truncate">
-          {isAgent ? <InlineMarkdown text={step.label} /> : step.label}
+          {isBench ? (
+            benchSummary
+          ) : isAgent ? (
+            <InlineMarkdown text={step.label} />
+          ) : (
+            step.label
+          )}
         </span>
         {/* Right-aligned trailing group: tool outcome, then time. */}
         <div className="flex shrink-0 items-center gap-2">
@@ -1218,7 +1731,12 @@ function StepRow({ step }) {
           component tree even from a portal, so nesting it inside the clickable
           row made the close button re-trigger the row's onClick and reopen it. */}
       {expandable ? (
-        <AgentMessageDialog open={open} onOpenChange={setOpen} text={modalText} />
+        <AgentMessageDialog
+          open={open}
+          onOpenChange={setOpen}
+          text={modalText}
+          improvements={improvements}
+        />
       ) : null}
     </>
   )
@@ -1286,8 +1804,12 @@ function UsagePill({ usage }) {
         <div className="flex flex-col gap-1.5">
           <UsageRow label="Input" value={input} />
           {/* Cache lines are a breakdown of Input (indented), not additive. */}
-          {cacheRead ? <UsageRow sub label="from cache" value={cacheRead} /> : null}
-          {cacheWrite ? <UsageRow sub label="cache writes" value={cacheWrite} /> : null}
+          {cacheRead ? (
+            <UsageRow sub label="from cache" value={cacheRead} />
+          ) : null}
+          {cacheWrite ? (
+            <UsageRow sub label="cache writes" value={cacheWrite} />
+          ) : null}
           {cacheRead || cacheWrite ? (
             <UsageRow sub label="fresh" value={freshInput} />
           ) : null}
@@ -1307,7 +1829,15 @@ function UsagePill({ usage }) {
 // to the bottom on new events only when the user is already pinned there (so
 // scrolling up to read history isn't yanked away). Uses a native overflow div —
 // shadcn ScrollArea exposes no viewport ref, which the auto-follow needs.
-function HarvestFeed({ events, running, aborted, draining = false }) {
+function HarvestFeed({
+  events,
+  running,
+  aborted,
+  draining = false,
+  api,
+  domain,
+  dataset,
+}) {
   const viewportRef = useRef(null)
   const stickRef = useRef(true)
 
@@ -1342,11 +1872,19 @@ function HarvestFeed({ events, running, aborted, draining = false }) {
         // bottom via the viewport-height shell) instead of a fixed max-h cap.
         // py-6: buffer so the first/last rows clear the scroll-fade mask (which
         // dissolves the top/bottom edges) instead of sitting under it at rest.
-        className="okf-thin-scroll scroll-fade-y flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto py-6 pr-1"
+        className="okf-thin-scroll flex min-h-0 flex-1 scroll-fade-y flex-col gap-1 overflow-y-auto py-6 pr-1"
       >
         {rows.map((r) =>
           r.kind === "fleet" ? (
             <FleetRow key={`fleet-${r.batch}`} row={r} />
+          ) : r.kind === "benchmark" ? (
+            <BenchmarkRow
+              key={`bench-${r.iteration}`}
+              row={r}
+              api={api}
+              domain={domain}
+              dataset={dataset}
+            />
           ) : (
             <StepRow key={r.seq} step={r} />
           )

@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 
 import {
+  answerHumanAPI,
   deleteHistoryAPI,
   fetchHistoryAPI,
   prepareAPI,
@@ -37,6 +38,10 @@ export function useChatSession({
   const [chatTurns, setChatTurns] = useState([])
   const [isStreaming, setIsStreaming] = useState(false)
   const [error, setError] = useState(null)
+  // A paused ask_human interrupt awaiting the user: the questions to render as a
+  // QA form in the composer. null when the agent isn't asking. Cleared on submit
+  // (answerHuman), stop, or conversation switch.
+  const [pendingAsk, setPendingAsk] = useState(null)
   // True while a resumed conversation's history is being fetched (drives the
   // skeleton placeholders in the transcript).
   const [loadingHistory, setLoadingHistory] = useState(false)
@@ -228,6 +233,14 @@ export function useChatSession({
               setError(chunk.message || "the agent hit an error")
               return
             }
+            if (chunk.type === "ask_human") {
+              // The agent paused to ask the user. Surface the questions for the
+              // composer's QA form; the run has ended server-side (graph paused at
+              // the checkpoint) and will resume on answerHuman(). Keep the whole
+              // chunk (questions carry per-question interrupt_id for the resume map).
+              setPendingAsk({ questions: chunk.questions || [] })
+              return
+            }
             if (chunk.type === "no_active_stream") {
               onNoActive?.()
               return
@@ -320,6 +333,51 @@ export function useChatSession({
     [appendChunk, consumeStream, ensurePump, finishIfDrained, isStreaming]
   )
 
+  // Submit the user's answers to a paused ask_human interrupt and resume the run.
+  // Continues the SAME turn (no new user bubble): the assistant's answer picks up
+  // where it paused. `answers` is [{ id, answer }] (answer: string | string[]).
+  const answerHuman = useCallback(
+    async (answers) => {
+      const cfg = cfgRef.current
+      if (isStreaming) return
+      setPendingAsk(null)
+      setError(null)
+      netDoneRef.current = false
+      rateRef.current = 0
+      accRef.current = 0
+      setIsStreaming(true)
+
+      const controller = new AbortController()
+      abortRef.current = controller
+      try {
+        const res = await answerHumanAPI({
+          threadId: cfg.threadId,
+          getToken: cfg.getToken,
+          answers,
+          // Same (model, effort, features, scope) as the conversation, so the server
+          // rebuilds the SAME graph the interrupt paused on (model is pinned + its
+          // checkpoint isn't portable across models).
+          model: cfg.model,
+          effort: cfg.effort,
+          features: cfg.features,
+          datasetScope: cfg.datasetScope,
+          signal: controller.signal,
+        })
+        await consumeStream(res, controller)
+      } catch (err) {
+        if (err.name !== "AbortError") {
+          setError(err.message || "failed to submit answers")
+          appendChunk({ end: true })
+          if (abortRef.current === controller) abortRef.current = null
+          netDoneRef.current = true
+          ensurePump()
+          finishIfDrained()
+        }
+      }
+    },
+    [appendChunk, consumeStream, ensurePump, finishIfDrained, isStreaming]
+  )
+
   // Re-attach to a turn that's still streaming server-side (returning to a thread
   // whose answer is in flight). LAZY: it does NOT open a turn or flip streaming up
   // front — a plain refresh of a thread that has NOTHING in flight must look
@@ -363,6 +421,11 @@ export function useChatSession({
             if (opened) setError(chunk.message || "the agent hit an error")
             return
           }
+          if (chunk.type === "ask_human") {
+            ensureTurnOpen()
+            setPendingAsk({ questions: chunk.questions || [] })
+            return
+          }
           if (chunk.end && !opened) return // the settling end for an inactive resume
           ensureTurnOpen()
           if (chunk.type === "user_message") {
@@ -399,11 +462,16 @@ export function useChatSession({
     const cfg = cfgRef.current
     setLoadingHistory(true)
     try {
-      const { history } = await fetchHistoryAPI({
+      const { history, pendingAsk: pending } = await fetchHistoryAPI({
         threadId: cfg.threadId,
         getToken: cfg.getToken,
       })
       if (history.length > 0) setChatTurns(history)
+      // If the conversation is paused at an ask_human interrupt (durable in the
+      // checkpoint), restore the QA form so a page reload can still answer it.
+      if (pending && Array.isArray(pending.questions) && pending.questions.length) {
+        setPendingAsk(pending)
+      }
     } catch {
       // A missing/unreadable history just means an empty conversation — fine.
     } finally {
@@ -447,6 +515,7 @@ export function useChatSession({
     setError(null)
     setIsStreaming(false)
     setLoadingHistory(false)
+    setPendingAsk(null)
   }, [threadId, cancelPump])
 
   // Cancel any pending frame on unmount so the pump never fires post-teardown.
@@ -457,7 +526,9 @@ export function useChatSession({
     isStreaming,
     error,
     loadingHistory,
+    pendingAsk,
     send,
+    answerHuman,
     stop,
     resume,
     prepare,

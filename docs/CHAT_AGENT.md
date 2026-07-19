@@ -45,7 +45,9 @@ consumption tools internally.
 
 - No write path to bundles (the agent is read-only over the wiki; annotations
   remain the existing feedback mechanism).
-- No human-in-the-loop interrupts / tool approval (AG-UI supports it; deferred).
+- ~~No human-in-the-loop interrupts~~ — SUPERSEDED: `ask_human` clarifying
+  questions are a middleware-owned interrupt, see §14d. (Tool APPROVAL is still
+  out of scope.)
 - No cross-user or shared conversations.
 
 ---
@@ -644,6 +646,69 @@ switch. The model is told **not** to hard-code colors, so charts stay on-brand i
 both themes. Supported types: `bar`, `line`, `area`, `pie`, `doughnut`, `radar`,
 `scatter`. No new env, no infra change, no new runtime dependency (server-side the
 tool is pure `langchain_core`).
+
+## 14d. Clarifying questions (`ask_human`) — human-in-the-loop interrupt — BUILT
+
+The agent can pause and ask the user clarifying questions when a request is
+genuinely ambiguous or hinges on a decision only the user can make (which of two
+same-named metrics, whether to include cancelled orders, an unstated grain/format).
+The `<asking_the_user>` prompt block tells it to do this sparingly — resolve from
+the wiki first, batch questions into ONE call, and prefer a brief stated assumption
+over interrupting.
+
+**The middleware owns the interrupt, not the tool.** `ask_human` (`chat/ask_human.py`)
+is an inert `StructuredTool` — its only arg is `questions`, a list of
+`{id, prompt, kind, options?}` where `kind` ∈ `single` | `multi` | `text`. It's
+always on (like `render_chart`, no deploy flag / opt-in). `AskHumanMiddleware`
+(`chat/ask_human_middleware.py`) intercepts the call in `awrap_tool_call`, validates
++ normalizes the questions, and raises LangGraph `interrupt(payload)` — so the graph
+checkpoints and stops. This is the SAME interrupt pattern §14c sketched for charts
+(verified on the installed langgraph/langchain), applied for real here: one call →
+one pending interrupt; a malformed call returns an error ToolMessage instead of
+interrupting, so the model can re-issue.
+
+**Protocol.** After the astream loop, the server builds the `ask_human` chunk from
+the graph's **checkpoint state** (`_ask_human_chunk_from_state`), NOT from the raw
+`__interrupt__` stream updates (which are dropped). This is deliberate: the state
+carries every pending `Interrupt` object *with its `id`*, and langgraph REQUIRES
+the id-keyed `Command(resume={interrupt_id: value})` map form to resume when more
+than one interrupt is pending (a bare resume value raises `RuntimeError`). If the
+model emits several `ask_human` calls in one turn (against the "batch into ONE"
+instruction), all pending interrupts are consolidated into a single chunk; each
+question is tagged with its owning `interrupt_id`. The run then ends (graph paused
+at the checkpoint — durable in DynamoDB, survives a VM recycle).
+
+A new request type **`answer_human`** (`answer_run`) resumes with
+`Command(resume={interrupt_id: answers})` built by `_build_resume_map` from the
+answers' `interrupt_id` tags — deliberately DISTINCT from the existing `resume`
+type, which only re-subscribes to a still-streaming run (§8). Two guards: (a) if the
+graph has NO pending interrupt (double-submit, stale UI, already-resumed run),
+`_build_resume_map` returns None and the run ends cleanly rather than injecting a
+phantom fresh turn; (b) `answer_human` carries the conversation's
+model/effort/features/scope so `build_agent` rebuilds the **same** graph the
+interrupt paused on (the model is pinned per conversation and its checkpoint is not
+portable across models) — and it does NOT touch the sidebar index (that would
+overwrite the pinned model/effort with defaults). The middleware's `interrupt(...)`
+call returns the routed answers, which it folds into the `ask_human` tool result the
+model reads to continue. Answers are `[{id, answer, interrupt_id?}]` where `answer`
+is a string (single/text) or string[] (multi), normalized by `normalize_answers`.
+
+**Question kinds + the "Other" rule.** `single` → radio (pick one); `multi` →
+checkboxes (pick any); `text` → free prose (no options). For `single`/`multi` the
+UI ALWAYS adds an "Other (type your own)" free-text choice (payload `allow_other`),
+so the user is never boxed into the model's options; `text` needs no such option.
+
+**UI (`ui/`).** The `ask_human` chunk sets `pendingAsk` on `useChatSession` and
+ends the stream; the composer (`ChatInput`) expands vertically into the
+`AskHumanForm` — one question at a time (Back/Next, Submit on the last), native
+radio/checkbox/textarea styled to the palette. Submit calls `answerHuman(answers)`
+→ `answerHumanAPI` (`answer_human`), which resumes the SSE and continues the SAME
+turn (no new user bubble). `pendingAsk` clears on submit, stop, or conversation
+switch. **Reload-safe:** the interrupt is durable in the checkpoint, so
+`read_history` (get_session_history) also returns `pending_ask` when the graph is
+paused; `loadHistory` restores it, so a page refresh re-renders the QA form and the
+user can still answer later. No new env, no infra change; server-side pure
+`langchain_core` + `langgraph`.
 
 ## 15. Open items / risks
 
