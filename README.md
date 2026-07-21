@@ -21,6 +21,8 @@ The bundles are Open Knowledge Format (OKF) bundles — a bundle is a directory 
 
 ---
 
+![Demo](./assets/data-wiki.gif)
+
 ## Features
 
 - **Automated Induction** - An AI agent reads your Glue catalog, samples real data, and authors a knowledge bundle describing tables, joins, metrics, and known issues.
