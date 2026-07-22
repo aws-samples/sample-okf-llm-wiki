@@ -40,9 +40,9 @@ const ICONS = {
   grep: TextSearchIcon,
   // run_sql = a live query against the catalog (terminal/prompt glyph)
   run_sql: TerminalIcon,
-  // render_chart is normally lifted into its own inline chart block (see
-  // buildMessageBlocks), so it rarely renders as a tool card — but keep an icon +
-  // label so an edge case (e.g. a raw tool listing) doesn't fall through to raw.
+  // render_chart is lifted into its own inline chart block and never appears in
+  // the timeline (see buildMessageBlocks) — but keep an icon + label so an edge
+  // case (e.g. a raw tool listing) doesn't fall through to raw.
   render_chart: BarChart3Icon,
 }
 
@@ -273,10 +273,9 @@ export function parseToolResult(toolName, rawContent) {
       }
     }
     case "render_chart": {
-      // The chart itself renders as its own block below the reasoning; in the
-      // timeline it's a LABEL-ONLY step (no expandable body — the ack the tool
-      // returns is just "rendered", nothing worth disclosing). kind:"none" → the
-      // step shows its label with no chevron/detail.
+      // Unreachable in practice: the chart renders as its own block and never
+      // enters the timeline (see buildMessageBlocks). Kept as a safe fallback —
+      // label only, no expandable body (the ack is just "rendered").
       return { summary: "", kind: "none" }
     }
     case "run_sql": {

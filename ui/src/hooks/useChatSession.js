@@ -64,8 +64,11 @@ export function useChatSession({
   // lurching. The rate is a low-pass-filtered function of the backlog (so it
   // eases up/down instead of snapping between fast and slow — that snapping is
   // what caused the burst-then-pause feel), with a fractional accumulator so
-  // sub-1-char/frame speeds work (e.g. 1 char every other frame). Non-text chunks
-  // (think / tool / end / error) pass through in order, promptly.
+  // sub-1-char/frame speeds work (e.g. 1 char every other frame). Reasoning
+  // (`think`) is metered like answer text: both providers stream reasoning as
+  // SUMMARIES emitted only when a raw-thinking segment completes, so the chunks
+  // arrive in paragraph-sized bursts that would otherwise pop in all at once.
+  // Other chunks (tool / end / error) pass through in order, promptly.
   const queueRef = useRef([]) // chunks awaiting reveal (FIFO)
   const rafRef = useRef(null)
   const netDoneRef = useRef(false) // network stream finished (still may be revealing)
@@ -81,10 +84,14 @@ export function useChatSession({
   const REVEAL_MAX = 6 // ≈360 chars/s ceiling
   const SMOOTH = 0.08 // rate low-pass factor
 
+  // Chunks the pump reveals char-by-char (answer text + reasoning summary).
+  const metered = (c) =>
+    (c.type === "text" || c.type === "think") && typeof c.content === "string"
+
   const pendingChars = () => {
     let n = 0
     for (const c of queueRef.current) {
-      if (c.type === "text" && typeof c.content === "string") n += c.content.length
+      if (metered(c)) n += c.content.length
     }
     return n
   }
@@ -122,7 +129,7 @@ export function useChatSession({
     const emit = []
     while (q.length > 0) {
       const head = q[0]
-      if (head.type === "text" && typeof head.content === "string") {
+      if (metered(head)) {
         if (budget <= 0) break
         if (head.content.length <= budget) {
           emit.push(head)
@@ -136,7 +143,7 @@ export function useChatSession({
           break
         }
       } else {
-        // Non-text (think / tool / end / error): pass through in order, free.
+        // Non-metered (tool / end / error): pass through in order, free.
         emit.push(head)
         q.shift()
       }

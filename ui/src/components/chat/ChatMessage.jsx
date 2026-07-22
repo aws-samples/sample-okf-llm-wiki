@@ -48,7 +48,7 @@ function blockSig(block) {
 // its own content changes — not when a sibling block streams. During a stream
 // only the last (growing) block re-parses; earlier blocks are skipped.
 const Block = memo(
-  function Block({ block, complete, datasetScope }) {
+  function Block({ block, complete, live, datasetScope }) {
     if (block.type === "think") {
       return (
         <UnifiedThinkingBlock
@@ -58,15 +58,17 @@ const Block = memo(
       )
     }
     // A chart the agent produced — rendered in a sandboxed iframe (ChartFrame owns
-    // all the confinement). Its code arrives whole on the tool call, so it renders
-    // as soon as the block appears, even mid-stream.
+    // all the confinement). Its code arrives whole on the tool call; `live` (the
+    // turn is streaming) drives ChartFrame's generating-animation → reveal, which
+    // ChartFrame captures at mount — so history-loaded charts plot immediately.
     if (block.type === "chart") {
-      return <ChartFrame code={block.code} title={block.title} />
+      return <ChartFrame code={block.code} title={block.title} live={live} />
     }
     return <Markdown datasetScope={datasetScope}>{block.content}</Markdown>
   },
   (prev, next) =>
     prev.complete === next.complete &&
+    prev.live === next.live &&
     prev.datasetScope === next.datasetScope &&
     blockSig(prev.block) === blockSig(next.block)
 )
@@ -132,6 +134,7 @@ function ChatMessageImpl({ turn, streaming, datasetScope }) {
                 key={key}
                 block={block}
                 complete={complete}
+                live={streaming}
                 datasetScope={datasetScope}
               />
             )
