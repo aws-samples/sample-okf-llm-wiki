@@ -307,13 +307,36 @@ function CompletionStep() {
   )
 }
 
-// The header label mirrors Sparky: current activity while streaming, settled
-// state when done. While a tool runs, reflect it (e.g. "Searching “races”").
-function headerLabel(steps, isComplete) {
+// Word cap for the reasoning-preview header.
+const HEADER_MAX_WORDS = 15
+
+// The opening words of the newest reasoning text, stripped of markdown
+// decoration so they read as a plain label ("**Planning** the query" →
+// "Planning the query"). Walks segments newest-first so a just-opened (still
+// empty) segment falls back to the previous one; "Reasoning" only when the
+// step has no text at all yet.
+function reasoningPreview(step) {
+  for (let i = step.segments.length - 1; i >= 0; i--) {
+    const text = (step.segments[i]?.content || "")
+      .replace(/[*_`#>]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+    if (!text) continue
+    const words = text.split(" ")
+    const head = words.slice(0, HEADER_MAX_WORDS).join(" ")
+    return words.length > HEADER_MAX_WORDS ? `${head}…` : head
+  }
+  return "Reasoning"
+}
+
+// The header label mirrors the LAST step of the timeline: the current activity
+// while streaming, the settled final step once done. A tool step shows its
+// label (e.g. "Queried “SELECT …”"); a reasoning step shows the opening words
+// of its newest text instead of a static "Reasoning".
+function headerLabel(steps) {
   if (steps.length === 0) return "Reasoning"
   const last = steps[steps.length - 1]
-  if (isComplete) return "Reasoning"
-  if (last.type === "thinking") return "Reasoning"
+  if (last.type === "thinking") return reasoningPreview(last)
   return toolLabel(last.toolName, last.toolInput, !last.isToolComplete)
 }
 
@@ -344,10 +367,7 @@ export function UnifiedThinkingBlock({ contentBlocks = [], isGroupComplete = fal
     [contentKey]
   )
 
-  const label = useMemo(
-    () => headerLabel(mergedSteps, isGroupComplete),
-    [mergedSteps, isGroupComplete]
-  )
+  const label = useMemo(() => headerLabel(mergedSteps), [mergedSteps])
 
   const toggle = useCallback(() => setExpanded((v) => !v), [])
 

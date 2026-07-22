@@ -408,6 +408,49 @@
   }
 }
 
+/* Chart "generating" placeholder (ChartFrame) — a ghost bar chart breathing:
+   a centered row of thin primary-tinted bars anchored to a common baseline
+   (no axes — just the bars floating in the footprint); each bar slowly rises
+   and falls (scaleY from the bottom) on its own duration/phase (set inline).
+   Paused (frozen mid-breath) unless .is-active, mirroring the agent avatar's
+   freeze-don't-reset behavior. */
+.okf-chart-breathe {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 90%;
+  height: 80%;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-evenly;
+}
+.okf-chart-breathe > span {
+  flex: none;
+  width: 30px;
+  border-radius: 3px 3px 0 0;
+  /* Light mode: a light wash of primary. Dark mode (below): dimmer still. */
+  background: color-mix(in oklch, var(--primary) 16%, transparent);
+  transform-origin: bottom;
+  animation: okf-chart-breathe 2.4s ease-in-out infinite;
+  animation-play-state: paused;
+}
+.dark .okf-chart-breathe > span {
+  background: color-mix(in oklch, var(--primary) 22%, transparent);
+}
+.okf-chart-breathe.is-active > span {
+  animation-play-state: running;
+}
+@keyframes okf-chart-breathe {
+  0%, 100% { transform: scaleY(0.55); }
+  50% { transform: scaleY(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .okf-chart-breathe > span {
+    animation: none;
+  }
+}
+
 /* Reasoning-effort slider — dotted track + a larger round thumb (the "Faster ↔
    Smarter" control in the chat composer's Effort popover). Overrides the shadcn
    Slider's thin bar: the track becomes a taller pill with a repeating-dot mask so

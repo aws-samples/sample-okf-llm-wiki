@@ -23,10 +23,11 @@
 // Charts rebuild when the theme changes (the text/axis colors differ light vs
 // dark) — driven by a MutationObserver on the <html> `dark` class (see below).
 
-import { AlertTriangleIcon, BarChart3Icon } from "lucide-react"
+import { AlertTriangleIcon } from "lucide-react"
 import { Component, useEffect, useMemo, useRef, useState } from "react"
 
 import { buildChartSrcdoc, resolveChartPalette } from "@/lib/chartIframe"
+import { cn } from "@/lib/utils"
 
 // A compact, INLINE error note shown when a chart can't render (bad code, bad
 // spec, or a frame-build failure). Kept chrome-light (no card/border) to match the
@@ -79,11 +80,77 @@ function readResolvedTheme() {
   return document.documentElement.classList.contains("dark") ? "dark" : "light"
 }
 
-function ChartFrameInner({ code, title }) {
+// The "generating" placeholder shown before the chart reveals: a ghost bar
+// chart breathing — faint axes and a handful of primary-tinted bars that
+// slowly rise and fall, each on its own rhythm (.okf-chart-breathe in
+// index.css). Absolutely positioned over the (still invisible) iframe so the
+// reveal is an in-place cross-fade, not a layout jump; the bars freeze
+// mid-breath as the placeholder fades out.
+//
+// Hand-tuned like the avatar's DOTS table: each bar's resting height (% of the
+// ghost plot area), breath duration, and starting phase. The phase becomes a
+// NEGATIVE animation-delay, so even the frozen (paused) field reads as varied
+// bar heights, never a flat row.
+const BREATHE_BARS = [
+  { h: 66, dur: 2.4, phase: 0.55 },
+  { h: 46, dur: 2.3, phase: 0.1 },
+  { h: 72, dur: 2.7, phase: 0.45 },
+  { h: 58, dur: 2.1, phase: 0.75 },
+  { h: 86, dur: 2.9, phase: 0.25 },
+  { h: 64, dur: 2.5, phase: 0.6 },
+  { h: 50, dur: 2.2, phase: 0.9 },
+  { h: 78, dur: 2.6, phase: 0.35 },
+]
+
+function ChartGenerating({ active }) {
+  return (
+    <div
+      className="pointer-events-none absolute inset-0 transition-opacity duration-500"
+      style={{ opacity: active ? 1 : 0 }}
+      aria-hidden="true"
+    >
+      <div className={cn("okf-chart-breathe", active && "is-active")}>
+        {BREATHE_BARS.map((b, i) => (
+          <span
+            key={i}
+            style={{
+              height: `${b.h}%`,
+              animationDuration: `${b.dur}s`,
+              animationDelay: `${(-(b.phase * b.dur)).toFixed(2)}s`,
+            }}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// How long the generating animation holds on a LIVE turn before the chart is
+// allowed to reveal. The code arrives whole and the frame draws in tens of ms,
+// so without this beat the skeleton would just flash.
+const MIN_GENERATING_MS = 900
+
+function ChartFrameInner({ code, title, live }) {
   const iframeRef = useRef(null)
-  const [height, setHeight] = useState(280)
+  // Default matches what the frame will report (#chartbox 340px + 8px wrap
+  // padding, see chartIframe.js) so the placeholder footprint == the reveal.
+  const [height, setHeight] = useState(348)
   const [status, setStatus] = useState("loading") // loading | ok | error
   const [errorMsg, setErrorMsg] = useState(null)
+
+  // "Theater" = this chart mounted mid-generation (a live streaming turn). Only
+  // then does the generating grid show and hold for its minimum beat; a
+  // history-loaded chart (live=false at mount) renders NO placeholder at all —
+  // just the reserved space, with the chart fading in when its frame reports ok.
+  // Mount-time capture on purpose — `live` flipping later (turn finishing) must
+  // not add or remove the theater mid-hold.
+  const [theater] = useState(() => Boolean(live))
+  const [minElapsed, setMinElapsed] = useState(() => !live)
+  useEffect(() => {
+    if (minElapsed) return undefined
+    const t = setTimeout(() => setMinElapsed(true), MIN_GENERATING_MS)
+    return () => clearTimeout(t)
+  }, [minElapsed])
 
   // The chart's TEXT/axis/grid colors are resolved from the app theme tokens
   // (--foreground/--border) at srcdoc-build time, so the frame must REBUILD when
@@ -171,31 +238,39 @@ function ChartFrameInner({ code, title }) {
     return <ChartError title={title} message={errorMsg} />
   }
 
+  // Revealed = the frame has drawn AND the live minimum beat has passed. The
+  // wrapper reserves the chart's footprint (the frame's reported height; 348
+  // default) from the very start, so the generating grid sits exactly where
+  // the chart will plot and the reveal is a cross-fade — no layout jump.
+  const showChart = status === "ok" && minElapsed
+
   return (
     // Inline with the answer — no card/border/background. The frame body is
     // transparent (see chartIframe.js), so the chart sits directly on the chat
     // surface like a paragraph, not a contained widget. Just vertical rhythm.
-    <div className="my-3">
-      {status === "loading" ? (
-        <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
-          <BarChart3Icon className="size-4 animate-pulse" />
-          <span>Rendering {title ? `"${title}"` : "chart"}…</span>
-        </div>
-      ) : null}
+    <div
+      className="relative my-3"
+      style={{ height: `${height}px`, transition: "height 0.4s ease" }}
+    >
+      {theater ? <ChartGenerating active={!showChart} /> : null}
       <iframe
         ref={iframeRef}
         title={title || "chart"}
         sandbox="allow-scripts"
         srcDoc={srcDoc}
         loading="lazy"
-        // Hidden until the frame reports ok, so the loading row doesn't jump.
+        // Kept mounted at full size (it must load + draw to report ok) but
+        // transparent until reveal; the placeholder floats above it meanwhile.
         style={{
           width: "100%",
-          height: status === "ok" ? `${height}px` : 0,
+          height: "100%",
           border: "0",
           display: "block",
           background: "transparent",
           colorScheme: "normal",
+          opacity: showChart ? 1 : 0,
+          transform: showChart ? "none" : "translateY(6px) scale(0.99)",
+          transition: "opacity 0.5s ease, transform 0.5s ease",
         }}
       />
     </div>
@@ -204,13 +279,15 @@ function ChartFrameInner({ code, title }) {
 
 // Public component: the boundary-wrapped chart frame. `code`/`title` come straight
 // from the render_chart tool call's args (see buildMessageBlocks chart block).
-export function ChartFrame({ code, title }) {
+// `live` = the block appeared mid-stream (drives the generating-animation hold);
+// history-loaded charts pass false and plot immediately.
+export function ChartFrame({ code, title, live = false }) {
   if (!code || typeof code !== "string") {
     return <ChartError title={title} message="chart had no code to run" />
   }
   return (
     <ChartBoundary title={title}>
-      <ChartFrameInner code={code} title={title} />
+      <ChartFrameInner code={code} title={title} live={live} />
     </ChartBoundary>
   )
 }

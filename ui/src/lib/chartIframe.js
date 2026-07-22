@@ -160,9 +160,24 @@ function helperSource() {
     var series = spec.series || [];
     if (!Array.isArray(series) || series.length === 0) throw new Error("chart spec needs a non-empty 'series' array");
 
+    // shadcn-style axes: NO axis border lines, NO y tick labels (values live in
+    // the tooltip), only faint horizontal gridlines; x labels in muted gray.
     var scalesLinear = {
-      x: { title: spec.xLabel ? { display: true, text: spec.xLabel } : { display: false }, stacked: !!spec.stacked, grid: { display: false } },
-      y: { title: spec.yLabel ? { display: true, text: spec.yLabel } : { display: false }, stacked: !!spec.stacked, beginAtZero: true, grid: { color: gridColor(0.22) } }
+      x: {
+        title: spec.xLabel ? { display: true, text: spec.xLabel } : { display: false },
+        stacked: !!spec.stacked,
+        grid: { display: false },
+        border: { display: false },
+        ticks: { color: rgb(P.mutedForeground || "115,115,115") }
+      },
+      y: {
+        title: spec.yLabel ? { display: true, text: spec.yLabel } : { display: false },
+        stacked: !!spec.stacked,
+        beginAtZero: true,
+        grid: { color: gridColor(0.14) },
+        border: { display: false },
+        ticks: { display: false }
+      }
     };
 
     if (type === "pie" || type === "doughnut") {
@@ -199,7 +214,10 @@ function helperSource() {
                    backgroundColor: rgb(seriesColor(i), 0.2), borderColor: rgb(seriesColor(i)), borderWidth: 2,
                    pointBackgroundColor: rgb(seriesColor(i)) };
         }) },
-        options: { scales: { r: { grid: { color: gridColor(0.25) }, angleLines: { color: gridColor(0.25) } } } }
+        // Radial tick labels (the backdropped numbers up the first spoke) are
+        // hidden like the y-axis: values live in the tooltip. Point labels
+        // (the category names around the web) stay.
+        options: { scales: { r: { grid: { color: gridColor(0.16) }, angleLines: { color: gridColor(0.16) }, ticks: { display: false } } } }
       };
     }
 
@@ -342,7 +360,7 @@ export function buildChartSrcdoc({ code, palette, fontFamily }) {
 <style>
   html, body { margin: 0; padding: 0; background: transparent; }
   #wrap { padding: 4px 2px; box-sizing: border-box; }
-  #chartbox { position: relative; width: 100%; height: 260px; }
+  #chartbox { position: relative; width: 100%; height: 340px; }
   body { font-family: ${family}; -webkit-font-smoothing: antialiased; }
   canvas { max-width: 100%; }
 </style>

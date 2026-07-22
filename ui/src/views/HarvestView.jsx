@@ -65,6 +65,13 @@ import {
 import { CopyButton } from "@/components/ui/copy-button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet"
+import {
   Card,
   CardContent,
   CardDescription,
@@ -559,11 +566,21 @@ export default function HarvestView({ api, selection }) {
               variant="outline"
               size="icon"
               onClick={() => setSettingsOpen(true)}
-              disabled={running || starting}
-              title="Harvest settings (model + reasoning effort)"
+              title="Harvest settings (model + dataset guidance)"
               aria-label="Harvest settings"
+              // Always clickable — dataset guidance lives in the panel now and
+              // must stay editable mid-run; only the model selects lock inside.
+              className="relative"
             >
               <SlidersHorizontalIcon className="size-4" />
+              {guidance?.guidance_dirty ? (
+                // Guidance edited but not yet applied — surface the pending
+                // state on the (otherwise opaque) settings button.
+                <span
+                  className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-amber-500"
+                  aria-hidden="true"
+                />
+              ) : null}
             </Button>
             {running ? (
               <Button
@@ -634,13 +651,20 @@ export default function HarvestView({ api, selection }) {
               </ButtonGroup>
             )}
           </div>
-          <HarvestSettingsDialog
+          <HarvestSettingsSheet
             open={settingsOpen}
             onOpenChange={setSettingsOpen}
             model={model}
             effort={effort}
             onModelChange={onModelChange}
             onEffortChange={setEffort}
+            locked={running || starting}
+            guidance={guidance}
+            guidanceDraft={guidanceDraft}
+            onGuidanceDraftChange={setGuidanceDraft}
+            guidanceLoading={guidanceLoading}
+            savingGuidance={savingGuidance}
+            onSaveGuidance={saveGuidance}
           />
           <Dialog open={confirmFullOpen} onOpenChange={setConfirmFullOpen}>
             <DialogContent>
@@ -705,57 +729,6 @@ export default function HarvestView({ api, selection }) {
                     <CircleDashedIcon />
                     not ready
                   </Badge>
-                )}
-              </div>
-
-              {/* Dataset guidance — shared authoring instructions that steer every
-                  harvest. Edit + Save persists it (goes DIRTY); the next full
-                  harvest, or an "Apply annotations + guidance" re-harvest, applies
-                  it and clears dirty. */}
-              <div className="rounded-lg border bg-muted/20 p-3">
-                <div className="mb-1.5 flex items-center gap-2">
-                  <SparklesIcon className="size-4 text-muted-foreground" />
-                  <span className="text-sm font-medium">Dataset guidance</span>
-                  {guidance?.guidance_dirty ? (
-                    <Badge
-                      variant="outline"
-                      className="border-amber-500/50 text-amber-600 dark:text-amber-400"
-                    >
-                      pending re-harvest
-                    </Badge>
-                  ) : guidance?.guidance ? (
-                    <Badge variant="outline">
-                      <CheckCircle2Icon />
-                      applied
-                    </Badge>
-                  ) : null}
-                </div>
-                {guidanceLoading ? (
-                  <Skeleton className="h-20 w-full" />
-                ) : (
-                  <>
-                    <Textarea
-                      value={guidanceDraft}
-                      onChange={(e) => setGuidanceDraft(e.target.value)}
-                      placeholder="Add dataset-specific authoring guidance…"
-                      className="min-h-20 resize-y text-sm"
-                      disabled={savingGuidance}
-                    />
-                    <div className="mt-2 flex items-center justify-end gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={saveGuidance}
-                        disabled={
-                          savingGuidance ||
-                          guidanceDraft === (guidance?.guidance || "")
-                        }
-                      >
-                        {savingGuidance ? <Spinner /> : null}
-                        Save guidance
-                      </Button>
-                    </div>
-                  </>
                 )}
               </div>
 
@@ -1525,22 +1498,34 @@ function AgentMessageDialog({ open, onOpenChange, text, improvements }) {
   )
 }
 
-// Per-harvest model + reasoning-effort picker. The options come from the
-// Terraform-provided catalog (MODEL_CATALOG); the effort list is model-specific
-// and re-derived each render so switching models shows only that model's efforts.
-function HarvestSettingsDialog({
+// Per-harvest settings panel — a FLOATING right sheet (inset + rounded, like
+// the app's floating sidebar) merging the model/effort picker with the dataset
+// guidance editor. Model options come from the Terraform-provided catalog
+// (MODEL_CATALOG); the effort list is model-specific and re-derived each render.
+// Guidance stays editable even mid-run (`locked` only freezes model/effort,
+// which are read at harvest start): edit + Save persists it (goes DIRTY); the
+// next full harvest, or an "Apply annotations + guidance" re-harvest, applies
+// it and clears dirty.
+function HarvestSettingsSheet({
   open,
   onOpenChange,
   model,
   effort,
   onModelChange,
   onEffortChange,
+  locked,
+  guidance,
+  guidanceDraft,
+  onGuidanceDraftChange,
+  guidanceLoading,
+  savingGuidance,
+  onSaveGuidance,
 }) {
   const efforts = effortsFor(model)
-  // The Select dropdown portals OUTSIDE DialogContent, so clicking an item (or
-  // the dropdown's own outside-click) looks like an "interact outside" to the
-  // Dialog and would close the whole modal. Ignore dismissal events that
-  // originate from a Select popup so only a real outside click closes the modal.
+  // The Select dropdown portals OUTSIDE the sheet, so clicking an item (or the
+  // dropdown's own outside-click) looks like an "interact outside" and would
+  // close the whole panel. Ignore dismissal events that originate from a Select
+  // popup so only a real outside click closes it.
   const keepOpenOnSelectInteraction = (e) => {
     const t = e.target
     if (t instanceof Element && t.closest("[data-slot='select-content']")) {
@@ -1548,25 +1533,30 @@ function HarvestSettingsDialog({
     }
   }
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        className="sm:max-w-md"
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent
+        side="right"
+        // Floating mode: inset from the viewport edges with rounded corners
+        // (data-side variants so they win over the flush inset-y-0/right-0 the
+        // base sheet sets for side="right").
+        className="rounded-2xl border shadow-lg data-[side=right]:inset-y-3 data-[side=right]:right-3 data-[side=right]:h-auto data-[side=right]:sm:max-w-md"
         onPointerDownOutside={keepOpenOnSelectInteraction}
         onInteractOutside={keepOpenOnSelectInteraction}
       >
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
+        <SheetHeader>
+          <SheetTitle className="flex items-center gap-2">
             <SlidersHorizontalIcon className="size-4" />
             Harvest settings
-          </DialogTitle>
-          <DialogDescription>
-            Choose the model and reasoning effort for the next harvest.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="flex flex-col gap-4">
+          </SheetTitle>
+          <SheetDescription>
+            Model and reasoning effort for the next harvest, plus the guidance
+            that steers this dataset&apos;s authoring.
+          </SheetDescription>
+        </SheetHeader>
+        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 pb-6">
           <div className="flex flex-col gap-2">
             <Label htmlFor="harvest-model">Model</Label>
-            <Select value={model} onValueChange={onModelChange}>
+            <Select value={model} onValueChange={onModelChange} disabled={locked}>
               <SelectTrigger id="harvest-model" className="w-full">
                 <SelectValue placeholder="Select a model..." />
               </SelectTrigger>
@@ -1583,7 +1573,7 @@ function HarvestSettingsDialog({
           </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="harvest-effort">Reasoning effort</Label>
-            <Select value={effort} onValueChange={onEffortChange}>
+            <Select value={effort} onValueChange={onEffortChange} disabled={locked}>
               <SelectTrigger id="harvest-effort" className="w-full">
                 <SelectValue placeholder="Select an effort..." />
               </SelectTrigger>
@@ -1598,14 +1588,67 @@ function HarvestSettingsDialog({
               </SelectContent>
             </Select>
           </div>
+          {locked ? (
+            <p className="text-xs text-muted-foreground">
+              A harvest is in flight — model and effort unlock when it finishes.
+            </p>
+          ) : null}
+
+          <Separator />
+
+          <div className="flex min-h-0 flex-col gap-2">
+            <div className="flex items-center gap-2">
+              <SparklesIcon className="size-4 text-muted-foreground" />
+              <span className="text-sm font-medium">Dataset guidance</span>
+              {guidance?.guidance_dirty ? (
+                <Badge
+                  variant="outline"
+                  className="border-amber-500/50 text-amber-600 dark:text-amber-400"
+                >
+                  pending re-harvest
+                </Badge>
+              ) : guidance?.guidance ? (
+                <Badge variant="outline">
+                  <CheckCircle2Icon />
+                  applied
+                </Badge>
+              ) : null}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Shared authoring instructions applied by the next full harvest or
+              an &quot;Apply annotations + guidance&quot; re-harvest.
+            </p>
+            {guidanceLoading ? (
+              <Skeleton className="h-32 w-full" />
+            ) : (
+              <>
+                <Textarea
+                  value={guidanceDraft}
+                  onChange={(e) => onGuidanceDraftChange(e.target.value)}
+                  placeholder="Add dataset-specific authoring guidance…"
+                  className="min-h-40 resize-y text-sm"
+                  disabled={savingGuidance}
+                />
+                <div className="flex items-center justify-end">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onSaveGuidance}
+                    disabled={
+                      savingGuidance ||
+                      guidanceDraft === (guidance?.guidance || "")
+                    }
+                  >
+                    {savingGuidance ? <Spinner /> : null}
+                    Save guidance
+                  </Button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
-        <DialogFooter>
-          <DialogClose asChild>
-            <Button type="button">Done</Button>
-          </DialogClose>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+      </SheetContent>
+    </Sheet>
   )
 }
 
