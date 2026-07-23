@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="32" height="32">
+  <!-- Data wiki knowledge cube; matches ui/src/components/WikiCubeIcon.jsx
+       (isometric faces inset toward their centroid, INSET 0.9, so thin seams
+       separate them). currentColor can't reach a favicon, so the app's
+       "primary" token is baked as a concrete hex; a media query swaps to the
+       dark-mode primary so the mark stays legible on dark browser chrome.
+       NOTE: XML comments must not contain "- -" (double ASCII hyphen), so no
+       CSS var names in here; Firefox rejects the whole SVG otherwise. -->
+  <style>
+    .cube { fill: #007595; }
+    @media (prefers-color-scheme: dark) { .cube { fill: #108db1; } }
+  </style>
+  <polygon class="cube" opacity="1"    points="12.000,3.450 19.200,7.500 12.000,11.550 4.800,7.500" />
+  <polygon class="cube" opacity="0.65" points="12.400,12.225 19.600,8.175 19.600,16.275 12.400,20.325" />
+  <polygon class="cube" opacity="0.4"  points="4.400,8.175 11.600,12.225 11.600,20.325 4.400,16.275" />
+</svg>

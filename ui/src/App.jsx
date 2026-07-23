@@ -136,7 +136,7 @@ function LoginScreen({ onSignIn }) {
       <Card className="w-full max-w-sm">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <WikiCubeIcon className="size-6" />
+            <WikiCubeIcon className="size-6 text-primary" />
             Data wiki
           </CardTitle>
           <CardDescription>
