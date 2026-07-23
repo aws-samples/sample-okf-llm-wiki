@@ -116,3 +116,12 @@ output "chat_scope" {
 output "cognito_token_endpoint" {
   value = "https://${aws_cognito_user_pool_domain.domain.domain}.auth.${var.region}.amazoncognito.com/oauth2/token"
 }
+
+
+output "chat_checkpoint_bucket" {
+  value = aws_s3_bucket.chat_checkpoints.bucket
+}
+
+output "chat_checkpoint_bucket_arn" {
+  value = aws_s3_bucket.chat_checkpoints.arn
+}

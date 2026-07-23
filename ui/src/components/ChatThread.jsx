@@ -153,7 +153,25 @@ export function ChatThread({
       if (!viewportH) return // don't advance prevCount; retry when height lands
       // Freeze the tail's reserved height at THIS moment (won't move as the
       // composer grows while typing) — enough for the question to pin near top.
-      setTailMinH(Math.max(viewportH - 132, 0))
+      // Measure the viewport LIVE here, not via viewportH state: with a
+      // MULTI-LINE draft the composer is tall at send time (transcript short),
+      // and the ResizeObserver's post-send update hasn't landed yet — a reserve
+      // frozen from that stale height is too small once the composer collapses
+      // back to one row, and the pin falls short. The child ChatInput has
+      // already reset by the time this parent layout effect runs (its resize is
+      // a layout effect), so clientHeight is the settled, post-collapse height.
+      const vh = viewportRef.current?.clientHeight || viewportH
+      const h = Math.max(vh - 132, 0)
+      setTailMinH(h)
+      // Apply the reserve to the DOM NOW, not on the next render: scrollTo
+      // clamps its target against scrollHeight at CALL time, and the state
+      // update above hasn't reached the DOM yet — without the reserve in place
+      // the pin falls short whenever the transcript is still shallow (the
+      // "sometimes the question doesn't scroll up" flakiness). The re-render
+      // then just confirms the same value.
+      if (lastTurnRef.current) {
+        lastTurnRef.current.style.minHeight = `${h}px`
+      }
       scrollLastTurnToTop(true)
     }
     prevCountRef.current = count

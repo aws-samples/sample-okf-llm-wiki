@@ -196,12 +196,34 @@ export function useChatSession({
     })
   }, [cancelPump])
 
+  // Hidden tabs pause requestAnimationFrame entirely, so the typewriter pump
+  // stalls while network chunks keep queueing — and returning to the tab would
+  // replay the whole backlog at the reveal rate, looking like live generation
+  // long after the run actually finished. The animation is a foreground nicety:
+  // while the tab is hidden, apply chunks immediately (no metering), and flush
+  // any backlog whenever visibility flips.
+  useEffect(() => {
+    const onVisibility = () => {
+      drainNow()
+      finishIfDrained()
+    }
+    document.addEventListener("visibilitychange", onVisibility)
+    return () => document.removeEventListener("visibilitychange", onVisibility)
+  }, [drainNow, finishIfDrained])
+
   const appendChunk = useCallback(
     (chunk) => {
       queueRef.current.push(chunk)
-      ensurePump()
+      if (document.hidden) {
+        // No frames will fire — reveal now so the transcript stays current and
+        // the end marker settles isStreaming while the user is away.
+        drainNow()
+        finishIfDrained()
+      } else {
+        ensurePump()
+      }
     },
-    [ensurePump]
+    [ensurePump, drainNow, finishIfDrained]
   )
 
   // EXPLICIT stop: tell the runtime to cancel the in-flight run (the ONLY thing
