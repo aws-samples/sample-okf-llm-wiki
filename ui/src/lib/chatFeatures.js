@@ -11,7 +11,8 @@ import { DatabaseIcon } from "lucide-react"
 
 // Vite inlines import.meta.env.* at build time. "true" (string) when the compute
 // stack was deployed with var.enable_chat_sql = true.
-const SQL_ENABLED = String(import.meta.env.VITE_CHAT_SQL_ENABLED || "") === "true"
+const SQL_ENABLED =
+  String(import.meta.env.VITE_CHAT_SQL_ENABLED || "") === "true"
 
 // The full catalog of known features, each with how it presents in the "+" menu
 // and as an enabled chip. `available` gates whether it's offered at all.
@@ -21,7 +22,9 @@ export const CHAT_FEATURES = [
     label: "SQL",
     // Shown in the "+" menu row.
     menuLabel: "Query with SQL",
-    description: "Run read-only SQL over the catalog (Athena)",
+    // The backend is picked per conversation: Athena over the catalog by
+    // default; the @-mentioned dataset's Redshift when it's Redshift-backed.
+    description: "Run read-only SQL against the live source data",
     icon: DatabaseIcon,
     available: SQL_ENABLED,
   },

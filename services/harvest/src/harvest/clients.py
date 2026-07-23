@@ -146,28 +146,26 @@ def _redshift_session_policy(
     region: str,
     account_id: str,
     *,
-    cluster_identifier: str | None,
-    workgroup_name: str | None,
     secret_arn: str | None,
 ) -> dict:
-    """Inline STS session policy pinning access to ONE Redshift target.
+    """Inline STS session policy pinning access to ONE Redshift connection secret.
 
     Intersected with the data role's identity policy at assume time. Grants:
 
-    * ``redshift-data`` API calls (async execute / describe / results). These
-      actions are NOT resource-scopable to a cluster/workgroup, so they target
-      ``*`` — cross-target containment is carried by the auth grant below, which
-      IS scopable (a statement can only reach the pinned cluster/dbuser or
-      workgroup), so ``redshift-data`` can only actually run against a target the
-      credential can authenticate to.
-    * The auth grant: for a provisioned cluster, ``redshift:GetClusterCredentials``
-      pinned to the ``dbuser``/``dbname`` on ``cluster_identifier``; for Serverless,
-      ``redshift-serverless:GetCredentials`` pinned to the workgroup. When auth is
-      via a Secrets Manager secret, ``secretsmanager:GetSecretValue`` on that ARN.
+    * ``redshift-data`` API calls (async execute / describe / results / cancel).
+      These actions are NOT resource-scopable to a cluster/workgroup, so they
+      target ``*``.
+    * ``secretsmanager:GetSecretValue`` on the ONE mapping secret. This is the
+      cross-target containment: the harvest authenticates exclusively via the
+      secret (the only auth mode the descriptor carries), so with a single pinned
+      secret the session can only reach targets that secret's DB credentials can
+      log in to. (Temp-credential auth — ``redshift:GetClusterCredentials`` /
+      ``redshift-serverless:GetCredentials`` with a ``DbUser`` — is deliberately
+      NOT granted: nothing wires a db_user from the descriptor, so granting it
+      would be dead, un-exercised privilege.)
 
     Stays well under the 2,048-char inline session-policy limit.
     """
-    rs = f"arn:aws:redshift:{region}:{account_id}"
     statements: list[dict] = [
         {
             "Sid": "RedshiftDataApi",
@@ -176,36 +174,11 @@ def _redshift_session_policy(
                 "redshift-data:ExecuteStatement",
                 "redshift-data:DescribeStatement",
                 "redshift-data:GetStatementResult",
+                "redshift-data:CancelStatement",
             ],
             "Resource": ["*"],
         }
     ]
-    if cluster_identifier:
-        statements.append(
-            {
-                # Temp-credential auth for a provisioned cluster, pinned to the
-                # cluster + the db user/name the session policy allows.
-                "Sid": "RedshiftClusterAuth",
-                "Effect": "Allow",
-                "Action": ["redshift:GetClusterCredentials"],
-                "Resource": [
-                    f"{rs}:dbuser:{cluster_identifier}/*",
-                    f"{rs}:dbname:{cluster_identifier}/*",
-                ],
-            }
-        )
-    if workgroup_name:
-        statements.append(
-            {
-                "Sid": "RedshiftServerlessAuth",
-                "Effect": "Allow",
-                "Action": ["redshift-serverless:GetCredentials"],
-                "Resource": [
-                    f"arn:aws:redshift-serverless:{region}:{account_id}"
-                    f":workgroup/{workgroup_name}"
-                ],
-            }
-        )
     if secret_arn:
         statements.append(
             {
@@ -411,8 +384,6 @@ def _build_redshift_source(
         policy = _redshift_session_policy(
             region=region,
             account_id=account_id,
-            cluster_identifier=cluster,
-            workgroup_name=workgroup,
             secret_arn=secret_arn,
         )
         try:

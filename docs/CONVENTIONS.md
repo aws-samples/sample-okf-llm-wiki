@@ -116,9 +116,14 @@ how the harvester reads it. The vocabulary lives in `okf_core.sources`
   (exactly one) + `secret_arn` (the Secrets Manager secret that authenticates to
   it). The operator picks these in the UI, so any cluster/workgroup in the account
   is harvestable with **no deploy-time connection config** — the harvest reads the
-  connection entirely from the descriptor. `build_redshift_source` enforces the
-  all-or-nothing rule: if a target OR a secret is given, BOTH are required (a `400`
-  otherwise). A bare db-only descriptor has no target and can't connect.
+  connection entirely from the descriptor. Registration REQUIRES the full
+  connection (target + secret; a `400` otherwise) — a db-only descriptor can't be
+  harvested, so it's rejected at the boundary rather than failing deep in the
+  async run. (`normalize_source` still tolerates a stored db-only row when
+  READING, so legacy rows never break readers.) The secret must hold a
+  **read-only DB user** and be named with the deployment's secret prefix
+  (`var.redshift_secret_name_prefix`, default `okf-`) — the IAM grants are scoped
+  to that name pattern. See `docs/DATA_SOURCES.md`.
 
 Config keys are stored generically on the item, so a new source type (BigQuery, …)
 adds a type + config keys with no item-schema migration. For a **glue** source the
@@ -133,15 +138,18 @@ validates on write (`PUT /domains/{domain}/datasets/{dataset}` accepts either a
 `source` object or a bare `glue_database`), rejects an unsupported type with `400`,
 and applies per-source registration rules (`assert_source_registrable`): a **glue**
 dataset name must equal its `glue_database` and the database must exist; a
-**redshift** dataset name is independent of `redshift_database` and gets no live
-existence probe (the harvest verifies the connection when it first runs).
+**redshift** dataset name is independent of `redshift_database`, must carry the
+full connection (target + secret, see above), and gets no live existence probe
+(the harvest verifies the connection when it first runs).
 
 The UI's mapping dialog fills a Redshift descriptor dynamically: `GET
 /redshift/clusters` lists provisioned clusters + Serverless workgroups
 (control-plane, no DB connection), and `GET
-/redshift/databases?cluster=…|workgroup=…&secret_arn=…` lists databases within a
-chosen target via the Redshift Data API (`ListDatabases`, which connects, hence the
-secret).
+/redshift/databases?cluster=…|workgroup=…&secret_arn=…[&database=…]` lists
+databases within a chosen target via the Redshift Data API (`ListDatabases`, which
+connects, hence the secret; `database` is the bootstrap DB to connect through — a
+provisioned cluster's `DBName` hint from `/redshift/clusters` — defaulting to
+`dev`).
 
 **Harvest status.** `pk = "HARVEST#<data_domain>#<dataset>"`, `sk = "STATUS"`,
 attrs `{status: queued | running | complete | failed | cancelled, mode,

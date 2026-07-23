@@ -44,14 +44,20 @@ __all__ = ["RedshiftSource"]
 # Redshift Data API terminal statement states.
 _RS_TERMINAL = {"FINISHED", "FAILED", "ABORTED"}
 
-# System schemas that are never dataset content.
+# System schemas that are never dataset content. The IN-list catches the named
+# ones; list_concepts ALSO filters `pg_%` by pattern (the `pg_` prefix is
+# reserved for system schemas — pg_toast, pg_automv, pg_temp_*, … — so no user
+# schema can be excluded by it; the ESCAPE keeps `_` literal so e.g. a "pgadmin"
+# schema is NOT swallowed by the wildcard).
 _SYSTEM_SCHEMAS = ("pg_catalog", "information_schema", "pg_internal")
+_SYSTEM_SCHEMA_PATTERN_SQL = "schema_name NOT LIKE 'pg!_%' ESCAPE '!'"
 
 
 class RedshiftDataClient(Protocol):  # pragma: no cover - typing only
     def execute_statement(self, **kwargs) -> dict: ...
     def describe_statement(self, **kwargs) -> dict: ...
     def get_statement_result(self, **kwargs) -> dict: ...
+    def cancel_statement(self, **kwargs) -> dict: ...
 
 
 class RedshiftSource:
@@ -163,6 +169,7 @@ class RedshiftSource:
             "FROM svv_all_tables "
             f"WHERE database_name = '{_q(self.database)}' "
             f"AND schema_name NOT IN ({_in_list(_SYSTEM_SCHEMAS)}) "
+            f"AND {_SYSTEM_SCHEMA_PATTERN_SQL} "
             "ORDER BY schema_name, table_name"  # nosec B608 - catalog identifiers, single-quoted; read-only
         ):
             schema = row.get("schema_name") or ""
@@ -347,7 +354,9 @@ class RedshiftSource:
         table = ref.hint["table"]
         # nosec B608 - not user input: schema/table come from the Redshift catalog
         # (system-authored metadata), double-quoted as Postgres identifiers; n is
-        # coerced with int(). Access is read-only under the scoped session.
+        # coerced with int(). NOTE: unlike Athena/IAM, SQL privileges here are the
+        # secret's DB user's — the read-only expectation is carried by that user's
+        # grants (see docs/DATA_SOURCES.md), not by the scoped session.
         query = f'SELECT * FROM "{schema}"."{table}" LIMIT {int(n)}'  # nosec B608
         try:
             return self.run_query(query, timeout_s=timeout_s)
@@ -357,11 +366,16 @@ class RedshiftSource:
     def run_query(
         self, query: str, *, timeout_s: float = 60.0, poll_s: float = 1.0
     ) -> list[dict[str, str | None]]:
-        """Run a read-only Redshift statement and return rows as dicts.
+        """Run a Redshift statement and return rows as dicts.
 
         A SQL NULL cell is returned as ``None`` (distinct from an empty string
         ``""``), matching ``GlueAthenaSource.run_query``. Raises on a non-FINISHED
-        terminal state or timeout.
+        terminal state; on timeout the statement is best-effort cancelled first.
+
+        Read-only expectation: statements execute with the SQL privileges of the
+        connection secret's DB USER — IAM cannot make Redshift SQL read-only the
+        way it bounds Athena. Provision the mapping's secret with a least-
+        privilege, read-only user (see docs/DATA_SOURCES.md).
         """
         return self._run_sql(query, timeout_s=timeout_s, poll_s=poll_s)
 
@@ -394,6 +408,12 @@ class RedshiftSource:
                     return []
                 break
             if time.monotonic() > deadline:
+                # Best-effort cancel so an abandoned statement doesn't keep
+                # burning cluster time after we stop waiting for it.
+                try:
+                    self.data.cancel_statement(Id=sid)
+                except Exception:  # noqa: BLE001 - the timeout is the real error
+                    pass
                 raise TimeoutError(f"Redshift statement {sid} timed out")
             time.sleep(poll_s)
 

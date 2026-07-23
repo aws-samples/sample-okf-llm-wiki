@@ -111,7 +111,7 @@ data "aws_iam_policy_document" "agentcore_baseline" {
 data "aws_iam_policy_document" "harvest_data" {
   # checkov:skip=CKV_AWS_108:Accepted residual — TableDataRead s3:GetObject must be "*" because a Glue table's storage location can be any bucket; contained by the per-invocation STS session policy (clients._session_policy), not this static ceiling.
   # checkov:skip=CKV_AWS_111:Athena/S3 write is scoped to the dedicated results bucket; the remaining broad reads are metadata/list actions that do not support ARN scoping. See the block comment above.
-  # checkov:skip=CKV_AWS_356:glue:GetDatabases and athena:* are catalog/workgroup-level actions that cannot be pinned to one resource ARN; cross-database containment is carried by the per-invocation session policy's pinned Glue table ARNs. redshift-data:*, the redshift auth actions, and secretsmanager:GetSecretValue likewise cannot be ARN-pinned on this static ceiling — Redshift mappings are self-describing so the target cluster/workgroup/secret aren't known at deploy time; the per-invocation session policy (clients._redshift_session_policy) pins all three to the one cluster/workgroup/secret the run actually uses.
+  # checkov:skip=CKV_AWS_356:glue:GetDatabases and athena:* are catalog/workgroup-level actions that cannot be pinned to one resource ARN; cross-database containment is carried by the per-invocation session policy's pinned Glue table ARNs. redshift-data:* likewise cannot be ARN-pinned; secretsmanager:GetSecretValue is scoped to the var.redshift_secret_name_prefix name pattern on this static ceiling and pinned to the run's ONE secret by the per-invocation session policy (clients._redshift_session_policy).
   statement {
     sid = "GlueReadOnly"
     actions = [
@@ -168,10 +168,11 @@ data "aws_iam_policy_document" "harvest_data" {
   # of the per-invocation session policy minted in clients._redshift_session_policy
   # (the session policy is intersected with this role, so anything it grants must
   # appear here or it's stripped). redshift-data:* actions are not ARN-scopable, so
-  # "*"; the auth grants (GetClusterCredentials / GetCredentials / GetSecretValue)
-  # carry cross-target containment and are pinned per-invocation by the session
-  # policy from the mapping's self-describing source descriptor. Enable via
-  # var.enable_redshift (no deploy-time connection config — see variables.tf).
+  # "*". Auth is SECRET-ONLY: the harvest authenticates exclusively via the
+  # mapping's Secrets Manager secret, so no redshift:GetClusterCredentials /
+  # redshift-serverless:GetCredentials is granted (nothing wires a DbUser — that
+  # would be dead privilege). Enable via var.enable_redshift (no deploy-time
+  # connection config — see variables.tf).
   dynamic "statement" {
     for_each = var.enable_redshift ? [1] : []
     content {
@@ -180,18 +181,7 @@ data "aws_iam_policy_document" "harvest_data" {
         "redshift-data:ExecuteStatement",
         "redshift-data:DescribeStatement",
         "redshift-data:GetStatementResult",
-      ]
-      resources = ["*"]
-    }
-  }
-
-  dynamic "statement" {
-    for_each = var.enable_redshift ? [1] : []
-    content {
-      sid = "RedshiftAuth"
-      actions = [
-        "redshift:GetClusterCredentials",
-        "redshift-serverless:GetCredentials",
+        "redshift-data:CancelStatement",
       ]
       resources = ["*"]
     }
@@ -199,14 +189,16 @@ data "aws_iam_policy_document" "harvest_data" {
 
   # Secret-based Redshift auth: read the connection secret a mapping names in its
   # source descriptor. Per-mapping secrets can't be enumerated at deploy time, so
-  # the grant is account-wide ("*") — the per-invocation session policy
-  # (clients._redshift_session_policy) pins it to the one secret for the run.
+  # the ceiling is scoped by NAME PREFIX (var.redshift_secret_name_prefix, default
+  # "okf-") — and the per-invocation session policy
+  # (clients._redshift_session_policy) pins it further to the ONE secret the run
+  # actually uses.
   dynamic "statement" {
     for_each = var.enable_redshift ? [1] : []
     content {
       sid       = "RedshiftSecretRead"
       actions   = ["secretsmanager:GetSecretValue"]
-      resources = ["*"]
+      resources = local.redshift_secret_resources
     }
   }
 }
@@ -604,6 +596,36 @@ data "aws_iam_policy_document" "chat" {
       sid       = "ChatSqlLakeFormationDataAccess"
       actions   = ["lakeformation:GetDataAccess"]
       resources = ["*"]
+    }
+  }
+
+  # Redshift SQL for @-scoped Redshift datasets: only when BOTH chat SQL and
+  # Redshift are enabled. redshift-data:* actions are not ARN-scopable, so "*".
+  # Unlike harvest there is no per-invocation STS hop here, so containment is:
+  # the secret grant is scoped to the var.redshift_secret_name_prefix pattern
+  # (only deliberately-named mapping secrets are usable), the runtime's query
+  # guard rejects non-read statements, and the mapping secret's DB user carries
+  # the real SQL privilege boundary — provision it read-only (DATA_SOURCES.md).
+  dynamic "statement" {
+    for_each = var.enable_chat_sql && var.enable_redshift ? [1] : []
+    content {
+      sid = "ChatSqlRedshiftData"
+      actions = [
+        "redshift-data:ExecuteStatement",
+        "redshift-data:DescribeStatement",
+        "redshift-data:GetStatementResult",
+        "redshift-data:CancelStatement",
+      ]
+      resources = ["*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_chat_sql && var.enable_redshift ? [1] : []
+    content {
+      sid       = "ChatSqlRedshiftSecretRead"
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = local.redshift_secret_resources
     }
   }
 }

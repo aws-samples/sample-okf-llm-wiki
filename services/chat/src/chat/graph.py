@@ -92,6 +92,20 @@ First read the relevant table doc so you use real column names, then write ONE r
 </sql_tool>"""
 )
 
+# The Redshift variant: the conversation is @-scoped to a Redshift-backed
+# dataset, so run_sql executes on THAT dataset's cluster/workgroup — different
+# dialect and qualification rules than the Athena block above.
+SYSTEM_PROMPT_WITH_SQL_REDSHIFT = (
+    SYSTEM_PROMPT
+    + """
+
+<sql_tool>
+You also have run_sql: a READ-ONLY SQL tool that executes on the Amazon Redshift database behind this conversation's @-mentioned dataset (amazon-redshift dialect — Postgres-derived, NOT Athena/Trino). Prefer the wiki for schema and meaning; reach for run_sql only when a question needs live data or aggregates the docs don't state — counts, sums, distinct values, freshness spot-checks, sanity-checking a documented claim against the actual data.
+
+First read the relevant table doc so you use real column names, then write ONE read-only statement (SELECT / WITH / SHOW / EXPLAIN — never INSERT/UPDATE/DELETE/CREATE/DROP). The connection is pinned to the dataset's database; qualify tables as "schema"."table" (the wiki's table concept ids are already schema-qualified, e.g. `tables/public.races`), and add a LIMIT. Report the numbers you actually got and, when useful, the query you ran; never fabricate or extrapolate results beyond what the query returned.
+</sql_tool>"""
+)
+
 
 def build_graph(
     chat_model: Any,

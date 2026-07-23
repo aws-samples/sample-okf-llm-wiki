@@ -365,7 +365,7 @@ questions (you can't see the questions anyway).
 def build_supervisor_prompt(
     recursive_improvement: bool = False,
     *,
-    profile: SourcePromptProfile = None,
+    profile: SourcePromptProfile | None = None,
 ) -> str:
     """The supervisor prompt for ``profile``'s source, with the RI section iff enabled.
 
@@ -566,7 +566,7 @@ def build_annotation_prompt(
     domain_description: str | None = None,
     domain_context: str | None = None,
     dataset_guidance: str | None = None,
-    profile: SourcePromptProfile = None,
+    profile: SourcePromptProfile | None = None,
 ) -> str:
     """The user prompt for an annotation-mode run (built for ``profile``'s source).
 
@@ -716,12 +716,12 @@ Return a one-line summary (the concept id, fact type, and what you verified).
 # -- per-source sub-agent prompt builders ------------------------------------
 
 
-def build_reviewer_prompt(profile: SourcePromptProfile = None) -> str:
+def build_reviewer_prompt(profile: SourcePromptProfile | None = None) -> str:
     """The adversarial-reviewer sub-agent prompt for ``profile``'s source."""
     return _fill(_RUNTIME_TMPL + _REVIEWER_BODY, profile or GlueAthenaSource.prompt_profile)
 
 
-def build_context_extractor_prompt(profile: SourcePromptProfile = None) -> str:
+def build_context_extractor_prompt(profile: SourcePromptProfile | None = None) -> str:
     """The context-extractor sub-agent prompt for ``profile``'s source."""
     return _fill(
         _RUNTIME_TMPL + _CONTEXT_EXTRACTOR_BODY,
@@ -729,14 +729,14 @@ def build_context_extractor_prompt(profile: SourcePromptProfile = None) -> str:
     )
 
 
-def build_table_author_prompt(profile: SourcePromptProfile = None) -> str:
+def build_table_author_prompt(profile: SourcePromptProfile | None = None) -> str:
     """The table-author sub-agent prompt for ``profile``'s source."""
     return _fill(
         _RUNTIME_TMPL + _TABLE_AUTHOR_BODY, profile or GlueAthenaSource.prompt_profile
     )
 
 
-def build_reference_author_prompt(profile: SourcePromptProfile = None) -> str:
+def build_reference_author_prompt(profile: SourcePromptProfile | None = None) -> str:
     """The reference-author sub-agent prompt for ``profile``'s source."""
     return _fill(
         _RUNTIME_TMPL + _REFERENCE_AUTHOR_BODY,

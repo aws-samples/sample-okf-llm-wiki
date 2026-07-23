@@ -251,13 +251,15 @@ def _r_list_redshift_clusters(cfg, params, body, query, caller):
 
 
 def _r_list_redshift_databases(cfg, params, body, query, caller):
-    # ?cluster=<id> | ?workgroup=<name>, plus ?secret_arn=<arn> (auth to connect).
+    # ?cluster=<id> | ?workgroup=<name>, plus ?secret_arn=<arn> (auth to connect)
+    # and optional ?database=<bootstrap db> (a cluster's DBName; default "dev").
     query = query or {}
     return 200, handlers.list_redshift_databases(
         cfg.redshift_data,
         cluster_identifier=query.get("cluster") or None,
         workgroup_name=query.get("workgroup") or None,
         secret_arn=query.get("secret_arn") or None,
+        database=query.get("database") or None,
     )
 
 
@@ -488,8 +490,14 @@ def _r_trigger_harvest(cfg, params, body, query, caller):
         cfg.ddb, registry_table=cfg.registry_table,
         data_domain=data_domain, dataset=dataset,
     )
-    if source is None or handlers.source_glue_database(source):
-        handlers.assert_glue_database_exists(cfg.glue, dataset)
+    glue_database = (
+        handlers.source_glue_database(source) if source is not None else dataset
+    )
+    if glue_database:
+        # Probe the DESCRIPTOR's database (registration enforces it equals the
+        # dataset name today, but the runtime reads the descriptor — keep the
+        # probe pointed at what will actually be harvested).
+        handlers.assert_glue_database_exists(cfg.glue, glue_database)
     return 200, handlers.trigger_harvest(
         cfg.agentcore,
         cfg.ddb,

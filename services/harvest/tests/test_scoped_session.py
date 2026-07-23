@@ -393,11 +393,15 @@ def test_build_source_redshift_branch_scoped(monkeypatch):
     # The redshift-data client came from the scoped session.
     assert src.data.name == "scoped:redshift-data"
     assert fake.made == ["redshift-data"]
-    # The policy grants the Data API + cluster auth, pinned to the cluster.
+    # The policy grants the Data API + the ONE mapping secret. Secret auth is the
+    # only wired mode, so no GetClusterCredentials/GetCredentials grants exist.
     sids = _sids(captured["policy"])
     assert "RedshiftDataApi" in sids
-    assert sids["RedshiftClusterAuth"]["Action"] == ["redshift:GetClusterCredentials"]
-    assert any("f1-cluster" in r for r in sids["RedshiftClusterAuth"]["Resource"])
+    assert "redshift-data:CancelStatement" in sids["RedshiftDataApi"]["Action"]
+    assert "RedshiftClusterAuth" not in sids
+    assert sids["RedshiftSecretRead"]["Resource"] == [
+        "arn:aws:secretsmanager:us-east-1:1:secret:f1"
+    ]
 
 
 def test_build_source_redshift_branch_ambient(monkeypatch):
@@ -467,7 +471,6 @@ def test_build_source_redshift_reads_connection_from_descriptor(monkeypatch):
     assert src.cluster_identifier is None
     assert src.secret_arn.endswith(":secret:map")
     sids = _sids(captured["policy"])
-    assert "RedshiftServerlessAuth" in sids
     assert sids["RedshiftSecretRead"]["Resource"] == [
         "arn:aws:secretsmanager:us-east-1:1:secret:map"
     ]
@@ -496,20 +499,19 @@ def test_build_source_redshift_bare_descriptor_has_no_target(monkeypatch):
         )
 
 
-def test_redshift_session_policy_serverless_and_secret():
+def test_redshift_session_policy_data_api_and_secret():
     policy = clients._redshift_session_policy(
         region=REGION,
         account_id=ACCOUNT,
-        cluster_identifier=None,
-        workgroup_name="wg1",
         secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:rs-xyz",
     )
     sids = _sids(policy)
     assert sids["RedshiftDataApi"]["Resource"] == ["*"]  # not ARN-scopable
-    assert sids["RedshiftServerlessAuth"]["Action"] == [
-        "redshift-serverless:GetCredentials"
-    ]
-    assert "RedshiftClusterAuth" not in sids  # serverless -> no cluster grant
+    assert "redshift-data:CancelStatement" in sids["RedshiftDataApi"]["Action"]
+    # Secret auth is the ONLY wired mode: the pinned secret carries cross-target
+    # containment, and no temp-credential grants exist (they'd be dead privilege).
+    assert "RedshiftClusterAuth" not in sids
+    assert "RedshiftServerlessAuth" not in sids
     assert sids["RedshiftSecretRead"]["Resource"] == [
         "arn:aws:secretsmanager:us-east-1:123456789012:secret:rs-xyz"
     ]

@@ -203,18 +203,39 @@ def test_put_domain_redshift_source_allows_distinct_dataset_name(cfg):
         _event(
             "PUT",
             "/domains/sales/datasets/orders_analytics",
-            body={"source": {"type": "redshift", "redshift_database": "warehouse"}},
+            body={
+                "source": {
+                    "type": "redshift",
+                    "redshift_database": "warehouse",
+                    "workgroup_name": "analytics-wg",
+                    "secret_arn": "arn:aws:secretsmanager:eu-west-1:1:secret:okf-x",
+                }
+            },
         ),
         cfg,
     )
     assert put["statusCode"] == 200
-    assert _json(put)["source"] == {
-        "type": "redshift",
-        "redshift_database": "warehouse",
-    }
+    assert _json(put)["source"]["type"] == "redshift"
+    assert _json(put)["source"]["redshift_database"] == "warehouse"
     lst = _json(app.route(_event("GET", "/domains"), cfg))
     row = next(r for r in lst if r["dataset"] == "orders_analytics")
     assert row["source"]["type"] == "redshift"
+
+
+def test_put_domain_redshift_without_connection_is_400(cfg):
+    # A db-only redshift descriptor has no target/secret — it can't be harvested,
+    # so registration fails FAST at the boundary instead of deep in the async run.
+    _declare_domain(cfg, "sales")
+    resp = app.route(
+        _event(
+            "PUT",
+            "/domains/sales/datasets/orders_analytics",
+            body={"source": {"type": "redshift", "redshift_database": "warehouse"}},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 400
+    assert "cluster_identifier or workgroup_name" in _json(resp)["error"]
 
 
 def test_put_domain_glue_still_requires_dataset_equals_database(cfg):

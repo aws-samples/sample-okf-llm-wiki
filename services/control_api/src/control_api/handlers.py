@@ -31,7 +31,10 @@ from okf_core.links import extract_links_with_headings
 from okf_core.paths import parse_concept_id
 from okf_core.session import HARVEST_LEASE_STALE_SECONDS, runtime_session_id
 from okf_core.sources import (
+    REDSHIFT_CLUSTER_KEY,
     REDSHIFT_DATABASE_KEY,
+    REDSHIFT_SECRET_ARN_KEY,
+    REDSHIFT_WORKGROUP_KEY,
     SOURCE_TYPE_GLUE,
     SOURCE_TYPE_REDSHIFT,
     SourceError,
@@ -152,9 +155,13 @@ def assert_source_registrable(glue, *, dataset: str, source: dict[str, Any]) -> 
       typo). This preserves the historical Glue contract.
     * **redshift** — the dataset name is the OKF dataset id and is INDEPENDENT of
       the ``redshift_database`` (a Redshift database holds many schemas/datasets),
-      so there is no equality rule. The connection is deploy-time env config the
-      Control API can't reach, so there is no live existence probe at registration;
-      an unreachable target surfaces when the first harvest runs.
+      so there is no equality rule. The mapping must be COMPLETE, though: the
+      self-describing connection (a ``cluster_identifier`` or ``workgroup_name``,
+      plus the ``secret_arn`` that authenticates to it) is required here, because
+      a db-only descriptor can't be harvested and would otherwise fail deep in the
+      async run instead of 400ing at this boundary. We deliberately do NOT probe
+      the connection live (that would run ``ListDatabases`` on every PUT); an
+      unreachable target surfaces when the first harvest runs.
 
     Raises :class:`SourceError` (mapped to 400 by the route) on a rule violation;
     :class:`ApiError` (404) if a named Glue database doesn't exist.
@@ -171,6 +178,18 @@ def assert_source_registrable(glue, *, dataset: str, source: dict[str, Any]) -> 
     elif source_type == SOURCE_TYPE_REDSHIFT:
         if not source.get(REDSHIFT_DATABASE_KEY):
             raise SourceError("redshift source requires a non-empty redshift_database")
+        # Fail fast on an unharvestable mapping: the harvest connects entirely
+        # from the descriptor, so registration requires the full connection.
+        if not (source.get(REDSHIFT_CLUSTER_KEY) or source.get(REDSHIFT_WORKGROUP_KEY)):
+            raise SourceError(
+                "redshift source requires a cluster_identifier or workgroup_name "
+                "(the harvest connects from the mapping's descriptor)"
+            )
+        if not source.get(REDSHIFT_SECRET_ARN_KEY):
+            raise SourceError(
+                "redshift source requires a secret_arn (the Secrets Manager "
+                "secret that authenticates to the cluster/workgroup)"
+            )
         # No equality rule and no live probe (see docstring).
     # Unknown types were already rejected by normalize_source.
 
@@ -184,7 +203,9 @@ def list_redshift_targets(redshift, redshift_serverless) -> list[dict[str, Any]]
     default DB when Redshift reports one (a hint for the UI). Both calls are pure
     IAM control-plane reads (no DB connection), so this feeds the UI's cluster
     picker without any credentials. Paginated. Best-effort per API: if one of the
-    two services errors (e.g. not enabled in-region), its list is simply empty.
+    two services errors (e.g. not enabled in-region, or ``var.enable_redshift``
+    is off so the role has no grants), its list is simply empty — but the error
+    is LOGGED so an IAM/throttling problem doesn't masquerade as "no clusters".
     """
     out: list[dict[str, Any]] = []
 
@@ -193,7 +214,12 @@ def list_redshift_targets(redshift, redshift_serverless) -> list[dict[str, Any]]
         kwargs: dict[str, Any] = {"Marker": token} if token else {}
         try:
             resp = redshift.describe_clusters(**kwargs)
-        except Exception:  # noqa: BLE001 - a disabled/again-empty service is fine
+        except Exception:  # noqa: BLE001 - a disabled/absent service is fine
+            logging.getLogger("control_api").warning(
+                "describe_clusters failed (enable_redshift off, or a real "
+                "IAM/availability error?); returning no provisioned clusters",
+                exc_info=True,
+            )
             break
         for c in resp.get("Clusters", []):
             out.append(
@@ -213,6 +239,11 @@ def list_redshift_targets(redshift, redshift_serverless) -> list[dict[str, Any]]
         try:
             resp = redshift_serverless.list_workgroups(**kwargs)
         except Exception:  # noqa: BLE001
+            logging.getLogger("control_api").warning(
+                "list_workgroups failed (enable_redshift off, or a real "
+                "IAM/availability error?); returning no Serverless workgroups",
+                exc_info=True,
+            )
             break
         for w in resp.get("workgroups", []):
             out.append({"kind": "workgroup", "id": w.get("workgroupName")})
@@ -229,6 +260,7 @@ def list_redshift_databases(
     cluster_identifier: str | None = None,
     workgroup_name: str | None = None,
     secret_arn: str | None = None,
+    database: str | None = None,
 ) -> list[str]:
     """List database names on one Redshift target via the Data API.
 
@@ -236,14 +268,18 @@ def list_redshift_databases(
     against the target), so it needs the target identifier + a Secrets Manager
     secret to authenticate. Feeds the UI's database picker once a cluster/workgroup
     is chosen. Requires exactly one of ``cluster_identifier`` / ``workgroup_name``.
+
+    ``database`` is the BOOTSTRAP database ``ListDatabases`` connects to first —
+    for a provisioned cluster pass its ``DBName`` (returned as the ``database``
+    hint by :func:`list_redshift_targets`), since a cluster created with a custom
+    initial database may have no ``dev`` at all. Falls back to the conventional
+    ``dev`` (always present on Serverless).
     """
     if not (cluster_identifier or workgroup_name):
         raise ApiError(400, "cluster or workgroup is required")
     if not secret_arn:
         raise ApiError(400, "secret_arn is required to list databases")
-    # ListDatabases needs a `Database` to connect to first; the cluster/workgroup
-    # default DB isn't known here, so use the conventional bootstrap DB name.
-    kwargs: dict[str, Any] = {"Database": "dev", "SecretArn": secret_arn}
+    kwargs: dict[str, Any] = {"Database": database or "dev", "SecretArn": secret_arn}
     if cluster_identifier:
         kwargs["ClusterIdentifier"] = cluster_identifier
     else:

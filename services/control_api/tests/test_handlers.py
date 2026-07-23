@@ -134,8 +134,34 @@ def test_assert_source_registrable_redshift_allows_distinct_dataset_name(cfg):
     handlers.assert_source_registrable(
         cfg.glue,
         dataset="orders_analytics",
-        source={"type": "redshift", "redshift_database": "warehouse"},
+        source={
+            "type": "redshift",
+            "redshift_database": "warehouse",
+            "cluster_identifier": "prod-cluster",
+            "secret_arn": "arn:aws:secretsmanager:eu-west-1:1:secret:okf-x",
+        },
     )  # does not raise
+
+
+def test_assert_source_registrable_redshift_requires_connection(cfg):
+    # The harvest connects entirely from the descriptor, so a mapping without a
+    # target or without a secret is unharvestable — reject at registration.
+    with pytest.raises(handlers.SourceError, match="cluster_identifier or workgroup"):
+        handlers.assert_source_registrable(
+            cfg.glue,
+            dataset="orders_analytics",
+            source={"type": "redshift", "redshift_database": "warehouse"},
+        )
+    with pytest.raises(handlers.SourceError, match="secret_arn"):
+        handlers.assert_source_registrable(
+            cfg.glue,
+            dataset="orders_analytics",
+            source={
+                "type": "redshift",
+                "redshift_database": "warehouse",
+                "workgroup_name": "analytics-wg",
+            },
+        )
 
 
 def test_assert_source_registrable_glue_requires_equality(cfg):
@@ -161,6 +187,25 @@ def test_list_redshift_databases_for_a_cluster(cfg):
         secret_arn="arn:aws:secretsmanager:eu-west-1:1:secret:x",
     )
     assert dbs == ["dev", "reporting"]
+
+
+def test_list_redshift_databases_bootstrap_database(cfg):
+    # ListDatabases must connect to SOME database first. Default is the
+    # conventional "dev"; a cluster's DBName hint (from list_redshift_targets)
+    # overrides it, since a cluster created with a custom initial DB has no "dev".
+    handlers.list_redshift_databases(
+        cfg.redshift_data,
+        cluster_identifier="prod-cluster",
+        secret_arn="arn:aws:secretsmanager:eu-west-1:1:secret:okf-x",
+    )
+    assert cfg.redshift_data.calls[-1]["Database"] == "dev"
+    handlers.list_redshift_databases(
+        cfg.redshift_data,
+        cluster_identifier="prod-cluster",
+        secret_arn="arn:aws:secretsmanager:eu-west-1:1:secret:okf-x",
+        database="warehouse",
+    )
+    assert cfg.redshift_data.calls[-1]["Database"] == "warehouse"
 
 
 def test_list_redshift_databases_requires_target_and_secret(cfg):

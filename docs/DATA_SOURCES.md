@@ -1,17 +1,22 @@
-# Data sources — how Glue is implemented, and how to add another
+# Data sources — Glue + Redshift, and how to add another
 
 Data Wiki authors an OKF bundle from a **data source** and serves it over MCP.
-Today the only implemented source is the **AWS Glue Data Catalog** (metadata)
-queried through **Amazon Athena** (row samples + verification SQL). This doc maps
-that implementation, marks the seams that are already source-generic vs. the code
-that is hardwired to Glue, and gives the recipe for adding a new source (Redshift,
-RDS, …).
+Two sources are implemented today:
 
-The registry data model, the UI, and the authoring skill were **already designed
-for multiple sources**. The gap is entirely in the *harvest runtime*: nothing yet
-reads the source `type` to pick a source implementation. See
-[The abstraction seams](#the-abstraction-seams-already-in-place) and
-[Recipe](#recipe-adding-a-new-data-source).
+- **AWS Glue Data Catalog** (metadata) queried through **Amazon Athena** (row
+  samples + verification SQL) — the original, reference implementation.
+- **Amazon Redshift** (provisioned clusters or Serverless) — metadata AND data
+  via the **Redshift Data API** over the `SVV_*` catalog views. Connection
+  details live on each mapping (a *self-describing* source descriptor), not in
+  deploy config.
+
+The harvest runtime dispatches on the mapping's source `type` through a
+source-neutral `Source` protocol; the registry data model, the UI, the chat SQL
+tool, and the authoring skill are all source-aware. This doc maps how the Glue
+implementation works, which seams a new source plugs into, the
+[security model](#security-model-redshift) for the Redshift path, and the
+[recipe](#recipe-adding-a-new-data-source) for adding a source (BigQuery,
+RDS, …).
 
 ## The concept model
 
@@ -149,12 +154,13 @@ Three seams were built ahead of the runtime work:
    views, DISTKEY/SORTKEY, `SUPER`, resource-URI form). The methodology layer is
    already multi-source-aware.
 
-The gap: nothing in the runtime reads `source["type"]` to select a source
-implementation, and `clients.build_source` still assumes `dataset == glue_database`.
+(That was the starting point; the runtime work below closed the gap — the
+runtime now dispatches on `source["type"]`, and `clients.build_source` reads the
+database from the descriptor instead of assuming `dataset == glue_database`.)
 
-### Runtime seams added (Phases A + B)
+### Runtime seams
 
-The harvest runtime now has the source-neutral boundary the recipe below needs:
+The harvest runtime has the source-neutral boundary the recipe below needs:
 
 - **`Source` protocol** (`harvest/source_base.py`) — the metadata-reader +
   query-engine contract, plus the shared `ConceptRef` and a `SourceMetadataProfile`
@@ -203,8 +209,17 @@ The harvest runtime now has the source-neutral boundary the recipe below needs:
   the control plane) and `GET /redshift/databases?cluster=…|workgroup=…&secret_arn=…`
   (lists databases within a chosen target via the Data API `ListDatabases`).
   `harvest.clients._build_redshift_source` reads the connection ENTIRELY from the
-  descriptor — there is no deploy-time connection env. A bare db-only descriptor
-  (no cluster/workgroup) can't connect (`RedshiftSource` raises).
+  descriptor — there is no deploy-time connection env. A db-only descriptor
+  (no cluster/workgroup + secret) is rejected at registration
+  (`assert_source_registrable` → 400), so an unharvestable mapping never reaches
+  the runtime; a legacy stored row without a connection still fails cleanly
+  (`RedshiftSource` raises).
+- **Chat SQL dispatch** — the chat agent's optional `run_sql` tool picks its
+  engine from the conversation's `@`-scoped mapping: a Redshift-backed dataset
+  gets a Data API engine pinned to that mapping's connection (Redshift dialect
+  prompt/description); everything else keeps the catalog-wide Athena engine. A
+  Redshift scope on a deployment without `var.enable_redshift` gets NO SQL tool
+  rather than a wrong-backend Athena fallback. See `docs/CHAT_AGENT.md` §14b.
 
 The one remaining Glue-only surface is the **`incremental` change-detection
 trigger**: it fires on `aws.glue` catalog events and resolves by Glue database name,
@@ -212,9 +227,37 @@ so it only covers Glue datasets. A Redshift dataset carries no flat `glue_databa
 mirror and is intentionally skipped by that path (`iter_dataset_mappings`) — it is
 refreshed by full/scheduled harvests instead. Redshift has no equivalent
 catalog-event source; a polling-based Redshift freshness path would be future work.
-The `prompts.py` narration is still Glue-worded (the authoring skill's per-source
-adapters carry the correct dialect), but that is cosmetic — the frozen `type`
-strings and dialect rules are already source-correct.
+
+## Security model (Redshift)
+
+The Redshift path has a different containment story than Glue/Athena — three
+things carry it:
+
+1. **Read-only is the SECRET'S DB USER, not IAM.** Athena reads are bounded by
+   IAM (the roles carry no write grants). Redshift SQL executes with the SQL
+   privileges of the DB user inside the mapping's Secrets Manager secret — IAM
+   cannot make a Data API statement read-only. The harvest agent's `run_sql` and
+   the chat `run_sql` both send model-authored SQL, so **provision each
+   connection secret with a least-privilege, read-only database user** (e.g.
+   `GRANT SELECT` / `GRANT USAGE` only). The chat tool additionally rejects
+   non-`SELECT`/`WITH`/… statements up front, but that guard is defense in
+   depth, not the boundary.
+2. **Secrets are scoped by name prefix.** Per-mapping secrets can't be
+   enumerated at deploy time, so the `secretsmanager:GetSecretValue` grants
+   (harvest data role, Control API role, chat role) are scoped to the
+   `var.redshift_secret_name_prefix` pattern (default `okf-`) instead of `"*"`.
+   Only secrets deliberately named for this system are usable — name connection
+   secrets accordingly (e.g. `okf-warehouse-ro`). The harvest additionally pins
+   its per-invocation STS session policy to the ONE secret of the run
+   (`clients._redshift_session_policy`).
+3. **The pickers exercise (never reveal) secrets.** `GET /redshift/databases`
+   connects with whatever prefix-matching secret ARN the console user supplies.
+   The secret VALUE is never returned, but any authenticated console user can
+   *use* any `okf-`-prefixed secret to list databases — the prefix is the blast
+   radius. Auth grants are deliberately minimal: no
+   `redshift:GetClusterCredentials` / `redshift-serverless:GetCredentials`
+   anywhere (secret auth is the only wired mode; temp-credential grants would be
+   dead privilege).
 
 ## Coupling scorecard
 
@@ -234,7 +277,8 @@ strings and dialect rules are already source-correct.
 | `harvest/clients.py` | **Done (Phase D)** — `build_source` dispatches on `type`; per-source session policy | Add a `_build_<x>_source` + session policy |
 | `harvest/metadata_export.py` | **Done (Phase B)** — labels driven by `SourceMetadataProfile` | Provide a profile on the new source |
 | `okf_core/hive_types.py` | Hive-only | Add a per-source type flattener |
-| `harvest/prompts.py` | Glue-narrated | Advertise dialect/`type` strings per source |
+| `harvest/prompts.py` | **Done** — token-filled per run from the source's `SourcePromptProfile` | Provide a `prompt_profile` on the new source |
+| chat `run_sql` (`chat/sql.py`, `server.py`) | **Done** — engine dispatched on the @-scope's source descriptor (Athena default, Redshift pinned) | Add an engine + dispatch branch if the source supports live SQL |
 | `incremental` + `infra/compute/incremental.tf` | **Glue-only by design** — `aws.glue` event trigger; non-glue rows skipped | No Redshift catalog-event source — full/scheduled harvests only |
 | `reindex`, `consumption_mcp` | Agnostic | — |
 | Terraform IAM | **Done (Phase E)** — `var.enable_redshift` gates the per-source grants (no connection env; mappings self-describe) | Add gated per-source grants |
@@ -242,9 +286,9 @@ strings and dialect rules are already source-correct.
 
 ## Recipe: adding a new data source
 
-Ordered so each step is independently testable offline. See the Redshift plan in
-`.claude/plans/` for the concrete instance. Steps marked ✅ are already built (the
-shared machinery exists; a new source only plugs into it).
+Ordered so each step is independently testable offline; the Redshift source is
+the worked example throughout. Steps marked ✅ are already built (the shared
+machinery exists; a new source only plugs into it).
 
 1. ✅ **Registry vocabulary** (done for Glue + Redshift) — in `okf_core/sources.py`
    add `SOURCE_TYPE_<X>`, its config keys, a `build_<x>_source`, and a
@@ -257,8 +301,10 @@ shared machinery exists; a new source only plugs into it).
 3. ✅ **Parameterized Glue-shaped bits** (done, Phase B) — concept `type` strings live
    in `okf_core/concept_types.py` (register the new source's types there); `guard.py`
    routes on `is_schema_bearing_type`; `.metadata/` labels come from the source's
-   `SourceMetadataProfile`. Still per-source: the type flattener (`hive_types.py` is
-   Hive-only — add one for the new source) and the `prompts.py` narration.
+   `SourceMetadataProfile`; the harvest prompts fill their source facts (dialect,
+   adapter, `type` strings, resource form) from the source's `SourcePromptProfile`.
+   Still per-source: the type flattener (`hive_types.py` is Hive-only — add one
+   for the new source if its type grammar nests).
 4. ✅ **Implement the source** (done for Redshift, Phase C) — a new
    `harvest/<x>_source.py` implementing `Source` (including a `metadata_profile` and
    its concept types registered in step 3); follow the matching

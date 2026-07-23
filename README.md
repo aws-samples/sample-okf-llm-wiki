@@ -124,7 +124,7 @@ The following tools must be installed on your local machine:
 
 - A **pre-created, versioned S3 bucket** for Terraform state (the deploy uses split state and won't create this for you).
 - **Amazon Bedrock model access** enabled in your region for the Claude induction model and Amazon Titan Text Embeddings V2. Follow the instructions [here](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html); without access you'll get an `AccessDeniedException` during a harvest.
-- A **data source** with tables to harvest — at least one **AWS Glue database**, and/or an **Amazon Redshift** cluster/workgroup. Redshift support is off by default; enable it with `TF_VAR_enable_redshift=true` before deploying `compute` (see [`docs/DATA_SOURCES.md`](./docs/DATA_SOURCES.md)). Each Redshift mapping supplies its own connection (cluster/workgroup + a Secrets Manager secret) in the console, so no per-cluster deploy config is needed.
+- A **data source** with tables to harvest — at least one **AWS Glue database**, and/or an **Amazon Redshift** cluster/workgroup. Redshift support is off by default; enable it with `TF_VAR_enable_redshift=true` before deploying `compute` (see [`docs/DATA_SOURCES.md`](./docs/DATA_SOURCES.md)). Each Redshift mapping supplies its own connection (cluster/workgroup + a Secrets Manager secret) in the console, so no per-cluster deploy config is needed. The secret must hold a **read-only DB user** (Redshift SQL runs with that user's privileges) and be named with the `okf-` prefix by default (`var.redshift_secret_name_prefix`) — the IAM grants are scoped to that pattern.
 
 > **Note:** S3 Vectors and Bedrock AgentCore Runtime are used by this stack. Verify they are available in your target region before deploying.
 

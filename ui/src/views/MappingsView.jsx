@@ -42,19 +42,33 @@ import {
   TableRow,
 } from "@/components/ui/table"
 
+// Whether the deployment carries the Redshift IAM grants (var.enable_redshift,
+// baked at build time). Without them the pickers can only ever come back empty,
+// so don't offer the option at all. UX gating — the backend still validates.
+const REDSHIFT_ENABLED =
+  String(import.meta.env.VITE_REDSHIFT_ENABLED || "") === "true"
+
 // Source types a mapping can draw from. This list is the single place the UI
 // knows about sources, so adding a type later (BigQuery, …) is a one-line change
-// here + backend support. Mirrors okf_core.sources.SUPPORTED_SOURCE_TYPES.
+// here + backend support. Mirrors okf_core.sources.SUPPORTED_SOURCE_TYPES,
+// filtered to what this deployment enables.
 const SOURCE_TYPES = [
   { value: "glue", label: "AWS Glue" },
-  { value: "redshift", label: "Amazon Redshift" },
+  ...(REDSHIFT_ENABLED
+    ? [{ value: "redshift", label: "Amazon Redshift" }]
+    : []),
 ]
 const DEFAULT_SOURCE_TYPE = "glue"
 
 // Human label for a source type (falls back to the raw value / a dash).
+// Covers EVERY known type (not just the offered SOURCE_TYPES): an existing
+// Redshift mapping row must still render its label on a deployment where the
+// Redshift option isn't offered for NEW mappings.
+const SOURCE_LABELS = { glue: "AWS Glue", redshift: "Amazon Redshift" }
+
 function sourceLabel(type) {
   if (!type) return "—"
-  return SOURCE_TYPES.find((s) => s.value === type)?.label || type
+  return SOURCE_LABELS[type] || type
 }
 
 // Maps Glue databases into declared data domains. Loads the existing registry
@@ -111,7 +125,11 @@ export default function MappingsView({ api, onChanged }) {
           </CardDescription>
           <div className="col-start-2 row-span-2 row-start-1 flex items-center gap-2 self-start justify-self-end">
             <Button variant="outline" onClick={refresh} disabled={loading}>
-              {loading ? <Spinner /> : <RefreshCwIcon data-icon="inline-start" />}
+              {loading ? (
+                <Spinner />
+              ) : (
+                <RefreshCwIcon data-icon="inline-start" />
+              )}
               Refresh
             </Button>
             <NewMappingDialog
@@ -209,6 +227,7 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
   // The dataset name is the operator's own id — it differs from the database (a
   // Redshift database holds many schemas), unlike Glue where dataset == database.
   const [rsTargets, setRsTargets] = useState([]) // [{kind,id,database?}]
+  const [rsTargetsLoaded, setRsTargetsLoaded] = useState(false)
   const [rsTargetsLoading, setRsTargetsLoading] = useState(false)
   const [rsTarget, setRsTarget] = useState("") // "kind:id"
   const [rsSecretArn, setRsSecretArn] = useState("")
@@ -221,18 +240,34 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
   const isGlue = sourceType === "glue"
   const dataset = isGlue ? glueDatabase : redshiftDataset
   // "kind:id" -> {kind, id}. kind is "cluster" | "workgroup".
-  const [rsTargetKind, rsTargetId] = rsTarget ? rsTarget.split(/:(.+)/) : ["", ""]
+  const [rsTargetKind, rsTargetId] = rsTarget
+    ? rsTarget.split(/:(.+)/)
+    : ["", ""]
+  // The selected target's default DB (a cluster's DBName) — the bootstrap
+  // database ListDatabases connects to. A cluster created with a custom initial
+  // DB may have no "dev", so this hint matters; workgroups always have "dev".
+  const rsBootstrapDb =
+    rsTargets.find((t) => t.kind === rsTargetKind && t.id === rsTargetId)
+      ?.database || ""
 
-  // Load Redshift targets the first time the user switches to Redshift.
+  // Load Redshift targets ONCE, the first time the user switches to Redshift.
+  // Guarded by a loaded flag — NOT by rsTargets.length: an account with zero
+  // targets (or an error) would otherwise settle back into the trigger state and
+  // refetch forever. Reopening the dialog is the retry path.
   useEffect(() => {
-    if (sourceType !== "redshift" || rsTargets.length || rsTargetsLoading) return
+    if (sourceType !== "redshift" || rsTargetsLoaded || rsTargetsLoading) return
     setRsTargetsLoading(true)
     api
       .listRedshiftClusters()
       .then((t) => setRsTargets(t || []))
-      .catch((err) => toast.error(`Could not list Redshift targets: ${err.message || err}`))
-      .finally(() => setRsTargetsLoading(false))
-  }, [sourceType, rsTargets.length, rsTargetsLoading, api])
+      .catch((err) =>
+        toast.error(`Could not list Redshift targets: ${err.message || err}`)
+      )
+      .finally(() => {
+        setRsTargetsLoaded(true)
+        setRsTargetsLoading(false)
+      })
+  }, [sourceType, rsTargetsLoaded, rsTargetsLoading, api])
 
   // Load databases for the selected target once we have a target + a secret.
   const loadRedshiftDatabases = async () => {
@@ -247,6 +282,7 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
         kind: rsTargetKind,
         id: rsTargetId,
         secretArn: rsSecretArn,
+        database: rsBootstrapDb,
       })
       setRsDatabases(dbs || [])
       if (!dbs?.length) toast.info("No databases returned for that target.")
@@ -261,6 +297,8 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
     setDomain("")
     setSourceType(DEFAULT_SOURCE_TYPE)
     setGlueDatabase("")
+    setRsTargets([])
+    setRsTargetsLoaded(false) // reopening the dialog re-fetches targets
     setRsTarget("")
     setRsSecretArn("")
     setRsDatabases([])
@@ -282,7 +320,12 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
     if (isGlue) {
       source = { type: "glue", glue_database: glueDatabase }
     } else {
-      if (!rsTargetId || !rsSecretArn || !redshiftDatabase || !redshiftDataset) {
+      if (
+        !rsTargetId ||
+        !rsSecretArn ||
+        !redshiftDatabase ||
+        !redshiftDataset
+      ) {
         toast.error(
           "Pick a cluster/workgroup, its secret, a database, and a dataset name."
         )
@@ -312,7 +355,13 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog
+      open={open}
+      onOpenChange={(v) => {
+        setOpen(v)
+        if (!v) reset() // closing discards the draft; reopening starts clean
+      }}
+    >
       <DialogTrigger asChild>
         <Button>
           <PlusIcon data-icon="inline-start" />
@@ -345,9 +394,9 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                 </SelectContent>
               </Select>
               {!isGlue ? (
-                <p className="text-muted-foreground text-xs">
-                  Pick a cluster or workgroup, give the Secrets Manager secret that
-                  connects to it, then load and pick a database.
+                <p className="text-xs text-muted-foreground">
+                  Pick a cluster or workgroup, give the Secrets Manager secret
+                  that connects to it, then load and pick a database.
                 </p>
               ) : null}
             </div>
@@ -423,7 +472,10 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                     }}
                     disabled={rsTargetsLoading || !rsTargets.length}
                   >
-                    <SelectTrigger id="new-mapping-rs-target" className="w-full">
+                    <SelectTrigger
+                      id="new-mapping-rs-target"
+                      className="w-full"
+                    >
                       <SelectValue
                         placeholder={
                           rsTargetsLoading
@@ -458,9 +510,13 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                     onChange={(e) => setRsSecretArn(e.target.value)}
                     placeholder="arn:aws:secretsmanager:...:secret:..."
                   />
-                  <p className="text-muted-foreground text-xs">
-                    Secrets Manager secret with the DB credentials used to read this
-                    cluster/workgroup.
+                  <p className="text-xs text-muted-foreground">
+                    Secrets Manager secret with the DB credentials used to read
+                    this cluster/workgroup. Use a <strong>read-only</strong>{" "}
+                    database user — SQL runs with this user's privileges — and
+                    name the secret with the deployment's prefix (default{" "}
+                    <span className="font-mono">okf-</span>) so the service is
+                    allowed to read it.
                   </p>
                 </div>
                 <div className="flex flex-col gap-2">
@@ -471,7 +527,10 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                       onValueChange={setRedshiftDatabase}
                       disabled={!rsDatabases.length}
                     >
-                      <SelectTrigger id="new-mapping-redshift-db" className="w-full">
+                      <SelectTrigger
+                        id="new-mapping-redshift-db"
+                        className="w-full"
+                      >
                         <SelectValue
                           placeholder={
                             rsDatabases.length
@@ -515,9 +574,9 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                 </div>
               </>
             )}
-            <p className="text-muted-foreground text-sm">
+            <p className="text-sm text-muted-foreground">
               Dataset:{" "}
-              <span className="text-foreground font-mono">
+              <span className="font-mono text-foreground">
                 {domain || "<domain>"}/{dataset || "<dataset>"}
               </span>
             </p>
@@ -528,7 +587,10 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                 Cancel
               </Button>
             </DialogClose>
-            <Button type="submit" disabled={submitting || !declaredDomains.length}>
+            <Button
+              type="submit"
+              disabled={submitting || !declaredDomains.length}
+            >
               {submitting ? <Spinner /> : null}
               Save mapping
             </Button>

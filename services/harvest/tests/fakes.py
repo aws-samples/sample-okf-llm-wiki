@@ -139,6 +139,7 @@ class FakeRedshiftData:
         self._status = status
         self._results: dict[str, list[dict[str, Any]]] = {}
         self.executed: list[str] = []
+        self.cancelled: list[str] = []
         self._n = 0
 
     def _match(self, sql: str) -> list[dict[str, Any]]:
@@ -174,6 +175,10 @@ class FakeRedshiftData:
             "ColumnMetadata": [{"name": c} for c in columns],
             "Records": [[_field(r[c]) for c in columns] for r in rows],
         }
+
+    def cancel_statement(self, **kwargs) -> dict:
+        self.cancelled.append(kwargs["Id"])
+        return {"Status": True}
 
 
 def _field(value: Any) -> dict[str, Any]:

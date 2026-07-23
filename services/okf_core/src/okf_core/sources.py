@@ -29,9 +29,11 @@ from typing import Any
 SOURCE_TYPE_GLUE = "glue"
 
 #: The Amazon Redshift source (metadata + data via the Redshift Data API over the
-#: SVV_* catalog views). Connection ROUTING (cluster vs Serverless workgroup, auth)
-#: is deploy-time env config on the harvest runtime; the descriptor names the
-#: target ``database``.
+#: SVV_* catalog views). The descriptor is SELF-DESCRIBING: it carries the
+#: connection routing (``cluster_identifier`` XOR ``workgroup_name``, plus the
+#: ``secret_arn`` that authenticates to it) alongside the target
+#: ``redshift_database``, so the harvest connects entirely from the descriptor —
+#: there is no deploy-time connection config.
 SOURCE_TYPE_REDSHIFT = "redshift"
 
 #: Every source type the platform recognizes. Add new types here as they land;
@@ -52,8 +54,10 @@ GLUE_DATABASE_KEY = "glue_database"
 #: required; the connection-routing keys make the mapping self-describing so the
 #: harvest connects with no deploy-time config. Exactly ONE of cluster/workgroup
 #: identifies the target; ``secret_arn`` is the per-mapping Secrets Manager auth.
-#: (They are typed optional so a legacy db-only descriptor still validates, but
-#: such a mapping has no target and can't be harvested.)
+#: (They are typed optional so a stored db-only descriptor still NORMALIZES —
+#: readers of legacy rows must not throw — but such a mapping has no target and
+#: can't be harvested, so the Control API rejects it at registration; see
+#: ``assert_source_registrable``.)
 REDSHIFT_DATABASE_KEY = "redshift_database"
 REDSHIFT_CLUSTER_KEY = "cluster_identifier"
 REDSHIFT_WORKGROUP_KEY = "workgroup_name"

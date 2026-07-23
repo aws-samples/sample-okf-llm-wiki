@@ -151,6 +151,24 @@ def test_run_query_raises_on_failed_statement():
         _source(data=data).run_query("SELECT 1")
 
 
+def test_run_query_timeout_cancels_statement():
+    # A statement still running at the deadline is best-effort cancelled so it
+    # doesn't keep burning cluster time after the harvest stops waiting.
+    data = FakeRedshiftData([(lambda sql: True, [{"x": "1"}])], status="STARTED")
+    with pytest.raises(TimeoutError):
+        _source(data=data).run_query("SELECT 1", timeout_s=0)
+    assert data.cancelled == ["stmt-1"]
+
+
+def test_list_concepts_filters_pg_system_schemas():
+    # pg_%-prefixed system schemas (pg_toast, pg_automv, …) are excluded by the
+    # SQL pattern; the ESCAPE keeps `_` literal so "pgadmin" would NOT match.
+    src = _source()
+    src.list_concepts()
+    listing = next(s for s in src.data.executed if "svv_all_tables" in s)
+    assert "NOT LIKE 'pg!_%' ESCAPE '!'" in listing
+
+
 def test_metadata_export_renders_redshift_snapshot(tmp_path):
     # The shared .metadata/ machinery drives off the source's SourceMetadataProfile,
     # so a Redshift source produces a correctly-labeled snapshot with no code fork.

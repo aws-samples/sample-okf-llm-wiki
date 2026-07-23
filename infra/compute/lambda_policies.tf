@@ -59,7 +59,7 @@ data "aws_iam_policy_document" "incremental" {
 # Control API: list Glue, read/write registry, read/write bundle + presign
 # uploads, read freshness, invoke the harvest runtime.
 data "aws_iam_policy_document" "control_api" {
-  # checkov:skip=CKV_AWS_356:glue:GetDatabases/GetTables (read-only catalog listing for the "register a dataset" picker) targets the whole catalog by design — the API lists across all databases. InvokeAgentRuntime IS scoped to the single harvest runtime (local.harvest_invoke_resources); StopRuntimeSession stays "*" (see its statement below). logs:FilterLogEvents is already scoped to the AgentCore runtime log-group namespace; DynamoDB/S3/Cognito grants below are resource-scoped. The Redshift picker list actions (redshift:DescribeClusters/redshift-serverless:ListWorkgroups/redshift-data:ListDatabases) don't support resource-level scoping; secretsmanager:GetSecretValue is "*" because Redshift mappings are self-describing and their per-mapping secrets can't be enumerated at deploy time.
+  # checkov:skip=CKV_AWS_356:glue:GetDatabases/GetTables (read-only catalog listing for the "register a dataset" picker) targets the whole catalog by design — the API lists across all databases. InvokeAgentRuntime IS scoped to the single harvest runtime (local.harvest_invoke_resources); StopRuntimeSession stays "*" (see its statement below). logs:FilterLogEvents is already scoped to the AgentCore runtime log-group namespace; DynamoDB/S3/Cognito grants below are resource-scoped. The Redshift picker list actions (redshift:DescribeClusters/redshift-serverless:ListWorkgroups/redshift-data:ListDatabases) don't support resource-level scoping; secretsmanager:GetSecretValue is scoped to the var.redshift_secret_name_prefix name pattern (mappings are self-describing, so per-mapping secrets can't be enumerated at deploy time).
   statement {
     actions   = ["glue:GetDatabases", "glue:GetTables"]
     resources = ["*"]
@@ -144,13 +144,15 @@ data "aws_iam_policy_document" "control_api" {
   }
   # Read the connection secret to authenticate the database listing. The operator
   # picks per-mapping secrets in the UI, which the API can't enumerate at deploy
-  # time, so the grant is account-wide ("*").
+  # time, so the grant is scoped by NAME PREFIX (var.redshift_secret_name_prefix,
+  # default "okf-") — this bounds which credentials a console user can exercise
+  # through the picker endpoints to secrets deliberately named for this system.
   dynamic "statement" {
     for_each = var.enable_redshift ? [1] : []
     content {
       sid       = "RedshiftSecretRead"
       actions   = ["secretsmanager:GetSecretValue"]
-      resources = ["*"]
+      resources = local.redshift_secret_resources
     }
   }
 }

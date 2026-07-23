@@ -67,6 +67,16 @@ locals {
 
   ui_bucket = var.ui_bucket_name != "" ? var.ui_bucket_name : "${var.name_prefix}-ui-${local.account_id}"
 
+  # Secrets Manager resources the Redshift GetSecretValue grants are scoped to
+  # (harvest data role, Control API role, chat role). Per-mapping secrets can't be
+  # enumerated at deploy time, so the ceiling is a NAME-PREFIX pattern instead of
+  # "*" — only secrets named "<prefix>*" are usable as Redshift connection
+  # secrets. "" prefix -> any secret (arn:...:secret:*). The trailing "-??????"
+  # random suffix Secrets Manager appends is covered by the "*".
+  redshift_secret_resources = [
+    "arn:aws:secretsmanager:${var.region}:${local.account_id}:secret:${var.redshift_secret_name_prefix}*",
+  ]
+
   # OTEL/ADOT env shared by BOTH AgentCore runtime containers. These are
   # self-built images (not AgentCore-CLI builds); opentelemetry-instrument + the
   # installed aws-opentelemetry-distro run in agent-observability mode.

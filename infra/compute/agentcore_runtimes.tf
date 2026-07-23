@@ -261,6 +261,11 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     OKF_ATHENA_WORKGROUP  = var.enable_chat_sql ? var.athena_workgroup : ""
     OKF_ATHENA_OUTPUT     = var.enable_chat_sql ? local.athena_output : ""
     OKF_CHAT_SQL_MAX_ROWS = tostring(var.chat_sql_max_rows)
+    # With SQL enabled, a conversation @-scoped to a Redshift-backed dataset gets
+    # run_sql against THAT dataset's cluster/workgroup via the Redshift Data API
+    # (connection read from the mapping's source descriptor). Empty when Redshift
+    # is off -> a Redshift-scoped run gets no SQL tool (never Athena fallback).
+    OKF_REDSHIFT_ENABLED = var.enable_redshift ? "true" : ""
 
     OTEL_RESOURCE_ATTRIBUTES = "service.name=${var.name_prefix}_chat"
 

@@ -57,9 +57,12 @@ export function makeApi(token) {
     // Redshift source pickers: list clusters/workgroups, then databases within a
     // chosen target (needs the secret that authenticates to it).
     listRedshiftClusters: () => request(token, "GET", "/redshift/clusters"),
-    listRedshiftDatabases: ({ kind, id, secretArn }) => {
+    listRedshiftDatabases: ({ kind, id, secretArn, database }) => {
       const key = kind === "cluster" ? "cluster" : "workgroup"
       const qs = new URLSearchParams({ [key]: id, secret_arn: secretArn })
+      // Bootstrap DB ListDatabases connects to first (a cluster's DBName hint
+      // from /redshift/clusters); the backend falls back to "dev".
+      if (database) qs.set("database", database)
       return request(token, "GET", `/redshift/databases?${qs.toString()}`)
     },
     listDomains: () => request(token, "GET", "/domains"),
@@ -67,7 +70,9 @@ export function makeApi(token) {
     // {type:"glue", glue_database} or {type:"redshift", redshift_database}. The
     // caller builds the right shape per source type; the backend validates it.
     setDomainMapping: (domain, dataset, source) =>
-      request(token, "PUT", `/domains/${domain}/datasets/${dataset}`, { source }),
+      request(token, "PUT", `/domains/${domain}/datasets/${dataset}`, {
+        source,
+      }),
     deleteDomainMapping: (domain, dataset) =>
       request(token, "DELETE", `/domains/${domain}/datasets/${dataset}`),
 
