@@ -226,12 +226,31 @@ function ChartFrameInner({ code, title, live }) {
   // A frame that never reports back (blocked/blank) shouldn't spin forever — after
   // a grace period with no "ok"/"error", treat it as failed so the user sees the
   // contained error rather than an empty box.
+  // The grace clock only runs while the tab is VISIBLE: hidden tabs pause the
+  // frame's rAF and throttle its timers (Chrome: up to a minute), so a chart
+  // mounted while the user is away would otherwise be declared dead before it
+  // ever had a frame to report in — the "chart could not be generated (but
+  // renders after refresh)" symptom.
   useEffect(() => {
     if (status !== "loading") return undefined
-    const t = setTimeout(() => {
-      setStatus((s) => (s === "loading" ? "error" : s))
-    }, 6000)
-    return () => clearTimeout(t)
+    let t = null
+    const fail = () => setStatus((s) => (s === "loading" ? "error" : s))
+    const arm = () => {
+      if (t == null && !document.hidden) t = setTimeout(fail, 6000)
+    }
+    const disarm = () => {
+      if (t != null) {
+        clearTimeout(t)
+        t = null
+      }
+    }
+    const onVisibility = () => (document.hidden ? disarm() : arm())
+    arm()
+    document.addEventListener("visibilitychange", onVisibility)
+    return () => {
+      disarm()
+      document.removeEventListener("visibilitychange", onVisibility)
+    }
   }, [status, srcDoc])
 
   if (status === "error") {
