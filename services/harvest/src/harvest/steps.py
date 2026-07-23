@@ -185,7 +185,7 @@ def shape_step(tool_name: str, args: dict[str, Any] | None) -> dict[str, str]:
             "label": f"Sampling rows from {cid}" if cid else "Sampling table rows",
         }
     if name == "run_sql":
-        return {"tool": name, "label": "Running an Athena query"}
+        return {"tool": name, "label": "Running a SQL query"}
 
     # LinkGraph tools (graph_tools.py).
     if name in ("get_backlinks", "get_links"):

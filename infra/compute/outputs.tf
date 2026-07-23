@@ -80,5 +80,9 @@ output "ui_env" {
     # Gates the composer's "+" → SQL affordance in the UI; the runtime + IAM are the
     # real boundary (offering it when off just yields a 403/handled error).
     VITE_CHAT_SQL_ENABLED = tostring(var.enable_chat_sql)
+    # Whether Amazon Redshift is deploy-enabled (var.enable_redshift). Gates the
+    # Redshift option in the UI's new-mapping source dropdown; IAM is the real
+    # boundary (offering it when off just yields empty pickers).
+    VITE_REDSHIFT_ENABLED = tostring(var.enable_redshift)
   }
 }

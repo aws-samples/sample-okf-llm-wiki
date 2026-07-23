@@ -186,13 +186,125 @@ def test_put_domain_unsupported_source_type_400(cfg):
         _event(
             "PUT",
             "/domains/sales/datasets/orders",
-            body={"source": {"type": "redshift", "glue_database": "orders"}},
+            body={"source": {"type": "bigquery", "project": "orders"}},
         ),
         cfg,
     )
     assert resp["statusCode"] == 400
     # Nothing persisted.
     assert _json(app.route(_event("GET", "/domains"), cfg)) == []
+
+
+def test_put_domain_redshift_source_allows_distinct_dataset_name(cfg):
+    # A redshift dataset name is INDEPENDENT of the database (no equality rule,
+    # no live Glue probe). It registers and surfaces its source on list.
+    _declare_domain(cfg, "sales")
+    put = app.route(
+        _event(
+            "PUT",
+            "/domains/sales/datasets/orders_analytics",
+            body={
+                "source": {
+                    "type": "redshift",
+                    "redshift_database": "warehouse",
+                    "workgroup_name": "analytics-wg",
+                    "secret_arn": "arn:aws:secretsmanager:eu-west-1:1:secret:okf-x",
+                }
+            },
+        ),
+        cfg,
+    )
+    assert put["statusCode"] == 200
+    assert _json(put)["source"]["type"] == "redshift"
+    assert _json(put)["source"]["redshift_database"] == "warehouse"
+    lst = _json(app.route(_event("GET", "/domains"), cfg))
+    row = next(r for r in lst if r["dataset"] == "orders_analytics")
+    assert row["source"]["type"] == "redshift"
+
+
+def test_put_domain_redshift_without_connection_is_400(cfg):
+    # A db-only redshift descriptor has no target/secret — it can't be harvested,
+    # so registration fails FAST at the boundary instead of deep in the async run.
+    _declare_domain(cfg, "sales")
+    resp = app.route(
+        _event(
+            "PUT",
+            "/domains/sales/datasets/orders_analytics",
+            body={"source": {"type": "redshift", "redshift_database": "warehouse"}},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 400
+    assert "cluster_identifier or workgroup_name" in _json(resp)["error"]
+
+
+def test_put_domain_glue_still_requires_dataset_equals_database(cfg):
+    # The historical Glue rule is preserved for glue sources.
+    _declare_domain(cfg, "sales")
+    resp = app.route(
+        _event(
+            "PUT",
+            "/domains/sales/datasets/orders",
+            body={"source": {"type": "glue", "glue_database": "different_db"}},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 400
+
+
+def test_put_domain_redshift_with_connection_fields_persists(cfg):
+    # A self-describing redshift mapping (cluster + secret) registers and the
+    # connection fields round-trip on list.
+    _declare_domain(cfg, "sales")
+    put = app.route(
+        _event(
+            "PUT",
+            "/domains/sales/datasets/orders_analytics",
+            body={
+                "source": {
+                    "type": "redshift",
+                    "redshift_database": "dev",
+                    "cluster_identifier": "prod-cluster",
+                    "secret_arn": "arn:aws:secretsmanager:eu-west-1:1:secret:x",
+                }
+            },
+        ),
+        cfg,
+    )
+    assert put["statusCode"] == 200
+    src = _json(put)["source"]
+    assert src["cluster_identifier"] == "prod-cluster"
+    assert src["secret_arn"].endswith(":secret:x")
+
+
+def test_list_redshift_clusters_route(cfg):
+    resp = app.route(_event("GET", "/redshift/clusters"), cfg)
+    assert resp["statusCode"] == 200
+    ids = {t["id"] for t in _json(resp)}
+    assert {"prod-cluster", "analytics-wg"} <= ids
+
+
+def test_list_redshift_databases_route(cfg):
+    resp = app.route(
+        _event(
+            "GET",
+            "/redshift/databases",
+            query={
+                "cluster": "prod-cluster",
+                "secret_arn": "arn:aws:secretsmanager:eu-west-1:1:secret:x",
+            },
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 200
+    assert _json(resp) == ["dev", "reporting"]
+
+
+def test_list_redshift_databases_route_missing_secret_400(cfg):
+    resp = app.route(
+        _event("GET", "/redshift/databases", query={"cluster": "prod-cluster"}), cfg
+    )
+    assert resp["statusCode"] == 400
 
 
 def test_put_domain_dataset_must_equal_glue_database_400(cfg):
@@ -507,6 +619,39 @@ def test_post_harvest_unknown_dataset_404_before_invoke(cfg, agentcore):
     )
     assert resp["statusCode"] == 404
     assert agentcore.calls == []
+
+
+def test_post_harvest_redshift_skips_glue_probe(cfg, agentcore):
+    # A Redshift dataset name is NOT a Glue database — the trigger must not probe
+    # Glue for it (regression: it used to 404 "no such Glue database"). It queues.
+    _declare_domain(cfg, "sales")
+    app.route(
+        _event(
+            "PUT",
+            "/domains/sales/datasets/sales_analytics",
+            body={
+                "source": {
+                    "type": "redshift",
+                    "redshift_database": "dev",
+                    "workgroup_name": "okf-test-wg",
+                    "secret_arn": "arn:aws:secretsmanager:eu-west-1:1:secret:x",
+                }
+            },
+        ),
+        cfg,
+    )
+    resp = app.route(
+        _event(
+            "POST",
+            "/harvest",
+            body={"data_domain": "sales", "dataset": "sales_analytics"},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 200
+    assert _json(resp)["status"] == "queued"
+    # The source descriptor rode the invocation payload.
+    assert agentcore.last_payload()["source"]["type"] == "redshift"
 
 
 def test_post_harvest_no_runtime_arn_500(aws, glue, agentcore):

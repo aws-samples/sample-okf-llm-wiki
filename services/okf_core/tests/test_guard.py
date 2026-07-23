@@ -1,3 +1,5 @@
+import pytest
+
 from okf_core.guard import (
     check_augmentation,
     check_frontmatter,
@@ -83,6 +85,20 @@ def test_augmentation_ignores_non_glue_types():
     new = "# nothing\n"
     r = check_augmentation(old, new, existing_type="Reference")
     assert r.ok
+
+
+@pytest.mark.parametrize(
+    "concept_type",
+    ["Redshift Database", "Redshift Table", "Redshift External Table"],
+)
+def test_augmentation_protects_redshift_types(concept_type):
+    # The guard routes on the concept-type registry (is_schema_bearing_type), so
+    # the Redshift types get the same shrink protection as the Glue ones.
+    old = "# Schema\n| `a` | int |\n| `b` | int |\n"
+    new = "# Schema\n| `a` | int |\n"
+    r = check_augmentation(old, new, existing_type=concept_type)
+    assert not r.ok
+    assert "`b`" in r.error
 
 
 def test_citation_entry_count():

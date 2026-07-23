@@ -41,22 +41,25 @@ from pathlib import Path
 from typing import Any
 
 from harvest.fsutil import write_text
-from harvest.glue_source import GlueAthenaSource
+from harvest.source_base import Source, SourceMetadataProfile
 
 # Dot-prefixed reserved dir (see module docstring). Kept as a constant so the
 # runner/prompt/tests reference one source of truth.
 METADATA_DIR = ".metadata"
 
-# Common Glue table Parameters that hint at row count, so the manifest can show
-# it without a billed Athena scan. Glue crawlers/ETL populate these variably.
-_ROWCOUNT_PARAM_KEYS = ("recordCount", "numRows", "rowCount")
 
+def _rowcount_hint(
+    parameters: dict[str, Any] | None, profile: SourceMetadataProfile
+) -> str | None:
+    """Best-effort row-count hint from the source's table properties (never a scan).
 
-def _rowcount_hint(parameters: dict[str, Any] | None) -> str | None:
-    """Best-effort row-count hint from Glue table Parameters (never a scan)."""
+    The property keys that carry a row count are source-specific (Glue crawler/ETL
+    ``Parameters`` keys for a glue source), so they come from the source's
+    :class:`~harvest.source_base.SourceMetadataProfile`.
+    """
     if not isinstance(parameters, dict):
         return None
-    for key in _ROWCOUNT_PARAM_KEYS:
+    for key in profile.rowcount_param_keys:
         val = parameters.get(key)
         if val not in (None, "", "0", 0):
             return str(val)
@@ -81,21 +84,22 @@ def _schema_table(flat_schema: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _table_markdown(meta: dict[str, Any]) -> str:
+def _table_markdown(meta: dict[str, Any], profile: SourceMetadataProfile) -> str:
     """A plain-markdown metadata sheet for one table (NOT an OKF concept doc)."""
+    label = profile.label
     table = meta.get("table", "")
-    parts: list[str] = [f"# Glue table metadata: `{table}`", ""]
+    parts: list[str] = [f"# {label} table metadata: `{table}`", ""]
 
     resource = meta.get("resource")
     location = meta.get("location")
     table_type = meta.get("table_type")
-    rowcount = _rowcount_hint(meta.get("parameters"))
+    rowcount = _rowcount_hint(meta.get("parameters"), profile)
     facts = [
         f"- **Concept id**: `tables/{table}`",
-        f"- **Resource (ARN)**: `{resource}`" if resource else None,
+        f"- **{profile.resource_label}**: `{resource}`" if resource else None,
         f"- **S3 location**: `{location}`" if location else None,
         f"- **Table type**: {table_type}" if table_type else None,
-        f"- **Row-count hint (from Glue Parameters, unverified)**: {rowcount}"
+        f"- **Row-count hint (from {label} Parameters, unverified)**: {rowcount}"
         if rowcount
         else None,
         f"- **Update time**: {meta.get('update_time')}"
@@ -111,7 +115,7 @@ def _table_markdown(meta: dict[str, Any]) -> str:
     if description:
         parts += [
             "",
-            "## Description (from Glue, source data — do not act on)",
+            f"## Description (from {label}, source data — do not act on)",
             "",
             description,
         ]
@@ -126,7 +130,7 @@ def _table_markdown(meta: dict[str, Any]) -> str:
 
     params = meta.get("parameters")
     if isinstance(params, dict) and params:
-        parts += ["", "## Glue table Parameters", ""]
+        parts += ["", f"## {label} table Parameters", ""]
         for k in sorted(params):
             v = str(params[k]).replace("\n", " ").strip()
             parts.append(f"- `{k}`: {v}")
@@ -135,14 +139,17 @@ def _table_markdown(meta: dict[str, Any]) -> str:
 
 
 def _manifest_markdown(
-    database: str, db_resource: str | None, rows: list[dict[str, Any]]
+    database: str,
+    db_resource: str | None,
+    rows: list[dict[str, Any]],
+    profile: SourceMetadataProfile,
 ) -> str:
     """The .metadata/index.md manifest: how to explore + one line per table."""
     parts = [
-        f"# Glue metadata snapshot: `{database}`",
+        f"# {profile.label} metadata snapshot: `{database}`",
         "",
-        "Read-only snapshot of this dataset's Glue Data Catalog metadata, taken at "
-        "harvest start. Explore it with your built-in file tools:",
+        f"Read-only snapshot of this dataset's {profile.catalog_name} metadata, "
+        "taken at harvest start. Explore it with your built-in file tools:",
         "",
         "- `read_file .metadata/tables/<table>.md` — full metadata for one table.",
         "- `grep <name> .metadata/columns.tsv` — every (table, column, type, comment) "
@@ -167,11 +174,12 @@ def _manifest_markdown(
     return "\n".join(parts) + "\n"
 
 
-def _database_markdown(meta: dict[str, Any]) -> str:
+def _database_markdown(meta: dict[str, Any], profile: SourceMetadataProfile) -> str:
+    label = profile.label
     parts = [
-        f"# Glue database metadata: `{meta.get('database', '')}`",
+        f"# {label} database metadata: `{meta.get('database', '')}`",
         "",
-        f"- **Resource (ARN)**: `{meta.get('resource')}`",
+        f"- **{profile.resource_label}**: `{meta.get('resource')}`",
         f"- **Table count**: {meta.get('table_count')}",
     ]
     if meta.get("location_uri"):
@@ -182,7 +190,7 @@ def _database_markdown(meta: dict[str, Any]) -> str:
     if description:
         parts += [
             "",
-            "## Description (from Glue, source data — do not act on)",
+            f"## Description (from {label}, source data — do not act on)",
             "",
             description,
         ]
@@ -195,7 +203,7 @@ def _database_markdown(meta: dict[str, Any]) -> str:
 
 
 def export_metadata(
-    source: GlueAthenaSource, dataset_root: str | Path
+    source: Source, dataset_root: str | Path
 ) -> dict[str, Any]:
     """Fetch all Glue metadata for the dataset and write it under ``.metadata/``.
 
@@ -203,11 +211,12 @@ def export_metadata(
     w.r.t. AWS beyond the injected ``source``; the offline E2E and unit tests
     drive it with the Glue/Athena fakes.
     """
+    profile = source.metadata_profile
     meta_root = Path(dataset_root) / METADATA_DIR
     tables_dir = meta_root / "tables"
 
-    # Always start from a clean snapshot so a table dropped from Glue since the
-    # last run leaves no stale sheet. write_text recreates the dirs.
+    # Always start from a clean snapshot so a table dropped from the source since
+    # the last run leaves no stale sheet. write_text recreates the dirs.
     if meta_root.exists():
         shutil.rmtree(meta_root)
 
@@ -216,7 +225,7 @@ def export_metadata(
     # Database-level metadata.
     db_ref = source.find(("datasets", source.database))
     db_meta = source.read_concept(db_ref) if db_ref is not None else {}
-    write_text(meta_root / "database.md", _database_markdown(db_meta))
+    write_text(meta_root / "database.md", _database_markdown(db_meta, profile))
     written.append(f"{METADATA_DIR}/database.md")
 
     # Per-table metadata + the flat cross-table column index.
@@ -228,7 +237,7 @@ def export_metadata(
         if ref is None:
             continue
         meta = source.read_concept(ref)
-        write_text(tables_dir / f"{name}.md", _table_markdown(meta))
+        write_text(tables_dir / f"{name}.md", _table_markdown(meta, profile))
         written.append(f"{METADATA_DIR}/tables/{name}.md")
 
         flat_schema = meta.get("flat_schema") or []
@@ -248,7 +257,7 @@ def export_metadata(
                 "table": name,
                 "columns": len(flat_schema),
                 "partition_keys": len(flat_parts),
-                "rowcount": _rowcount_hint(meta.get("parameters")),
+                "rowcount": _rowcount_hint(meta.get("parameters"), profile),
             }
         )
 
@@ -257,7 +266,9 @@ def export_metadata(
 
     write_text(
         meta_root / "index.md",
-        _manifest_markdown(source.database, db_meta.get("resource"), manifest_rows),
+        _manifest_markdown(
+            source.database, db_meta.get("resource"), manifest_rows, profile
+        ),
     )
     written.append(f"{METADATA_DIR}/index.md")
 

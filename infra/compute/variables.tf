@@ -251,6 +251,49 @@ variable "athena_workgroup" {
   default = "primary"
 }
 
+variable "enable_redshift" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Set true to allow harvests to read an Amazon Redshift data source via the
+    Redshift Data API. It adds the Redshift IAM grants — to the harvest DATA role
+    (redshift-data + secretsmanager:GetSecretValue), to the Control API role
+    (DescribeClusters / ListWorkgroups / ListDatabases + GetSecretValue for the
+    UI's cluster/database pickers), and to the chat role when var.enable_chat_sql
+    is also on (redshift-data + GetSecretValue for the chat run_sql tool on
+    Redshift-scoped conversations). Default off — a Glue-only deployment needs
+    none of this.
+
+    NO connection config is set at deploy time: each Redshift mapping is
+    self-describing — the operator picks the cluster/workgroup and its Secrets
+    Manager secret in the UI, and the harvest reads the connection from the
+    mapping's source descriptor ({type: redshift, cluster_identifier|workgroup_name,
+    secret_arn}). Per-mapping secrets can't be enumerated at deploy time, so the
+    GetSecretValue grants are scoped by NAME PREFIX instead — see
+    var.redshift_secret_name_prefix.
+
+    NOTE ON READ-ONLY: Redshift SQL executes with the SQL privileges of the
+    secret's DB user — IAM cannot make it read-only the way it bounds Athena.
+    Create the connection secrets with a least-privilege, read-only database user
+    (see docs/DATA_SOURCES.md).
+  EOT
+}
+
+variable "redshift_secret_name_prefix" {
+  type        = string
+  default     = "okf-"
+  description = <<-EOT
+    Secrets Manager NAME PREFIX the Redshift GetSecretValue grants are scoped to
+    (harvest data role, Control API role, and — with enable_chat_sql — the chat
+    role). Only secrets named with this prefix are usable as Redshift connection
+    secrets; this bounds which credentials the browser-facing pickers and the
+    chat SQL tool can exercise, instead of granting account-wide secret access.
+    Name your Redshift connection secrets accordingly (e.g. okf-warehouse-ro), or
+    change the prefix. Set to "" to allow any secret in the account (the pre-
+    hardening behavior; not recommended).
+  EOT
+}
+
 variable "control_api_provisioned_concurrency" {
   type        = number
   description = "Pre-warmed execution environments for the control API Lambda, to minimize cold starts on the browser-facing plane. 0 disables it."

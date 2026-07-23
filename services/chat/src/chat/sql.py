@@ -1,26 +1,39 @@
-"""Optional read-only SQL over the Glue catalog for the chat agent (Athena).
+"""Optional read-only SQL over live source data for the chat agent.
 
 This is the one chat tool that touches SOURCE DATA (every other tool reads the
 authored wiki bundle). It is therefore gated TWO ways, both server-side — a
 client string can never turn it on by itself:
 
   1. **Deploy-time** — ``OKF_CHAT_SQL_ENABLED`` must be true. The chat IAM role
-     only carries Glue/Athena grants when ``var.enable_chat_sql`` is set, so with
-     the flag off the tool would 403 anyway; we don't even offer it to the model.
+     only carries the source-data grants when ``var.enable_chat_sql`` is set, so
+     with the flag off the tool would 403 anyway; we don't even offer it.
   2. **Per-conversation** — the browser opts in via ``features: ["sql"]`` on the
      run envelope (the composer's "+" menu). The runtime adds the tool only when
      BOTH the deploy flag AND the per-run opt-in are present.
 
-Read-only is enforced by IAM (the role has no Glue/S3 write grants) AND by a
-query guard here (``SELECT``/``WITH`` only, single statement) so a non-read query
-gets a clean error instead of an opaque Athena/permission failure — defense in
-depth, not the sole boundary.
+Two engines, dispatched on the conversation's ``@``-scope (see
+``server.make_agent_factory``):
 
-Catalog-wide: unlike harvest (pinned to one database per invocation via a scoped
-STS session), the chat SQL tool can query ANY database — the model writes
-fully-qualified ``"db"."table"`` references. A ``dataset_scope`` (the ``@``-mention)
-is used only as the DEFAULT database for unqualified names + advisory context; it
-is not a security boundary.
+* :class:`AthenaSQL` — the default. Catalog-wide over the Glue catalog: unlike
+  harvest (pinned to one database per invocation via a scoped STS session), it
+  can query ANY database — the model writes fully-qualified ``"db"."table"``
+  references. A glue ``dataset_scope`` is used only as the DEFAULT database for
+  unqualified names + advisory context; it is not a security boundary.
+  Read-only is enforced by IAM (no write grants) AND the query guard below.
+* :class:`RedshiftDataSQL` — used when the ``@``-scoped dataset's registry
+  mapping is a REDSHIFT source (and ``OKF_REDSHIFT_ENABLED`` is on). Pinned to
+  that mapping's cluster/workgroup + database + Secrets Manager secret (the
+  self-describing source descriptor). NOTE the different read-only story: the
+  statement executes with the SQL privileges of the SECRET'S DB USER — IAM
+  cannot bound Redshift SQL the way it bounds Athena — so the guard here is the
+  runtime check and the mapping's read-only DB user is the real boundary
+  (docs/DATA_SOURCES.md). A Redshift-scoped run on a deployment without
+  Redshift enabled gets NO SQL tool rather than silently querying the wrong
+  backend via Athena.
+
+The query guard (``SELECT``/``WITH``/… only, single statement) applies to both
+engines so a non-read query gets a clean error instead of an opaque backend or
+permission failure — defense in depth, not the sole boundary.
 """
 
 from __future__ import annotations
@@ -40,11 +53,21 @@ _READ_ONLY_HEADS = ("select", "with", "show", "describe", "explain")
 # Athena terminal states — CANCELLED has two L's (matches harvest's glue_source).
 _ATHENA_TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
 
+# Redshift Data API terminal statement states (matches harvest's redshift_source).
+_RS_TERMINAL = {"FINISHED", "FAILED", "ABORTED"}
+
 
 class AthenaClient(Protocol):  # pragma: no cover - typing only
     def start_query_execution(self, **kwargs) -> dict: ...
     def get_query_execution(self, **kwargs) -> dict: ...
     def get_query_results(self, **kwargs) -> dict: ...
+
+
+class RedshiftDataClient(Protocol):  # pragma: no cover - typing only
+    def execute_statement(self, **kwargs) -> dict: ...
+    def describe_statement(self, **kwargs) -> dict: ...
+    def get_statement_result(self, **kwargs) -> dict: ...
+    def cancel_statement(self, **kwargs) -> dict: ...
 
 
 def strip_sql_comments(sql: str) -> str:
@@ -97,6 +120,11 @@ class AthenaSQL:
         self.max_rows = max_rows
         self.timeout_s = timeout_s
         self.poll_s = poll_s
+
+    @property
+    def tool_description(self) -> str:
+        """The run_sql tool description the model sees for this engine."""
+        return _RUN_SQL_DESC
 
     def run(self, sql: str, *, default_database: str | None = None) -> dict[str, Any]:
         """Execute one read-only query; return ``{columns, rows, row_count, truncated}``.
@@ -175,6 +203,152 @@ class AthenaSQL:
         }
 
 
+class RedshiftDataSQL:
+    """Runs a read-only query against ONE Redshift database via the Data API.
+
+    Built when the conversation is ``@``-scoped to a Redshift-backed dataset:
+    the connection (cluster/workgroup + database + Secrets Manager secret) comes
+    from that mapping's self-describing source descriptor, so — unlike the
+    catalog-wide Athena engine — this engine is PINNED to the scoped dataset's
+    backend. Returns the same ``{columns, rows, row_count, truncated}`` shape as
+    :class:`AthenaSQL`, with SQL ``NULL`` as ``None`` (distinct from ``""``).
+
+    Read-only: the guard rejects non-read statements up front, but the statement
+    ultimately executes with the SQL privileges of the secret's DB user — use a
+    read-only user in the mapping's secret (docs/DATA_SOURCES.md).
+    """
+
+    def __init__(
+        self,
+        *,
+        data: RedshiftDataClient,
+        database: str,
+        cluster_identifier: str | None = None,
+        workgroup_name: str | None = None,
+        secret_arn: str | None = None,
+        max_rows: int = 200,
+        timeout_s: float = 60.0,
+        poll_s: float = 1.0,
+    ) -> None:
+        if not (cluster_identifier or workgroup_name):
+            raise ValueError(
+                "RedshiftDataSQL needs a cluster_identifier (provisioned) or "
+                "workgroup_name (serverless)"
+            )
+        if not secret_arn:
+            raise ValueError("RedshiftDataSQL needs the mapping's secret_arn")
+        self.data = data
+        self.database = database
+        self.cluster_identifier = cluster_identifier
+        self.workgroup_name = workgroup_name
+        self.secret_arn = secret_arn
+        self.max_rows = max_rows
+        self.timeout_s = timeout_s
+        self.poll_s = poll_s
+
+    @property
+    def tool_description(self) -> str:
+        """The run_sql tool description the model sees (names the pinned DB)."""
+        return _RUN_SQL_DESC_REDSHIFT.format(database=self.database)
+
+    def run(self, sql: str, *, default_database: str | None = None) -> dict[str, Any]:
+        """Execute one read-only statement; return ``{columns, rows, row_count,
+        truncated}``.
+
+        ``default_database`` is accepted for signature parity with
+        :class:`AthenaSQL` and IGNORED — the connection is pinned to the scoped
+        mapping's database. Raises ``ValueError`` for a non-read query and
+        ``RuntimeError``/``TimeoutError`` on backend failure (a timed-out
+        statement is best-effort cancelled first).
+        """
+        if not is_read_only(sql):
+            raise ValueError(
+                "run_sql accepts a single read-only statement only "
+                "(SELECT / WITH / SHOW / DESCRIBE / EXPLAIN)."
+            )
+        params: dict[str, Any] = {
+            "Sql": sql,
+            "Database": self.database,
+            "SecretArn": self.secret_arn,
+        }
+        if self.cluster_identifier:
+            params["ClusterIdentifier"] = self.cluster_identifier
+        else:
+            params["WorkgroupName"] = self.workgroup_name
+
+        sid = self.data.execute_statement(**params)["Id"]
+
+        deadline = time.monotonic() + self.timeout_s
+        while True:
+            info = self.data.describe_statement(Id=sid)
+            status = info.get("Status")
+            if status in _RS_TERMINAL:
+                if status != "FINISHED":
+                    reason = info.get("Error", "")
+                    raise RuntimeError(f"Redshift statement {status}: {reason}".strip())
+                if not info.get("HasResultSet"):
+                    return {"columns": [], "rows": [], "row_count": 0, "truncated": False}
+                break
+            if time.monotonic() > deadline:
+                # Best-effort cancel so an abandoned statement doesn't keep
+                # burning cluster time after the chat turn stops waiting.
+                try:
+                    self.data.cancel_statement(Id=sid)
+                except Exception:  # noqa: BLE001 - the timeout is the real error
+                    pass
+                raise TimeoutError(f"Redshift statement {sid} timed out")
+            time.sleep(self.poll_s)
+
+        return self._collect(sid)
+
+    def _collect(self, sid: str) -> dict[str, Any]:
+        columns: list[str] | None = None
+        rows: list[dict[str, Any]] = []
+        truncated = False
+        token = None
+        while True:
+            params: dict[str, Any] = {"Id": sid}
+            if token:
+                params["NextToken"] = token
+            res = self.data.get_statement_result(**params)
+            if columns is None:
+                columns = [c.get("name", "") for c in res.get("ColumnMetadata", [])]
+            for rec in res.get("Records", []):
+                if len(rows) >= self.max_rows:
+                    truncated = True
+                    break
+                rows.append(
+                    {columns[i]: _rs_cell(rec[i]) for i in range(len(columns))}
+                )
+            token = res.get("NextToken")
+            if not token or truncated:
+                break
+        return {
+            "columns": columns or [],
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": truncated,
+        }
+
+
+def _rs_cell(datum: dict[str, Any]) -> str | None:
+    """One Redshift Data API cell as ``str`` (or None for SQL NULL).
+
+    A Field is a one-key dict: ``isNull`` for SQL NULL, else one of
+    ``stringValue`` / ``longValue`` / ``doubleValue`` / ``booleanValue`` /
+    ``blobValue``. Coerced to text (bool → ``true``/``false``) so downstream sees
+    the same ``str | None`` shape the Athena engine yields.
+    """
+    if datum.get("isNull"):
+        return None
+    if "booleanValue" in datum:
+        return "true" if datum["booleanValue"] else "false"
+    for key in ("stringValue", "longValue", "doubleValue", "blobValue"):
+        if key in datum:
+            return str(datum[key])
+    return None
+
+
 # The tool description the model sees. Explicit about read-only + qualifying names
 # so the agent uses it correctly (it can't see the guard/IAM, only this text).
 _RUN_SQL_DESC = (
@@ -189,19 +363,44 @@ _RUN_SQL_DESC = (
     "truncated. Ground the query in schema you read from the wiki."
 )
 
+# The Redshift variant: pinned to the @-scoped dataset's database, Postgres-
+# derived dialect, schema-qualified names (a Redshift database holds many
+# schemas — unqualified names resolve via the connection's search_path).
+_RUN_SQL_DESC_REDSHIFT = (
+    "Run a read-only SQL query against `{database}` — the Amazon Redshift "
+    "database behind this conversation's @-mentioned dataset (amazon-redshift "
+    "dialect, Postgres-derived; NOT Athena/Trino) — and return the result rows. "
+    "Use this to answer questions that need LIVE data or aggregates the wiki "
+    "docs don't state (counts, sums, distinct values, spot-checks) — NOT to "
+    "rediscover schema, which you should read from the wiki first.\n"
+    "Rules: exactly ONE statement, SELECT/WITH/SHOW/EXPLAIN only (no "
+    "INSERT/UPDATE/DELETE/CREATE/DROP). The connection is pinned to "
+    "`{database}`; qualify tables as \"schema\".\"table\" (the wiki's concept ids "
+    "are already schema-qualified). Add your own LIMIT; large results are "
+    "truncated. Ground the query in schema you read from the wiki."
+)
+
 
 def make_sql_tool(
-    engine: AthenaSQL, *, dataset_scope: dict[str, str] | None = None
+    engine: AthenaSQL | RedshiftDataSQL,
+    *,
+    dataset_scope: dict[str, str] | None = None,
 ) -> Any:
-    """Wrap an :class:`AthenaSQL` as a LangChain ``run_sql`` StructuredTool.
+    """Wrap a SQL engine as a LangChain ``run_sql`` StructuredTool.
 
-    When the conversation is ``@``-scoped, that dataset's Glue database is used as
+    The tool description comes from the ENGINE (``engine.tool_description``), so
+    the model is told the right backend, dialect, and qualification rules for the
+    run — an Athena description on a Redshift run would produce wrong SQL.
+
+    For the catalog-wide Athena engine, an ``@``-scoped dataset's Glue database is
     the DEFAULT database for unqualified table names (advisory — the model may
     still query other databases by qualifying them). The scope's ``glue_database``
     (the real Glue DB name, resolved from the registry) is preferred; the
     ``dataset`` id is only a fallback for when it wasn't resolved, and the two can
     differ (a dataset id need not equal its Glue database name), so an unqualified
     query would hit a non-existent database if we defaulted to the dataset id.
+    The Redshift engine is pinned to its mapping's database and ignores the
+    default.
     """
     from langchain_core.tools import StructuredTool
 
@@ -227,7 +426,7 @@ def make_sql_tool(
     return StructuredTool.from_function(
         func=run_sql,
         name="run_sql",
-        description=_RUN_SQL_DESC,
+        description=engine.tool_description,
     )
 
 

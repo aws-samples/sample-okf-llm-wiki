@@ -21,8 +21,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Any
 
 from harvest.glue_source import GlueAthenaSource
+from harvest.redshift_source import RedshiftSource
+from harvest.source_base import Source
 
 log = logging.getLogger("harvest.clients")
 
@@ -139,6 +142,56 @@ def _session_policy(
     return {"Version": "2012-10-17", "Statement": statements}
 
 
+def _redshift_session_policy(
+    region: str,
+    account_id: str,
+    *,
+    secret_arn: str | None,
+) -> dict:
+    """Inline STS session policy pinning access to ONE Redshift connection secret.
+
+    Intersected with the data role's identity policy at assume time. Grants:
+
+    * ``redshift-data`` API calls (async execute / describe / results / cancel).
+      These actions are NOT resource-scopable to a cluster/workgroup, so they
+      target ``*``.
+    * ``secretsmanager:GetSecretValue`` on the ONE mapping secret. This is the
+      cross-target containment: the harvest authenticates exclusively via the
+      secret (the only auth mode the descriptor carries), so with a single pinned
+      secret the session can only reach targets that secret's DB credentials can
+      log in to. (Temp-credential auth — ``redshift:GetClusterCredentials`` /
+      ``redshift-serverless:GetCredentials`` with a ``DbUser`` — is deliberately
+      NOT granted: nothing wires a db_user from the descriptor, so granting it
+      would be dead, un-exercised privilege.)
+
+    Stays well under the 2,048-char inline session-policy limit.
+    """
+    statements: list[dict] = [
+        {
+            "Sid": "RedshiftDataApi",
+            "Effect": "Allow",
+            "Action": [
+                "redshift-data:ExecuteStatement",
+                "redshift-data:DescribeStatement",
+                "redshift-data:GetStatementResult",
+                "redshift-data:CancelStatement",
+            ],
+            "Resource": ["*"],
+        }
+    ]
+    if secret_arn:
+        statements.append(
+            {
+                # Secret-based auth: read only the one connection secret.
+                "Sid": "RedshiftSecretRead",
+                "Effect": "Allow",
+                "Action": ["secretsmanager:GetSecretValue"],
+                "Resource": [secret_arn],
+            }
+        )
+    return {"Version": "2012-10-17", "Statement": statements}
+
+
 def _results_bucket_arn(output_location: str | None) -> str | None:
     """Best-effort: derive the results bucket ARN from ``s3://bucket/prefix``.
 
@@ -201,30 +254,57 @@ def build_scoped_session(
 
 
 def build_source(
-    database: str,
+    dataset: str,
     *,
+    source: dict[str, Any] | None = None,
     region: str | None = None,
     account_id: str | None = None,
-) -> GlueAthenaSource:
-    """Build a GlueAthenaSource whose Glue/Athena clients use PER-INVOCATION
-    down-scoped credentials.
+) -> Source:
+    """Build the :class:`~harvest.source_base.Source` for a dataset, dispatching on
+    the source descriptor's ``type``.
 
-    When ``OKF_HARVEST_DATA_ROLE_ARN`` is set (the deployed runtime), we assume
-    the data role with an inline session policy pinned to ``database`` + the
-    configured Athena workgroup, and build the clients from those scoped creds.
-    When it is unset (local dev / unit tests), we fall back to ambient creds so
-    nothing else needs wiring — the scoping is a production hardening, not a
-    correctness dependency.
+    ``source`` is the ``okf_core.sources`` descriptor (``{type, ...config}``) the
+    Control API resolves from the registry and threads through the invocation
+    payload. When absent (a legacy caller / an older payload), we default to a Glue
+    source whose database IS the ``dataset`` name — the historical convention — so
+    nothing that predates the descriptor breaks.
+
+    Per-invocation credential down-scoping (see ``_glue_session_policy`` /
+    ``_redshift_session_policy``): when ``OKF_HARVEST_DATA_ROLE_ARN`` is set we assume
+    the data role with an inline policy pinned to THIS dataset's resources and build
+    the source's clients from those scoped creds; unset (local dev / tests) falls
+    back to ambient creds. Scoping is a production hardening, not a correctness dep.
     """
-    import boto3
+    from okf_core.sources import normalize_source
 
     region = region or os.environ.get("AWS_REGION", "us-east-1")
     account_id = account_id or os.environ.get("OKF_ACCOUNT_ID", "")
+
+    # Resolve the descriptor. Absent -> the historical glue-by-dataset-name default.
+    resolved = normalize_source(source, glue_database=None if source else dataset)
+    source_type = resolved.get("type")
+
+    if source_type == GlueAthenaSource.name:
+        return _build_glue_source(resolved, region=region, account_id=account_id)
+    if source_type == RedshiftSource.name:
+        return _build_redshift_source(resolved, region=region, account_id=account_id)
+    # normalize_source already rejects unsupported types, so this is defensive.
+    raise ValueError(f"no harvest source implementation for type {source_type!r}")
+
+
+def _build_glue_source(
+    source: dict[str, Any], *, region: str, account_id: str
+) -> GlueAthenaSource:
+    """A GlueAthenaSource with per-invocation scoped Glue/Athena clients."""
+    import boto3
+
+    database = source["glue_database"]
     workgroup = os.environ.get("OKF_ATHENA_WORKGROUP") or "primary"
     output_location = os.environ.get("OKF_ATHENA_OUTPUT")
     data_role_arn = os.environ.get("OKF_HARVEST_DATA_ROLE_ARN")
     enable_lf = bool(os.environ.get("OKF_ENABLE_LAKEFORMATION"))
 
+    glue = athena = None
     if data_role_arn:
         policy = _session_policy(
             region=region,
@@ -259,9 +339,8 @@ def build_source(
                 "execution-role creds (per-invocation scoping NOT applied)",
                 database,
             )
-            glue = boto3.client("glue", region_name=region)
-            athena = boto3.client("athena", region_name=region)
-    else:
+            glue = athena = None
+    if glue is None:
         glue = boto3.client("glue", region_name=region)
         athena = boto3.client("athena", region_name=region)
 
@@ -274,6 +353,69 @@ def build_source(
         athena_output_location=output_location,
         athena_workgroup=os.environ.get("OKF_ATHENA_WORKGROUP"),
         catalog_id=os.environ.get("OKF_GLUE_CATALOG_ID") or None,
+    )
+
+
+def _build_redshift_source(
+    source: dict[str, Any], *, region: str, account_id: str
+) -> RedshiftSource:
+    """A RedshiftSource with a per-invocation scoped ``redshift-data`` client.
+
+    Connection routing comes ENTIRELY from the mapping's self-describing source
+    descriptor (``cluster_identifier``/``workgroup_name`` + ``secret_arn``), which
+    the operator sets in the UI — so any cluster/workgroup in the account is
+    harvestable with no deploy-time connection config. Mirrors the Glue path's
+    fail-open behavior (a scoped-assume failure falls back to ambient creds).
+    """
+    import boto3
+
+    database = source["redshift_database"]
+    # The connection comes ENTIRELY from the mapping's self-describing descriptor —
+    # the operator picks the cluster/workgroup + secret in the UI. There is no
+    # deploy-time connection env (a db-only descriptor with no target simply has no
+    # cluster/workgroup, and RedshiftSource raises if neither is set).
+    cluster = source.get("cluster_identifier") or None
+    workgroup = source.get("workgroup_name") or None
+    secret_arn = source.get("secret_arn") or None
+    data_role_arn = os.environ.get("OKF_HARVEST_DATA_ROLE_ARN")
+
+    data = None
+    if data_role_arn:
+        policy = _redshift_session_policy(
+            region=region,
+            account_id=account_id,
+            secret_arn=secret_arn,
+        )
+        try:
+            session = build_scoped_session(
+                role_arn=data_role_arn,
+                session_policy=policy,
+                region=region,
+                session_name=f"okf-harvest-{database}"[:64],
+            )
+            data = session.client("redshift-data", region_name=region)
+            log.info(
+                "Harvest using per-invocation scoped creds (data role, redshift db=%s)",
+                database,
+            )
+        except Exception:  # noqa: BLE001 - never let scoping wiring wedge a harvest
+            log.exception(
+                "Scoped-session assume FAILED for redshift db=%s; falling back to "
+                "ambient execution-role creds (per-invocation scoping NOT applied)",
+                database,
+            )
+            data = None
+    if data is None:
+        data = boto3.client("redshift-data", region_name=region)
+
+    return RedshiftSource(
+        database=database,
+        data=data,
+        cluster_identifier=cluster,
+        workgroup_name=workgroup,
+        secret_arn=secret_arn,
+        region=region,
+        account_id=account_id,
     )
 
 

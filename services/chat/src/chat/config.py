@@ -99,15 +99,22 @@ class ChatConfig:
     # no offload (DynamoDB only).
     checkpoint_offload_bucket: str = ""
 
-    # Optional read-only SQL (Athena) tool — the ONE tool that touches source
-    # data. Deploy-gated by OKF_CHAT_SQL_ENABLED (the IAM role only carries
-    # Glue/Athena when var.enable_chat_sql is set); also requires a per-run opt-in
+    # Optional read-only SQL tool — the ONE tool that touches source data.
+    # Deploy-gated by OKF_CHAT_SQL_ENABLED (the IAM role only carries Glue/Athena
+    # when var.enable_chat_sql is set); also requires a per-run opt-in
     # (features:["sql"]). The Athena knobs mirror harvest's OKF_ATHENA_* env.
     sql_enabled: bool = False
     athena_workgroup: str | None = None
     athena_output: str | None = None
     athena_catalog: str = "AwsDataCatalog"
     sql_max_rows: int = 200
+    # Whether Amazon Redshift is deploy-enabled (OKF_REDSHIFT_ENABLED, set from
+    # var.enable_redshift). With sql_enabled, a conversation @-scoped to a
+    # Redshift-backed dataset gets run_sql against THAT dataset's cluster/
+    # workgroup via the Redshift Data API (connection read from the mapping's
+    # source descriptor). Off -> a Redshift-scoped run simply gets no SQL tool
+    # (it must never silently fall back to Athena — wrong backend).
+    redshift_enabled: bool = False
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ChatConfig":
@@ -148,6 +155,8 @@ class ChatConfig:
             athena_output=env.get("OKF_ATHENA_OUTPUT") or None,
             athena_catalog=env.get("OKF_ATHENA_CATALOG", "AwsDataCatalog"),
             sql_max_rows=_int_env("OKF_CHAT_SQL_MAX_ROWS", 200, env),
+            redshift_enabled=env.get("OKF_REDSHIFT_ENABLED", "").lower()
+            in ("true", "1", "yes"),
         )
 
     def resolve_model_effort(

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from okf_core.concept_types import is_schema_bearing_type
 from okf_core.document import (
     REQUIRED_FRONTMATTER_KEYS,
     OKFDocument,
@@ -148,16 +149,20 @@ def check_augmentation(
     *,
     existing_type: str | None,
 ) -> GuardResult:
-    """Reject a write that *shrinks* a Glue-derived concept's ``# Schema`` field
+    """Reject a write that *shrinks* a source-derived concept's ``# Schema`` field
     set or its ``# Citations`` entry count.
 
-    Real column names and the source ARN are populated from Glue metadata; any
-    later pass (a doc-context enrichment, an incremental re-review) must
-    *augment*, not silently drop them. This is the augmentation guard the
-    reference producer baked into ``write_concept_doc``; here it is enforced by
-    the middleware for arbitrary ``write_file``/``edit_file`` calls.
+    Real column names and the source resource (ARN/URI) are populated from the
+    source's catalog metadata; any later pass (a doc-context enrichment, an
+    incremental re-review) must *augment*, not silently drop them. This is the
+    augmentation guard the reference producer baked into ``write_concept_doc``;
+    here it is enforced by the middleware for arbitrary ``write_file``/
+    ``edit_file`` calls. It applies to every schema-bearing concept type (see
+    ``okf_core.concept_types.SCHEMA_BEARING_TYPES``), so a new source's table/
+    database concepts are protected by registering their types there — no edit
+    to this guard.
     """
-    if existing_type not in ("Glue Table", "Glue Database"):
+    if not is_schema_bearing_type(existing_type):
         return GuardResult(ok=True)
 
     old_fields = schema_field_names(existing_body)
@@ -170,7 +175,7 @@ def check_augmentation(
             ok=False,
             error=(
                 f"Refusing to write: the existing # Schema section lists "
-                f"{len(old_fields)} field(s) populated from Glue metadata, but "
+                f"{len(old_fields)} field(s) populated from source metadata, but "
                 f"your new # Schema is missing {len(missing)} of them: {shown}"
                 f"{truncated}. Augment the existing schema — read the current "
                 f"file, then re-write with every field name preserved."
@@ -184,7 +189,7 @@ def check_augmentation(
             ok=False,
             error=(
                 f"Refusing to write: the existing # Citations section had "
-                f"{old_cites} entries (including the Glue resource ARN), but "
+                f"{old_cites} entries (including the source resource), but "
                 f"your new # Citations has only {new_cites}. Append rather than "
                 f"replace — preserve every existing citation plus any new one."
             ),

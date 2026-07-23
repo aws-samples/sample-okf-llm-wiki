@@ -84,7 +84,7 @@ export default function DomainsView({ api, onChanged }) {
             Data domains
           </CardTitle>
           <CardDescription>
-            Declare domains before mapping Glue databases into them. Each domain
+            Declare domains before mapping data sources into them. Each domain
             represents a business area with a description and context.
           </CardDescription>
           <div className="col-start-2 row-span-2 row-start-1 flex items-center gap-2 self-start justify-self-end">
@@ -112,7 +112,7 @@ export default function DomainsView({ api, onChanged }) {
               <AlertTitle>No domains declared</AlertTitle>
               <AlertDescription>
                 Create a domain with the "New domain" button to define a business
-                area. Then map Glue databases into it from the Datasets page.
+                area. Then map data sources into it from the Datasets page.
               </AlertDescription>
             </Alert>
           ) : (
@@ -282,9 +282,9 @@ function NewDomainDialog({ api, onCreated }) {
           <DialogHeader>
             <DialogTitle>Declare a new domain</DialogTitle>
             <DialogDescription>
-              A domain groups related Glue databases under a shared business
-              context. Provide a short description and optional richer context
-              (used by the harvester and exposed to agents over MCP).
+              A domain groups related datasets under a shared business context.
+              Provide a short description and optional richer context (used by the
+              harvester and exposed to agents over MCP).
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-4">

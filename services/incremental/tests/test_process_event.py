@@ -142,6 +142,8 @@ def test_version_bump_computes_diff_invokes_and_updates_version(aws):
     assert payload["dataset"] == "f1"
     assert payload["changed_table"] == "races"
     assert payload["diff"] == result["diff"]
+    # This path is Glue-only: the source descriptor names the emitting database.
+    assert payload["source"] == {"type": "glue", "glue_database": "f1_db"}
 
     # Version row updated to the new version id.
     stored = store.get_stored_version(

@@ -17,7 +17,15 @@ import pytest
 from moto import mock_aws
 
 from control_api.app import Config
-from tests.fakes import FakeAgentCore, FakeCognito, FakeGlue, FakeLogs
+from tests.fakes import (
+    FakeAgentCore,
+    FakeCognito,
+    FakeGlue,
+    FakeLogs,
+    FakeRedshift,
+    FakeRedshiftData,
+    FakeRedshiftServerless,
+)
 
 REGION = "us-east-1"
 BUCKET = "okf-bundle-test"
@@ -100,7 +108,24 @@ def logs():
 
 
 @pytest.fixture
-def cfg(aws, glue, agentcore, cognito, logs):
+def redshift():
+    return FakeRedshift([{"ClusterIdentifier": "prod-cluster", "DBName": "dev"}])
+
+
+@pytest.fixture
+def redshift_serverless():
+    return FakeRedshiftServerless([{"workgroupName": "analytics-wg"}])
+
+
+@pytest.fixture
+def redshift_data():
+    return FakeRedshiftData(
+        {"prod-cluster": ["dev", "reporting"], "analytics-wg": ["dev"]}
+    )
+
+
+@pytest.fixture
+def cfg(aws, glue, agentcore, cognito, logs, redshift, redshift_serverless, redshift_data):
     return Config(
         bucket=BUCKET,
         registry_table=REGISTRY,
@@ -110,6 +135,9 @@ def cfg(aws, glue, agentcore, cognito, logs):
         ddb=aws["ddb"],
         glue=glue,
         agentcore=agentcore,
+        redshift=redshift,
+        redshift_serverless=redshift_serverless,
+        redshift_data=redshift_data,
         cognito=cognito,
         user_pool_id=USER_POOL_ID,
         mcp_scope=MCP_SCOPE,

@@ -18,11 +18,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from harvest.glue_source import GlueAthenaSource
+from harvest.source_base import Source
 from okf_core.paths import parse_concept_id
 
 
-def make_source_tools(source: GlueAthenaSource) -> list[Any]:
+def make_source_tools(source: Source) -> list[Any]:
     from langchain_core.tools import tool
 
     @tool

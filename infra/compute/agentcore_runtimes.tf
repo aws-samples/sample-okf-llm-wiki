@@ -72,6 +72,10 @@ resource "aws_bedrockagentcore_agent_runtime" "harvest" {
     # includes lakeformation:GetDataAccess so LF can vend S3 creds for governed
     # table data (must match the data role's identity policy; see clients.py).
     OKF_ENABLE_LAKEFORMATION = var.enable_lakeformation ? "true" : ""
+    # Amazon Redshift needs NO deploy-time connection env: each mapping is
+    # self-describing (cluster/workgroup + secret_arn in its source descriptor) and
+    # the harvest reads the connection from there. var.enable_redshift only toggles
+    # the IAM grants (see agentcore_iam.tf).
     # Network-isolated Code Interpreter for the run_code tool (extract text from
     # binary .context/ docs). Empty when the feature is disabled -> the agent runs
     # without run_code (build_sandbox returns None on an unset id).
@@ -256,10 +260,15 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     # offered. Athena workgroup/output mirror the harvest runtime's; the runtime
     # only builds an Athena client + the tool when the flag is on AND a chat opts
     # in via features:["sql"].
-    OKF_CHAT_SQL_ENABLED = tostring(var.enable_chat_sql)
-    OKF_ATHENA_WORKGROUP = var.enable_chat_sql ? var.athena_workgroup : ""
-    OKF_ATHENA_OUTPUT    = var.enable_chat_sql ? local.athena_output : ""
+    OKF_CHAT_SQL_ENABLED  = tostring(var.enable_chat_sql)
+    OKF_ATHENA_WORKGROUP  = var.enable_chat_sql ? var.athena_workgroup : ""
+    OKF_ATHENA_OUTPUT     = var.enable_chat_sql ? local.athena_output : ""
     OKF_CHAT_SQL_MAX_ROWS = tostring(var.chat_sql_max_rows)
+    # With SQL enabled, a conversation @-scoped to a Redshift-backed dataset gets
+    # run_sql against THAT dataset's cluster/workgroup via the Redshift Data API
+    # (connection read from the mapping's source descriptor). Empty when Redshift
+    # is off -> a Redshift-scoped run gets no SQL tool (never Athena fallback).
+    OKF_REDSHIFT_ENABLED = var.enable_redshift ? "true" : ""
 
     OTEL_RESOURCE_ATTRIBUTES = "service.name=${var.name_prefix}_chat"
 

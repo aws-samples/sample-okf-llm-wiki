@@ -46,7 +46,7 @@ from harvest.steps import (
             {"concept_id": "tables/races"},
             "Sampling rows from tables/races",
         ),
-        ("run_sql", {"query": "SELECT 1"}, "Running an Athena query"),
+        ("run_sql", {"query": "SELECT 1"}, "Running a SQL query"),
         (
             "get_backlinks",
             {"concept_id": "tables/races"},
@@ -296,7 +296,7 @@ def test_emitter_keeps_top_level_tool_call_and_result():
     assert [e["kind"] for e in events] == [KIND_TOOL_CALL, KIND_TOOL_RESULT]
     assert (
         events[0]["tool"] == "run_sql"
-        and events[0]["label"] == "Running an Athena query"
+        and events[0]["label"] == "Running a SQL query"
     )
     assert events[1]["ok"] is True and events[1]["call_id"] == events[0]["call_id"]
 
@@ -543,7 +543,7 @@ def test_log_sink_emits_marked_json_line(caplog):
                 "seq": 3,
                 "kind": KIND_TOOL_CALL,
                 "tool": "run_sql",
-                "label": "Running an Athena query",
+                "label": "Running a SQL query",
                 "agent": "main",
             }
         )
@@ -556,7 +556,7 @@ def test_log_sink_emits_marked_json_line(caplog):
     assert payload["dataset"] == "orders"
     assert payload["session_id"] == "okf-sales-orders-x"
     assert payload["seq"] == 3
-    assert payload["label"] == "Running an Athena query"
+    assert payload["label"] == "Running a SQL query"
     assert payload["ts"]  # ISO timestamp stamped server-side
 
 

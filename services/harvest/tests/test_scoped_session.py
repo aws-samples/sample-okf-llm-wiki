@@ -203,7 +203,8 @@ def test_build_source_falls_back_to_ambient_when_no_data_role(monkeypatch):
     monkeypatch.setattr(
         clients, "build_scoped_session", lambda **k: pytest.fail("should not assume")
     )
-    import sys, types
+    import sys
+    import types
 
     fake_boto3 = types.SimpleNamespace(client=_FakeBoto().client)
     monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
@@ -298,7 +299,8 @@ def test_build_source_fails_open_to_ambient_on_assume_error(monkeypatch):
             made.append(name)
             return _FakeClient(f"ambient:{name}")
 
-    import sys, types
+    import sys
+    import types
 
     monkeypatch.setitem(
         sys.modules, "boto3", types.SimpleNamespace(client=_FakeBoto().client)
@@ -307,3 +309,211 @@ def test_build_source_fails_open_to_ambient_on_assume_error(monkeypatch):
     src = clients.build_source(DB, region=REGION, account_id=ACCOUNT)
     assert src.glue.name == "ambient:glue"
     assert src.athena.name == "ambient:athena"
+
+
+# --- source-descriptor dispatch (Phase D) -----------------------------------
+
+
+def test_build_source_glue_reads_database_from_descriptor(monkeypatch):
+    # The glue database comes from the descriptor, NOT the (possibly different)
+    # dataset id — this is what lets a mapping name a db != dataset in future.
+    monkeypatch.delenv("OKF_HARVEST_DATA_ROLE_ARN", raising=False)
+    monkeypatch.setenv("OKF_ACCOUNT_ID", ACCOUNT)
+
+    class _FakeBoto:
+        def client(self, name, **kw):
+            return _FakeClient(f"ambient:{name}")
+
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "boto3", types.SimpleNamespace(client=_FakeBoto().client)
+    )
+    src = clients.build_source(
+        "dataset_alias",
+        source={"type": "glue", "glue_database": "real_glue_db"},
+        region=REGION,
+        account_id=ACCOUNT,
+    )
+    assert src.name == "glue"
+    assert src.database == "real_glue_db"
+
+
+def test_build_source_defaults_to_glue_by_dataset_when_no_descriptor(monkeypatch):
+    # Back-compat: an absent descriptor -> a glue source named by the dataset.
+    monkeypatch.delenv("OKF_HARVEST_DATA_ROLE_ARN", raising=False)
+    monkeypatch.setenv("OKF_ACCOUNT_ID", ACCOUNT)
+
+    class _FakeBoto:
+        def client(self, name, **kw):
+            return _FakeClient(f"ambient:{name}")
+
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "boto3", types.SimpleNamespace(client=_FakeBoto().client)
+    )
+    src = clients.build_source(DB, region=REGION, account_id=ACCOUNT)
+    assert src.name == "glue"
+    assert src.database == DB
+
+
+def test_build_source_redshift_branch_scoped(monkeypatch):
+    monkeypatch.setenv(
+        "OKF_HARVEST_DATA_ROLE_ARN", f"arn:aws:iam::{ACCOUNT}:role/okf-harvest-data"
+    )
+    monkeypatch.setenv("OKF_ACCOUNT_ID", ACCOUNT)
+
+    captured = {}
+    fake = _FakeSession()
+
+    def _fake_build_scoped(
+        *, role_arn, session_policy, region, session_name="okf-harvest"
+    ):
+        captured["policy"] = session_policy
+        return fake
+
+    monkeypatch.setattr(clients, "build_scoped_session", _fake_build_scoped)
+    # Connection comes from the self-describing descriptor (no deploy-time env).
+    src = clients.build_source(
+        "dev",
+        source={
+            "type": "redshift",
+            "redshift_database": "dev",
+            "cluster_identifier": "f1-cluster",
+            "secret_arn": "arn:aws:secretsmanager:us-east-1:1:secret:f1",
+        },
+        region=REGION,
+        account_id=ACCOUNT,
+    )
+    assert src.name == "redshift"
+    assert src.database == "dev"
+    # The redshift-data client came from the scoped session.
+    assert src.data.name == "scoped:redshift-data"
+    assert fake.made == ["redshift-data"]
+    # The policy grants the Data API + the ONE mapping secret. Secret auth is the
+    # only wired mode, so no GetClusterCredentials/GetCredentials grants exist.
+    sids = _sids(captured["policy"])
+    assert "RedshiftDataApi" in sids
+    assert "redshift-data:CancelStatement" in sids["RedshiftDataApi"]["Action"]
+    assert "RedshiftClusterAuth" not in sids
+    assert sids["RedshiftSecretRead"]["Resource"] == [
+        "arn:aws:secretsmanager:us-east-1:1:secret:f1"
+    ]
+
+
+def test_build_source_redshift_branch_ambient(monkeypatch):
+    monkeypatch.delenv("OKF_HARVEST_DATA_ROLE_ARN", raising=False)
+    monkeypatch.setenv("OKF_ACCOUNT_ID", ACCOUNT)
+
+    made = []
+
+    class _FakeBoto:
+        def client(self, name, **kw):
+            made.append(name)
+            return _FakeClient(f"ambient:{name}")
+
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "boto3", types.SimpleNamespace(client=_FakeBoto().client)
+    )
+    src = clients.build_source(
+        "dev",
+        source={
+            "type": "redshift",
+            "redshift_database": "dev",
+            "workgroup_name": "wg1",
+            "secret_arn": "arn:aws:secretsmanager:us-east-1:1:secret:wg1",
+        },
+        region=REGION,
+        account_id=ACCOUNT,
+    )
+    assert src.data.name == "ambient:redshift-data"
+    assert src.workgroup_name == "wg1"
+    assert made == ["redshift-data"]
+
+
+def test_build_source_redshift_reads_connection_from_descriptor(monkeypatch):
+    # A self-describing mapping's cluster/workgroup + secret come from the
+    # DESCRIPTOR — so any cluster in the account is harvestable with no deploy env.
+    monkeypatch.setenv(
+        "OKF_HARVEST_DATA_ROLE_ARN", f"arn:aws:iam::{ACCOUNT}:role/okf-harvest-data"
+    )
+    monkeypatch.setenv("OKF_ACCOUNT_ID", ACCOUNT)
+
+    captured = {}
+    fake = _FakeSession()
+
+    def _fake_build_scoped(
+        *, role_arn, session_policy, region, session_name="okf-harvest"
+    ):
+        captured["policy"] = session_policy
+        return fake
+
+    monkeypatch.setattr(clients, "build_scoped_session", _fake_build_scoped)
+    src = clients.build_source(
+        "dev",
+        source={
+            "type": "redshift",
+            "redshift_database": "dev",
+            "workgroup_name": "mapping-wg",
+            "secret_arn": "arn:aws:secretsmanager:us-east-1:1:secret:map",
+        },
+        region=REGION,
+        account_id=ACCOUNT,
+    )
+    # The descriptor's workgroup + secret were used, NOT the env cluster.
+    assert src.workgroup_name == "mapping-wg"
+    assert src.cluster_identifier is None
+    assert src.secret_arn.endswith(":secret:map")
+    sids = _sids(captured["policy"])
+    assert sids["RedshiftSecretRead"]["Resource"] == [
+        "arn:aws:secretsmanager:us-east-1:1:secret:map"
+    ]
+
+
+def test_build_source_redshift_bare_descriptor_has_no_target(monkeypatch):
+    # A db-only descriptor (no cluster/workgroup) can't connect — there is no
+    # deploy-time env fallback anymore, so RedshiftSource raises.
+    monkeypatch.delenv("OKF_HARVEST_DATA_ROLE_ARN", raising=False)
+    monkeypatch.setenv("OKF_ACCOUNT_ID", ACCOUNT)
+
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules,
+        "boto3",
+        types.SimpleNamespace(client=lambda name, **kw: _FakeClient(f"ambient:{name}")),
+    )
+    with pytest.raises(ValueError, match="cluster_identifier"):
+        clients.build_source(
+            "dev",
+            source={"type": "redshift", "redshift_database": "dev"},
+            region=REGION,
+            account_id=ACCOUNT,
+        )
+
+
+def test_redshift_session_policy_data_api_and_secret():
+    policy = clients._redshift_session_policy(
+        region=REGION,
+        account_id=ACCOUNT,
+        secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:rs-xyz",
+    )
+    sids = _sids(policy)
+    assert sids["RedshiftDataApi"]["Resource"] == ["*"]  # not ARN-scopable
+    assert "redshift-data:CancelStatement" in sids["RedshiftDataApi"]["Action"]
+    # Secret auth is the ONLY wired mode: the pinned secret carries cross-target
+    # containment, and no temp-credential grants exist (they'd be dead privilege).
+    assert "RedshiftClusterAuth" not in sids
+    assert "RedshiftServerlessAuth" not in sids
+    assert sids["RedshiftSecretRead"]["Resource"] == [
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:rs-xyz"
+    ]
+    # Inline session policies are capped at 2048 chars.
+    assert len(json.dumps(policy)) < 2048

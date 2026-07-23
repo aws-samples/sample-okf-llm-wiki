@@ -498,6 +498,11 @@ def build_deps(config: Any = None):
     # deploy flag is on (else the role has no Glue/Athena grants anyway).
     if chat_config.sql_enabled:
         clients["athena"] = boto3.client("athena", region_name=region)
+    # Redshift Data API client for SQL on a Redshift-scoped conversation — needs
+    # BOTH deploy flags (the role only carries redshift-data/secret grants when
+    # var.enable_redshift AND var.enable_chat_sql are set).
+    if chat_config.sql_enabled and chat_config.redshift_enabled:
+        clients["redshift_data"] = boto3.client("redshift-data", region_name=region)
     return chat_config, consumption_config, clients
 
 
@@ -552,12 +557,18 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     from chat.ask_human_middleware import AskHumanMiddleware
     from chat.charts import make_chart_tool
     from chat.config import build_chat_model
-    from chat.graph import SYSTEM_PROMPT_WITH_SQL, build_graph
-    from chat.sql import AthenaSQL, make_sql_tool
+    from chat.graph import (
+        SYSTEM_PROMPT_WITH_SQL,
+        SYSTEM_PROMPT_WITH_SQL_REDSHIFT,
+        build_graph,
+    )
+    from chat.sql import AthenaSQL, RedshiftDataSQL, make_sql_tool
     from chat.tools import build_consumption_tools, make_agent_tools
 
-    # The Athena client is present only when sql is deploy-enabled (build_deps).
+    # The Athena / Redshift Data API clients are present only when their deploy
+    # flags are on (build_deps).
     athena_client = clients.pop("athena", None)
+    redshift_data_client = clients.pop("redshift_data", None)
     tools_impl = build_consumption_tools(config=consumption_config, **clients)
 
     def _sql_engine() -> AthenaSQL | None:
@@ -571,15 +582,41 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
             max_rows=chat_config.sql_max_rows,
         )
 
-    def _sql_scope(scope: dict | None) -> dict | None:
-        """Enrich a dataset scope with its real Glue database for the SQL default DB.
+    def _redshift_sql_engine(source: dict) -> RedshiftDataSQL | None:
+        """A Data API engine pinned to the scoped mapping's connection, or None.
 
-        The UI-sent scope carries only ``{data_domain, dataset}``, but a dataset id
-        need not equal its Glue database name (the registry stores ``glue_database``
-        separately). run_sql's default database for unqualified names must be the
-        Glue DB, so resolve it from the registry mapping row here. Best-effort: on
-        any lookup failure make_sql_tool falls back to the dataset id (advisory —
-        the model is told to qualify tables anyway).
+        None when Redshift SQL isn't deploy-enabled (no client) or the mapping's
+        descriptor is incomplete (a legacy db-only row) — the caller then wires NO
+        SQL tool for the run, never the Athena engine (wrong backend).
+        """
+        if not (chat_config.sql_enabled and redshift_data_client is not None):
+            return None
+        if not source.get("redshift_database"):
+            return None
+        try:
+            return RedshiftDataSQL(
+                data=redshift_data_client,
+                database=source["redshift_database"],
+                cluster_identifier=source.get("cluster_identifier") or None,
+                workgroup_name=source.get("workgroup_name") or None,
+                secret_arn=source.get("secret_arn") or None,
+                max_rows=chat_config.sql_max_rows,
+            )
+        except ValueError:
+            # No target/secret in the descriptor -> unconnectable mapping.
+            return None
+
+    def _sql_scope(scope: dict | None) -> dict | None:
+        """Enrich a dataset scope with its registry mapping's source facts.
+
+        The UI-sent scope carries only ``{data_domain, dataset}``. From the
+        mapping row we add: ``glue_database`` (a dataset id need not equal its
+        Glue database name — run_sql's default database for unqualified names
+        must be the real Glue DB) and ``source`` (the ``{type, ...config}``
+        descriptor, so the SQL tool dispatches to the right backend — a Redshift
+        dataset must not be queried through Athena). Best-effort: on any lookup
+        failure the scope passes through unenriched, which yields the historical
+        Athena default (the model is told to qualify tables anyway).
         """
         if not scope:
             return scope
@@ -590,10 +627,15 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                     "sk": f"DATASET#{scope['dataset']}",
                 }
             )
-            gdb = (resp.get("Item") or {}).get("glue_database")
-            if gdb:
-                return {**scope, "glue_database": gdb}
-        except Exception:  # noqa: BLE001 - fall back to the dataset id
+            item = resp.get("Item") or {}
+            enriched = dict(scope)
+            if item.get("glue_database"):
+                enriched["glue_database"] = item["glue_database"]
+            # The resource-API Table returns the source map as a plain dict.
+            if isinstance(item.get("source"), dict):
+                enriched["source"] = item["source"]
+            return enriched
+        except Exception:  # noqa: BLE001 - fall back to the unenriched scope
             pass
         return scope
 
@@ -617,17 +659,34 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # prompt block covers when to use it, so the base prompt already knows about it.
         agent_tools = [*agent_tools, make_ask_human_tool()]
         # Optional read-only SQL: both the deploy flag (engine present) and the
-        # per-run opt-in (features) are required. system_prompt gains a line so the
-        # model knows the tool exists this turn.
+        # per-run opt-in (features) are required. system_prompt gains a block so
+        # the model knows the tool exists this turn. The ENGINE is picked by the
+        # @-scoped dataset's source descriptor: a Redshift-backed dataset gets a
+        # Data API engine pinned to its mapping's connection; anything else (no
+        # scope, glue scope, legacy row) gets the catalog-wide Athena engine. A
+        # Redshift scope on a deployment without Redshift enabled gets NO SQL
+        # tool — running the dataset's queries through Athena would silently hit
+        # the wrong backend/dialect.
         prompt = None
         if features and "sql" in features:
-            engine = _sql_engine()
-            if engine is not None:
-                agent_tools = [
-                    *agent_tools,
-                    make_sql_tool(engine, dataset_scope=_sql_scope(scope)),
-                ]
-                prompt = SYSTEM_PROMPT_WITH_SQL
+            scoped = _sql_scope(scope)
+            scoped_source = (scoped or {}).get("source") or {}
+            if scoped_source.get("type") == "redshift":
+                engine = _redshift_sql_engine(scoped_source)
+                if engine is not None:
+                    agent_tools = [
+                        *agent_tools,
+                        make_sql_tool(engine, dataset_scope=scoped),
+                    ]
+                    prompt = SYSTEM_PROMPT_WITH_SQL_REDSHIFT
+            else:
+                engine = _sql_engine()
+                if engine is not None:
+                    agent_tools = [
+                        *agent_tools,
+                        make_sql_tool(engine, dataset_scope=scoped),
+                    ]
+                    prompt = SYSTEM_PROMPT_WITH_SQL
         # Bedrock prompt caching (Sparky's setup): the middleware passes cache
         # settings via model_settings and ChatBedrockConverse inserts the
         # cachePoint blocks at request time — so the tool schemas + the static

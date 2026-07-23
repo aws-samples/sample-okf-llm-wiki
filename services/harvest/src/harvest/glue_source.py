@@ -13,27 +13,24 @@ so the AgentCore execution role stays the single source of credentials.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from okf_core.concept_types import GLUE_DATABASE_TYPE, GLUE_TABLE_TYPE
 from okf_core.hive_types import flatten_hive_type
+
+# ConceptRef is the source-neutral concept-reference vocabulary; it lives in
+# source_base (with the Source protocol) so every source implementation imports it
+# from one home. Re-exported here for back-compat with existing importers.
+from harvest.source_base import (
+    ConceptRef,
+    SourceMetadataProfile,
+    SourcePromptProfile,
+)
+
+__all__ = ["ConceptRef", "GlueAthenaSource"]
 
 # Athena terminal states — note CANCELLED has two L's.
 _ATHENA_TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
-
-
-@dataclass(frozen=True)
-class ConceptRef:
-    """A source-advertised concept. Mirrors the reference agent's ConceptRef."""
-
-    id: tuple[str, ...]
-    type: str
-    resource: str | None = None
-    hint: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def id_str(self) -> str:
-        return "/".join(self.id)
 
 
 class GlueClient(Protocol):  # pragma: no cover - typing only
@@ -52,6 +49,30 @@ class GlueAthenaSource:
     """Reads one Glue database (a dataset) and samples rows via Athena."""
 
     name = "glue"
+
+    #: Labels for the ``.metadata/`` snapshot (see metadata_export). Glue resources
+    #: are ARNs; row counts are hinted by Glue crawler/ETL Parameters keys.
+    metadata_profile = SourceMetadataProfile(
+        label="Glue",
+        catalog_name="Glue Data Catalog",
+        resource_label="Resource (ARN)",
+        rowcount_param_keys=("recordCount", "numRows", "rowCount"),
+    )
+
+    #: Source facts the harvest prompts state (see SourcePromptProfile). Reproduces
+    #: the original Glue/Athena wording so the Glue harvest prompt is unchanged.
+    prompt_profile = SourcePromptProfile(
+        engine_sentence="a single AWS Glue database queried via Amazon Athena",
+        label="Glue",
+        adapter_file="athena-glue.md",
+        dialect="Athena/Trino",
+        database_type=GLUE_DATABASE_TYPE,
+        table_type_note=f"`{GLUE_TABLE_TYPE}` for each table",
+        resource_note=(
+            "the Glue ARN from the table's `.metadata/tables/<table>.md` sheet"
+        ),
+        schema_type_term="Hive types",
+    )
 
     def __init__(
         self,
@@ -110,7 +131,7 @@ class GlueAthenaSource:
         concepts: list[ConceptRef] = [
             ConceptRef(
                 id=("datasets", self.database),
-                type="Glue Database",
+                type=GLUE_DATABASE_TYPE,
                 resource=self._database_arn(),
                 hint={"database": self.database},
             )
@@ -121,7 +142,7 @@ class GlueAthenaSource:
             concepts.append(
                 ConceptRef(
                     id=("tables", name),
-                    type="Glue Table",
+                    type=GLUE_TABLE_TYPE,
                     resource=self._table_arn(name),
                     hint={"table": name},
                 )
@@ -136,7 +157,7 @@ class GlueAthenaSource:
         return None
 
     def table_names(self) -> list[str]:
-        return [r.id[1] for r in self.list_concepts() if r.type == "Glue Table"]
+        return [r.id[1] for r in self.list_concepts() if r.type == GLUE_TABLE_TYPE]
 
     # -- metadata --------------------------------------------------------
 
@@ -151,7 +172,7 @@ class GlueAthenaSource:
         return tbl
 
     def read_concept(self, ref: ConceptRef) -> dict[str, Any]:
-        if ref.type == "Glue Database":
+        if ref.type == GLUE_DATABASE_TYPE:
             kwargs: dict[str, Any] = {"Name": self.database}
             if self.catalog_id:
                 kwargs["CatalogId"] = self.catalog_id
@@ -168,7 +189,7 @@ class GlueAthenaSource:
                 "resource": self._database_arn(),
             }
 
-        if ref.type == "Glue Table":
+        if ref.type == GLUE_TABLE_TYPE:
             table = ref.hint["table"]
             tbl = self._get_table_raw(table)
             sd = tbl.get("StorageDescriptor", {}) or {}
@@ -199,7 +220,7 @@ class GlueAthenaSource:
     def sample_rows(
         self, ref: ConceptRef, n: int = 5, *, timeout_s: float = 60.0
     ) -> list[dict[str, str | None]] | None:
-        if ref.type != "Glue Table" or self.athena is None:
+        if ref.type != GLUE_TABLE_TYPE or self.athena is None:
             return None
         table = ref.hint["table"]
         # nosec B608 - not user input: self.database/table come from the Glue

@@ -823,11 +823,22 @@ class _SqlFactoryConfig:
         self.sql_max_rows = 200
 
 
-def _factory_tool_names(monkeypatch, *, sql_enabled, features, has_athena=True):
+def _factory_tool_names(
+    monkeypatch,
+    *,
+    sql_enabled,
+    features,
+    has_athena=True,
+    has_redshift_data=False,
+    scope=None,
+    registry_item=None,
+):
     """Build a graph via make_agent_factory, capturing the tool names it wired.
 
     Stubs the heavy collaborators (model build, consumption tools, build_graph) so
-    the test exercises ONLY the gating logic: does run_sql get added?
+    the test exercises ONLY the gating/dispatch logic: does run_sql get added, and
+    with which engine? ``registry_item`` is the mapping row ``_sql_scope`` reads
+    for a ``scope``-carrying run (a resource-API item: plain Python values).
     """
     captured = {}
 
@@ -838,8 +849,16 @@ def _factory_tool_names(monkeypatch, *, sql_enabled, features, has_athena=True):
     import chat.tools as chat_tools_mod
 
     monkeypatch.setattr(chat_config_mod, "build_chat_model", lambda *a, **k: object())
+
+    class _FakeRegistryTable:
+        def get_item(self, Key=None, **kw):
+            return {"Item": registry_item} if registry_item else {}
+
+    class _FakeToolsImpl:
+        ddb = _FakeRegistryTable()
+
     monkeypatch.setattr(
-        chat_tools_mod, "build_consumption_tools", lambda **k: object()
+        chat_tools_mod, "build_consumption_tools", lambda **k: _FakeToolsImpl()
     )
 
     class _T:
@@ -854,6 +873,9 @@ def _factory_tool_names(monkeypatch, *, sql_enabled, features, has_athena=True):
 
     def _fake_build_graph(model, tools, cp, system_prompt=None, middleware=None):
         captured["tools"] = [t.name for t in tools]
+        captured["tool_descriptions"] = {
+            t.name: getattr(t, "description", "") for t in tools
+        }
         captured["prompt"] = system_prompt
         captured["middleware"] = [type(m).__name__ for m in (middleware or [])]
         return object()
@@ -863,9 +885,11 @@ def _factory_tool_names(monkeypatch, *, sql_enabled, features, has_athena=True):
     clients = {"s3": object(), "s3vectors": object(), "bedrock_runtime": object(), "ddb": object()}
     if has_athena:
         clients["athena"] = object()
+    if has_redshift_data:
+        clients["redshift_data"] = object()
 
     factory = server.make_agent_factory(_SqlFactoryConfig(sql_enabled), object(), clients)
-    factory("us.anthropic.claude-opus-4-8", "high", None, object(), features=features)
+    factory("us.anthropic.claude-opus-4-8", "high", scope, object(), features=features)
     return captured
 
 
@@ -909,3 +933,83 @@ def test_prompt_caching_middleware_always_wired(monkeypatch):
     cap = _factory_tool_names(monkeypatch, sql_enabled=False, features=set())
     assert cap["middleware"][0] == "BedrockPromptCachingMiddleware"
     assert "AskHumanMiddleware" in cap["middleware"]
+
+
+# --- per-source SQL engine dispatch (the @-scope's registry mapping) ----------
+
+_RS_SCOPE = {"data_domain": "sales", "dataset": "orders_analytics"}
+_RS_ITEM = {
+    "glue_database": None,
+    "source": {
+        "type": "redshift",
+        "redshift_database": "warehouse",
+        "cluster_identifier": "prod-cluster",
+        "secret_arn": "arn:aws:secretsmanager:eu-west-1:1:secret:okf-x",
+    },
+}
+
+
+def test_sql_redshift_scope_gets_redshift_engine(monkeypatch):
+    # A run @-scoped to a Redshift-backed dataset gets run_sql pinned to that
+    # mapping's connection, with the Redshift prompt block + tool description.
+    cap = _factory_tool_names(
+        monkeypatch,
+        sql_enabled=True,
+        features={"sql"},
+        has_redshift_data=True,
+        scope=_RS_SCOPE,
+        registry_item=_RS_ITEM,
+    )
+    assert "run_sql" in cap["tools"]
+    assert "Redshift" in cap["tool_descriptions"]["run_sql"]
+    assert "`warehouse`" in cap["tool_descriptions"]["run_sql"]
+    assert "Redshift" in cap["prompt"]
+
+
+def test_sql_redshift_scope_without_redshift_deploy_gets_no_tool(monkeypatch):
+    # Redshift-scoped run on a deployment WITHOUT enable_redshift: no redshift
+    # client -> NO SQL tool at all. It must never fall back to Athena (wrong
+    # backend/dialect for the dataset's queries).
+    cap = _factory_tool_names(
+        monkeypatch,
+        sql_enabled=True,
+        features={"sql"},
+        has_athena=True,
+        has_redshift_data=False,
+        scope=_RS_SCOPE,
+        registry_item=_RS_ITEM,
+    )
+    assert "run_sql" not in cap["tools"]
+    assert cap["prompt"] is None
+
+
+def test_sql_redshift_scope_with_incomplete_mapping_gets_no_tool(monkeypatch):
+    # A legacy db-only redshift row (no target/secret) can't connect -> no tool.
+    cap = _factory_tool_names(
+        monkeypatch,
+        sql_enabled=True,
+        features={"sql"},
+        has_redshift_data=True,
+        scope=_RS_SCOPE,
+        registry_item={"source": {"type": "redshift", "redshift_database": "warehouse"}},
+    )
+    assert "run_sql" not in cap["tools"]
+
+
+def test_sql_glue_scope_still_gets_athena_engine(monkeypatch):
+    # A glue-mapped scope keeps the catalog-wide Athena engine (with the scope's
+    # real glue_database as the default DB — asserted via the Athena description).
+    cap = _factory_tool_names(
+        monkeypatch,
+        sql_enabled=True,
+        features={"sql"},
+        has_redshift_data=True,
+        scope={"data_domain": "sales", "dataset": "orders"},
+        registry_item={
+            "glue_database": "orders",
+            "source": {"type": "glue", "glue_database": "orders"},
+        },
+    )
+    assert "run_sql" in cap["tools"]
+    assert "Athena" in cap["tool_descriptions"]["run_sql"]
+    assert "run_sql" in cap["prompt"] and "Redshift" not in cap["prompt"]

@@ -36,17 +36,17 @@ from pathlib import Path
 from typing import Any
 
 from harvest.fsutil import mkdirs
-from harvest.glue_source import GlueAthenaSource
 from harvest.graph_tools import make_graph_tools
 from harvest.guard_engine import OKFGuardEngine
 from harvest.okf_guard import OKFGuardMiddleware
 from harvest.prompts import (
-    CONTEXT_EXTRACTOR_PROMPT,
-    REFERENCE_AUTHOR_PROMPT,
-    REVIEWER_PROMPT,
-    TABLE_AUTHOR_PROMPT,
+    build_context_extractor_prompt,
+    build_reference_author_prompt,
+    build_reviewer_prompt,
     build_supervisor_prompt,
+    build_table_author_prompt,
 )
+from harvest.source_base import Source
 from harvest.source_tools import make_source_tools
 from okf_core.link_graph import LinkGraph
 
@@ -373,7 +373,7 @@ class HarvestAgent:
     """A built agent plus the session objects the entrypoint needs."""
 
     agent: Any  # compiled deepagents graph
-    source: GlueAthenaSource
+    source: Source
     link_graph: LinkGraph
     dataset_root: Path
     # Present only on a recursive-improvement run: the per-run benchmark session,
@@ -416,7 +416,7 @@ def _build_benchmark_session(
     run: dict[str, Any],
     questions: Any,
     chat_model: Any,
-    source: GlueAthenaSource,
+    source: Source,
     source_tools: list[Any],
     dataset_root: Path,
     step_emitter: Any,
@@ -496,7 +496,7 @@ def _make_benchmark_tool(session: Any) -> Any:
 
 
 def build_harvest_agent(
-    source: GlueAthenaSource,
+    source: Source,
     dataset_root: str | Path,
     *,
     model: str = DEFAULT_MODEL,
@@ -658,6 +658,10 @@ def build_harvest_agent(
         routes=routes,
     )
 
+    # Every prompt is built for THIS run's source (correct type strings, dialect,
+    # adapter, resource form) — a Redshift run must not be told to write Glue types.
+    prompt_profile = source.prompt_profile
+
     # One dynamic sub-agent, dispatched once per table. Its tools + middleware
     # REPLACE the defaults, so we pass the guard and the same source/graph tools
     # explicitly (the sub-agent does the writing). Sub-agents inherit the skills
@@ -665,10 +669,10 @@ def build_harvest_agent(
     table_author = {
         "name": "table-author",
         "description": (
-            "Enrich exactly one Glue table and write its OKF markdown doc. "
+            "Enrich exactly one source table and write its OKF markdown doc. "
             "Pass the table's concept id, e.g. 'tables/races'."
         ),
-        "system_prompt": TABLE_AUTHOR_PROMPT,
+        "system_prompt": build_table_author_prompt(prompt_profile),
         "tools": all_tools,
         "middleware": [guard],
     }
@@ -690,7 +694,7 @@ def build_harvest_agent(
             "(references/usage_guardrails.md). Pass the concept id + fact type + a "
             "grounding brief. NOT for per-table enums/joins (table-author owns those)."
         ),
-        "system_prompt": REFERENCE_AUTHOR_PROMPT,
+        "system_prompt": build_reference_author_prompt(prompt_profile),
         "tools": all_tools,
         "middleware": [guard],
     }
@@ -708,7 +712,7 @@ def build_harvest_agent(
             "gotcha, SQL that errors/returns wrong rows) with the query that "
             "proves each — or 'no issues found'."
         ),
-        "system_prompt": REVIEWER_PROMPT,
+        "system_prompt": build_reviewer_prompt(prompt_profile),
         "tools": all_tools,  # source + graph tools; read_file comes from the backend
     }
 
@@ -730,7 +734,7 @@ def build_harvest_agent(
             "docs are read once, not re-read by every table-author. READ-ONLY — "
             "returns plain-text findings, writes nothing."
         ),
-        "system_prompt": CONTEXT_EXTRACTOR_PROMPT,
+        "system_prompt": build_context_extractor_prompt(prompt_profile),
         "tools": all_tools,  # source + graph + run_code; read_file from the backend
     }
 
@@ -761,7 +765,8 @@ def build_harvest_agent(
         model=chat_model,
         tools=all_tools,
         system_prompt=build_supervisor_prompt(
-            recursive_improvement=benchmark_session is not None
+            recursive_improvement=benchmark_session is not None,
+            profile=prompt_profile,
         ),
         middleware=main_middleware,
         subagents=[table_author, reference_author, reviewer, context_extractor],

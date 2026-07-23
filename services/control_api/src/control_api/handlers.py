@@ -31,8 +31,13 @@ from okf_core.links import extract_links_with_headings
 from okf_core.paths import parse_concept_id
 from okf_core.session import HARVEST_LEASE_STALE_SECONDS, runtime_session_id
 from okf_core.sources import (
+    REDSHIFT_CLUSTER_KEY,
+    REDSHIFT_DATABASE_KEY,
+    REDSHIFT_SECRET_ARN_KEY,
+    REDSHIFT_WORKGROUP_KEY,
+    SOURCE_TYPE_GLUE,
+    SOURCE_TYPE_REDSHIFT,
     SourceError,
-    build_glue_source,
     normalize_source,
     source_glue_database,
 )
@@ -139,6 +144,160 @@ def assert_glue_database_exists(glue, database: str) -> None:
         if code == "EntityNotFoundException":
             raise ApiError(404, f"no such Glue database: {database!r}") from e
         raise
+
+
+def assert_source_registrable(glue, *, dataset: str, source: dict[str, Any]) -> None:
+    """Per-source registration guards for ``PUT /domains/{d}/datasets/{ds}``.
+
+    * **glue** — the dataset name MUST equal the Glue database name (the harvest
+      runtime and the incremental path resolve a dataset to a Glue database of the
+      SAME name), and the database must exist (front-run ``GetTables`` → 404 on a
+      typo). This preserves the historical Glue contract.
+    * **redshift** — the dataset name is the OKF dataset id and is INDEPENDENT of
+      the ``redshift_database`` (a Redshift database holds many schemas/datasets),
+      so there is no equality rule. The mapping must be COMPLETE, though: the
+      self-describing connection (a ``cluster_identifier`` or ``workgroup_name``,
+      plus the ``secret_arn`` that authenticates to it) is required here, because
+      a db-only descriptor can't be harvested and would otherwise fail deep in the
+      async run instead of 400ing at this boundary. We deliberately do NOT probe
+      the connection live (that would run ``ListDatabases`` on every PUT); an
+      unreachable target surfaces when the first harvest runs.
+
+    Raises :class:`SourceError` (mapped to 400 by the route) on a rule violation;
+    :class:`ApiError` (404) if a named Glue database doesn't exist.
+    """
+    source_type = source.get("type")
+    if source_type == SOURCE_TYPE_GLUE:
+        glue_database = source_glue_database(source)
+        if dataset != glue_database:
+            raise SourceError(
+                f"dataset must equal glue_database (got dataset={dataset!r}, "
+                f"glue_database={glue_database!r})"
+            )
+        assert_glue_database_exists(glue, glue_database)
+    elif source_type == SOURCE_TYPE_REDSHIFT:
+        if not source.get(REDSHIFT_DATABASE_KEY):
+            raise SourceError("redshift source requires a non-empty redshift_database")
+        # Fail fast on an unharvestable mapping: the harvest connects entirely
+        # from the descriptor, so registration requires the full connection.
+        if not (source.get(REDSHIFT_CLUSTER_KEY) or source.get(REDSHIFT_WORKGROUP_KEY)):
+            raise SourceError(
+                "redshift source requires a cluster_identifier or workgroup_name "
+                "(the harvest connects from the mapping's descriptor)"
+            )
+        if not source.get(REDSHIFT_SECRET_ARN_KEY):
+            raise SourceError(
+                "redshift source requires a secret_arn (the Secrets Manager "
+                "secret that authenticates to the cluster/workgroup)"
+            )
+        # No equality rule and no live probe (see docstring).
+    # Unknown types were already rejected by normalize_source.
+
+
+def list_redshift_targets(redshift, redshift_serverless) -> list[dict[str, Any]]:
+    """List every Redshift compute target the account can harvest from.
+
+    Returns ``[{kind, id, database?}]`` where ``kind`` is ``"cluster"`` (a
+    provisioned cluster) or ``"workgroup"`` (a Serverless workgroup) and ``id`` is
+    the identifier the mapping/harvest connects by. ``database`` is the cluster's
+    default DB when Redshift reports one (a hint for the UI). Both calls are pure
+    IAM control-plane reads (no DB connection), so this feeds the UI's cluster
+    picker without any credentials. Paginated. Best-effort per API: if one of the
+    two services errors (e.g. not enabled in-region, or ``var.enable_redshift``
+    is off so the role has no grants), its list is simply empty — but the error
+    is LOGGED so an IAM/throttling problem doesn't masquerade as "no clusters".
+    """
+    out: list[dict[str, Any]] = []
+
+    token: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {"Marker": token} if token else {}
+        try:
+            resp = redshift.describe_clusters(**kwargs)
+        except Exception:  # noqa: BLE001 - a disabled/absent service is fine
+            logging.getLogger("control_api").warning(
+                "describe_clusters failed (enable_redshift off, or a real "
+                "IAM/availability error?); returning no provisioned clusters",
+                exc_info=True,
+            )
+            break
+        for c in resp.get("Clusters", []):
+            out.append(
+                {
+                    "kind": "cluster",
+                    "id": c.get("ClusterIdentifier"),
+                    "database": c.get("DBName"),
+                }
+            )
+        token = resp.get("Marker")
+        if not token:
+            break
+
+    token = None
+    while True:
+        kwargs = {"nextToken": token} if token else {}
+        try:
+            resp = redshift_serverless.list_workgroups(**kwargs)
+        except Exception:  # noqa: BLE001
+            logging.getLogger("control_api").warning(
+                "list_workgroups failed (enable_redshift off, or a real "
+                "IAM/availability error?); returning no Serverless workgroups",
+                exc_info=True,
+            )
+            break
+        for w in resp.get("workgroups", []):
+            out.append({"kind": "workgroup", "id": w.get("workgroupName")})
+        token = resp.get("nextToken")
+        if not token:
+            break
+
+    return out
+
+
+def list_redshift_databases(
+    redshift_data,
+    *,
+    cluster_identifier: str | None = None,
+    workgroup_name: str | None = None,
+    secret_arn: str | None = None,
+    database: str | None = None,
+) -> list[str]:
+    """List database names on one Redshift target via the Data API.
+
+    Unlike :func:`list_redshift_targets`, this DOES connect (``ListDatabases`` runs
+    against the target), so it needs the target identifier + a Secrets Manager
+    secret to authenticate. Feeds the UI's database picker once a cluster/workgroup
+    is chosen. Requires exactly one of ``cluster_identifier`` / ``workgroup_name``.
+
+    ``database`` is the BOOTSTRAP database ``ListDatabases`` connects to first —
+    for a provisioned cluster pass its ``DBName`` (returned as the ``database``
+    hint by :func:`list_redshift_targets`), since a cluster created with a custom
+    initial database may have no ``dev`` at all. Falls back to the conventional
+    ``dev`` (always present on Serverless).
+    """
+    if not (cluster_identifier or workgroup_name):
+        raise ApiError(400, "cluster or workgroup is required")
+    if not secret_arn:
+        raise ApiError(400, "secret_arn is required to list databases")
+    kwargs: dict[str, Any] = {"Database": database or "dev", "SecretArn": secret_arn}
+    if cluster_identifier:
+        kwargs["ClusterIdentifier"] = cluster_identifier
+    else:
+        kwargs["WorkgroupName"] = workgroup_name
+    names: list[str] = []
+    token: str | None = None
+    while True:
+        if token:
+            kwargs["NextToken"] = token
+        try:
+            resp = redshift_data.list_databases(**kwargs)
+        except Exception as e:  # noqa: BLE001 - surface a clean 400 to the UI
+            raise ApiError(400, f"could not list Redshift databases: {e}") from e
+        names.extend(resp.get("Databases", []) or [])
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return names
 
 
 # --------------------------------------------------------------------------- #
@@ -380,40 +539,46 @@ def upsert_domain_mapping(
     registry_table: str,
     data_domain: str,
     dataset: str,
-    glue_database: str,
+    source: dict[str, Any] | None = None,
+    glue_database: str | None = None,
 ) -> dict[str, Any]:
     """Create/replace the DOMAIN#<domain> / DATASET#<dataset> registry item.
 
     Item shape (CONVENTIONS.md): attrs ``data_domain, dataset, source,
-    glue_database, created_at``. ``source`` is the first-class, future-extensible
-    source descriptor — a nested map ``{type, ...config}`` (see
-    ``okf_core.sources``); today the only type is ``glue``. The flat
-    ``glue_database`` attribute is ALSO written for back-compat: the harvest
-    payload and the incremental scan (which filters on ``glue_database``) still
-    read it directly, so no consumer needs to change in lockstep. We PutItem
-    (full overwrite) since the mapping is small and PUT matches the REST verb.
+    created_at`` (+ a flat ``glue_database`` mirror for glue sources only).
+    ``source`` is the first-class source descriptor — a nested map
+    ``{type, ...config}`` (see ``okf_core.sources``); its config keys are stored
+    generically so a new source type adds no per-key code here. For a GLUE source
+    we ALSO write the flat top-level ``glue_database`` attribute for back-compat:
+    the incremental scan (``iter_dataset_mappings``) filters on it. A non-glue
+    source writes no such mirror — it isn't reached by the glue-event path. We
+    PutItem (full overwrite) since the mapping is small and PUT matches the verb.
+
+    Pass EITHER a ``source`` descriptor or the convenience ``glue_database`` (lifted
+    into a glue source); ``normalize_source`` reconciles both into one shape.
     """
-    source = build_glue_source(glue_database)
-    item = {
+    source = normalize_source(source, glue_database=glue_database)
+    # Store every source-config key as a nested string map, source-generically.
+    source_map = {k: {"S": str(v)} for k, v in source.items()}
+    item: dict[str, Any] = {
         "pk": {"S": f"DOMAIN#{data_domain}"},
         "sk": {"S": f"DATASET#{dataset}"},
         "data_domain": {"S": data_domain},
         "dataset": {"S": dataset},
-        "source": {
-            "M": {
-                "type": {"S": source["type"]},
-                "glue_database": {"S": source["glue_database"]},
-            }
-        },
-        "glue_database": {"S": glue_database},  # back-compat mirror of source config
+        "source": {"M": source_map},
         "created_at": {"S": _now_iso()},
     }
+    # Back-compat mirror: only a glue source carries the flat glue_database that the
+    # incremental (aws.glue-event) path reads. Other source types omit it.
+    glue_db = source_glue_database(source)
+    if glue_db:
+        item["glue_database"] = {"S": glue_db}
     ddb.put_item(TableName=registry_table, Item=item)
     return {
         "data_domain": data_domain,
         "dataset": dataset,
         "source": source,
-        "glue_database": glue_database,
+        "glue_database": glue_db,
     }
 
 
@@ -452,6 +617,30 @@ def get_dataset_guidance(
         "dataset": dataset,
         **_guidance_fields(item),
     }
+
+
+def get_dataset_source(
+    ddb, *, registry_table: str, data_domain: str, dataset: str
+) -> dict[str, Any] | None:
+    """The dataset's normalized source descriptor (``{type, ...config}``), or None.
+
+    Read from the mapping's ``source`` attr (tolerating legacy flat ``glue_database``
+    rows via ``_source_from_item``), so ``trigger_harvest`` / the annotation run can
+    thread it into the invocation payload and the runtime dispatches on ``type``
+    instead of assuming a Glue database named by the dataset. Best-effort: a missing
+    mapping returns None (the runtime then defaults to a glue source by dataset name).
+    """
+    resp = ddb.get_item(
+        TableName=registry_table,
+        Key={"pk": {"S": f"DOMAIN#{data_domain}"}, "sk": {"S": f"DATASET#{dataset}"}},
+    )
+    item = resp.get("Item")
+    if not item:
+        return None
+    try:
+        return _source_from_item(item)
+    except SourceError:
+        return None
 
 
 def set_dataset_guidance(
@@ -1481,6 +1670,15 @@ def trigger_harvest(
         "dataset": dataset,
         "mode": mode,
     }
+    # First-class source descriptor ({type, ...config}) so the runtime dispatches on
+    # the source type instead of assuming a Glue database named by the dataset.
+    # Best-effort: a missing/legacy mapping omits it and the runtime defaults to a
+    # glue source by dataset name (back-compat).
+    source = get_dataset_source(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
+    if source:
+        payload["source"] = source
     # Per-harvest model/effort override (already validated against the catalog in
     # the route adapter). Omitted -> the runtime uses its deploy-time env default.
     if model:
@@ -2702,6 +2900,12 @@ def trigger_annotation_harvest(
             "user_sub": user_sub,
             "annotations": payload_annotations,
         }
+        # Source descriptor so the annotation re-harvest reads the right backend.
+        source = get_dataset_source(
+            ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+        )
+        if source:
+            payload["source"] = source
         if domain_meta:
             if domain_meta.get("description"):
                 payload["domain_description"] = domain_meta["description"]

@@ -7,9 +7,11 @@ import pytest
 from okf_core.sources import (
     DEFAULT_SOURCE_TYPE,
     SOURCE_TYPE_GLUE,
+    SOURCE_TYPE_REDSHIFT,
     SUPPORTED_SOURCE_TYPES,
     SourceError,
     build_glue_source,
+    build_redshift_source,
     is_supported_source_type,
     normalize_source,
     source_glue_database,
@@ -19,9 +21,11 @@ from okf_core.sources import (
 
 def test_glue_is_the_default_and_supported():
     assert DEFAULT_SOURCE_TYPE == SOURCE_TYPE_GLUE == "glue"
-    assert SUPPORTED_SOURCE_TYPES == ("glue",)
+    # Glue and Redshift are the supported source types today.
+    assert SUPPORTED_SOURCE_TYPES == ("glue", "redshift")
     assert is_supported_source_type("glue")
-    assert not is_supported_source_type("redshift")
+    assert is_supported_source_type("redshift")
+    assert not is_supported_source_type("bigquery")
     assert not is_supported_source_type(None)
 
 
@@ -62,7 +66,80 @@ def test_normalize_defaults_missing_type_to_glue():
 
 def test_normalize_rejects_unsupported_type():
     with pytest.raises(SourceError, match="unsupported source type"):
-        normalize_source({"type": "redshift", "cluster": "c"})
+        normalize_source({"type": "bigquery", "project": "p"})
+
+
+def test_build_redshift_source_shape():
+    assert build_redshift_source("dev") == {
+        "type": SOURCE_TYPE_REDSHIFT,
+        "redshift_database": "dev",
+    }
+
+
+def test_build_redshift_source_requires_database():
+    with pytest.raises(SourceError):
+        build_redshift_source("")
+
+
+def test_normalize_from_redshift_source_object():
+    src = normalize_source({"type": "redshift", "redshift_database": "dev"})
+    assert src == {"type": "redshift", "redshift_database": "dev"}
+
+
+def test_normalize_rejects_redshift_without_database():
+    with pytest.raises(SourceError, match="redshift source requires"):
+        normalize_source({"type": "redshift"})
+
+
+def test_build_redshift_source_with_serverless_connection():
+    src = build_redshift_source(
+        "dev",
+        workgroup_name="wg1",
+        secret_arn="arn:aws:secretsmanager:eu-west-1:1:secret:x",
+    )
+    assert src == {
+        "type": "redshift",
+        "redshift_database": "dev",
+        "workgroup_name": "wg1",
+        "secret_arn": "arn:aws:secretsmanager:eu-west-1:1:secret:x",
+    }
+
+
+def test_build_redshift_source_with_provisioned_connection():
+    src = build_redshift_source(
+        "dev",
+        cluster_identifier="c1",
+        secret_arn="arn:aws:secretsmanager:eu-west-1:1:secret:x",
+    )
+    assert src["cluster_identifier"] == "c1"
+    assert "workgroup_name" not in src
+
+
+def test_build_redshift_source_rejects_both_targets():
+    with pytest.raises(SourceError, match="only ONE"):
+        build_redshift_source(
+            "dev", cluster_identifier="c1", workgroup_name="wg1", secret_arn="s"
+        )
+
+
+def test_build_redshift_source_target_requires_secret():
+    with pytest.raises(SourceError, match="secret_arn is required"):
+        build_redshift_source("dev", workgroup_name="wg1")
+
+
+def test_build_redshift_source_secret_requires_target():
+    with pytest.raises(SourceError, match="cluster_identifier or workgroup_name"):
+        build_redshift_source("dev", secret_arn="s")
+
+
+def test_normalize_redshift_roundtrips_connection_fields():
+    obj = {
+        "type": "redshift",
+        "redshift_database": "dev",
+        "cluster_identifier": "c1",
+        "secret_arn": "arn:aws:secretsmanager:eu-west-1:1:secret:x",
+    }
+    assert normalize_source(obj) == obj
 
 
 def test_normalize_rejects_glue_without_database():

@@ -565,6 +565,24 @@ flag, to bound a turn's token cost. New env: `OKF_CHAT_SQL_ENABLED`,
 `OKF_ATHENA_OUTPUT` (only meaningful when SQL is on). New UI env:
 `VITE_CHAT_SQL_ENABLED` (gates the composer's "+" → SQL affordance).
 
+**Per-source dispatch (Redshift).** The engine behind `run_sql` is picked per
+conversation from the `@`-scoped dataset's registry mapping
+(`server.make_agent_factory._sql_scope` reads the `source` descriptor). Default —
+no scope, a glue scope, or a legacy row — is the catalog-wide Athena engine above.
+A **Redshift-backed** scope gets `chat/sql.py:RedshiftDataSQL` instead: the
+Redshift Data API, PINNED to that mapping's cluster/workgroup + database +
+Secrets Manager secret (the self-describing descriptor), with a Redshift-dialect
+tool description and prompt block so the model writes `amazon-redshift` SQL with
+`"schema"."table"` qualification. Requires `var.enable_redshift` **and**
+`var.enable_chat_sql` (adds `redshift-data:*` + prefix-scoped
+`secretsmanager:GetSecretValue` to the chat role, and sets
+`OKF_REDSHIFT_ENABLED`). A Redshift-scoped run on a deployment without Redshift
+enabled gets **no SQL tool** — never a silent Athena fallback against the wrong
+backend. **Read-only caveat:** unlike Athena, IAM cannot bound Redshift SQL — the
+statement runs with the SQL privileges of the mapping secret's DB user, so the
+query guard is the runtime check and a **read-only DB user in the secret** is the
+real boundary (see `docs/DATA_SOURCES.md`).
+
 ## 14c. Inline charts (`render_chart`) — BUILT
 
 The agent can show a **chart inline** in its answer when a visual carries the point

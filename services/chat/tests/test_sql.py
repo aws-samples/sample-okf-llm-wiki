@@ -15,6 +15,7 @@ import pytest
 from chat.sql import (
     KNOWN_FEATURES,
     AthenaSQL,
+    RedshiftDataSQL,
     is_read_only,
     make_sql_tool,
     normalize_features,
@@ -204,6 +205,160 @@ def test_make_sql_tool_no_scope_has_no_default_db():
     assert "Database" not in athena.started[0]["QueryExecutionContext"]
 
 
+# --- the Redshift Data API engine (fake client) ------------------------------
+
+
+class _FakeRedshiftData:
+    """Canned execute/describe/result pages. Records calls for assertions."""
+
+    def __init__(self, pages, *, status="FINISHED"):
+        # pages: list of {"ColumnMetadata": [...], "Records": [...]} result pages.
+        self._pages = pages
+        self._status = status
+        self.executed = []
+        self.cancelled = []
+
+    def execute_statement(self, **kwargs):
+        self.executed.append(kwargs)
+        return {"Id": "stmt-1"}
+
+    def describe_statement(self, **kwargs):
+        return {
+            "Status": self._status,
+            "Error": "boom",
+            "HasResultSet": bool(self._pages),
+        }
+
+    def get_statement_result(self, **kwargs):
+        idx = 0 if "NextToken" not in kwargs else int(kwargs["NextToken"])
+        page = dict(self._pages[idx])
+        if idx + 1 < len(self._pages):
+            page["NextToken"] = str(idx + 1)
+        return page
+
+    def cancel_statement(self, **kwargs):
+        self.cancelled.append(kwargs["Id"])
+        return {"Status": True}
+
+
+def _rs_page(columns, records):
+    return {
+        "ColumnMetadata": [{"name": c} for c in columns],
+        "Records": records,
+    }
+
+
+def _rs_engine(data, **kw):
+    kw.setdefault("cluster_identifier", "prod-cluster")
+    kw.setdefault("secret_arn", "arn:aws:secretsmanager:eu-west-1:1:secret:okf-x")
+    return RedshiftDataSQL(data=data, database="warehouse", **kw)
+
+
+def test_redshift_engine_requires_target_and_secret():
+    with pytest.raises(ValueError):
+        RedshiftDataSQL(data=_FakeRedshiftData([]), database="warehouse")
+    with pytest.raises(ValueError):
+        RedshiftDataSQL(
+            data=_FakeRedshiftData([]), database="warehouse", workgroup_name="wg"
+        )
+
+
+def test_redshift_engine_returns_typed_rows_and_preserves_null():
+    data = _FakeRedshiftData(
+        [
+            _rs_page(
+                ["id", "name"],
+                [
+                    [{"longValue": 1}, {"stringValue": "a"}],
+                    [{"longValue": 2}, {"isNull": True}],
+                    [{"booleanValue": True}, {"stringValue": ""}],
+                ],
+            )
+        ]
+    )
+    out = _rs_engine(data).run('SELECT id, name FROM "public"."t"')
+    assert out["columns"] == ["id", "name"]
+    assert out["rows"] == [
+        {"id": "1", "name": "a"},
+        {"id": "2", "name": None},  # NULL preserved (not "")
+        {"id": "true", "name": ""},  # bool -> "true"; empty string stays ""
+    ]
+    assert out["row_count"] == 3 and out["truncated"] is False
+    # The pinned connection flowed into the Data API call.
+    exe = data.executed[0]
+    assert exe["Database"] == "warehouse"
+    assert exe["ClusterIdentifier"] == "prod-cluster"
+    assert exe["SecretArn"].endswith(":secret:okf-x")
+    assert "WorkgroupName" not in exe
+
+
+def test_redshift_engine_workgroup_connection():
+    data = _FakeRedshiftData([_rs_page(["n"], [[{"longValue": 1}]])])
+    eng = RedshiftDataSQL(
+        data=data,
+        database="warehouse",
+        workgroup_name="analytics-wg",
+        secret_arn="arn:aws:secretsmanager:eu-west-1:1:secret:okf-x",
+    )
+    eng.run("SELECT n FROM t")
+    assert data.executed[0]["WorkgroupName"] == "analytics-wg"
+    assert "ClusterIdentifier" not in data.executed[0]
+
+
+def test_redshift_engine_paginates_and_truncates():
+    data = _FakeRedshiftData(
+        [
+            _rs_page(["n"], [[{"longValue": 1}], [{"longValue": 2}]]),
+            _rs_page(["n"], [[{"longValue": 3}], [{"longValue": 4}]]),
+        ]
+    )
+    out = _rs_engine(data, max_rows=3).run("SELECT n FROM t")
+    assert [r["n"] for r in out["rows"]] == ["1", "2", "3"]
+    assert out["truncated"] is True
+
+
+def test_redshift_engine_rejects_non_read_before_calling_backend():
+    data = _FakeRedshiftData([])
+    with pytest.raises(ValueError):
+        _rs_engine(data).run("DROP TABLE t")
+    assert data.executed == []  # never reached the Data API
+
+
+def test_redshift_engine_raises_on_failed_statement():
+    data = _FakeRedshiftData([_rs_page(["n"], [])], status="FAILED")
+    with pytest.raises(RuntimeError):
+        _rs_engine(data).run("SELECT 1")
+
+
+def test_redshift_engine_timeout_cancels_statement():
+    data = _FakeRedshiftData([_rs_page(["n"], [])], status="STARTED")
+    with pytest.raises(TimeoutError):
+        _rs_engine(data, timeout_s=0).run("SELECT 1")
+    assert data.cancelled == ["stmt-1"]
+
+
+def test_redshift_engine_ignores_default_database():
+    # Signature parity with AthenaSQL: the connection stays pinned to the
+    # mapping's database regardless of any scope-derived default.
+    data = _FakeRedshiftData([_rs_page(["n"], [[{"longValue": 1}]])])
+    _rs_engine(data).run("SELECT n FROM t", default_database="something_else")
+    assert data.executed[0]["Database"] == "warehouse"
+
+
+def test_make_sql_tool_uses_engine_description():
+    # The tool description must match the ENGINE (backend + dialect), not a fixed
+    # Athena blurb — the model writes SQL based on this text.
+    athena_tool = make_sql_tool(AthenaSQL(athena=_FakeAthena([])))
+    assert "Athena" in athena_tool.description
+    rs_tool = make_sql_tool(
+        _rs_engine(_FakeRedshiftData([])),
+        dataset_scope={"data_domain": "sales", "dataset": "orders_analytics"},
+    )
+    assert "Redshift" in rs_tool.description
+    assert "`warehouse`" in rs_tool.description  # names the pinned database
+    assert "Trino" not in rs_tool.description or "NOT Athena/Trino" in rs_tool.description
+
+
 # --- feature normalization --------------------------------------------------
 
 
@@ -220,6 +375,11 @@ def test_normalize_features_keeps_known_drops_unknown():
 
 
 class _FailingEngine:
+    # tool_description is part of the engine contract make_sql_tool reads (real
+    # engines: AthenaSQL / RedshiftDataSQL). The value is irrelevant to these
+    # error-path tests, but the attribute must exist.
+    tool_description = "run_sql (test double)"
+
     def __init__(self, exc):
         self._exc = exc
 
