@@ -547,6 +547,8 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     ``stream_run`` drives ``.astream`` on it directly.
     """
     from chat.ask_human import make_ask_human_tool
+    from langchain_aws.middleware import BedrockPromptCachingMiddleware
+
     from chat.ask_human_middleware import AskHumanMiddleware
     from chat.charts import make_chart_tool
     from chat.config import build_chat_model
@@ -626,8 +628,14 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                     make_sql_tool(engine, dataset_scope=_sql_scope(scope)),
                 ]
                 prompt = SYSTEM_PROMPT_WITH_SQL
+        # Bedrock prompt caching (Sparky's setup): the middleware passes cache
+        # settings via model_settings and ChatBedrockConverse inserts the
+        # cachePoint blocks at request time — so the tool schemas + the static
+        # system prompt + prior turns become a CACHE READ on every tool-loop
+        # iteration instead of full-price input. No-ops (with a warning) on a
+        # non-Bedrock model (a Mantle GPT catalog entry).
         # AskHumanMiddleware owns the human-in-the-loop interrupt for ask_human.
-        middleware = [AskHumanMiddleware()]
+        middleware = [BedrockPromptCachingMiddleware(), AskHumanMiddleware()]
         if prompt is not None:
             return build_graph(
                 chat_model, agent_tools, checkpointer,
@@ -641,13 +649,26 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
 
 
 def make_checkpointer(chat_config: Any):
-    """Build the DynamoDBSaver checkpointer from config (PK/SK schema, optional TTL)."""
+    """Build the DynamoDBSaver checkpointer from config (PK/SK schema, optional TTL).
+
+    Compression is always on, and when OKF_CHAT_CHECKPOINT_BUCKET is set,
+    checkpoint blobs too large for DynamoDB's 400KB item cap are offloaded to S3
+    (otherwise a long turn with big tool results dies with "PutItem ... Item size
+    has exceeded the maximum allowed size"). Both are handled transparently by
+    DynamoDBSaver.
+    """
     from langgraph_checkpoint_aws import DynamoDBSaver
 
+    kwargs: dict[str, Any] = {}
+    bucket = getattr(chat_config, "checkpoint_offload_bucket", "")
+    if bucket:
+        kwargs["s3_offload_config"] = {"bucket_name": bucket}
     return DynamoDBSaver(
         table_name=chat_config.checkpoint_table,
         region_name=chat_config.region,
         ttl_seconds=chat_config.checkpoint_ttl_seconds,
+        enable_checkpoint_compression=True,
+        **kwargs,
     )
 
 

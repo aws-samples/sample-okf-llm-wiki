@@ -898,3 +898,14 @@ def test_ask_human_tool_and_middleware_always_wired(monkeypatch):
     cap = _factory_tool_names(monkeypatch, sql_enabled=False, features=set())
     assert "ask_human" in cap["tools"]
     assert "AskHumanMiddleware" in cap["middleware"]
+
+
+def test_prompt_caching_middleware_always_wired(monkeypatch):
+    # Bedrock prompt caching rides EVERY chat agent (Sparky's setup): the
+    # middleware passes cache settings via model_settings and
+    # ChatBedrockConverse inserts the cachePoint blocks at request time, so the
+    # tool schemas + static system prompt + prior turns become cache reads on
+    # every tool-loop iteration. First in the list, before AskHumanMiddleware.
+    cap = _factory_tool_names(monkeypatch, sql_enabled=False, features=set())
+    assert cap["middleware"][0] == "BedrockPromptCachingMiddleware"
+    assert "AskHumanMiddleware" in cap["middleware"]

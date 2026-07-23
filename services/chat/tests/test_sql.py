@@ -214,3 +214,39 @@ def test_normalize_features_keeps_known_drops_unknown():
     assert normalize_features(None) == set()
     assert normalize_features("sql") == set()  # must be a list, not a bare string
     assert "sql" in KNOWN_FEATURES
+
+
+# --- tool-level error conversion: failures return as results, never raise ----
+
+
+class _FailingEngine:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def run(self, sql, *, default_database=None):
+        raise self._exc
+
+
+def _tool_fn(engine):
+    return make_sql_tool(engine).func
+
+
+def test_run_sql_athena_failure_returned_not_raised():
+    fn = _tool_fn(_FailingEngine(RuntimeError(
+        "Athena query FAILED: COLUMN_NOT_FOUND: line 1:44: Column 'mc.x' cannot be resolved"
+    )))
+    out = fn(sql="SELECT mc.x FROM t")  # no raise
+    assert isinstance(out, str) and out.startswith("Error: run_sql failed:")
+    assert "COLUMN_NOT_FOUND" in out  # Athena's text passes through verbatim
+
+
+def test_run_sql_guard_valueerror_is_concise():
+    fn = _tool_fn(_FailingEngine(ValueError("run_sql accepts a single read-only statement only")))
+    out = fn(sql="DROP TABLE t")
+    assert out == "Error: run_sql accepts a single read-only statement only"
+
+
+def test_run_sql_timeout_returned_not_raised():
+    fn = _tool_fn(_FailingEngine(TimeoutError("Athena query q1 timed out")))
+    out = fn(sql="SELECT 1")
+    assert "TimeoutError" in out and out.startswith("Error: run_sql failed:")

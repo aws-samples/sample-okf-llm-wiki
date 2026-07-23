@@ -461,6 +461,20 @@ data "aws_iam_policy_document" "chat" {
     resources = [local.d.chat_checkpoints_table_arn, local.d.chat_table_arn]
   }
 
+  # Checkpoint S3 offload: DynamoDBSaver spills checkpoint blobs > the 400KB
+  # DynamoDB item cap into this dedicated bucket (OKF_CHAT_CHECKPOINT_BUCKET)
+  # and reads/deletes them on checkpoint load/cleanup.
+  statement {
+    sid       = "ChatCheckpointOffloadRW"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["${local.d.chat_checkpoint_bucket_arn}/*"]
+  }
+  statement {
+    sid       = "ChatCheckpointOffloadList"
+    actions   = ["s3:ListBucket"]
+    resources = [local.d.chat_checkpoint_bucket_arn]
+  }
+
   # Bedrock Mantle (OpenAI-compatible) — needed when a GPT id is reachable at chat
   # time (deploy-time default OR any catalog entry the picker offers). Separate IAM
   # namespace from bedrock:*; the bearer token provide_token() mints inherits this

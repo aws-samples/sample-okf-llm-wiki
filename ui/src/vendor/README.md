@@ -21,3 +21,18 @@ registers the `Chart` global, which is exactly what the inline `<script>` needs.
 **To update:** bump `chart.js` in `package.json`, then
 `cp node_modules/chart.js/dist/chart.umd.min.js src/vendor/chart.umd.min.js` and
 update the version above.
+
+## `chartjs-chart-sankey.min.js` — chartjs-chart-sankey v0.15.0 (MIT)
+
+UMD build of [chartjs-chart-sankey](https://github.com/kurkle/chartjs-chart-sankey),
+copied verbatim from `node_modules/chartjs-chart-sankey/dist/chartjs-chart-sankey.min.js`.
+Registers the `sankey` controller against the global `Chart` when inlined after
+the core lib (same vendoring rationale as chart.umd.min.js: the sandboxed chart
+frame can't fetch anything, so the plugin must ride the srcdoc).
+
+## `chartjs-chart-treemap.min.js` — chartjs-chart-treemap v4.2.0 (MIT)
+
+UMD build of [chartjs-chart-treemap](https://github.com/kurkle/chartjs-chart-treemap),
+copied verbatim from `node_modules/chartjs-chart-treemap/dist/chartjs-chart-treemap.min.js`.
+Registers the `treemap` controller against the global `Chart`; inlined into the
+chart frame's srcdoc after the core lib, same rationale as above.

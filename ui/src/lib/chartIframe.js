@@ -21,6 +21,11 @@
 // React wrapper (ChartFrame.jsx) sizes the iframe and shows a contained error.
 
 import CHART_JS_SRC from "@/vendor/chart.umd.min.js?raw"
+// Plugin controllers for the two non-core chart types (see vendor/README.md).
+// Their UMD builds self-register against the global `Chart`, so inlining them
+// after the core lib is all the wiring the frame needs.
+import CHART_SANKEY_SRC from "@/vendor/chartjs-chart-sankey.min.js?raw"
+import CHART_TREEMAP_SRC from "@/vendor/chartjs-chart-treemap.min.js?raw"
 
 // The palette + UI tokens we resolve from the app theme and hand to the frame.
 // --chart-1..5 are the series palette; the rest style axes/legend/tooltip so the
@@ -152,7 +157,10 @@ function helperSource() {
   // Map the agent's spec → a Chart.js config. Colors always come from the palette
   // (the spec's own colors are ignored unless the model set them explicitly, which
   // the authoring contract discourages). Supports bar/line/area/pie/doughnut/
-  // radar/scatter; anything else throws a clear error the wrapper surfaces.
+  // radar/scatter/bubble/polarArea plus the inlined plugin types sankey/treemap,
+  // horizontal bar/line/area (spec.horizontal → indexAxis "y"), and mixed charts
+  // (a per-series 'type' of bar|line|area overlaid on the base); anything else
+  // throws a clear error the wrapper surfaces.
   function toConfig(spec) {
     if (!spec || typeof spec !== "object") throw new Error("chart spec must be an object");
     var type = spec.type;
@@ -160,15 +168,18 @@ function helperSource() {
     var series = spec.series || [];
     if (!Array.isArray(series) || series.length === 0) throw new Error("chart spec needs a non-empty 'series' array");
 
-    // shadcn-style axes: NO axis border lines, NO y tick labels (values live in
-    // the tooltip), only faint horizontal gridlines; x labels in muted gray.
+    // shadcn-style axes: NO axis border lines, NO tick labels on the VALUE axis
+    // (values live in the tooltip), only faint gridlines along it; CATEGORY
+    // labels in muted gray. spec.horizontal swaps which physical axis is which
+    // (indexAxis "y"), so the two configs mirror each other.
+    var mutedTicks = { color: rgb(P.mutedForeground || "115,115,115") };
     var scalesLinear = {
       x: {
         title: spec.xLabel ? { display: true, text: spec.xLabel } : { display: false },
         stacked: !!spec.stacked,
         grid: { display: false },
         border: { display: false },
-        ticks: { color: rgb(P.mutedForeground || "115,115,115") }
+        ticks: mutedTicks
       },
       y: {
         title: spec.yLabel ? { display: true, text: spec.yLabel } : { display: false },
@@ -179,30 +190,168 @@ function helperSource() {
         ticks: { display: false }
       }
     };
+    var scalesHorizontal = {
+      x: {
+        title: spec.xLabel ? { display: true, text: spec.xLabel } : { display: false },
+        stacked: !!spec.stacked,
+        beginAtZero: true,
+        grid: { color: gridColor(0.14) },
+        border: { display: false },
+        ticks: { display: false }
+      },
+      y: {
+        title: spec.yLabel ? { display: true, text: spec.yLabel } : { display: false },
+        stacked: !!spec.stacked,
+        grid: { display: false },
+        border: { display: false },
+        ticks: mutedTicks
+      }
+    };
 
-    if (type === "pie" || type === "doughnut") {
+    if (type === "pie" || type === "doughnut" || type === "polarArea") {
       var s0 = series[0] || { data: [] };
+      // polarArea slices overlap the radial grid, so they get a light alpha
+      // (like radar fills); pie/doughnut slices stay solid.
+      var polar = type === "polarArea";
       return {
         type: type,
         data: { labels: labels, datasets: [{
           label: s0.name || "",
           data: s0.data || [],
-          backgroundColor: (s0.data || []).map(function (_, i) { return rgb(seriesColor(i)); }),
+          backgroundColor: (s0.data || []).map(function (_, i) { return rgb(seriesColor(i), polar ? 0.7 : undefined); }),
           borderColor: rgb(P.card || "255,255,255"),
           borderWidth: 2
         }] },
-        options: { plugins: { legend: { position: "right" } } }
+        options: polar
+          ? { plugins: { legend: { position: "right" } },
+              scales: { r: { grid: { color: gridColor(0.16) }, ticks: { display: false } } } }
+          : { plugins: { legend: { position: "right" } } }
       };
     }
 
-    if (type === "scatter") {
+    if (type === "scatter" || type === "bubble") {
+      // Same shape; bubble points carry {x, y, r} and get a light alpha so
+      // overlapping bubbles stay readable.
+      var bubble = type === "bubble";
       return {
-        type: "scatter",
+        type: type,
         data: { datasets: series.map(function (s, i) {
           return { label: s.name || ("Series " + (i + 1)), data: s.data || [],
-                   backgroundColor: rgb(seriesColor(i)), borderColor: rgb(seriesColor(i)) };
+                   backgroundColor: rgb(seriesColor(i), bubble ? 0.6 : undefined),
+                   borderColor: rgb(seriesColor(i)) };
         }) },
         options: { scales: scalesLinear }
+      };
+    }
+
+    if (type === "sankey") {
+      // Flow diagram (chartjs-chart-sankey, inlined + self-registered in this
+      // frame). One series; data = [{from, to, flow}] edges. Nodes are colored
+      // by first appearance so a node keeps ONE palette color on both sides of
+      // its flows; the link is a gradient between its endpoints' colors.
+      var sk = series[0] || { data: [] };
+      var flows = sk.data || [];
+      var nodes = [];
+      flows.forEach(function (f) {
+        if (f && f.from != null && nodes.indexOf(f.from) === -1) nodes.push(f.from);
+        if (f && f.to != null && nodes.indexOf(f.to) === -1) nodes.push(f.to);
+      });
+      var nodeColor = function (name) {
+        return rgb(seriesColor(Math.max(0, nodes.indexOf(name))), 0.85);
+      };
+      return {
+        type: "sankey",
+        data: { datasets: [{
+          label: sk.name || "",
+          data: flows,
+          colorFrom: function (c) { return nodeColor(c.dataset.data[c.dataIndex].from); },
+          colorTo: function (c) { return nodeColor(c.dataset.data[c.dataIndex].to); },
+          colorMode: "gradient",
+          borderWidth: 0,
+          color: rgb(P.foreground || "23,23,23") // node label text
+        }] },
+        options: { plugins: { legend: { display: false } } }
+      };
+    }
+
+    if (type === "treemap") {
+      // Share-of-total rectangles (chartjs-chart-treemap). One series; data =
+      // [{label, value}] leaves, optionally with a 'group' field for one
+      // nesting level. PLUGIN SEMANTICS (non-obvious, from its group() source):
+      // at every node, raw._data.label is that LEVEL's value (the group name on
+      // a header rect, the leaf name on a leaf rect) and raw._data.group is the
+      // grouping KEY NAME ("group" on headers / "label" on leaves) — so colors
+      // key off a precomputed label→group map, never off _data.group.
+      var tm = series[0] || { data: [] };
+      var items = tm.data || [];
+      var hasGroups = items.some(function (d) { return d && d.group != null; });
+      var groupNames = [];
+      var groupOf = {}; // any node label (group OR leaf name) → palette index
+      items.forEach(function (d) {
+        var g = d && (hasGroups ? d.group : d.label);
+        if (g != null && groupNames.indexOf(g) === -1) groupNames.push(g);
+      });
+      groupNames.forEach(function (g, i) { groupOf[g] = i; });
+      items.forEach(function (d) {
+        if (d && d.label != null && groupOf[d.label] == null) {
+          groupOf[d.label] = hasGroups ? (groupOf[d.group] || 0) : 0;
+        }
+      });
+      var nodeIdx = function (c) {
+        var o = (c.raw && c.raw._data) || {};
+        return groupOf[o.label] != null ? groupOf[o.label] : 0;
+      };
+      return {
+        type: "treemap",
+        data: { datasets: [{
+          label: tm.name || "",
+          tree: items,
+          key: "value",
+          groups: hasGroups ? ["group", "label"] : ["label"],
+          // No border strokes — separation comes from spacing alone (the gaps
+          // show the page surface), which reads cleaner on the flat tints.
+          borderWidth: 0,
+          borderRadius: 4,
+          spacing: 1.5,
+          backgroundColor: function (c) {
+            if (c.type !== "data") return "transparent";
+            var o = (c.raw && c.raw._data) || {};
+            // Only the LEAVES carry color (a solid group-hue tint). The group
+            // header rect is left TRANSPARENT — its saturated fill otherwise
+            // competes with the leaves it contains; the caption + the shared
+            // leaf hue already convey the grouping. Leaves still read as one
+            // color family per group via nodeIdx.
+            var isHeader = hasGroups && o.group === "group";
+            return isHeader ? "transparent" : rgb(seriesColor(nodeIdx(c)), 0.75);
+          },
+          labels: {
+            display: true,
+            color: "rgba(255,255,255,0.95)",
+            formatter: function (c) {
+              var o = (c.raw && c.raw._data) || {};
+              if (o.label == null) return "";
+              // Two lines: name + value (the number is the point of a treemap).
+              var v = o.value != null ? o.value : c.raw && c.raw.v;
+              return typeof v === "number"
+                ? [String(o.label), v.toLocaleString()]
+                : String(o.label);
+            }
+          },
+          captions: {
+            display: true,
+            // The header band is now transparent (draws on the chart/page
+            // surface, not a filled rect), so the caption uses the app
+            // foreground rather than white — readable in both themes.
+            color: rgb(P.foreground || "23,23,23"),
+            // The default caption prints the grouping KEY NAME ("group") —
+            // show the actual group value (this level's label) instead.
+            formatter: function (c) {
+              var o = (c.raw && c.raw._data) || {};
+              return o.label != null ? String(o.label) : "";
+            }
+          }
+        }] },
+        options: { plugins: { legend: { display: false } } }
       };
     }
 
@@ -221,29 +370,49 @@ function helperSource() {
       };
     }
 
-    // area = a filled line chart.
+    // area = a filled line chart. A series may carry its OWN type (bar|line|
+    // area) to overlay on the base — Chart.js mixed charts — e.g. monthly bars
+    // with a cumulative line. spec.horizontal flips the index axis (ranked
+    // "top N" lists with long category names read better as horizontal bars).
     var isArea = type === "area";
     var chartType = isArea ? "line" : type;
     if (chartType !== "line" && chartType !== "bar") {
       throw new Error("unsupported chart type: " + JSON.stringify(type));
     }
+    var horizontal = !!spec.horizontal;
+    // Value-axis chrome (the faint gridlines — ticks are already hidden).
+    // Horizontal bars default to NONE: they're usually ranked lists where the
+    // category labels carry the story and gridlines are just noise; values
+    // live in the tooltip. spec.axes overrides either way (axes: true keeps
+    // gridlines on a horizontal chart, axes: false strips them vertically).
+    var showAxes = spec.axes != null ? !!spec.axes : !horizontal;
+    if (!showAxes) {
+      (horizontal ? scalesHorizontal.x : scalesLinear.y).grid = { display: false };
+    }
     return {
       type: chartType,
       data: { labels: labels, datasets: series.map(function (s, i) {
+        // Per-series override for mixed charts; anything unrecognized falls
+        // back to the spec's base type rather than throwing mid-chart.
+        var sIsArea = s.type ? s.type === "area" : isArea;
+        var sType = s.type === "bar" ? "bar" : s.type === "line" || sIsArea ? "line" : chartType;
         var base = {
+          type: sType,
           label: s.name || ("Series " + (i + 1)),
           data: s.data || [],
           borderColor: rgb(seriesColor(i)),
-          backgroundColor: (chartType === "bar") ? rgb(seriesColor(i)) : rgb(seriesColor(i), isArea ? 0.2 : 1),
+          backgroundColor: (sType === "bar") ? rgb(seriesColor(i)) : rgb(seriesColor(i), sIsArea ? 0.2 : 1),
           borderWidth: 2,
-          borderRadius: (chartType === "bar") ? 4 : 0,
+          borderRadius: (sType === "bar") ? 4 : 0,
           tension: 0.3,
-          pointRadius: (chartType === "line") ? 2 : 0
+          pointRadius: (sType === "line") ? 2 : 0
         };
-        if (isArea) base.fill = true;
+        if (sIsArea) base.fill = true;
         return base;
       }) },
-      options: { scales: scalesLinear }
+      options: horizontal
+        ? { indexAxis: "y", scales: scalesHorizontal }
+        : { scales: scalesLinear }
     };
   }
 
@@ -343,6 +512,8 @@ function bootstrapSource(userCode) {
 // app so text in the frame reads consistently.
 export function buildChartSrcdoc({ code, palette, fontFamily }) {
   const lib = neutralizeScriptClose(CHART_JS_SRC)
+  const sankey = neutralizeScriptClose(CHART_SANKEY_SRC)
+  const treemap = neutralizeScriptClose(CHART_TREEMAP_SRC)
   const paletteJson = neutralizeScriptClose(JSON.stringify(palette || {}))
   const family = (fontFamily || "system-ui, sans-serif").replace(/"/g, "'")
   // CSP: no default sources, inline scripts/styles only (we embed everything), NO
@@ -369,6 +540,8 @@ export function buildChartSrcdoc({ code, palette, fontFamily }) {
 <div id="wrap"><div id="chartbox"><canvas id="okf-canvas"></canvas></div></div>
 <script>window.__OKF_PALETTE__ = ${paletteJson};</script>
 <script>${lib}</script>
+<script>${sankey}</script>
+<script>${treemap}</script>
 <script>${helperSource()}</script>
 <script>${bootstrapSource(code)}</script>
 </body>
