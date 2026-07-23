@@ -64,7 +64,14 @@ const Block = memo(
     if (block.type === "chart") {
       return <ChartFrame code={block.code} title={block.title} live={live} />
     }
-    return <Markdown datasetScope={datasetScope}>{block.content}</Markdown>
+    // `streaming` (block still revealing) lets Markdown hold back / repair the
+    // unstable tail — partial <cite prefixes and unbalanced bold/backtick
+    // markers otherwise flash as literal ghost text while tokens arrive.
+    return (
+      <Markdown datasetScope={datasetScope} streaming={!complete}>
+        {block.content}
+      </Markdown>
+    )
   },
   (prev, next) =>
     prev.complete === next.complete &&

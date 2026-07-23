@@ -72,6 +72,29 @@ const CITE_ORPHAN_CLOSE_RE = /<\/cite\s*>/gi
 const CITE_PARTIAL_RE = /<\/?cite\b[^>]*$/i
 const CITE_SCHEME = "okf-cite:"
 
+// While the typewriter is still revealing a block, hold back / repair the
+// UNSTABLE TAIL so half-arrived markup never flashes as literal "ghost" text:
+//  - a partial `<cite`/`</cite` PREFIX at the very end (`<`, `<c`, `<ci`, …) —
+//    CITE_PARTIAL_RE only matches once "cite" is complete, so the first few
+//    characters of every citation otherwise flash at the line end;
+//  - an unbalanced `**` (bold) or single-backtick run — react-markdown renders
+//    the opener literally until its pair arrives ("**Wolfs" shows raw
+//    asterisks). BALANCING (appending the closer) renders the in-progress span
+//    styled as intended instead, with no visual jump when the real closer lands.
+// Skipped inside an open ``` fence (CodeView owns that text verbatim), and
+// applied ONLY while streaming — a completed message renders exactly as sent.
+const CITE_PREFIX_TAIL_RE = /<\/?(?:c(?:i(?:t(?:e)?)?)?)?$/i
+function stripStreamTail(md) {
+  if (!md) return md || ""
+  let out = md.replace(CITE_PREFIX_TAIL_RE, "")
+  const inFence = ((out.match(/^```/gm) || []).length) % 2 === 1
+  if (!inFence) {
+    if (((out.match(/\*\*/g) || []).length) % 2 === 1) out += "**"
+    if (((out.match(/`/g) || []).length) % 2 === 1) out += "`"
+  }
+  return out
+}
+
 // Turn a comma-separated `src` into clustered citation-chip markdown links (one per
 // concept id). Empty → "" (drops a src-less tag entirely).
 function citeChips(src) {
@@ -227,7 +250,7 @@ function makeComponents(datasetScope) {
   }
 }
 
-export function Markdown({ children, datasetScope = null }) {
+export function Markdown({ children, datasetScope = null, streaming = false }) {
   const scopeKey = datasetScope
     ? `${datasetScope.data_domain}/${datasetScope.dataset}`
     : ""
@@ -235,6 +258,9 @@ export function Markdown({ children, datasetScope = null }) {
     () => makeComponents(datasetScope),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [scopeKey]
+  )
+  const source = preprocessCitations(
+    streaming ? stripStreamTail(children) : children
   )
   return (
     <div className="okf-prose text-sm">
@@ -244,7 +270,7 @@ export function Markdown({ children, datasetScope = null }) {
           urlTransform={urlTransform}
           components={components}
         >
-          {preprocessCitations(children)}
+          {source}
         </ReactMarkdown>
       </TooltipProvider>
     </div>

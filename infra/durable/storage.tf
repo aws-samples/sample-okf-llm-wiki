@@ -113,3 +113,47 @@ resource "aws_s3vectors_index" "concepts" {
     non_filterable_metadata_keys = ["title", "description", "s3_key"]
   }
 }
+
+
+# --- Chat checkpoint offload bucket -------------------------------------------
+# DynamoDB items cap at 400KB; a long chat turn with big tool results overflows
+# the checkpoint row ("PutItem ... Item size has exceeded the maximum allowed
+# size"). DynamoDBSaver offloads oversized checkpoint blobs here transparently
+# (OKF_CHAT_CHECKPOINT_BUCKET on the chat runtime). Blobs are derived
+# conversation state, not durable truth: no versioning, and a lifecycle rule
+# expires them — deleting a thread only removes the DynamoDB rows, so orphaned
+# blobs must age out here.
+resource "aws_s3_bucket" "chat_checkpoints" {
+  bucket = "${var.name_prefix}-chat-checkpoints-${local.account_id}"
+  tags   = var.tags
+}
+
+resource "aws_s3_bucket_public_access_block" "chat_checkpoints" {
+  bucket                  = aws_s3_bucket.chat_checkpoints.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "chat_checkpoints" {
+  bucket = aws_s3_bucket.chat_checkpoints.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "aws:kms"
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "chat_checkpoints" {
+  bucket = aws_s3_bucket.chat_checkpoints.id
+  rule {
+    id     = "expire-offloaded-checkpoints"
+    status = "Enabled"
+    filter {}
+    expiration {
+      days = var.chat_checkpoint_offload_expire_days
+    }
+  }
+}

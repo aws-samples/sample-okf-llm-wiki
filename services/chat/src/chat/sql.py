@@ -38,9 +38,12 @@ permission failure — defense in depth, not the sole boundary.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Any, Callable, Protocol
+
+log = logging.getLogger("chat.sql")
 
 # Trailing-semicolon-tolerant single-statement read-only guard. We strip SQL
 # comments first so a ``SELECT 1 -- ; DROP`` can't smuggle a second statement.
@@ -405,8 +408,20 @@ def make_sql_tool(
     if dataset_scope:
         default_db = dataset_scope.get("glue_database") or dataset_scope.get("dataset")
 
-    def run_sql(sql: str) -> dict[str, Any]:
-        return engine.run(sql, default_database=default_db)
+    def run_sql(sql: str) -> Any:
+        # A failed query must come back to the model as a tool RESULT it can
+        # react to — fix the column name, qualify the table, report the denied
+        # permission — NOT propagate out and kill the whole run (same convention
+        # as chat.tools._make_tool). Athena's own error text (COLUMN_NOT_FOUND:
+        # line N:M ..., Insufficient Lake Formation permission(s) ...) is exactly
+        # the feedback the model needs, so it passes through verbatim.
+        try:
+            return engine.run(sql, default_database=default_db)
+        except ValueError as e:  # the read-only guard — concise, actionable
+            return f"Error: {e}"
+        except Exception as e:  # noqa: BLE001 - a tool error is feedback, not a crash
+            log.warning("run_sql failed", exc_info=True)
+            return f"Error: run_sql failed: {type(e).__name__}: {e}"
 
     return StructuredTool.from_function(
         func=run_sql,

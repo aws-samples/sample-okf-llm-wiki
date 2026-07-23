@@ -38,7 +38,19 @@ from typing import Any
 # The chart types the bundled renderer (Chart.js) supports. Kept here so the tool
 # description, the ack, and the tests all name the SAME set — the UI's renderChart
 # helper maps each onto a Chart.js config.
-SUPPORTED_CHART_TYPES = ("bar", "line", "area", "pie", "doughnut", "radar", "scatter")
+SUPPORTED_CHART_TYPES = (
+    "bar",
+    "line",
+    "area",
+    "pie",
+    "doughnut",
+    "radar",
+    "scatter",
+    "bubble",
+    "polarArea",
+    "sankey",
+    "treemap",
+)
 
 # The authoring contract the model sees. This is where the whole "how to write a
 # chart" instruction lives — NOT in the system prompt — so the base agent never
@@ -57,16 +69,24 @@ HOW IT RENDERS: your `code` runs inside a sandboxed browser frame that already h
 `el` is the <canvas> your code must draw into (already in the DOM — do not create your own). `spec` is a plain object:
 
     renderChart(el, {
-      type: "bar",                       // bar | line | area | pie | doughnut | radar | scatter
+      type: "bar",                       // bar | line | area | pie | doughnut | radar | scatter | bubble | polarArea | sankey | treemap
       title: "Race wins by constructor", // optional heading shown above the chart
       labels: ["Ferrari", "McLaren", "Mercedes"],   // x-axis / category labels
       series: [                          // one entry per data series
         { name: "Wins", data: [243, 183, 125] }
       ],
-      // optional: stacked: true (bar/area), yLabel: "Wins", xLabel: "Team"
+      // optional: stacked: true (bar/area), yLabel: "Wins", xLabel: "Team",
+      // horizontal: true (bar/line/area — swaps the axes; use for long category
+      // names or ranked "top N" lists, which read better as horizontal bars),
+      // axes: true|false (show/hide the value-axis gridlines; horizontal charts
+      // default to false — a clean ranked list — vertical charts to true)
     });
 
-For scatter, each series' `data` is an array of {x, y} points and `labels` is omitted.
+For scatter, each series' `data` is an array of {x, y} points and `labels` is omitted. For bubble, points are {x, y, r} (r = radius in px, scale it to your third dimension). polarArea is like pie/doughnut (one series; each slice's RADIUS encodes the value).
+
+For sankey (FLOW between stages/categories — sources, transitions, allocations), one series whose `data` is [{from, to, flow}] edges (node names as strings, flow = the magnitude); `labels` is omitted. For treemap (share-of-total across many items, optionally grouped), one series whose `data` is [{label, value}] leaves — add a `group` field ({label, value, group}) for one level of nesting; `labels` is omitted.
+
+MIXED charts: give an individual series its own `type` to overlay it on the base type — e.g. monthly bars with a cumulative line: type: "bar", series: [{ name: "Monthly", data: [...] }, { name: "Cumulative", type: "line", data: [...] }]. Per-series `type` accepts bar | line | area.
 
 Your `code` is the BODY of a function that receives `el` — write statements, not a module. Example value for the `code` argument:
 

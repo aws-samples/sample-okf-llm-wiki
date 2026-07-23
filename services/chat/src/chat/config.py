@@ -93,6 +93,12 @@ class ChatConfig:
     # Optional TTL (seconds) for checkpoint rows; None = no expiry.
     checkpoint_ttl_seconds: int | None = None
 
+    # Optional S3 bucket for checkpoint blobs that exceed DynamoDB's 400KB item
+    # cap (a long turn with big tool results otherwise dies with
+    # "PutItem ... Item size has exceeded the maximum allowed size"). Empty =
+    # no offload (DynamoDB only).
+    checkpoint_offload_bucket: str = ""
+
     # Optional read-only SQL tool — the ONE tool that touches source data.
     # Deploy-gated by OKF_CHAT_SQL_ENABLED (the IAM role only carries Glue/Athena
     # when var.enable_chat_sql is set); also requires a per-run opt-in
@@ -142,6 +148,7 @@ class ChatConfig:
             not in ("false", "0", ""),
             mantle_base_url=env.get("OKF_CHAT_MANTLE_BASE_URL"),
             checkpoint_ttl_seconds=int(ttl_raw) if ttl_raw else None,
+            checkpoint_offload_bucket=env.get("OKF_CHAT_CHECKPOINT_BUCKET", ""),
             sql_enabled=env.get("OKF_CHAT_SQL_ENABLED", "").lower()
             in ("true", "1", "yes"),
             athena_workgroup=env.get("OKF_ATHENA_WORKGROUP") or None,

@@ -16,7 +16,7 @@ import {
   SquareIcon,
   XIcon,
 } from "lucide-react"
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 
 import { AskHumanForm } from "@/components/chat/AskHumanForm"
 import { Button } from "@/components/ui/button"
@@ -362,7 +362,14 @@ export function ChatInput({
     el.style.height = `${Math.min(el.scrollHeight, MAX_HEIGHT)}px`
   }, [])
 
-  useEffect(() => {
+  // LAYOUT effect, deliberately: the composer must collapse back to one row
+  // in the SAME frame the send clears the draft — ChatThread's new-turn pin
+  // runs in the parent's layout effect and measures the transcript viewport,
+  // so a post-paint resize (plain useEffect) leaves it measuring against the
+  // still-tall composer and the pin falls short for multi-line messages. Child
+  // layout effects run before the parent's, which is exactly the ordering the
+  // pin relies on. (Also removes the one-frame flash of a tall empty composer.)
+  useLayoutEffect(() => {
     grow()
   }, [text, grow])
 

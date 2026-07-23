@@ -241,6 +241,9 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     OKF_CHAT_CHECKPOINT_TTL_SECONDS = (
       var.chat_checkpoint_ttl_seconds > 0 ? tostring(var.chat_checkpoint_ttl_seconds) : ""
     )
+    # S3 offload for checkpoint blobs over DynamoDB's 400KB item cap (see
+    # chat/server.make_checkpointer + the durable bucket's lifecycle rule).
+    OKF_CHAT_CHECKPOINT_BUCKET = local.d.chat_checkpoint_bucket
 
     # Deploy-time DEFAULT model + the catalog the runtime validates a per-
     # conversation (model, effort) against (RAW JSON — set directly by TF, never

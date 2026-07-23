@@ -127,3 +127,10 @@ variable "transaction_search_indexing_percentage" {
   description = "Percentage of spans indexed as trace summaries (0-100). 1 keeps cost minimal; raise for denser search. Full span data is always in aws/spans regardless."
   default     = 1
 }
+
+
+variable "chat_checkpoint_offload_expire_days" {
+  type        = number
+  description = "Days before offloaded chat-checkpoint blobs in S3 expire. Keep >= the chat checkpoint TTL (compute var.chat_checkpoint_ttl_seconds) so live threads never lose offloaded state; orphans from deleted threads age out with the same rule."
+  default     = 90
+}
