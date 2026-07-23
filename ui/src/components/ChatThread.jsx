@@ -15,6 +15,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
+import { WikiCubeIcon } from "@/components/WikiCubeIcon"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 
@@ -183,7 +184,10 @@ export function ChatThread({
       <div className="flex min-h-0 flex-1 flex-col">
         <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col items-center justify-center gap-6 px-4">
           <div className="text-center">
-            <h2 className="text-2xl font-semibold tracking-tight">{emptyGreeting}</h2>
+            <h2 className="flex items-center justify-center gap-2.5 text-2xl font-semibold tracking-tight">
+              <WikiCubeIcon className="size-12 shrink-0 text-primary" />
+              {emptyGreeting}
+            </h2>
             {emptyHint ? (
               <p className="mt-2 text-sm text-muted-foreground">{emptyHint}</p>
             ) : null}

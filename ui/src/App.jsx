@@ -17,13 +17,13 @@ import {
   MonitorIcon,
   MoonIcon,
   NetworkIcon,
-  NotebookTextIcon,
   PanelLeftIcon,
   PlayIcon,
   SunIcon,
 } from "lucide-react"
 
 import { ChatPanel } from "@/components/ChatPanel"
+import { WikiCubeIcon } from "@/components/WikiCubeIcon"
 import { useChatController } from "@/hooks/useChatController"
 import { makeApi } from "@/lib/api"
 import { signInPreservingRoute } from "@/lib/auth"
@@ -136,7 +136,7 @@ function LoginScreen({ onSignIn }) {
       <Card className="w-full max-w-sm">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <NotebookTextIcon className="size-4" />
+            <WikiCubeIcon className="size-6" />
             Data wiki
           </CardTitle>
           <CardDescription>
@@ -270,14 +270,14 @@ function SidebarToggle({ label, className }) {
   )
 }
 
-// Sidebar brand + collapse control. The logo (NotebookText + "Data wiki"
+// Sidebar brand + collapse control. The logo (the isometric knowledge cube — see WikiCubeIcon — + "Data wiki"
 // wordmark) sits on the left and the collapse toggle is pinned to the right
 // edge. Collapsing fully hides the sidebar (offcanvas), so re-expanding is
 // handled by the persistent trigger in the top bar (see TopbarTrigger).
 function SidebarBrand() {
   return (
     <div className="flex h-8 items-center gap-2 px-1.5 font-heading font-medium">
-      <NotebookTextIcon className="size-5 shrink-0 text-primary" />
+      <WikiCubeIcon className="size-8 shrink-0 text-primary" />
       <span className="truncate">Data wiki</span>
       <SidebarToggle
         label="Collapse sidebar"

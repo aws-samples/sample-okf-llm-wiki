@@ -365,16 +365,19 @@
    scale/opacity change — just color. Transparent background, pure CSS. */
 .okf-agent-dots {
   display: grid;
-  grid-template-columns: repeat(3, 8px); /* 8px pitch between dot centers */
-  grid-template-rows: repeat(3, 8px);
+  grid-template-columns: repeat(3, 7px); /* 7px pitch between sticker centers */
+  grid-template-rows: repeat(3, 7px);
   place-content: center;
   place-items: center;
   background: transparent;
 }
+/* Rubik-face stickers (matches the WikiCubeIcon brand cube): square cells with
+   thin seams instead of round dots. Same grid, same glow animation — only the
+   shape changed, so the twinkle/freeze behaviour is untouched. */
 .okf-agent-dots > span {
-  width: 3.5px; /* a bit bigger than the slider grain */
-  height: 3.5px;
-  border-radius: 50%;
+  width: 5.5px;
+  height: 5.5px;
+  border-radius: 1px;
   background-color: color-mix(in oklch, var(--primary) 25%, transparent);
   /* The glow animation is ALWAYS applied but PAUSED by default — so when the
      agent finishes, each dot FREEZES on whatever color it had reached. `.is-
