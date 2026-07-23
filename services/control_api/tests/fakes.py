@@ -51,6 +51,46 @@ class FakeGlue:
         return {"TableList": []}
 
 
+class FakeRedshift:
+    """redshift control-plane fake: describe_clusters (Marker pagination)."""
+
+    def __init__(self, clusters: list[dict[str, Any]] | None = None):
+        self._clusters = clusters or []
+
+    def describe_clusters(self, **kwargs) -> dict:
+        return {"Clusters": list(self._clusters)}
+
+
+class FakeRedshiftServerless:
+    """redshift-serverless control-plane fake: list_workgroups (nextToken)."""
+
+    def __init__(self, workgroups: list[dict[str, Any]] | None = None):
+        self._workgroups = workgroups or []
+
+    def list_workgroups(self, **kwargs) -> dict:
+        return {"workgroups": list(self._workgroups)}
+
+
+class FakeRedshiftData:
+    """redshift-data fake: list_databases keyed by the connection target.
+
+    ``databases_by_target`` maps a cluster id / workgroup name -> the DB names it
+    returns. A call for an unknown target (or missing secret) mimics the Data API
+    raising, which the handler maps to a clean 400.
+    """
+
+    def __init__(self, databases_by_target: dict[str, list[str]] | None = None):
+        self._by_target = databases_by_target or {}
+        self.calls: list[dict[str, Any]] = []
+
+    def list_databases(self, **kwargs) -> dict:
+        self.calls.append(kwargs)
+        target = kwargs.get("ClusterIdentifier") or kwargs.get("WorkgroupName")
+        if target not in self._by_target:
+            raise RuntimeError(f"cannot connect to {target!r}")
+        return {"Databases": list(self._by_target[target])}
+
+
 class FakeAgentCore:
     """bedrock-agentcore data-plane fake capturing every invoke_agent_runtime call."""
 

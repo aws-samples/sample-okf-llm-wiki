@@ -37,6 +37,7 @@ from typing import Any, Callable
 
 from okf_aws.s3_bundle import is_bundle_ready
 from okf_core.session import runtime_session_id
+from okf_core.sources import build_glue_source
 
 from incremental import store
 from incremental.diff import compute_column_diff
@@ -208,6 +209,11 @@ def process_event(
         "mode": "incremental",
         "changed_table": table,
         "diff": diff,
+        # This path is Glue-only (it fires on aws.glue catalog events keyed by the
+        # Glue database name), so the source is unambiguously the glue database that
+        # emitted the event. Thread the descriptor so the runtime dispatches on type
+        # the same way the Control API triggers do.
+        "source": build_glue_source(database),
     }
     if domain_ctx.get("domain_description"):
         payload["domain_description"] = domain_ctx["domain_description"]

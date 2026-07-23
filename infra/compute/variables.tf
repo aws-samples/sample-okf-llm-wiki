@@ -251,6 +251,26 @@ variable "athena_workgroup" {
   default = "primary"
 }
 
+variable "enable_redshift" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Set true to allow harvests to read an Amazon Redshift data source via the
+    Redshift Data API. It adds the Redshift IAM grants — to the harvest DATA role
+    (redshift-data + redshift(-serverless) auth + secretsmanager:GetSecretValue)
+    and to the Control API role (DescribeClusters / ListWorkgroups / ListDatabases
+    + secretsmanager:GetSecretValue for the UI's cluster/database pickers). Default
+    off — a Glue-only deployment needs none of this.
+
+    NO connection config is set at deploy time: each Redshift mapping is
+    self-describing — the operator picks the cluster/workgroup and its Secrets
+    Manager secret in the UI, and the harvest reads the connection from the
+    mapping's source descriptor ({type: redshift, cluster_identifier|workgroup_name,
+    secret_arn}). Because per-mapping secrets can't be enumerated at deploy time,
+    the GetSecretValue grants are account-wide ("*") when this flag is on.
+  EOT
+}
+
 variable "control_api_provisioned_concurrency" {
   type        = number
   description = "Pre-warmed execution environments for the control API Lambda, to minimize cold starts on the browser-facing plane. 0 disables it."

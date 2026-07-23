@@ -108,18 +108,40 @@ Absent or `enabled=false` ⇒ the feature is entirely inert for the dataset.
 `source` is the first-class, future-extensible **source descriptor** — a nested
 map `{type, ...type-specific config}` naming WHERE the dataset's data lives and
 how the harvester reads it. The vocabulary lives in `okf_core.sources`
-(`SUPPORTED_SOURCE_TYPES`, `DEFAULT_SOURCE_TYPE`); today the only supported type
-is `glue`, whose config is `{"type": "glue", "glue_database": "<db>"}`. New
-source types (Redshift, BigQuery, …) add a type + config keys there with no item-
-schema migration. The flat top-level `glue_database` attribute is **also written**
-as a back-compat mirror of the glue source's config: the harvest invocation
-payload and the incremental scan (`incremental/store.py`, which filters on
-`glue_database`) read it directly, so they need no change in lockstep. Readers go
-through `okf_core.normalize_source`, which reconciles both the new nested shape
-and pre-`source` rows (flat `glue_database` only) into one `{type, ...config}`
-dict. The Control API validates the type on write (`PUT
-/domains/{domain}/datasets/{dataset}` accepts either a `source` object or a bare
-`glue_database`) and rejects any unsupported type with `400`.
+(`SUPPORTED_SOURCE_TYPES`, `DEFAULT_SOURCE_TYPE`). Supported types:
+
+- **glue** — `{"type": "glue", "glue_database": "<db>"}`.
+- **redshift** — `{"type": "redshift", "redshift_database": "<db>"}` plus
+  **self-describing** connection routing: `cluster_identifier` OR `workgroup_name`
+  (exactly one) + `secret_arn` (the Secrets Manager secret that authenticates to
+  it). The operator picks these in the UI, so any cluster/workgroup in the account
+  is harvestable with **no deploy-time connection config** — the harvest reads the
+  connection entirely from the descriptor. `build_redshift_source` enforces the
+  all-or-nothing rule: if a target OR a secret is given, BOTH are required (a `400`
+  otherwise). A bare db-only descriptor has no target and can't connect.
+
+Config keys are stored generically on the item, so a new source type (BigQuery, …)
+adds a type + config keys with no item-schema migration. For a **glue** source the
+flat top-level `glue_database` attribute is **also written** as a back-compat
+mirror: the harvest invocation payload and the incremental scan
+(`incremental/store.py`, which filters on `glue_database`) read it directly. A
+non-glue source writes no such mirror, which is what (correctly) scopes the
+`aws.glue`-event incremental path to Glue datasets. Readers go through
+`okf_core.normalize_source`, which reconciles the nested shape and pre-`source`
+rows (flat `glue_database` only) into one `{type, ...config}` dict. The Control API
+validates on write (`PUT /domains/{domain}/datasets/{dataset}` accepts either a
+`source` object or a bare `glue_database`), rejects an unsupported type with `400`,
+and applies per-source registration rules (`assert_source_registrable`): a **glue**
+dataset name must equal its `glue_database` and the database must exist; a
+**redshift** dataset name is independent of `redshift_database` and gets no live
+existence probe (the harvest verifies the connection when it first runs).
+
+The UI's mapping dialog fills a Redshift descriptor dynamically: `GET
+/redshift/clusters` lists provisioned clusters + Serverless workgroups
+(control-plane, no DB connection), and `GET
+/redshift/databases?cluster=…|workgroup=…&secret_arn=…` lists databases within a
+chosen target via the Redshift Data API (`ListDatabases`, which connects, hence the
+secret).
 
 **Harvest status.** `pk = "HARVEST#<data_domain>#<dataset>"`, `sk = "STATUS"`,
 attrs `{status: queued | running | complete | failed | cancelled, mode,
@@ -317,10 +339,22 @@ id>, payload=json.dumps({...}).encode())`, where the payload is either:
 
 ```json
 { "data_domain": "sales", "dataset": "orders", "mode": "full",
+  "source": { "type": "glue", "glue_database": "orders" },
   "model": "openai.gpt-5.6-sol", "effort": "xhigh",
   "domain_description": "Revenue & order pipelines",
   "domain_context": "Covers all B2C sales; refunds excluded." }
 ```
+
+`source` (optional, all modes) is the first-class source descriptor
+(`okf_core.sources`, `{type, ...config}`) the Control API resolves from the mapping
+row and threads through so the runtime dispatches on the source type
+(`harvest.clients.build_source`) instead of assuming a Glue database named by the
+dataset. A `glue` source carries `glue_database`; a `redshift` source carries
+`redshift_database` plus its cluster/workgroup + `secret_arn` connection routing
+(self-describing — the harvest connects from the descriptor, no deploy-time env).
+**Absent → the runtime defaults to a glue source named by `dataset`** (back-compat:
+older payloads and the provision/write-domain-doc modes carry no `source`). The incremental path is
+Glue-only (it fires on `aws.glue` catalog events) and always sends a `glue` source.
 
 (`model`/`effort` optional — see below.) Or, for an incremental run:
 
@@ -472,7 +506,8 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_FRESHNESS_TABLE` | DynamoDB freshness table (default `okf-freshness`) |
 | `OKF_ANNOTATIONS_TABLE` | DynamoDB annotations table (default `okf-annotations`) — user-scoped wiki feedback + the harvest runner's resolution write-back |
 | `OKF_HARVEST_RUNTIME_ARN` | AgentCore harvest runtime ARN |
-| `OKF_ATHENA_OUTPUT` / `OKF_ATHENA_WORKGROUP` | Athena results |
+| `OKF_ATHENA_OUTPUT` / `OKF_ATHENA_WORKGROUP` | Athena results (glue source) |
+| `OKF_GLUE_CATALOG_ID` | Glue catalog id override (glue source; default the runtime account's catalog) |
 | `OKF_MOUNT_PATH` | S3 Files mount (default `/mnt/data`) |
 | `OKF_CODE_INTERPRETER_ID` | AgentCore Code Interpreter id backing the harvest agent's `run_code` tool (extracts text from binary `.context/` docs). A network-isolated SANDBOX-mode interpreter. Unset → harvest runs without `run_code` (text-only `.context` reading) |
 | `OKF_ENABLE_LAKEFORMATION` | Set (`"true"`) when the harvested Glue catalog is Lake Formation-governed → adds `lakeformation:GetDataAccess` to the harvest data role's per-invocation session policy so LF can vend S3 creds for governed table data. Set by `var.enable_lakeformation`; requires adopter-side LF grants + data-location registration (see `docs/LAKE_FORMATION.md`). Unset → plain IAM catalog access |

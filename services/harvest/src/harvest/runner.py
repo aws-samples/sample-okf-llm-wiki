@@ -30,9 +30,9 @@ from harvest.annotations import (
 from harvest.code_interpreter import build_sandbox
 from harvest.finalize import finalize_bundle, mark_in_progress
 from harvest.fsutil import clean_authored_output, write_text
-from harvest.glue_source import GlueAthenaSource
 from harvest.metadata_export import export_metadata
 from harvest.prompts import build_annotation_prompt
+from harvest.source_base import Source
 from harvest.status import (
     build_registry_client,
     report_status,
@@ -253,7 +253,7 @@ def _sandbox_for(dataset_root: str | Path):
         sandbox.stop()
 
 
-def _table_versions(source: GlueAthenaSource) -> dict[str, str]:
+def _table_versions(source: Source) -> dict[str, str]:
     versions: dict[str, str] = {}
     for name in source.table_names():
         ref = source.find(("tables", name))
@@ -294,7 +294,7 @@ def _guidance_preamble(dataset_guidance: str | None) -> str:
 
 def run_full_harvest(
     *,
-    source: GlueAthenaSource,
+    source: Source,
     dataset_root: str | Path,
     data_domain: str,
     dataset: str,
@@ -476,7 +476,7 @@ def run_full_harvest(
 
 def run_incremental_harvest(
     *,
-    source: GlueAthenaSource,
+    source: Source,
     dataset_root: str | Path,
     data_domain: str,
     dataset: str,
@@ -705,7 +705,7 @@ def _reconcile_annotation_results(
 
 def run_annotation_harvest(
     *,
-    source: GlueAthenaSource,
+    source: Source,
     dataset_root: str | Path,
     data_domain: str,
     dataset: str,
@@ -795,6 +795,7 @@ def run_annotation_harvest(
             domain_description=domain_description,
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
+            profile=source.prompt_profile,
         )
         emitter = _build_emitter(
             data_domain=data_domain, dataset=dataset, session_id=session_id

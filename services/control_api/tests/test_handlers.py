@@ -107,6 +107,81 @@ def test_upsert_writes_nested_source_object(cfg):
     assert item["glue_database"]["S"] == "orders"  # back-compat mirror
 
 
+def test_upsert_redshift_source_stores_generic_map_no_glue_mirror(cfg):
+    # A redshift source is stored generically (its config keys under source.M) and
+    # writes NO flat glue_database mirror (it isn't reached by the glue-event path).
+    result = handlers.upsert_domain_mapping(
+        cfg.ddb,
+        registry_table=REGISTRY,
+        data_domain="sales",
+        dataset="orders_analytics",
+        source={"type": "redshift", "redshift_database": "warehouse"},
+    )
+    assert result["source"] == {"type": "redshift", "redshift_database": "warehouse"}
+    assert result["glue_database"] is None
+    item = cfg.ddb.get_item(
+        TableName=REGISTRY,
+        Key={"pk": {"S": "DOMAIN#sales"}, "sk": {"S": "DATASET#orders_analytics"}},
+    )["Item"]
+    assert item["source"]["M"]["type"]["S"] == "redshift"
+    assert item["source"]["M"]["redshift_database"]["S"] == "warehouse"
+    assert "glue_database" not in item  # no mirror for a non-glue source
+
+
+def test_assert_source_registrable_redshift_allows_distinct_dataset_name(cfg):
+    # Redshift: dataset name is independent of the database; no equality rule, no
+    # live probe. (A glue source would require dataset == glue_database.)
+    handlers.assert_source_registrable(
+        cfg.glue,
+        dataset="orders_analytics",
+        source={"type": "redshift", "redshift_database": "warehouse"},
+    )  # does not raise
+
+
+def test_assert_source_registrable_glue_requires_equality(cfg):
+    with pytest.raises(handlers.SourceError, match="dataset must equal glue_database"):
+        handlers.assert_source_registrable(
+            cfg.glue,
+            dataset="orders",
+            source={"type": "glue", "glue_database": "different_db"},
+        )
+
+
+def test_list_redshift_targets_merges_clusters_and_workgroups(cfg):
+    targets = handlers.list_redshift_targets(cfg.redshift, cfg.redshift_serverless)
+    kinds = {(t["kind"], t["id"]) for t in targets}
+    assert ("cluster", "prod-cluster") in kinds
+    assert ("workgroup", "analytics-wg") in kinds
+
+
+def test_list_redshift_databases_for_a_cluster(cfg):
+    dbs = handlers.list_redshift_databases(
+        cfg.redshift_data,
+        cluster_identifier="prod-cluster",
+        secret_arn="arn:aws:secretsmanager:eu-west-1:1:secret:x",
+    )
+    assert dbs == ["dev", "reporting"]
+
+
+def test_list_redshift_databases_requires_target_and_secret(cfg):
+    with pytest.raises(ApiError) as ei:
+        handlers.list_redshift_databases(cfg.redshift_data, secret_arn="s")
+    assert ei.value.status == 400
+    with pytest.raises(ApiError) as ei2:
+        handlers.list_redshift_databases(
+            cfg.redshift_data, workgroup_name="analytics-wg"
+        )
+    assert ei2.value.status == 400
+
+
+def test_list_redshift_databases_unreachable_target_is_400(cfg):
+    with pytest.raises(ApiError) as ei:
+        handlers.list_redshift_databases(
+            cfg.redshift_data, cluster_identifier="ghost", secret_arn="s"
+        )
+    assert ei.value.status == 400
+
+
 def test_list_domains_derives_source_for_legacy_rows(cfg):
     # A pre-`source` row (flat glue_database only) still yields a source object.
     cfg.ddb.put_item(
@@ -682,6 +757,45 @@ def test_trigger_harvest_incremental_requires_changed_table(cfg, agentcore):
         )
     assert ei.value.status == 400
     assert agentcore.calls == []  # never invoked the runtime
+
+
+def test_trigger_harvest_threads_source_descriptor_from_mapping(cfg, agentcore):
+    # A registered mapping's source descriptor rides the invocation payload so the
+    # runtime dispatches on the source type (Phase D).
+    handlers.upsert_domain_mapping(
+        cfg.ddb,
+        registry_table=REGISTRY,
+        data_domain="sales",
+        dataset="orders",
+        glue_database="orders",
+    )
+    handlers.trigger_harvest(
+        agentcore,
+        cfg.ddb,
+        registry_table=REGISTRY,
+        runtime_arn=HARVEST_ARN,
+        data_domain="sales",
+        dataset="orders",
+        mode="full",
+    )
+    assert agentcore.last_payload()["source"] == {
+        "type": "glue",
+        "glue_database": "orders",
+    }
+
+
+def test_trigger_harvest_omits_source_when_no_mapping(cfg, agentcore):
+    # No mapping row -> no source key (the runtime back-compat-defaults to glue).
+    handlers.trigger_harvest(
+        agentcore,
+        cfg.ddb,
+        registry_table=REGISTRY,
+        runtime_arn=HARVEST_ARN,
+        data_domain="sales",
+        dataset="orders",
+        mode="full",
+    )
+    assert "source" not in agentcore.last_payload()
 
 
 def test_trigger_harvest_rejects_concurrent_same_dataset_409(cfg, agentcore):

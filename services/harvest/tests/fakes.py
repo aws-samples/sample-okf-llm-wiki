@@ -1,12 +1,13 @@
-"""In-memory fakes for the Glue + Athena clients used by GlueAthenaSource tests.
+"""In-memory fakes for the Glue + Athena and Redshift Data API clients.
 
 Modeled on the real F1 database so tests exercise realistic shapes (Hive types,
-ARNs, an Athena SELECT with a header row).
+ARNs, an Athena SELECT with a header row; and the Redshift Data API's async
+execute/describe/get-result surface over the SVV_* catalog views).
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 
 class FakeGlue:
@@ -110,3 +111,167 @@ def f1_like_glue() -> FakeGlue:
         ),
     }
     return FakeGlue("na_mi_formula_1_curated", tables)
+
+
+# -- Redshift Data API -------------------------------------------------------
+
+
+class FakeRedshiftData:
+    """In-memory ``redshift-data`` client for RedshiftSource tests.
+
+    Built from ``handlers``: an ORDERED list of ``(predicate, rows)`` where
+    ``predicate(sql) -> bool`` picks the first matching rule and ``rows`` is a
+    ``list[dict]`` (column name -> Python value, ``None`` for SQL NULL). Each
+    ``execute_statement`` renders those rows into the Data API's
+    ``ColumnMetadata`` / ``Records`` shape, keyed by a per-call statement id, so
+    ``describe_statement`` / ``get_statement_result`` return the right result set.
+    A SQL with no matching rule yields an empty (``HasResultSet=False``) result —
+    the same as a metadata query against a table that has none.
+    """
+
+    def __init__(
+        self,
+        handlers: list[tuple[Callable[[str], bool], list[dict[str, Any]]]],
+        *,
+        status: str = "FINISHED",
+    ):
+        self._handlers = handlers
+        self._status = status
+        self._results: dict[str, list[dict[str, Any]]] = {}
+        self.executed: list[str] = []
+        self._n = 0
+
+    def _match(self, sql: str) -> list[dict[str, Any]]:
+        for predicate, rows in self._handlers:
+            if predicate(sql):
+                return rows
+        return []
+
+    def execute_statement(self, **kwargs) -> dict:
+        sql = kwargs["Sql"]
+        self.executed.append(sql)
+        self._n += 1
+        sid = f"stmt-{self._n}"
+        self._results[sid] = self._match(sql)
+        return {"Id": sid}
+
+    def describe_statement(self, **kwargs) -> dict:
+        sid = kwargs["Id"]
+        rows = self._results.get(sid, [])
+        return {
+            "Status": self._status,
+            "Error": "boom",
+            "HasResultSet": bool(rows),
+        }
+
+    def get_statement_result(self, **kwargs) -> dict:
+        sid = kwargs["Id"]
+        rows = self._results.get(sid, [])
+        if not rows:
+            return {"ColumnMetadata": [], "Records": []}
+        columns = list(rows[0].keys())
+        return {
+            "ColumnMetadata": [{"name": c} for c in columns],
+            "Records": [[_field(r[c]) for c in columns] for r in rows],
+        }
+
+
+def _field(value: Any) -> dict[str, Any]:
+    """Render one cell as a Redshift Data API Field.
+
+    ``None`` -> ``{"isNull": True}``; ``bool`` -> ``booleanValue``; ``int`` ->
+    ``longValue``; ``float`` -> ``doubleValue``; else ``stringValue`` (an empty
+    string stays a stringValue, distinct from NULL — the None-vs-"" contract).
+    """
+    if value is None:
+        return {"isNull": True}
+    if isinstance(value, bool):
+        return {"booleanValue": value}
+    if isinstance(value, int):
+        return {"longValue": value}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    return {"stringValue": str(value)}
+
+
+def f1_like_redshift() -> FakeRedshiftData:
+    """A Redshift Data API fake mirroring the F1 dataset: one native + one external
+    table, across the SVV_* metadata queries RedshiftSource issues."""
+
+    def has(*subs: str) -> Callable[[str], bool]:
+        return lambda sql: all(s in sql for s in subs)
+
+    all_tables = [
+        {"schema_name": "public", "table_name": "races", "table_type": "TABLE"},
+        {
+            "schema_name": "spectrum",
+            "table_name": "results_ext",
+            "table_type": "EXTERNAL TABLE",
+        },
+    ]
+    races_cols = [
+        {
+            "column_name": "raceid",
+            "data_type": "bigint",
+            "character_maximum_length": None,
+            "numeric_precision": 64,
+            "numeric_scale": 0,
+            "is_nullable": "NO",
+            "remarks": "Unique id (PK)",
+        },
+        {
+            "column_name": "name",
+            "data_type": "character varying",
+            "character_maximum_length": 255,
+            "numeric_precision": None,
+            "numeric_scale": None,
+            "is_nullable": "YES",
+            "remarks": "Race name",
+        },
+    ]
+    ext_cols = [
+        {
+            "column_name": "resultid",
+            "data_type": "bigint",
+            "character_maximum_length": None,
+            "numeric_precision": 64,
+            "numeric_scale": 0,
+            "is_nullable": "YES",
+            "remarks": "",
+        },
+        {
+            "column_name": "season",
+            "data_type": "integer",
+            "character_maximum_length": None,
+            "numeric_precision": 32,
+            "numeric_scale": 0,
+            "is_nullable": "YES",
+            "remarks": "",
+        },
+    ]
+    return FakeRedshiftData(
+        [
+            (has("svv_all_tables"), all_tables),
+            (has("svv_all_columns", "'races'"), races_cols),
+            (has("svv_all_columns", "'results_ext'"), ext_cols),
+            (
+                has("svv_table_info", "'races'"),
+                [
+                    {
+                        "diststyle": "KEY(raceid)",
+                        "sortkey1": "year",
+                        "tbl_rows": 976,
+                        "estimated_visible_rows": 976,
+                    }
+                ],
+            ),
+            (
+                has("svv_external_tables", "'results_ext'"),
+                [{"location": "s3://fake-f1/results/"}],
+            ),
+            (
+                has("svv_external_columns", "'results_ext'"),
+                [{"columnname": "season", "external_type": "int"}],
+            ),
+        ]
+    )

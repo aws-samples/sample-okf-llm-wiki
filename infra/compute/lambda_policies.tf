@@ -59,7 +59,7 @@ data "aws_iam_policy_document" "incremental" {
 # Control API: list Glue, read/write registry, read/write bundle + presign
 # uploads, read freshness, invoke the harvest runtime.
 data "aws_iam_policy_document" "control_api" {
-  # checkov:skip=CKV_AWS_356:glue:GetDatabases/GetTables (read-only catalog listing for the "register a dataset" picker) targets the whole catalog by design — the API lists across all databases. InvokeAgentRuntime IS scoped to the single harvest runtime (local.harvest_invoke_resources); StopRuntimeSession stays "*" (see its statement below). logs:FilterLogEvents is already scoped to the AgentCore runtime log-group namespace; DynamoDB/S3/Cognito grants below are resource-scoped.
+  # checkov:skip=CKV_AWS_356:glue:GetDatabases/GetTables (read-only catalog listing for the "register a dataset" picker) targets the whole catalog by design — the API lists across all databases. InvokeAgentRuntime IS scoped to the single harvest runtime (local.harvest_invoke_resources); StopRuntimeSession stays "*" (see its statement below). logs:FilterLogEvents is already scoped to the AgentCore runtime log-group namespace; DynamoDB/S3/Cognito grants below are resource-scoped. The Redshift picker list actions (redshift:DescribeClusters/redshift-serverless:ListWorkgroups/redshift-data:ListDatabases) don't support resource-level scoping; secretsmanager:GetSecretValue is "*" because Redshift mappings are self-describing and their per-mapping secrets can't be enumerated at deploy time.
   statement {
     actions   = ["glue:GetDatabases", "glue:GetTables"]
     resources = ["*"]
@@ -124,5 +124,33 @@ data "aws_iam_policy_document" "control_api" {
       "cognito-idp:DescribeUserPoolClient",
     ]
     resources = [local.d.user_pool_arn]
+  }
+
+  # Redshift source pickers (var.enable_redshift): the UI lists clusters/workgroups
+  # (control-plane, no DB connection) and then databases within a chosen target
+  # (redshift-data:ListDatabases, which DOES connect and needs a Secrets Manager
+  # secret). These list actions don't support resource-level scoping, so "*".
+  dynamic "statement" {
+    for_each = var.enable_redshift ? [1] : []
+    content {
+      sid = "RedshiftSourcePickers"
+      actions = [
+        "redshift:DescribeClusters",
+        "redshift-serverless:ListWorkgroups",
+        "redshift-data:ListDatabases",
+      ]
+      resources = ["*"]
+    }
+  }
+  # Read the connection secret to authenticate the database listing. The operator
+  # picks per-mapping secrets in the UI, which the API can't enumerate at deploy
+  # time, so the grant is account-wide ("*").
+  dynamic "statement" {
+    for_each = var.enable_redshift ? [1] : []
+    content {
+      sid       = "RedshiftSecretRead"
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = ["*"]
+    }
   }
 }

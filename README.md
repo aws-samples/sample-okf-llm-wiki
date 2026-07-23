@@ -1,8 +1,10 @@
 # Data Wiki: AI-powered knowledge bundles for your AWS data, served to agents over MCP
 
-**Data Wiki** turns AWS Glue databases into portable knowledge bundles and serves them to AI agents over the Model Context Protocol (MCP). It reads a Glue catalog, has an LLM author a set of markdown documents describing each dataset — its tables, joins, metrics, and known issues — keeps those documents in sync as the catalog changes, and exposes them to agents through an MCP server. The result: agents that understand *what your data means*, not just what columns exist.
+**Data Wiki** turns your AWS data sources into portable knowledge bundles and serves them to AI agents over the Model Context Protocol (MCP). It reads a source's catalog, has an LLM author a set of markdown documents describing each dataset — its tables, joins, metrics, and known issues — keeps those documents in sync as the source changes, and exposes them to agents through an MCP server. The result: agents that understand *what your data means*, not just what columns exist.
 
-The bundles are Open Knowledge Format (OKF) bundles — a bundle is a directory of markdown files with YAML frontmatter. Data Wiki maps OKF's model onto AWS as `data domain → dataset (Glue database) → table`. The `okf`/`OKF_` prefix on code identifiers, resource names, and env vars refers to the format, not the product.
+Two source types are supported today: the **AWS Glue Data Catalog** (queried via Amazon Athena) and **Amazon Redshift** (provisioned clusters or Serverless, via the Redshift Data API). The architecture is source-pluggable — see [`docs/DATA_SOURCES.md`](./docs/DATA_SOURCES.md) for how a source is implemented and how to add another.
+
+The bundles are Open Knowledge Format (OKF) bundles — a bundle is a directory of markdown files with YAML frontmatter. Data Wiki maps OKF's model onto AWS as `data domain → dataset → table` (a dataset is a Glue database or a Redshift database). The `okf`/`OKF_` prefix on code identifiers, resource names, and env vars refers to the format, not the product.
 
 
 **Note:** This is a sample implementation provided for educational and demonstration purposes. You should review, test, and customize this code for your specific requirements before deploying to any environment.
@@ -15,6 +17,7 @@ The bundles are Open Knowledge Format (OKF) bundles — a bundle is a directory 
 - 🔌 [Connect an Agent (MCP)](./quick-start-guide/connect-an-agent.md) — mint credentials and query bundles from your agents
 - 🚀 [Getting Started](#getting-started) — prerequisites and one-command deploy
 - 🏗️ [Architecture](./docs/ARCHITECTURE.md) — how the pieces fit and the reasoning behind them
+- 🔗 [Data Sources](./docs/DATA_SOURCES.md) — the Glue + Redshift sources and how to add another
 - 📐 [Conventions](./docs/CONVENTIONS.md) — the contract between services (S3 layout, DynamoDB shapes, env vars)
 - 📘 [API Reference](./docs/API_REFERENCE.md) — external API shapes the code was written against
 - 📊 [Benchmark](./benchmark/mini_dev/) — BIRD mini_dev text-to-SQL evaluation (EX 74.0, [report PDF](./benchmark/mini_dev/OKF_mini_dev_report.pdf))
@@ -25,9 +28,10 @@ The bundles are Open Knowledge Format (OKF) bundles — a bundle is a directory 
 
 ## Features
 
-- **Automated Induction** - An AI agent reads your Glue catalog, samples real data, and authors a knowledge bundle describing tables, joins, metrics, and known issues.
+- **Automated Induction** - An AI agent reads your source catalog (Glue or Redshift), samples real data, and authors a knowledge bundle describing tables, joins, metrics, and known issues — in the source's own SQL dialect and type vocabulary.
+- **Pluggable Data Sources** - Harvest from the AWS Glue Data Catalog (via Athena) or Amazon Redshift (via the Redshift Data API); a Redshift mapping is self-describing, so any cluster/workgroup in the account is selectable in the console. The source layer is an extensible seam for adding more.
 - **Grounded in Your Docs** - Attach your own source documents (DDL, data dictionaries, runbooks, specs) so the bundle reflects your organization's knowledge, not just the raw schema.
-- **Self-Healing Freshness** - Glue catalog changes automatically trigger scoped re-harvests, and the semantic search index stays in sync with the bundle on every write.
+- **Self-Healing Freshness** - Glue catalog changes automatically trigger scoped re-harvests, and the semantic search index stays in sync with the bundle on every write. (The event-driven path is Glue-only; Redshift datasets refresh via full/scheduled harvests.)
 - **Served Over MCP** - Any MCP-capable agent can discover, read, and semantically search your bundles with `list_domains`, `list_directory`, `read_page`, `glob`, `grep`, `get_backlinks`, and `semantic_search`.
 - **Machine Credentials** - Mint scoped OAuth2 credentials so applications and agents can call the MCP server programmatically.
 - **Web Console** - Register datasets, upload context docs, run and watch harvests, browse bundles, and explore the link graph from a React UI.
@@ -65,7 +69,7 @@ Full methodology, per-database breakdown, and operational KPIs (tool usage, agen
 **AWS Services Used:**
 
 - Amazon S3 (bundle storage) and S3 Vectors (semantic index)
-- AWS Glue (source catalog) and Amazon Athena (data sampling)
+- AWS Glue + Amazon Athena and/or Amazon Redshift (source catalogs + data sampling)
 - Amazon Bedrock (Claude for induction, Titan V2 for embeddings)
 - Amazon Bedrock AgentCore Runtime (harvest + consumption MCP)
 - AWS Lambda (Control API, reindex, incremental)
@@ -94,7 +98,7 @@ data-wiki/
 ├── okf-mcp/             # Claude Code plugin: connect an agent to the MCP server
 ├── scripts/             # run_tests.sh, build_lambdas.sh, deploy.sh
 ├── quick-start-guide/   # task-oriented guides for using the console
-└── docs/                # ARCHITECTURE.md, CONVENTIONS.md, API_REFERENCE.md
+└── docs/                # ARCHITECTURE.md, CONVENTIONS.md, DATA_SOURCES.md, API_REFERENCE.md
 ```
 
 See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for how the pieces fit together and the reasoning behind the main decisions.
@@ -120,7 +124,7 @@ The following tools must be installed on your local machine:
 
 - A **pre-created, versioned S3 bucket** for Terraform state (the deploy uses split state and won't create this for you).
 - **Amazon Bedrock model access** enabled in your region for the Claude induction model and Amazon Titan Text Embeddings V2. Follow the instructions [here](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html); without access you'll get an `AccessDeniedException` during a harvest.
-- At least one **AWS Glue database** with tables you want to harvest.
+- A **data source** with tables to harvest — at least one **AWS Glue database**, and/or an **Amazon Redshift** cluster/workgroup. Redshift support is off by default; enable it with `TF_VAR_enable_redshift=true` before deploying `compute` (see [`docs/DATA_SOURCES.md`](./docs/DATA_SOURCES.md)). Each Redshift mapping supplies its own connection (cluster/workgroup + a Secrets Manager secret) in the console, so no per-cluster deploy config is needed.
 
 > **Note:** S3 Vectors and Bedrock AgentCore Runtime are used by this stack. Verify they are available in your target region before deploying.
 
@@ -261,7 +265,7 @@ To tear down everything the deploy created:
 
 This tears down both Terraform stacks (durable and compute). The Terraform **state bucket** you pre-created is not managed by the deploy — remove it manually if you no longer need it.
 
-> **Warning:** This permanently deletes the harvested bundles, the vector index, and all registry/credential state. The underlying Glue databases and their data are not touched.
+> **Warning:** This permanently deletes the harvested bundles, the vector index, and all registry/credential state. The underlying source data (Glue databases, Redshift clusters) is not touched.
 
 ---
 

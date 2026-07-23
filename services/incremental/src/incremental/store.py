@@ -58,12 +58,19 @@ class DatasetMapping:
 
 
 def iter_dataset_mappings(registry_table) -> Iterator[DatasetMapping]:
-    """Yield every DATASET item in the registry table.
+    """Yield every GLUE-backed DATASET item in the registry table.
 
     Registry DATASET items live at ``pk="DOMAIN#<domain>"`` /
-    ``sk begins_with "DATASET#"`` with a ``glue_database`` attribute. We scan
-    (the demo registry is tiny) and filter on the sk prefix + presence of a
-    glue_database so partially-written rows are skipped.
+    ``sk begins_with "DATASET#"``. We scan (the demo registry is tiny) and filter
+    on the sk prefix + presence of the flat ``glue_database`` attribute so
+    partially-written rows are skipped.
+
+    Filtering on ``glue_database`` also (correctly) scopes this whole module to
+    GLUE sources: the incremental + nightly-reconcile paths are driven by
+    ``aws.glue`` catalog events / a Glue table sweep, which only apply to Glue.
+    A non-glue source (e.g. Redshift) writes NO flat ``glue_database`` mirror
+    (see ``handlers.upsert_domain_mapping``), so it is intentionally excluded here
+    — such datasets are refreshed by full/scheduled harvests, not this path.
     """
     scan_kwargs: dict[str, Any] = {
         "FilterExpression": Attr("sk").begins_with("DATASET#")

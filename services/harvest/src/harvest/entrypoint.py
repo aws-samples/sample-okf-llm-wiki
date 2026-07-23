@@ -9,7 +9,9 @@ at ~15 min.
 Payload (from the Control API's InvokeAgentRuntime call):
   {
     "data_domain": "sales",
-    "dataset": "orders",              # the Glue database name
+    "dataset": "orders",              # the dataset id (Glue: the database name)
+    "source": {"type": "glue", "glue_database": "orders"},  # source descriptor;
+                                      # absent -> default glue source named by dataset
     "mode": "full" | "incremental" | "annotated",
     "changed_table": "customers",     # incremental only
     "diff": {...}                      # incremental only, optional
@@ -67,7 +69,11 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
         return
 
     root = dataset_root(MOUNT_PATH, data_domain, dataset)
-    source = build_source(dataset)
+    # The Control API threads the resolved source descriptor ({type, ...config})
+    # into the payload; build_source dispatches on its type. Absent (an older
+    # payload) -> build_source defaults to a glue source named by the dataset, the
+    # historical convention, so nothing that predates the descriptor breaks.
+    source = build_source(dataset, source=payload.get("source"))
 
     # Domain description/context (enriched by control_api from DOMAIN#/META).
     domain_description = payload.get("domain_description")

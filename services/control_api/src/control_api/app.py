@@ -72,6 +72,9 @@ class Config:
         ddb,
         glue,
         agentcore,
+        redshift=None,
+        redshift_serverless=None,
+        redshift_data=None,
         cognito=None,
         user_pool_id: str = "",
         mcp_scope: str = "",
@@ -97,6 +100,12 @@ class Config:
         self.ddb = ddb
         self.glue = glue
         self.agentcore = agentcore
+        # Redshift control-plane (cluster/workgroup listing) + Data API (database
+        # listing) clients for the UI's Redshift source pickers. Optional so tests
+        # that don't touch Redshift can omit them.
+        self.redshift = redshift
+        self.redshift_serverless = redshift_serverless
+        self.redshift_data = redshift_data
         # Cognito M2M credential vending (create/delete user-pool app clients).
         self.cognito = cognito
         self.user_pool_id = user_pool_id
@@ -145,6 +154,11 @@ class Config:
             ddb=boto3.client("dynamodb", region_name=region),
             glue=boto3.client("glue", region_name=region),
             agentcore=boto3.client("bedrock-agentcore", region_name=region),
+            redshift=boto3.client("redshift", region_name=region),
+            redshift_serverless=boto3.client(
+                "redshift-serverless", region_name=region
+            ),
+            redshift_data=boto3.client("redshift-data", region_name=region),
             cognito=boto3.client("cognito-idp", region_name=region),
             user_pool_id=os.environ.get("OKF_USER_POOL_ID", ""),
             mcp_scope=os.environ.get("OKF_MCP_SCOPE", ""),
@@ -232,6 +246,21 @@ def _r_list_glue(cfg, params, body, query, caller):
     return 200, handlers.list_glue_databases(cfg.glue)
 
 
+def _r_list_redshift_clusters(cfg, params, body, query, caller):
+    return 200, handlers.list_redshift_targets(cfg.redshift, cfg.redshift_serverless)
+
+
+def _r_list_redshift_databases(cfg, params, body, query, caller):
+    # ?cluster=<id> | ?workgroup=<name>, plus ?secret_arn=<arn> (auth to connect).
+    query = query or {}
+    return 200, handlers.list_redshift_databases(
+        cfg.redshift_data,
+        cluster_identifier=query.get("cluster") or None,
+        workgroup_name=query.get("workgroup") or None,
+        secret_arn=query.get("secret_arn") or None,
+    )
+
+
 def _r_list_domains(cfg, params, body, query, caller):
     return 200, handlers.list_domains(cfg.ddb, registry_table=cfg.registry_table)
 
@@ -292,9 +321,9 @@ def _r_delete_declared_domain(cfg, params, body, query, caller):
 
 
 def _r_upsert_domain(cfg, params, body, query, caller):
-    # Accept the first-class `source` object ({type, glue_database}) or the
-    # legacy flat `glue_database` (the only-supported source today is glue).
-    # normalize_source validates the type and rejects anything unsupported.
+    # Accept the first-class `source` object ({type, ...config}) or the legacy
+    # flat `glue_database`. normalize_source validates the type and rejects
+    # anything unsupported (400).
     body = body or {}
     try:
         source = handlers.normalize_source(
@@ -302,28 +331,24 @@ def _r_upsert_domain(cfg, params, body, query, caller):
         )
     except handlers.SourceError as e:
         raise ApiError(400, str(e)) from e
-    glue_database = handlers.source_glue_database(source)
     dataset = params["dataset"]
-    # The dataset name IS the Glue database name: the harvest runtime queries
-    # Glue by the dataset name directly (CONVENTIONS.md frozen payload), so a
-    # mapping where they differ is unharvestable. Reject it at the boundary.
-    if dataset != glue_database:
-        raise ApiError(
-            400,
-            f"dataset must equal glue_database (got dataset={dataset!r}, "
-            f"glue_database={glue_database!r})",
-        )
     # A mapping must select from a PRE-DECLARED domain.
     handlers.assert_domain_declared(
         cfg.ddb, registry_table=cfg.registry_table, data_domain=params["domain"]
     )
-    handlers.assert_glue_database_exists(cfg.glue, glue_database)
+    # Per-source registration guards: a GLUE dataset must equal its Glue database
+    # name (the incremental path resolves by that name) and the database must
+    # exist; other sources set their own rules (see assert_source_registrable).
+    try:
+        handlers.assert_source_registrable(cfg.glue, dataset=dataset, source=source)
+    except handlers.SourceError as e:
+        raise ApiError(400, str(e)) from e
     result = handlers.upsert_domain_mapping(
         cfg.ddb,
         registry_table=cfg.registry_table,
         data_domain=params["domain"],
         dataset=dataset,
-        glue_database=glue_database,
+        source=source,
     )
     # Pre-create the dataset's bundle dirs THROUGH the harvest mount (uid 1000)
     # so a later presigned .context/ upload (which PUTs straight to S3, bypassing
@@ -451,10 +476,20 @@ def _r_trigger_harvest(cfg, params, body, query, caller):
         # effort without model is ambiguous (which model's scale?) — reject rather
         # than silently applying it to the default model.
         raise ApiError(400, "'effort' requires 'model' to be specified")
-    # The runtime resolves the dataset to a same-named Glue database; verify it
-    # exists now so a typo fails fast with a 404 here instead of an
-    # EntityNotFoundException deep in the async harvest job.
-    handlers.assert_glue_database_exists(cfg.glue, dataset)
+    # Pre-flight existence check is source-specific. For a GLUE dataset the runtime
+    # resolves it to a same-named Glue database, so verify that exists now — a typo
+    # fails fast with a 404 here instead of an EntityNotFoundException deep in the
+    # async job. This also covers the fallback case (no mapping / legacy row): the
+    # runtime defaults an absent source to glue-by-dataset-name, so we probe then
+    # too. We SKIP the probe only for an explicitly non-Glue source (e.g. Redshift),
+    # whose dataset name is independent of the backend database and whose connection
+    # the harvest verifies when it runs.
+    source = handlers.get_dataset_source(
+        cfg.ddb, registry_table=cfg.registry_table,
+        data_domain=data_domain, dataset=dataset,
+    )
+    if source is None or handlers.source_glue_database(source):
+        handlers.assert_glue_database_exists(cfg.glue, dataset)
     return 200, handlers.trigger_harvest(
         cfg.agentcore,
         cfg.ddb,
@@ -750,6 +785,8 @@ def _r_bundle_graph(cfg, params, body, query, caller):
 # as a dataset segment. We list the fixed-suffix routes first.
 _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("GET", "/glue/databases", _r_list_glue),
+    ("GET", "/redshift/clusters", _r_list_redshift_clusters),
+    ("GET", "/redshift/databases", _r_list_redshift_databases),
     ("GET", "/domain-defs", _r_list_declared_domains),
     ("GET", "/domain-defs/{domain}", _r_get_declared_domain),
     ("PUT", "/domain-defs/{domain}", _r_upsert_declared_domain),

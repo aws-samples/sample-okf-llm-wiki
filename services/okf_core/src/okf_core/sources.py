@@ -28,20 +28,43 @@ from typing import Any
 #: The AWS Glue Data Catalog source (metadata in Glue, data queried via Athena).
 SOURCE_TYPE_GLUE = "glue"
 
+#: The Amazon Redshift source (metadata + data via the Redshift Data API over the
+#: SVV_* catalog views). Connection ROUTING (cluster vs Serverless workgroup, auth)
+#: is deploy-time env config on the harvest runtime; the descriptor names the
+#: target ``database``.
+SOURCE_TYPE_REDSHIFT = "redshift"
+
 #: Every source type the platform recognizes. Add new types here as they land;
 #: this is the single allowlist the Control API validates a mapping against and
-#: the UI renders its (currently read-only) source dropdown from.
-SUPPORTED_SOURCE_TYPES: tuple[str, ...] = (SOURCE_TYPE_GLUE,)
+#: the UI renders its source dropdown from.
+SUPPORTED_SOURCE_TYPES: tuple[str, ...] = (SOURCE_TYPE_GLUE, SOURCE_TYPE_REDSHIFT)
 
-#: The default source when none is specified — the only one supported today, and
-#: what the UI preselects. Keeping this a named constant means "the default
-#: source" is defined in exactly one place.
+#: The default source when none is specified — and what the UI preselects. Keeping
+#: this a named constant means "the default source" is defined in exactly one place.
 DEFAULT_SOURCE_TYPE = SOURCE_TYPE_GLUE
 
 #: The config key carrying the Glue database name inside a ``glue`` source object.
 #: (For a Glue source the dataset name equals this by convention — see the
 #: Control API's mapping guard.)
 GLUE_DATABASE_KEY = "glue_database"
+
+#: Config keys inside a ``redshift`` source object. ``redshift_database`` is
+#: required; the connection-routing keys make the mapping self-describing so the
+#: harvest connects with no deploy-time config. Exactly ONE of cluster/workgroup
+#: identifies the target; ``secret_arn`` is the per-mapping Secrets Manager auth.
+#: (They are typed optional so a legacy db-only descriptor still validates, but
+#: such a mapping has no target and can't be harvested.)
+REDSHIFT_DATABASE_KEY = "redshift_database"
+REDSHIFT_CLUSTER_KEY = "cluster_identifier"
+REDSHIFT_WORKGROUP_KEY = "workgroup_name"
+REDSHIFT_SECRET_ARN_KEY = "secret_arn"
+
+#: Every optional connection key on a redshift source, in item-storage order.
+REDSHIFT_CONNECTION_KEYS = (
+    REDSHIFT_CLUSTER_KEY,
+    REDSHIFT_WORKGROUP_KEY,
+    REDSHIFT_SECRET_ARN_KEY,
+)
 
 
 class SourceError(ValueError):
@@ -62,6 +85,59 @@ def build_glue_source(glue_database: str) -> dict[str, Any]:
     if not glue_database:
         raise SourceError("glue source requires a non-empty glue_database")
     return {"type": SOURCE_TYPE_GLUE, GLUE_DATABASE_KEY: glue_database}
+
+
+def build_redshift_source(
+    redshift_database: str,
+    *,
+    cluster_identifier: str | None = None,
+    workgroup_name: str | None = None,
+    secret_arn: str | None = None,
+) -> dict[str, Any]:
+    """The canonical nested source object for a Redshift-backed mapping.
+
+    Required: ``redshift_database``. Connection routing makes the mapping
+    self-describing so it can name ANY cluster/workgroup in the account with no
+    deploy-time config:
+
+    * exactly ONE of ``cluster_identifier`` (provisioned) / ``workgroup_name``
+      (Serverless) names WHERE the database lives, and
+    * ``secret_arn`` is the Secrets Manager secret used to authenticate to it.
+
+    Omitting all three yields a bare db-only descriptor
+    (``{"type": "redshift", "redshift_database": <db>}``) — it validates but has no
+    target, so the harvest can't connect to it. When routing IS given, both a target
+    and a secret are required (validated here), so a real mapping is always complete.
+    """
+    if not redshift_database:
+        raise SourceError("redshift source requires a non-empty redshift_database")
+    source: dict[str, Any] = {
+        "type": SOURCE_TYPE_REDSHIFT,
+        REDSHIFT_DATABASE_KEY: redshift_database,
+    }
+    if cluster_identifier and workgroup_name:
+        raise SourceError(
+            "redshift source: set only ONE of cluster_identifier / workgroup_name"
+        )
+    target = cluster_identifier or workgroup_name
+    if target or secret_arn:
+        # A self-describing mapping needs BOTH a target and a secret to connect.
+        if not target:
+            raise SourceError(
+                "redshift source: cluster_identifier or workgroup_name is required "
+                "when a secret_arn is given"
+            )
+        if not secret_arn:
+            raise SourceError(
+                "redshift source: secret_arn is required when a cluster/workgroup "
+                "is given"
+            )
+        if cluster_identifier:
+            source[REDSHIFT_CLUSTER_KEY] = cluster_identifier
+        else:
+            source[REDSHIFT_WORKGROUP_KEY] = workgroup_name
+        source[REDSHIFT_SECRET_ARN_KEY] = secret_arn
+    return source
 
 
 def normalize_source(
@@ -108,7 +184,17 @@ def validate_source(source: dict[str, Any]) -> dict[str, Any]:
         if not glue_database:
             raise SourceError("glue source requires a non-empty glue_database")
         return build_glue_source(glue_database)
-    # Unreachable while SUPPORTED_SOURCE_TYPES == (glue,), but keeps the shape
+    if source_type == SOURCE_TYPE_REDSHIFT:
+        redshift_database = source.get(REDSHIFT_DATABASE_KEY)
+        if not redshift_database:
+            raise SourceError("redshift source requires a non-empty redshift_database")
+        return build_redshift_source(
+            redshift_database,
+            cluster_identifier=source.get(REDSHIFT_CLUSTER_KEY),
+            workgroup_name=source.get(REDSHIFT_WORKGROUP_KEY),
+            secret_arn=source.get(REDSHIFT_SECRET_ARN_KEY),
+        )
+    # Unreachable (every SUPPORTED type has a branch above), but keeps the shape
     # for the next source type: return a copy with the type normalized in.
     return {**source, "type": source_type}
 

@@ -54,14 +54,20 @@ export function makeApi(token) {
 
     // Glue + domain mapping
     listGlueDatabases: () => request(token, "GET", "/glue/databases"),
+    // Redshift source pickers: list clusters/workgroups, then databases within a
+    // chosen target (needs the secret that authenticates to it).
+    listRedshiftClusters: () => request(token, "GET", "/redshift/clusters"),
+    listRedshiftDatabases: ({ kind, id, secretArn }) => {
+      const key = kind === "cluster" ? "cluster" : "workgroup"
+      const qs = new URLSearchParams({ [key]: id, secret_arn: secretArn })
+      return request(token, "GET", `/redshift/databases?${qs.toString()}`)
+    },
     listDomains: () => request(token, "GET", "/domains"),
-    // sourceType defaults to "glue" (the only supported source today). The
-    // backend also accepts a bare glue_database for back-compat, but we send the
-    // first-class `source` object so the data model is exercised end to end.
-    setDomainMapping: (domain, dataset, glueDatabase, sourceType = "glue") =>
-      request(token, "PUT", `/domains/${domain}/datasets/${dataset}`, {
-        source: { type: sourceType, glue_database: glueDatabase },
-      }),
+    // `source` is the first-class source descriptor ({type, ...config}) — e.g.
+    // {type:"glue", glue_database} or {type:"redshift", redshift_database}. The
+    // caller builds the right shape per source type; the backend validates it.
+    setDomainMapping: (domain, dataset, source) =>
+      request(token, "PUT", `/domains/${domain}/datasets/${dataset}`, { source }),
     deleteDomainMapping: (domain, dataset) =>
       request(token, "DELETE", `/domains/${domain}/datasets/${dataset}`),
 
