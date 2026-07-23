@@ -495,10 +495,22 @@ function bootstrapSource(userCode) {
       (function (el) {
         ${neutralizeScriptClose(userCode)}
       })(el);
-      // Let Chart.js lay out, then report success + height.
+      // Let Chart.js lay out, then report success + height. rAF is the happy
+      // path; hidden tabs PAUSE rAF entirely (the chart still draws — only the
+      // report would stall until the tab is foregrounded, and the parent's
+      // watchdog would misread that as a failure), so a timer fallback reports
+      // too — throttled timers still fire in hidden tabs. First one wins.
+      var _reportedOk = false;
+      function reportOk() {
+        if (_reportedOk) return;
+        _reportedOk = true;
+        post({ status: "ok" });
+        reportHeight();
+      }
       requestAnimationFrame(function () {
-        requestAnimationFrame(function () { post({ status: "ok" }); reportHeight(); });
+        requestAnimationFrame(reportOk);
       });
+      setTimeout(reportOk, 1500);
     } catch (err) {
       post({ status: "error", error: (err && err.message) ? String(err.message) : "chart failed to render" });
     }
