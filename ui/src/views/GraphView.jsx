@@ -2,12 +2,15 @@ import { memo, useCallback, useEffect, useMemo, useState } from "react"
 import ReactFlow, {
   Background,
   BackgroundVariant,
+  BaseEdge,
   Controls,
+  getBezierPath,
   Handle,
   MarkerType,
   Position,
   ReactFlowProvider,
   useReactFlow,
+  useStore,
 } from "reactflow"
 import "reactflow/dist/style.css"
 import {
@@ -50,6 +53,89 @@ const ARROW = {
   height: 16,
   color: "var(--muted-foreground)",
 }
+
+// --- Floating edges ----------------------------------------------------------
+// The layouts here are RADIAL (circle / focus ring), but default RF edges pin
+// to fixed handles (target=left, source=right) — so an edge to a node sitting
+// on the "wrong" side had to swing all the way around the canvas and enter
+// from outside. A floating edge instead connects the two node BORDERS along
+// the line between their centers (the canonical React Flow floating-edges
+// recipe), so arrows always point sensibly at their nodes.
+
+function nodeCenter(node) {
+  return {
+    x: node.positionAbsolute.x + node.width / 2,
+    y: node.positionAbsolute.y + node.height / 2,
+  }
+}
+
+// Intersection of the center-to-center line with `node`'s rectangle.
+function nodeIntersection(node, other) {
+  const w = node.width / 2
+  const h = node.height / 2
+  const c = nodeCenter(node)
+  const o = nodeCenter(other)
+  const xx1 = (o.x - c.x) / (2 * w) - (o.y - c.y) / (2 * h)
+  const yy1 = (o.x - c.x) / (2 * w) + (o.y - c.y) / (2 * h)
+  const a = 1 / (Math.abs(xx1) + Math.abs(yy1) || 1)
+  const xx3 = a * xx1
+  const yy3 = a * yy1
+  return { x: w * (xx3 + yy3) + c.x, y: h * (-xx3 + yy3) + c.y }
+}
+
+// Which side of the node the intersection lands on (orients the bezier + the
+// arrowhead).
+function edgeSide(node, point) {
+  const x = node.positionAbsolute.x
+  const y = node.positionAbsolute.y
+  if (point.x <= x + 1) return Position.Left
+  if (point.x >= x + node.width - 1) return Position.Right
+  if (point.y <= y + 1) return Position.Top
+  return Position.Bottom
+}
+
+function FloatingEdge({ id, source, target, markerEnd, markerStart, style }) {
+  const sourceNode = useStore(
+    useCallback((store) => store.nodeInternals.get(source), [source])
+  )
+  const targetNode = useStore(
+    useCallback((store) => store.nodeInternals.get(target), [target])
+  )
+  if (!sourceNode?.width || !targetNode?.width) return null
+
+  // Self-link: a small loop off the node's top-right corner (the intersection
+  // math degenerates when both centers coincide).
+  if (source === target) {
+    const x = sourceNode.positionAbsolute.x + sourceNode.width
+    const y = sourceNode.positionAbsolute.y
+    const path = `M ${x - 28},${y} C ${x + 8},${y - 44} ${x + 44},${y - 8} ${x},${y + 20}`
+    return (
+      <BaseEdge id={id} path={path} markerEnd={markerEnd} style={style} />
+    )
+  }
+
+  const s = nodeIntersection(sourceNode, targetNode)
+  const t = nodeIntersection(targetNode, sourceNode)
+  const [path] = getBezierPath({
+    sourceX: s.x,
+    sourceY: s.y,
+    sourcePosition: edgeSide(sourceNode, s),
+    targetX: t.x,
+    targetY: t.y,
+    targetPosition: edgeSide(targetNode, t),
+  })
+  return (
+    <BaseEdge
+      id={id}
+      path={path}
+      markerEnd={markerEnd}
+      markerStart={markerStart}
+      style={style}
+    />
+  )
+}
+
+const EDGE_TYPES = { floating: FloatingEdge }
 
 // Map a concept's frontmatter `type` to an icon + accent color. Types are
 // free-form, so we match on keywords and fall back to a generic concept style.
@@ -134,6 +220,7 @@ function collapseEdges(rawEdges) {
     id: `e-${p.source} ${p.target}`,
     source: p.source,
     target: p.target,
+    type: "floating",
     // markerEnd points at the target; markerStart adds a reverse arrow when the
     // pair is also linked the other way (both directions).
     markerEnd: p.aToB ? ARROW : undefined,
@@ -156,7 +243,7 @@ const ConceptNode = memo(function ConceptNode({ data, selected }) {
       <Handle
         type="target"
         position={Position.Left}
-        className="!size-1.5 !border-0 !bg-border"
+        className="!size-1.5 !border-0 !bg-transparent !opacity-0"
       />
       <span
         className="flex size-7 shrink-0 items-center justify-center rounded-lg"
@@ -178,7 +265,7 @@ const ConceptNode = memo(function ConceptNode({ data, selected }) {
       <Handle
         type="source"
         position={Position.Right}
-        className="!size-1.5 !border-0 !bg-border"
+        className="!size-1.5 !border-0 !bg-transparent !opacity-0"
       />
     </div>
   )
@@ -292,14 +379,24 @@ function GraphPane({ api, domain, dataset, onOpenConcept }) {
     return circleLayout(graph.nodes)
   }, [graph, focusSet, focusId])
 
-  // Re-fit the viewport whenever the layout (focus or full) changes.
+  // Re-fit the viewport whenever the layout (focus or full) changes. DOUBLE
+  // rAF on purpose: React Flow measures the re-laid-out nodes on the frame
+  // AFTER commit, and a single-frame fit raced that measurement — it fit the
+  // STALE bounds, so entering/clearing focus sometimes left the camera behind.
+  // Keyed on the laid-out `nodes` array so every layout swap re-fits.
   useEffect(() => {
-    if (loading || !graph) return
-    const id = window.requestAnimationFrame(() =>
-      fitView({ padding: 0.2, duration: 400 })
-    )
-    return () => window.cancelAnimationFrame(id)
-  }, [focusId, loading, graph, fitView])
+    if (loading || !graph) return undefined
+    let raf2 = null
+    const raf1 = window.requestAnimationFrame(() => {
+      raf2 = window.requestAnimationFrame(() =>
+        fitView({ padding: 0.2, duration: 400 })
+      )
+    })
+    return () => {
+      window.cancelAnimationFrame(raf1)
+      if (raf2 != null) window.cancelAnimationFrame(raf2)
+    }
+  }, [nodes, focusId, loading, graph, fitView])
 
   if (error) {
     return (
@@ -447,6 +544,7 @@ function ConceptGraphCanvas({
             nodes={nodes}
             edges={edges}
             nodeTypes={NODE_TYPES}
+            edgeTypes={EDGE_TYPES}
             fitView
             minZoom={0.1}
             nodesConnectable={false}

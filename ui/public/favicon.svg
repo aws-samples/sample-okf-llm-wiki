@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="32" height="32">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="3.25 3.14 17.5 17.5" width="32" height="32">
   <!-- Data wiki knowledge cube; matches ui/src/components/WikiCubeIcon.jsx
        (isometric faces inset toward their centroid, INSET 0.9, so thin seams
        separate them). currentColor can't reach a favicon, so the app's

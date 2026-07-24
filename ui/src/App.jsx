@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useAuth } from "react-oidc-context"
 import {
   BoxesIcon,
@@ -27,17 +27,14 @@ import { WikiCubeIcon } from "@/components/WikiCubeIcon"
 import { useChatController } from "@/hooks/useChatController"
 import { makeApi } from "@/lib/api"
 import { signInPreservingRoute } from "@/lib/auth"
+import {
+  loadRecentDatasets,
+  pushRecentDataset,
+} from "@/lib/recentDatasets"
 import { useRouter } from "@/lib/route"
 import { cn } from "@/lib/utils"
 import { useTheme } from "@/components/theme-provider.jsx"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import {
-  Breadcrumb,
-  BreadcrumbItem,
-  BreadcrumbList,
-  BreadcrumbPage,
-  BreadcrumbSeparator,
-} from "@/components/ui/breadcrumb"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -77,6 +74,7 @@ import {
   SidebarProvider,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { Toaster } from "@/components/ui/sonner"
 
@@ -159,15 +157,17 @@ function LoginScreen({ onSignIn }) {
 // the chosen (data_domain, dataset) is shared with Context / Harvest / Browse.
 // Styled to sit inline in the breadcrumb: borderless/transparent, muted text,
 // with a subtle hover — it reads as the breadcrumb's last segment, not a form.
-function DatasetPicker({ datasets, selectionKey, onChange }) {
+function DatasetPicker({ datasets, selectionKey, onChange, loading }) {
   const [open, setOpen] = useState(false)
 
+  // Registry still loading: hold the picker's spot with a skeleton instead of
+  // flashing the empty-state text before the first response lands.
+  if (loading) {
+    return <Skeleton className="h-4 w-40" />
+  }
+
   if (!datasets.length) {
-    return (
-      <span className="text-sm text-muted-foreground">
-        No datasets — create a mapping in Datasets.
-      </span>
-    )
+    return <span className="text-sm text-muted-foreground">No datasets</span>
   }
 
   const select = (key) => {
@@ -270,7 +270,135 @@ function SidebarToggle({ label, className }) {
   )
 }
 
-// Sidebar brand + collapse control. The logo (the isometric knowledge cube — see WikiCubeIcon — + "Data wiki"
+// Collapsed-sidebar trigger with QUICK NAV. At rest it shows the wiki cube (a
+// compact brand affordance in the corner); hovering morphs it into the usual
+// expand icon AND opens a popover with the section menu, so users can jump
+// between views without expanding the sidebar. Clicking still expands the
+// sidebar (unchanged). The popover opens/closes on hover with a short close
+// DELAY — the pointer crosses a gap between button and panel, and an immediate
+// close on mouseleave would flicker the panel shut before it can be reached.
+function CollapsedNavTrigger({
+  label,
+  className,
+  section,
+  onNavigate,
+  chatCtrl,
+  recents,
+  selectionKey,
+  onSelectRecent,
+}) {
+  const { toggleSidebar } = useSidebar()
+  const [open, setOpen] = useState(false)
+  const closeTimer = useRef(null)
+  // Ignore hover-opens right after mount: collapsing the sidebar mounts this
+  // trigger, and the browser re-evaluates hover on that layout change — firing
+  // a synthetic mouseenter with NO pointer movement, which flashed the popover
+  // open for a moment on every collapse. Real hovers arrive later than this.
+  const mountedAt = useRef(0)
+  useEffect(() => {
+    mountedAt.current = performance.now()
+    return () => closeTimer.current && clearTimeout(closeTimer.current)
+  }, [])
+  const hoverOpen = useCallback(() => {
+    if (performance.now() - mountedAt.current < 350) return
+    if (closeTimer.current) clearTimeout(closeTimer.current)
+    closeTimer.current = null
+    setOpen(true)
+  }, [])
+  const hoverClose = useCallback(() => {
+    if (closeTimer.current) clearTimeout(closeTimer.current)
+    closeTimer.current = setTimeout(() => setOpen(false), 140)
+  }, [])
+  return (
+    <Popover
+      open={open}
+      // Only honor CLOSE requests (outside click / escape); opening is
+      // hover-driven, and the trigger click must keep meaning "expand sidebar",
+      // not "toggle popover".
+      onOpenChange={(v) => {
+        if (!v) setOpen(false)
+      }}
+    >
+      <PopoverTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label={label}
+          onClick={toggleSidebar}
+          onMouseEnter={hoverOpen}
+          onMouseLeave={hoverClose}
+          // aria-expanded:bg-transparent: the ghost variant paints an
+          // aria-expanded (popover open) background — reads as a stuck hover
+          // on the logo. Hover tint still applies while actually hovered.
+          className={cn(
+            "group/collapsed rounded-md aria-expanded:bg-transparent",
+            className
+          )}
+        >
+          {/* size-8 = the SidebarBrand logo size, so the mark reads identically
+              collapsed and expanded (the SVG's internal margins keep it clear
+              of the button edges). */}
+          <WikiCubeIcon className="size-8 text-primary group-hover/collapsed:hidden" />
+          <PanelLeftIcon className="hidden size-5 group-hover/collapsed:block" />
+        </Button>
+      </PopoverTrigger>
+      {/* Styled as a floating slice of the real sidebar: same surface tokens,
+          same group label, and the REAL SidebarMenu/SidebarMenuButton
+          components (their styling is self-contained), so items render
+          pixel-identical to the expanded sidebar. */}
+      <PopoverContent
+        side="bottom"
+        align="start"
+        sideOffset={4}
+        onMouseEnter={hoverOpen}
+        onMouseLeave={hoverClose}
+        // Radix dismisses popovers when focus moves OUTSIDE the content — and
+        // navigating to chat auto-focuses the composer, which read as exactly
+        // that. This popover is hover-scoped, not focus-scoped: ignore
+        // focus-outside; hover-out / Escape / outside CLICKS still close it.
+        onFocusOutside={(e) => e.preventDefault()}
+        className="w-56 border-sidebar-border bg-sidebar p-2 text-sidebar-foreground"
+      >
+        <SidebarGroupLabel>Manage</SidebarGroupLabel>
+        <SidebarMenu>
+          {NAV.map((item) =>
+            item.key === "chat" && chatCtrl ? (
+              // The REAL ChatNav (submenu included). Clicks deliberately do
+              // NOT close the popover — it lives while hovered (leave to close),
+              // so users can hop sections / fire chat actions in sequence.
+              <ChatNav
+                key={item.key}
+                item={item}
+                active={section === "chat"}
+                onNavigate={(k) => onNavigate?.(k)}
+                ctrl={chatCtrl}
+                tooltip={null}
+              />
+            ) : (
+              <SidebarMenuItem key={item.key}>
+                <SidebarMenuButton
+                  isActive={section === item.key}
+                  onClick={() => onNavigate?.(item.key)}
+                >
+                  <item.icon />
+                  <span>{item.label}</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            )
+          )}
+        </SidebarMenu>
+        <RecentDatasetsMenu
+          recents={recents}
+          selectionKey={selectionKey}
+          onSelect={onSelectRecent}
+        />
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+// Sidebar brand + collapse control. The logo (the dot-grid knowledge cube —
+// the chat agent's avatar extruded to 3D, see WikiCubeIcon — + "Data wiki"
 // wordmark) sits on the left and the collapse toggle is pinned to the right
 // edge. Collapsing fully hides the sidebar (offcanvas), so re-expanding is
 // handled by the persistent trigger in the top bar (see TopbarTrigger).
@@ -295,33 +423,40 @@ function SidebarBrand() {
 // Chat has no top bar (it fills the full height), so when the sidebar is hidden
 // its expand toggle would be unreachable — float a small one at the top-left of
 // the chat area. Only rendered while the sidebar is collapsed / on mobile.
-function ChatCollapsedToggle() {
+// The ONE collapsed-sidebar trigger, floated over the inset at the exact spot
+// the in-flow header toggle used to occupy (header px-4/pt-4 put it at 16,16 =
+// top-4 left-4). A SINGLE persistent instance for every section — chat
+// included — so navigating to/from chat through the quick-nav popover no
+// longer unmounts the trigger mid-click and takes the open popover with it
+// (the old chat-specific floating toggle and the header's in-flow trigger were
+// two different React elements; TopbarHeader keeps a same-size spacer so the
+// breadcrumb can't slide under this overlay).
+function CollapsedTriggerOverlay({
+  section,
+  onNavigate,
+  chatCtrl,
+  recents,
+  selectionKey,
+  onSelectRecent,
+}) {
   const { state, isMobile } = useSidebar()
   if (!isMobile && state !== "collapsed") return null
-  return (
-    <div className="absolute top-2 left-2 z-20">
-      {/* Ghost/transparent by default (no fill or shadow) — just a hover tint,
-          matching the in-sidebar toggle. */}
-      <SidebarToggle
-        label="Expand sidebar"
-        className="size-8 hover:bg-foreground/10 dark:hover:bg-foreground/10"
-      />
-    </div>
-  )
-}
-
-function TopbarTrigger() {
-  const { state, isMobile } = useSidebar()
-  const collapsed = state === "collapsed"
-  if (!isMobile && !collapsed) return null
   // The ghost variant's hover (bg-muted) is ~invisible on the top bar since
   // --muted ≈ --background in this theme; use a foreground tint so the hover
   // reads. dark:hover overrides the variant's dark:hover:bg-muted/50 too.
   return (
-    <SidebarToggle
-      label="Expand sidebar"
-      className="hover:bg-foreground/10 dark:hover:bg-foreground/10"
-    />
+    <div className="absolute top-4 left-4 z-20">
+      <CollapsedNavTrigger
+        label="Expand sidebar"
+        section={section}
+        onNavigate={onNavigate}
+        chatCtrl={chatCtrl}
+        recents={recents}
+        selectionKey={selectionKey}
+        onSelectRecent={onSelectRecent}
+        className="hover:bg-foreground/10 dark:hover:bg-foreground/10"
+      />
+    </div>
   )
 }
 
@@ -330,47 +465,6 @@ function TopbarTrigger() {
 // the sidebar is hidden (collapsed, or on mobile), where the breadcrumb is the
 // sole section indicator. The dataset picker (on dataset-scoped views) always
 // shows so the current dataset stays visible/switchable.
-function TopbarBreadcrumb({
-  activeNav,
-  datasets,
-  selectionKey,
-  onSelectionChange,
-}) {
-  const { state, isMobile } = useSidebar()
-  const showSection = isMobile || state === "collapsed"
-  return (
-    <Breadcrumb>
-      <BreadcrumbList className="gap-1 sm:gap-1">
-        {showSection ? (
-          <BreadcrumbItem>
-            <BreadcrumbPage>{activeNav.label}</BreadcrumbPage>
-          </BreadcrumbItem>
-        ) : null}
-        {/* On views that need a dataset, the last breadcrumb segment is the
-            dataset picker itself. A "|" divider (only when the section label is
-            also shown) instead of the default chevron, tight spacing, so label +
-            picker read as a unit. */}
-        {activeNav.needsSelection ? (
-          <>
-            {showSection ? (
-              <BreadcrumbSeparator className="text-muted-foreground/40">
-                |
-              </BreadcrumbSeparator>
-            ) : null}
-            <BreadcrumbItem>
-              <DatasetPicker
-                datasets={datasets}
-                selectionKey={selectionKey}
-                onChange={onSelectionChange}
-              />
-            </BreadcrumbItem>
-          </>
-        ) : null}
-      </BreadcrumbList>
-    </Breadcrumb>
-  )
-}
-
 // Top bar. h-12 (48px) with pt-4 pushes the row's center to ~32px — the same
 // line as the "Data wiki" brand row in the floating sidebar, so the two stay
 // parallel. The collapse/expand toggle (shown only while the sidebar is hidden)
@@ -380,16 +474,24 @@ function TopbarBreadcrumb({
 // on the same axis as the content below (max-w-6xl / max-w-7xl).
 function TopbarHeader({
   centered,
-  activeNav,
+  needsSelection,
   datasets,
+  datasetsLoading,
   selectionKey,
   onSelectionChange,
 }) {
   const { state, isMobile } = useSidebar()
   const showToggle = isMobile || state === "collapsed"
+  // The strip carries EXACTLY one thing: the dataset picker. Views that take
+  // no dataset get no header at all (the collapsed expand-toggle floats over
+  // the content there, chat-style).
+  if (!needsSelection) return null
   return (
     <header className="sticky top-0 z-10 flex h-12 shrink-0 items-center gap-1 bg-background/95 px-4 pt-4 supports-backdrop-filter:backdrop-blur">
-      {showToggle ? <TopbarTrigger /> : null}
+      {/* Spacer where the toggle used to sit in flow — the trigger itself is
+          now the persistent CollapsedTriggerOverlay floated at this exact spot,
+          so the breadcrumb keeps its alignment without sliding under it. */}
+      {showToggle ? <div aria-hidden="true" className="size-8 shrink-0" /> : null}
       {/* Match the content column below: centered views cap the breadcrumb at
           max-w-6xl, full-width views at max-w-7xl (px-1 lines it up with the
           cards' ring inset). mx-auto absorbs the free space so the column
@@ -401,11 +503,11 @@ function TopbarHeader({
           centered ? "max-w-6xl" : "max-w-7xl"
         )}
       >
-        <TopbarBreadcrumb
-          activeNav={activeNav}
+        <DatasetPicker
           datasets={datasets}
           selectionKey={selectionKey}
-          onSelectionChange={onSelectionChange}
+          onChange={onSelectionChange}
+          loading={datasetsLoading}
         />
       </div>
       {/* Mirror the toggle's footprint (size-8) so the breadcrumb column stays
@@ -422,13 +524,13 @@ function TopbarHeader({
 // as sub-items beneath it — driven by the shared chat controller so they operate
 // the same conversation the chat page renders. The model is fixed (Opus 4.8);
 // effort lives in the composer, so no model/effort controls here.
-function ChatNav({ item, active, onNavigate, ctrl }) {
+function ChatNav({ item, active, onNavigate, ctrl, tooltip = item.label }) {
   const { historyOpen, setHistoryOpen } = ctrl
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
         isActive={active}
-        tooltip={item.label}
+        tooltip={tooltip}
         onClick={() => onNavigate(item.key)}
       >
         <item.icon />
@@ -462,11 +564,41 @@ function ChatNav({ item, active, onNavigate, ctrl }) {
   )
 }
 
+// The last few datasets this user opened (per-user MRU, see lib/
+// recentDatasets.js) — rendered identically in the sidebar and the collapsed
+// quick-nav popover, like recent chats in a chat app. Clicking one re-selects
+// it; the caller decides which section to land on.
+function RecentDatasetsMenu({ recents, selectionKey, onSelect }) {
+  if (!recents?.length) return null
+  return (
+    <>
+      <SidebarGroupLabel>Recent datasets</SidebarGroupLabel>
+      <SidebarMenu>
+        {recents.map((key) => (
+          <SidebarMenuItem key={key}>
+            <SidebarMenuButton
+              isActive={selectionKey === key}
+              onClick={() => onSelect(key)}
+            >
+              <HistoryIcon />
+              <span>{key}</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        ))}
+      </SidebarMenu>
+    </>
+  )
+}
+
 // Sections that live in the URL; anything else falls back to "domains".
 const SECTION_KEYS = new Set(NAV.map((n) => n.key))
 
 function Console({ auth, api }) {
   const [datasets, setDatasets] = useState([])
+  // True only until the FIRST registry response lands — the picker shows a
+  // skeleton then. Deliberately never reset: later reloads (onChanged after a
+  // mapping edit) keep showing current data rather than flashing a skeleton.
+  const [datasetsLoading, setDatasetsLoading] = useState(true)
   // The URL hash is the source of truth for section / dataset / open concept,
   // so browser back/forward navigate the app. See lib/route.js.
   const { route, push, replace } = useRouter()
@@ -530,6 +662,8 @@ function Console({ auth, api }) {
     } catch {
       // Non-fatal for the shell; the Domains view surfaces the error.
       setDatasets([])
+    } finally {
+      setDatasetsLoading(false)
     }
   }, [api])
 
@@ -576,11 +710,49 @@ function Console({ auth, api }) {
   }, [selectionKey, datasets])
 
   const email = auth.user?.profile?.email
+  const userSub = auth.user?.profile?.sub
+
+  // Recent datasets (per-user MRU, localStorage). Recording keys off the URL's
+  // selectionKey, so picker choices AND deep links both count as an "access".
+  const [recentDatasets, setRecentDatasets] = useState(() =>
+    loadRecentDatasets(userSub)
+  )
+  useEffect(() => {
+    setRecentDatasets(loadRecentDatasets(userSub))
+  }, [userSub])
+  useEffect(() => {
+    if (selectionKey) setRecentDatasets(pushRecentDataset(userSub, selectionKey))
+  }, [selectionKey, userSub])
+  // Opening a recent keeps a dataset-scoped section, else lands on Browse (the
+  // natural reading view for "take me back to that dataset").
+  const openRecentDataset = useCallback(
+    (key) => {
+      const scoped = NAV.find((n) => n.key === section)?.needsSelection
+      push({
+        section: scoped ? section : "browse",
+        selectionKey: key,
+        concept: null,
+      })
+    },
+    [push, section]
+  )
+  // Show only datasets that still exist in the registry (stale/renamed entries
+  // hide rather than 404). While the registry is still loading, show as-is.
+  const visibleRecents = useMemo(() => {
+    if (!datasets.length) return recentDatasets
+    const known = new Set(datasets.map((d) => `${d.data_domain}/${d.dataset}`))
+    return recentDatasets.filter((k) => known.has(k))
+  }, [recentDatasets, datasets])
+
   const activeNav = NAV.find((n) => n.key === section) || NAV[0]
   // Browse/Graph fill the full inset width; the other views cap their cards at
   // max-w-6xl and center them. The breadcrumb sits in the same-width column so
   // it never runs wider than the content below it.
   const centered = section !== "browse" && section !== "graph"
+  // Whether the top strip (dataset picker) renders: dataset-scoped sections,
+  // except Browse, which hosts the picker inside its tree-pane header. Drives
+  // both TopbarHeader and the content region's top padding below.
+  const hasTopStrip = activeNav.needsSelection && section !== "browse"
 
   return (
     // Pin the shell to exactly the viewport height (the wrapper is min-h-svh by
@@ -622,6 +794,17 @@ function Console({ auth, api }) {
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
+          {visibleRecents.length ? (
+            <SidebarGroup>
+              <SidebarGroupContent>
+                <RecentDatasetsMenu
+                  recents={visibleRecents}
+                  selectionKey={selectionKey}
+                  onSelect={openRecentDataset}
+                />
+              </SidebarGroupContent>
+            </SidebarGroup>
+          ) : null}
         </SidebarContent>
         <SidebarFooter>
           {email ? (
@@ -650,15 +833,22 @@ function Console({ auth, api }) {
           min-width:auto and would grow to its widest content (e.g. a long
           unbroken line in Harvest's raw-status <pre>), pushing past the
           viewport. min-w-0 lets it shrink so inner overflow containers scroll. */}
-      <SidebarInset className="min-w-0">
+      <SidebarInset className="relative min-w-0">
+        <CollapsedTriggerOverlay
+          section={section}
+          onNavigate={navigate}
+          chatCtrl={chat}
+          recents={visibleRecents}
+          selectionKey={selectionKey}
+          onSelectRecent={openRecentDataset}
+        />
         {/* Chat is a FULL-HEIGHT page: it fills the ENTIRE inset (no top bar), so
             the transcript + composer own the whole vertical layout — its controls
-            live in the sidebar (ChatNav), not a header. A collapsed sidebar still
-            needs its expand toggle, so chat overlays a tiny floating one. Every
-            other section keeps the TopbarHeader (breadcrumb + dataset picker). */}
+            live in the sidebar (ChatNav), not a header. The collapsed expand
+            toggle is the shared CollapsedTriggerOverlay above. Every other
+            section keeps the TopbarHeader (breadcrumb + dataset picker). */}
         {section === "chat" ? (
           <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
-            <ChatCollapsedToggle />
             <ChatPanel api={api} auth={auth} ctrl={chat} datasets={datasets} />
           </div>
         ) : (
@@ -667,16 +857,30 @@ function Console({ auth, api }) {
                 so the brand sits at ~32px; TopbarHeader's pt-4 matches that. */}
             <TopbarHeader
               centered={centered}
-              activeNav={activeNav}
+              // Browse hosts the picker inside its tree-pane header instead,
+              // so it gets no top strip at all — full height for the card.
+              needsSelection={hasTopStrip}
               datasets={datasets}
+              datasetsLoading={datasetsLoading}
               selectionKey={selectionKey}
               onSelectionChange={setSelectionKey}
             />
             {/* Content region fills the viewport below the header. Browse/Graph
                 get the full width/height and manage their own internal scrolling;
                 the other views stay centered (max-w-6xl) and scroll as a block.
-                pb-2 (8px) lines the bottom edge up with the sidebar's p-2 gap. */}
-            <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pt-4 pb-2">
+                pb-2 (8px) lines the bottom edge up with the sidebar's p-2 gap —
+                and stripless sections put their cards' TOP edge on the same 8px
+                line as the sidebar: Browse's full-width wrapper has no vertical
+                padding of its own so it gets pt-2 directly, while the centered
+                views add p-1 ring room inside their scroll container, so pt-1
+                outside + p-1 inside = the same 8px. Sections with the picker
+                strip keep pt-4 as breathing room below it. */}
+            <div
+              className={cn(
+                "flex min-h-0 flex-1 flex-col overflow-hidden px-4 pb-2",
+                hasTopStrip ? "pt-4" : centered ? "pt-1" : "pt-2"
+              )}
+            >
               {section === "browse" ? (
                 // Full-width views still cap + center (max-w-7xl) so they leave a
                 // margin on both sides and line up under the top-bar toggle/picker.
@@ -685,6 +889,14 @@ function Console({ auth, api }) {
                   <BrowseView
                     api={api}
                     selection={selection}
+                    picker={
+                      <DatasetPicker
+                        datasets={datasets}
+                        selectionKey={selectionKey}
+                        onChange={setSelectionKey}
+                        loading={datasetsLoading}
+                      />
+                    }
                     concept={routeConcept}
                     onConceptChange={onBrowseConcept}
                   />
