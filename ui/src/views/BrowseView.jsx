@@ -24,9 +24,6 @@ import {
 } from "@/components/ui/breadcrumb"
 import {
   Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
   CardTitle,
 } from "@/components/ui/card"
 import {
@@ -62,7 +59,13 @@ function textOf(children) {
 }
 
 // Browse a harvested bundle: a directory tree of concepts + a markdown viewer.
-export default function BrowseView({ api, selection, concept, onConceptChange }) {
+export default function BrowseView({
+  api,
+  selection,
+  concept,
+  onConceptChange,
+  picker,
+}) {
   const domain = selection?.data_domain
   const dataset = selection?.dataset
   const hasSelection = Boolean(domain && dataset)
@@ -81,6 +84,7 @@ export default function BrowseView({ api, selection, concept, onConceptChange })
 
   return (
     <FilesPane
+      picker={picker}
       api={api}
       domain={domain}
       dataset={dataset}
@@ -90,7 +94,7 @@ export default function BrowseView({ api, selection, concept, onConceptChange })
   )
 }
 
-function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
+function FilesPane({ api, domain, dataset, concept, onConceptChange, picker }) {
   const [files, setFiles] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -198,17 +202,22 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
   )
 
   return (
-    // Fill the content region; on md+ it's a two-column grid (tree | viewer)
-    // that stretches to the full height. Annotations live in a slide-in Sheet.
-    <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 md:h-full md:grid-rows-1 md:grid-cols-[minmax(240px,320px)_1fr]">
-      <Card className="min-h-0 gap-0 py-0 max-md:h-[50vh]">
-        <CardHeader className="border-b px-4 py-3">
-          <CardTitle className="text-sm">Concepts</CardTitle>
-          <CardDescription>
-            {files.length} file{files.length === 1 ? "" : "s"}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="min-h-0 flex-1 p-0">
+    // Fill the content region. Tree + viewer are ONE card on md+ (two panes
+    // split by a border, the tree pane tinted so the halves read apart);
+    // annotations live in a slide-in Sheet.
+    <div className="flex min-h-0 flex-1 flex-col md:h-full">
+      <Card className="grid min-h-0 flex-1 grid-cols-1 gap-0 overflow-hidden py-0 md:grid-rows-1 md:grid-cols-[minmax(240px,320px)_1fr]">
+        <div className="flex min-h-0 flex-col border-b bg-muted/40 max-md:h-[40vh] md:border-r md:border-b-0">
+          {/* Equal-height header rows (h-12) in BOTH panes + the same fade
+              hairline below, so the two separators sit on one level. */}
+          <div className="flex h-12 shrink-0 items-center justify-between gap-2 px-4">
+            {picker ?? <CardTitle className="text-sm">Concepts</CardTitle>}
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {files.length} file{files.length === 1 ? "" : "s"}
+            </span>
+          </div>
+          <div className="h-px shrink-0 bg-gradient-to-r from-transparent via-border/60 to-transparent" />
+          <div className="min-h-0 flex-1">
           {error ? (
             <div className="p-4">
               <Alert variant="destructive">
@@ -247,15 +256,15 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
               </div>
             </ScrollArea>
           )}
-        </CardContent>
-      </Card>
+          </div>
+        </div>
 
-      {/* min-w-0: this is the grid's `1fr` doc column. Grid items default to
-          min-width:auto, so a wide child (a table or a long code line) would grow
-          the track past the viewport instead of scrolling internally. min-w-0 lets
-          the track shrink so the inner ScrollArea + label-grid/CodeView scroll. */}
-      <Card className="min-h-0 min-w-0 gap-0 py-0 max-md:h-[70vh]">
-        <CardHeader className="flex flex-row items-center justify-between gap-2 border-b px-4 py-3">
+        {/* min-w-0: this is the grid's `1fr` doc column. Grid items default to
+            min-width:auto, so a wide child (a table or a long code line) would grow
+            the track past the viewport instead of scrolling internally. min-w-0 lets
+            the track shrink so the inner ScrollArea + label-grid/CodeView scroll. */}
+        <div className="flex min-h-0 min-w-0 flex-col max-md:h-[60vh]">
+          <div className="flex h-12 shrink-0 flex-row items-center justify-between gap-2 px-4">
           {selectedId ? (
             <ConceptBreadcrumb conceptId={selectedId} />
           ) : (
@@ -279,9 +288,10 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
               </Badge>
             )}
           </Button>
-        </CardHeader>
-        <CardContent className="min-h-0 flex-1 p-0">
-          <ScrollArea className="okf-doc-scroll h-full">
+          </div>
+          <div className="h-px shrink-0 bg-gradient-to-r from-transparent via-border/60 to-transparent" />
+          <div className="min-h-0 flex-1">
+            <ScrollArea className="okf-doc-scroll h-full">
             <div className="min-w-0 p-5">
               {loadingDoc ? (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -315,8 +325,9 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange }) {
                 </SelectionAnnotator>
               )}
             </div>
-          </ScrollArea>
-        </CardContent>
+            </ScrollArea>
+          </div>
+        </div>
       </Card>
 
       {/* Annotations: a floating panel that slides in from the RIGHT. Floating

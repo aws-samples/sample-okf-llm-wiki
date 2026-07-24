@@ -554,13 +554,6 @@ export default function HarvestView({ api, selection }) {
             <PlayIcon className="size-4" />
             Harvest
           </CardTitle>
-          <CardDescription>
-            Induct{" "}
-            <span className="font-medium text-foreground">
-              {domain}/{dataset}
-            </span>{" "}
-            into a knowledge bundle.
-          </CardDescription>
           <div className="col-start-2 row-span-2 row-start-1 flex items-center gap-2 self-start justify-self-end">
             <Button
               variant="outline"
