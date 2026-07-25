@@ -120,6 +120,24 @@ variable "harvest_model_catalog" {
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "xhigh"
     },
+    {
+      model          = "global.anthropic.claude-opus-5"
+      label          = "Claude Opus 5"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "xhigh"
+    },
+    {
+      model          = "global.anthropic.claude-sonnet-5"
+      label          = "Claude Sonnet 5"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "xhigh"
+    },
+    {
+      model          = "openai.gpt-5.6-terra"
+      label          = "GPT-5.6 Terra"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "xhigh"
+    },
   ]
 }
 

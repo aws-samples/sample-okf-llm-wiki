@@ -18,7 +18,9 @@ Usage:
   python benchmark/translate_gold_to_athena.py            # translate + verify + write
   python benchmark/translate_gold_to_athena.py --check    # verify only, write nothing
 
-Writes benchmark/formula_1_questions_athena.csv (question,gold_sql) on success.
+Writes benchmark/formula_1_questions_athena.csv (question,gold_sql) on success,
+plus formula_1_questions_athena_hints.csv — the same rows with the BIRD
+``evidence`` hint appended to each question (matched from mini_dev_sqlite.json).
 Exits non-zero if any translation fails to verify — nothing partial ships.
 """
 
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import sqlite3
@@ -34,12 +37,85 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC_CSV = os.path.join(HERE, "formula_1_questions.csv")
 OUT_CSV = os.path.join(HERE, "formula_1_questions_athena.csv")
+OUT_HINTS_CSV = os.path.join(HERE, "formula_1_questions_athena_hints.csv")
+MINI_DEV_JSON = os.path.join(HERE, "mini_dev", "data", "mini_dev_sqlite.json")
 SQLITE_DB = os.path.join(
     HERE, "mini_dev", "data", "dev_databases", "formula_1", "formula_1.sqlite"
 )
 
 
 # -- translation -------------------------------------------------------------
+
+
+def _lenient_cast(expr: str, target: str) -> str:
+    """SQLite-semantics text→number cast, spelled in Trino.
+
+    SQLite's CAST parses the longest numeric PREFIX of a string ('1:' → 1,
+    '05:07' → 5, 'abc' → 0, NULL → NULL); Trino's CAST raises on any of those.
+    Several golds rely on the lenient behaviour because the Glue tables type
+    the SQLite TEXT columns (lapTimes.time, pitStops.duration, results.
+    fastestLapSpeed, …) as varchar. regexp_extract pulls the prefix (NULL when
+    the string is NULL or has no digits), COALESCE supplies SQLite's 0 for the
+    no-digits case, and the outer IF preserves NULL-in → NULL-out so SUM/AVG
+    skip the same rows they skip in SQLite.
+    """
+    pattern = "^[0-9]+" if target == "INTEGER" else r"^[0-9]+(\.[0-9]+)?"
+    return (
+        f"IF({expr} IS NULL, NULL, "
+        f"CAST(COALESCE(regexp_extract({expr}, '{pattern}'), '0') AS {target}))"
+    )
+
+
+def _rewrite_substr_casts(s: str) -> str:
+    """Rewrite every ``CAST(SUBSTR(...) AS INTEGER|DOUBLE)`` to the lenient form.
+
+    The SUBSTR-of-a-time-string golds (q45/q49/q61/q64/q65) slice 'M:SS.mmm'
+    strings at positions that can land on ':' or '.' ('1:', '8.', '05:07' — the
+    hour-format '2:05:07.547' lap times make it worse), which SQLite casts
+    leniently and Athena rejects (INVALID_CAST_ARGUMENT). Paren-aware scan, not
+    a regex — the SUBSTR argument lists nest (strpos(...) arithmetic).
+    Numeric casts (CAST(COUNT(...) AS DOUBLE) etc.) are left untouched.
+    """
+    out = []
+    i = 0
+    while True:
+        m = re.search(r"\bCAST\s*\(", s[i:], flags=re.I)
+        if not m:
+            out.append(s[i:])
+            break
+        start = i + m.start()
+        j = i + m.end()  # first char after '('
+        depth = 1
+        while depth:
+            if s[j] == "(":
+                depth += 1
+            elif s[j] == ")":
+                depth -= 1
+            j += 1
+        inner = s[i + m.end() : j - 1]  # "expr AS TYPE"
+        # Split on the LAST top-level ' AS ' (the expr itself may contain none).
+        split_at = None
+        depth = 0
+        for k in range(len(inner) - 3):
+            if inner[k] == "(":
+                depth += 1
+            elif inner[k] == ")":
+                depth -= 1
+            elif depth == 0 and inner[k : k + 4].upper() == " AS ":
+                split_at = k
+        out.append(s[i:start])
+        if split_at is not None:
+            expr = inner[:split_at].strip()
+            target = inner[split_at + 4 :].strip().upper()
+            if target in ("INTEGER", "DOUBLE") and re.match(
+                r"SUBSTR\s*\(", expr, flags=re.I
+            ):
+                out.append(_lenient_cast(expr, target))
+                i = j
+                continue
+        out.append(s[start:j])
+        i = j
+    return "".join(out)
 
 
 def translate(sql: str) -> str:
@@ -102,6 +178,44 @@ def translate(sql: str) -> str:
     # named "real" (none here) wouldn't be touched.
     s = re.sub(r"\bAS\s+REAL\b", "AS DOUBLE", s, flags=re.I)
 
+    # --- varchar-typed numeric columns (Glue maps SQLite TEXT → string) -------
+    # SQLite arithmetic/aggregates coerce text to numbers; Trino is strict. Each
+    # rule below reproduces the SQLite result on a column Athena sees as varchar.
+
+    # CAST(SUBSTR(...) AS INTEGER|DOUBLE): lenient prefix-parse (after AS REAL →
+    # AS DOUBLE so a single pass catches everything).
+    s = _rewrite_substr_casts(s)
+
+    # q16: SUM(IF(cond, fastestLapSpeed, 0)) — varchar vs integer branches
+    # (TYPE_MISMATCH) and SUM over varchar. The true branch becomes a lenient
+    # double; NULL speeds stay NULL exactly as in SQLite (SUM skips them).
+    s = re.sub(
+        r"IF\((\w+\.raceId = \d+), (\w+\.fastestLapSpeed), 0\)",
+        lambda m: f"IF({m.group(1)}, {_lenient_cast(m.group(2), 'DOUBLE')}, 0)",
+        s,
+    )
+
+    # q47/q57: AVG over the varchar columns fastestLapSpeed / duration
+    # (FUNCTION_NOT_FOUND avg(varchar)). Lenient double keeps SQLite semantics:
+    # NULLs skipped; a '16:38.234'-style long pit stop counts as 16.0, exactly
+    # as SQLite coerces it.
+    s = re.sub(
+        r"AVG\((\w+\.(?:fastestLapSpeed|duration))\)",
+        lambda m: f"AVG({_lenient_cast(m.group(1), 'DOUBLE')})",
+        s,
+        flags=re.I,
+    )
+
+    # q60: SQLite lets a SELECTed column stay out of GROUP BY (bare-column
+    # semantics); Trino errors (EXPRESSION_NOT_AGGREGATE). nationality is
+    # functionally dependent on the constructor name here, so grouping by both
+    # is result-identical — the local verify proves it on this data.
+    if "T2.nationality" in s:
+        s = s.replace(
+            "GROUP BY T2.name ORDER BY SUM(T1.points) DESC",
+            "GROUP BY T2.name, T2.nationality ORDER BY SUM(T1.points) DESC",
+        )
+
     return s
 
 
@@ -129,10 +243,23 @@ def _register_trino_shims(conn: sqlite3.Connection) -> None:
         return int(str(x)[:4])
 
     conn.create_function("year", 1, _year)
+
+    # regexp_extract(s, pattern): first substring matched (group 0), NULL when
+    # the input is NULL or nothing matches — Trino semantics. Our patterns are
+    # plain digit/dot classes, identical in Python's re and Java's regex.
+    def _regexp_extract(s, pattern):
+        if s is None:
+            return None
+        m = re.search(pattern, s)
+        return m.group(0) if m else None
+
+    conn.create_function("regexp_extract", 2, _regexp_extract)
     # current_date is not a function in SQLite; translate handles it via a view
     # below (we substitute a literal at verify time).
-    # substr / cast(as double) are native to SQLite — no shim needed (SQLite's
-    # CAST(x AS DOUBLE)? SQLite lacks DOUBLE affinity but accepts it as REAL).
+    # substr / COALESCE / cast(as double) are native to SQLite — no shim needed
+    # (SQLite lacks DOUBLE affinity but accepts it as REAL). Note the lenient
+    # cast's inner CAST only ever sees a purely-numeric string or '0', so
+    # SQLite's lenient CAST and Trino's strict CAST agree on it by construction.
 
 
 def _run(conn: sqlite3.Connection, sql: str):
@@ -230,6 +357,35 @@ def main() -> int:
             for r in out_rows:
                 w.writerow([r["question"], r["gold_sql"]])
         print(f"\nwrote {OUT_CSV}")
+
+        # Same rows with the BIRD `evidence` hint folded into the question —
+        # for runs where the agent should see the external knowledge the BIRD
+        # authors assumed. Matched by exact question text against mini-dev.
+        evidence = {
+            d["question"].strip(): d.get("evidence", "").strip()
+            for d in json.load(open(MINI_DEV_JSON))
+            if d["db_id"] == "formula_1"
+        }
+        unmatched = [
+            r["question"] for r in out_rows if r["question"].strip() not in evidence
+        ]
+        if unmatched:
+            print(
+                f"{len(unmatched)} question(s) not found in {MINI_DEV_JSON}; "
+                "hints CSV not written:",
+                file=sys.stderr,
+            )
+            for q in unmatched:
+                print(f"  {q}", file=sys.stderr)
+            return 1
+        with open(OUT_HINTS_CSV, "w", newline="") as f:
+            w = csv.writer(f, quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
+            w.writerow(["question", "gold_sql"])
+            for r in out_rows:
+                hint = evidence[r["question"].strip()]
+                q = f"{r['question']} (Hint: {hint})" if hint else r["question"]
+                w.writerow([q, r["gold_sql"]])
+        print(f"wrote {OUT_HINTS_CSV}")
     return 0
 
 

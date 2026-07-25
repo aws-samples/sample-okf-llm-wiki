@@ -59,8 +59,14 @@ def _patch(monkeypatch, agent, transitions):
         only_if_active=False,
         model=None,
         effort=None,
+        subagent_model=None,
+        subagent_effort=None,
+        reviewer_model=None,
+        reviewer_effort=None,
     ):
-        transitions.append((status, detail))
+        transitions.append(
+            (status, detail, subagent_model, subagent_effort, reviewer_model)
+        )
 
     monkeypatch.setattr(runner, "report_status", fake_report)
 
@@ -77,6 +83,64 @@ def test_full_harvest_reports_running_then_complete(tmp_path, monkeypatch):
     )
 
     assert [t[0] for t in transitions] == ["running", "complete"]
+
+
+def test_full_harvest_stamps_subagent_override_on_running(tmp_path, monkeypatch):
+    # A run with a separate sub-agent config records it at `running`; without
+    # one, nothing is stamped (the UI reads absence as "same as harvester").
+    transitions: list[tuple] = []
+    _patch(monkeypatch, _OkAgent(), transitions)
+
+    runner.run_full_harvest(
+        source=_Src(),
+        dataset_root=tmp_path / "s" / "db",
+        data_domain="s",
+        dataset="db",
+        subagent_model_config={
+            "model": "openai.gpt-5.6-sol",
+            "effort": "high",
+            "max_tokens": 32000,
+        },
+    )
+
+    running = next(t for t in transitions if t[0] == "running")
+    assert running[2] == "openai.gpt-5.6-sol"
+    assert running[3] == "high"
+
+
+def test_full_harvest_stamps_reviewer_override_on_running(tmp_path, monkeypatch):
+    transitions: list[tuple] = []
+    _patch(monkeypatch, _OkAgent(), transitions)
+
+    runner.run_full_harvest(
+        source=_Src(),
+        dataset_root=tmp_path / "s" / "db",
+        data_domain="s",
+        dataset="db",
+        reviewer_model_config={
+            "model": "openai.gpt-5.6-sol",
+            "effort": "high",
+            "max_tokens": 32000,
+        },
+    )
+
+    running = next(t for t in transitions if t[0] == "running")
+    assert running[4] == "openai.gpt-5.6-sol"
+
+
+def test_full_harvest_no_subagent_stamp_without_override(tmp_path, monkeypatch):
+    transitions: list[tuple] = []
+    _patch(monkeypatch, _OkAgent(), transitions)
+
+    runner.run_full_harvest(
+        source=_Src(),
+        dataset_root=tmp_path / "s" / "db",
+        data_domain="s",
+        dataset="db",
+    )
+
+    running = next(t for t in transitions if t[0] == "running")
+    assert running[2] is None and running[3] is None
 
 
 def test_full_harvest_reports_failed_and_reraises(tmp_path, monkeypatch):

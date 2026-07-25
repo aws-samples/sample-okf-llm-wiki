@@ -90,6 +90,10 @@ tallies only to VERIFY (grain, enum coverage), then leave the raw figures OUT of
 the prose — a precise count decays every load; state the structure instead. Keep
 a magnitude only when it is stable and decision-shaping (a fixed enum cardinality,
 or an order-of-magnitude that dictates partition-filtering).
+**Right-size every doc you write**: match a doc's length to what its content
+needs — cover the substance, then stop. No filler sections, no redundant
+summaries, no boilerplate; omit a conventional section (Gotchas, Examples) when
+there is nothing real to put in it. A short, dense doc beats a long, padded one.
 
 DO NOT try to run any Pass 4 index/validate tooling — there is none to run in
 this runtime. Index regeneration and conformance validation are handled for you
@@ -198,6 +202,15 @@ You plan and coordinate; sub-agents do the heavy authoring — `table-author` pe
 table, `reference-author` per cross-cutting reference. You DISCOVER what to author
 and DISPATCH; you do not first-draft docs a sub-agent should own.
 
+**Delegation discipline.** Dispatch sub-agents ONLY where this workflow
+prescribes them: one `table-author` per table, one `reference-author` per
+cross-cutting reference, `context-extractor`s for a large `.context/` (step 3a),
+and one `reviewer` per cluster in the single review pass (step 7). Do not invent
+other delegations, do not dispatch several sub-agents for the same doc, and do
+not dispatch a sub-agent for something you can finish yourself in a couple of
+tool calls. Beyond the one prescribed review pass, add NO further verification —
+no extra reviewer rounds, no verification sub-agents for your own edits.
+
 1. Read the okf-authoring SKILL (SKILL.md + the ⟪ADAPTER⟫ adapter).
 2. `read_file .metadata/index.md` to see the database and all its tables
    (the manifest). `grep .metadata/columns.tsv` when you need cross-table column
@@ -267,39 +280,51 @@ and DISPATCH; you do not first-draft docs a sub-agent should own.
    reference is linked from where a consumer would look for it (metrics from the
    tables that expose them; the guardrails doc from the dataset overview).
 7. **Adversarial review pass — MUST run in `reviewer` sub-agents, never in you.**
-   After the bundle is authored, FAN OUT one `reviewer` sub-agent per authored
-   concept doc to verify each doc's load-bearing claims against LIVE data, then
-   fix only the CONFIRMED findings. **Do NOT review the docs yourself.** You (or a
-   table-author) wrote them, so you carry the author's bias — you'll rationalize
-   the grain you already stated and re-run the same query that "confirmed" it the
-   first time. A fresh reviewer sub-agent, given only the finished doc and the
-   live source, has no such stake and will actually try to break it. The
-   independence is the whole point: routing review through separate sub-agents is
-   what makes it adversarial rather than self-affirming. Your role in this pass is
-   to DISPATCH reviewers, collect their findings, and APPLY confirmed fixes — not
+   After the bundle is authored, FAN OUT `reviewer` sub-agents — one per CLUSTER
+   of link-related docs (below) — to verify every doc's load-bearing claims
+   against LIVE data, then fix only the CONFIRMED findings.
+   **Do NOT review the docs yourself.** You (or a table-author) wrote them, so
+   you carry the author's bias — you'll rationalize the grain you already
+   stated and re-run the same query that "confirmed" it the first time. A fresh
+   reviewer sub-agent, given only the finished docs and the live source, has no
+   such stake and will actually try to break them. The independence is the
+   whole point: routing review through separate sub-agents is what makes it
+   adversarial rather than self-affirming. Your role in this pass is to
+   DISPATCH reviewers, collect their findings, and APPLY confirmed fixes — not
    to be the one scrutinizing claims.
 
-   **Review the WHOLE bundle, not a subset.** Build the review list by DISCOVERING
-   every authored doc on disk (`glob **/*.md`, or `ls` each of `tables/`,
-   `datasets/`, `references/**`), not from memory — a doc you forget to list is a
-   doc that ships unverified. Reviewing only the tables, only a "representative"
-   sample, or only the docs you think are risky is NOT a review pass; it is a spot
-   check, and the findings you miss are exactly the ones in the docs you skipped.
-   Dispatch one reviewer per doc for the COMPLETE set — every `tables/*`, every
-   `references/**/*` (joins, metrics, enums, named_sets, glossary, known_issues),
-   and the `datasets/*` overview. Exclude only the reserved generated files
-   (`index.md`, `log.md`). You have a code interpreter: write JS that enumerates
-   the docs and dispatches a reviewer for each in parallel, e.g.
+   **Review the WHOLE bundle, not a subset.** Build the review fan-out with the
+   `cluster_concepts` tool: it walks the link graph and returns clusters of
+   AT MOST 5 link-related docs (a table with the joins/enums that reference it),
+   covering EVERY non-reserved doc on disk exactly once — discovered fresh from
+   disk, not from memory, so never invent your own grouping or review from a
+   list you recall. One reviewer per cluster reviews EVERY doc in it with the
+   full checklist and additionally checks the docs against EACH OTHER (a join
+   doc contradicting its table docs is a finding one-doc-at-a-time review can't
+   see). Reviewing only the tables, only a "representative" sample, or only the
+   docs you think are risky is NOT a review pass; it is a spot check, and the
+   findings you miss are exactly the ones in the docs you skipped. Exclude only
+   the reserved generated files (`index.md`, `log.md`) — `cluster_concepts`
+   already does. Cross-check coverage: the clusters' flattened ids must equal
+   the docs on disk (`glob **/*.md` minus reserved files); a doc in no cluster
+   is a doc that ships unverified.
 
-       // Enumerate the ACTUAL authored docs — do not hand-type a partial list.
-       const docs = (await glob({ pattern: "**/*.md" }))
-         .map((p) => p.replace(/\\.md$/, ""))
-         .filter((id) => !/(^|\\/)(index|log)$/.test(id));   // drop reserved files
-       const reviews = await Promise.all(docs.map((id) =>
-         task({ description: `Adversarially verify ${id} against live data.`,
+   **Dispatch in TWO steps.** (1) Call `cluster_concepts` DIRECTLY, as an
+   ordinary tool call. (2) Fan out with the code interpreter, inlining the
+   clusters you received as a literal. Inside `eval` JS,
+   ONLY the `task()` global exists — your other tools (`cluster_concepts`,
+   `glob`, `read_file`, `run_sql`, ...) are NOT callable there, so a
+   `glob(...)` or `cluster_concepts(...)` call inside the JS will throw. E.g.
+
+       // Step 1 returned the clusters — paste them VERBATIM and COMPLETE:
+       // every cluster, exactly as the tool returned them, no re-grouping.
+       const clusters = [["tables/races", "references/joins/circuits__races"],
+                         ["tables/results", "references/enums/status_id"]];
+       const reviews = await Promise.all(clusters.map((ids) =>
+         task({ description: `Adversarially verify these related docs against live data: ${ids.join(", ")}`,
                 subagentType: "reviewer" })));
-       // reviews[i] = the reviewer's plain-text findings (or "no issues found").
-       // One reviewer per doc, for EVERY doc — no sampling, no skipping.
+       // reviews[i] = that cluster's plain-text findings (or "no issues found").
+       // One reviewer per cluster, every doc in exactly one cluster — no sampling, no skipping.
 
    **Do NOT pass `responseSchema` (or any structured-output option) to `task()`.**
    This runtime's model runs with thinking always on, and native structured
@@ -315,14 +340,16 @@ and DISPATCH; you do not first-draft docs a sub-agent should own.
    For each confirmed finding, re-open the doc and fix it (respecting the guard),
    then use `get_backlinks` to propagate the correction. Run the review pass
    ONCE — apply the confirmed fixes and then finish; do NOT re-review docs after
-   fixing them (a single pass is sufficient and keeps the harvest bounded). In
+   fixing them, and do NOT add verification passes of your own on top (a single
+   pass is sufficient and keeps the harvest bounded). In
    your final summary, state how many docs EXIST in the bundle and how many you
-   reviewed — these MUST match (every non-reserved doc reviewed); call out any gap
-   explicitly — plus how many reviewers errored (if any) and how many findings you
-   confirmed and fixed, so the review outcome is visible in the trace, not silently
-   dropped.
+   reviewed (summed across all review clusters) — these MUST match (every
+   non-reserved doc reviewed); call out any gap explicitly — plus how many
+   reviewers errored (if any) and how many findings you confirmed and fixed, so
+   the review outcome is visible in the trace, not silently dropped.
 
-Author clean markdown; no narration.
+Author clean markdown; no narration. Keep your final summary short — the
+coverage counts, findings, and fixes, not a retelling of the run.
 """
 
 # Appended to the supervisor prompt ONLY when recursive improvement is enabled for
@@ -366,26 +393,37 @@ def build_supervisor_prompt(
     recursive_improvement: bool = False,
     *,
     profile: SourcePromptProfile | None = None,
+    gpt: bool = False,
 ) -> str:
     """The supervisor prompt for ``profile``'s source, with the RI section iff enabled.
 
     ``profile`` defaults to the Glue profile so the no-arg call (and legacy callers)
     still produce the Glue prompt. An RI run appends the benchmark-loop section.
+    ``gpt`` appends the GPT-family addendum (set iff the SUPERVISOR's resolved
+    model is an OpenAI GPT — see ``_GPT_ADDENDUM``).
     """
     profile = profile or GlueAthenaSource.prompt_profile
     prompt = _fill(_RUNTIME_TMPL + _SUPERVISOR_BODY, profile)
     if recursive_improvement:
-        return prompt + _RECURSIVE_IMPROVEMENT_SECTION
-    return prompt
+        prompt = prompt + _RECURSIVE_IMPROVEMENT_SECTION
+    return _with_gpt(prompt, gpt)
 
 
 _REVIEWER_BODY = """
 ## Your job (adversarial reviewer — READ-ONLY, you do NOT write files)
 
-You are given ONE concept id (e.g. `tables/races`). Try hard to REFUTE its
-load-bearing claims by checking them against LIVE data — do not trust the prose.
+You are given a small CLUSTER of 1-5 RELATED concept ids (e.g. `tables/races`
+plus the `references/joins/*` and `references/enums/*` docs that link to it).
+Try hard to REFUTE their load-bearing claims by checking them against LIVE
+data — do not trust the prose.
 
-1. `read_file` the doc for the given concept id.
+Your scope is EXACTLY the cluster you were given — every other doc has its own
+reviewer. You may READ a linked doc outside the cluster when a consistency
+check needs it (the far side of a join), but do not review, re-verify, or
+report on the rest of the bundle.
+
+1. `read_file` EVERY doc in your cluster. Each doc gets the FULL scrutiny below
+   — a doc you skim is a doc that ships unverified.
 2. Scrutinize and VERIFY with `run_sql` / `sample_rows` (using the okf-authoring
    skill's ⟪DIALECT⟫ dialect rules):
    - **Grain**: does the stated "one row per X" actually hold? Prove it —
@@ -413,17 +451,25 @@ load-bearing claims by checking them against LIVE data — do not trust the pros
      flag any hallucinated code→meaning.
    - **Gotchas**: is each stated gotcha real (reproduce it), and is an obvious
      confusable sibling MISSING a gotcha it needs?
+   - **Cross-doc consistency — the reason you review these docs TOGETHER**: the
+     docs in your cluster link to each other, so check that they AGREE. A join
+     doc whose `ON` keys or stated cardinality contradict either table doc it
+     links, an enum doc whose codes disagree with the `# Schema` row that
+     references it, a metric whose SQL contradicts a table's stated grain or
+     gotcha — each contradiction is a finding (name BOTH docs and which one the
+     live data supports).
    - **No volatile stats baked in**: flag any precise row count, table byte size,
      distinct-value tally, or freshness timestamp written into the prose as a
      stated fact — these decay with every load and don't capture meaning. (A
      stable, decision-shaping magnitude — a fixed enum cardinality, or an
      order-of-magnitude that dictates partition-filtering — is fine; a decaying
      precise count is not.)
-3. Report ONLY findings you REPRODUCED, each with: the claim, why it's wrong, the
-   exact query that proves it, and the corrected fact. If everything checks out,
-   return exactly "no issues found". Return your findings as plain markdown prose
-   — one finding per bullet. Do NOT emit JSON or attempt structured output; the
-   supervisor reads your reply as text.
+3. Report ONLY findings you REPRODUCED, GROUPED BY CONCEPT ID, each with: the
+   claim, why it's wrong, the exact query that proves it, and the corrected
+   fact. If every doc in the cluster checks out, return exactly
+   "no issues found". Return your findings as plain markdown prose — one
+   finding per bullet under its doc's id. Do NOT emit JSON or attempt
+   structured output; the supervisor reads your reply as text.
 
 Default to skepticism, but don't invent problems — a finding you can't back with
 a query is not a finding. You write NOTHING to disk; the supervisor applies fixes.
@@ -567,6 +613,7 @@ def build_annotation_prompt(
     domain_context: str | None = None,
     dataset_guidance: str | None = None,
     profile: SourcePromptProfile | None = None,
+    gpt: bool = False,
 ) -> str:
     """The user prompt for an annotation-mode run (built for ``profile``'s source).
 
@@ -589,7 +636,10 @@ def build_annotation_prompt(
         )
     guidance_block = _dataset_guidance_block(dataset_guidance)
     annotation_prompt = _fill(_RUNTIME_TMPL + _ANNOTATION_BODY, profile)
-    job = annotation_prompt.replace("{results_rel}", results_rel)
+    # `gpt` is keyed to the SUPERVISOR's resolved model (this prompt is the
+    # supervisor's user message). The `{results_rel}` JSON results file is
+    # written via write_file, so the addendum's Markdown-reply rule holds.
+    job = _with_gpt(annotation_prompt.replace("{results_rel}", results_rel), gpt)
     listing = json.dumps(annotations, indent=2)
     if annotations:
         task = (
@@ -713,34 +763,110 @@ Return a one-line summary (the concept id, fact type, and what you verified).
 """
 
 
+# -- GPT-family runtime addendum ----------------------------------------------
+# Appended to a deepagents prompt when THAT agent's resolved model is an OpenAI
+# GPT model (okf_aws.model_factory.is_openai_model) — per the GPT-5.x prompting
+# guidance. The supervisor and the sub-agents can now run DIFFERENT model
+# families, so each prompt is flagged for the model that will actually read it.
+# The three blocks target the GPT behaviors that are wrong for this headless
+# authoring job out of the box:
+#   <persistence>       — GPT agents hand back at uncertainty; a harvest has no
+#                         user mid-run, so the agent must decide and continue.
+#   <context_gathering> — explicit stop criteria so exploration doesn't loop
+#                         (GPT-5 is thorough by default; the prescribed live-data
+#                         verifications are the depth bar, not a floor to exceed).
+#   <output_discipline> — GPT is trained to emit tool preambles and to NOT
+#                         format final answers as Markdown; both are inverted
+#                         here (no narration; everything is Markdown).
+# Deliberately NOT applied to the benchmark solver/adjudicator prompts: their
+# fenced SQL/JSON output contracts are explicit and must not be contradicted.
+_GPT_ADDENDUM = """
+## GPT-family runtime notes
+
+<persistence>
+You are an autonomous agent on a long-running headless job — there is NO user
+to hand back to mid-run. Keep going until your assigned work is COMPLETELY done
+before ending your turn. Never stop at uncertainty: decide the most reasonable
+interpretation from the data, proceed, and record the assumption in the doc or
+finding it affects.
+</persistence>
+
+<context_gathering>
+Gather context efficiently: batch independent reads and queries in parallel,
+never re-read a file you already read, and stop gathering as soon as you can
+act. The verification queries this job prescribes (grain, joins, enums against
+live data) are the depth bar — beyond them, prefer acting over more searching.
+</context_gathering>
+
+<output_discipline>
+Do not emit tool preambles or progress updates — never announce what you are
+about to do; go straight from deciding to the tool call. Everything you author
+or return is Markdown: bundle docs are markdown-with-frontmatter files, and
+your final reply (findings, digest, or summary) is plain Markdown prose — not
+JSON, not XML-tagged blocks.
+</output_discipline>
+"""
+
+
+def _with_gpt(prompt: str, gpt: bool) -> str:
+    """Append the GPT-family addendum when the reading model is a GPT."""
+    return prompt + _GPT_ADDENDUM if gpt else prompt
+
+
 # -- per-source sub-agent prompt builders ------------------------------------
 
 
-def build_reviewer_prompt(profile: SourcePromptProfile | None = None) -> str:
-    """The adversarial-reviewer sub-agent prompt for ``profile``'s source."""
-    return _fill(_RUNTIME_TMPL + _REVIEWER_BODY, profile or GlueAthenaSource.prompt_profile)
+def build_reviewer_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
+    """The adversarial-reviewer sub-agent prompt for ``profile``'s source.
+
+    ``gpt`` appends the GPT-family addendum (set iff the SUB-AGENT model — which
+    the reviewer runs on — is an OpenAI GPT). Same on the other sub-agent
+    builders below.
+    """
+    return _with_gpt(
+        _fill(_RUNTIME_TMPL + _REVIEWER_BODY, profile or GlueAthenaSource.prompt_profile),
+        gpt,
+    )
 
 
-def build_context_extractor_prompt(profile: SourcePromptProfile | None = None) -> str:
+def build_context_extractor_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
     """The context-extractor sub-agent prompt for ``profile``'s source."""
-    return _fill(
-        _RUNTIME_TMPL + _CONTEXT_EXTRACTOR_BODY,
-        profile or GlueAthenaSource.prompt_profile,
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _CONTEXT_EXTRACTOR_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
     )
 
 
-def build_table_author_prompt(profile: SourcePromptProfile | None = None) -> str:
+def build_table_author_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
     """The table-author sub-agent prompt for ``profile``'s source."""
-    return _fill(
-        _RUNTIME_TMPL + _TABLE_AUTHOR_BODY, profile or GlueAthenaSource.prompt_profile
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _TABLE_AUTHOR_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
     )
 
 
-def build_reference_author_prompt(profile: SourcePromptProfile | None = None) -> str:
+def build_reference_author_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
     """The reference-author sub-agent prompt for ``profile``'s source."""
-    return _fill(
-        _RUNTIME_TMPL + _REFERENCE_AUTHOR_BODY,
-        profile or GlueAthenaSource.prompt_profile,
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _REFERENCE_AUTHOR_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
     )
 
 

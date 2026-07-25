@@ -81,6 +81,57 @@ def test_report_status_records_model_and_effort():
     assert call["ExpressionAttributeValues"][":e"] == {"S": "xhigh"}
 
 
+def test_report_status_records_subagent_override():
+    # A run that chose a separate sub-agent config stamps it alongside the
+    # supervisor's pair; absence (next test) means "same as harvester".
+    ddb = _FakeDDB()
+    status.report_status(
+        (ddb, "t"),
+        data_domain="d",
+        dataset="ds",
+        status="running",
+        model="global.anthropic.claude-opus-4-8",
+        effort="xhigh",
+        subagent_model="openai.gpt-5.6-sol",
+        subagent_effort="high",
+    )
+    call = ddb.calls[0]
+    assert "subagent_model = :sm" in call["UpdateExpression"]
+    assert call["ExpressionAttributeValues"][":sm"] == {"S": "openai.gpt-5.6-sol"}
+    assert call["ExpressionAttributeValues"][":se"] == {"S": "high"}
+
+
+def test_report_status_records_reviewer_override():
+    ddb = _FakeDDB()
+    status.report_status(
+        (ddb, "t"),
+        data_domain="d",
+        dataset="ds",
+        status="running",
+        reviewer_model="openai.gpt-5.6-sol",
+        reviewer_effort="high",
+    )
+    call = ddb.calls[0]
+    assert "reviewer_model = :rm" in call["UpdateExpression"]
+    assert call["ExpressionAttributeValues"][":rm"] == {"S": "openai.gpt-5.6-sol"}
+    assert call["ExpressionAttributeValues"][":re"] == {"S": "high"}
+
+
+def test_report_status_omits_subagent_fields_when_absent():
+    ddb = _FakeDDB()
+    status.report_status(
+        (ddb, "t"),
+        data_domain="d",
+        dataset="ds",
+        status="running",
+        model="global.anthropic.claude-opus-4-8",
+        effort="xhigh",
+    )
+    call = ddb.calls[0]
+    assert ":sm" not in call["ExpressionAttributeValues"]
+    assert ":se" not in call["ExpressionAttributeValues"]
+
+
 def test_report_status_omits_model_effort_when_absent():
     # Not passed (e.g. terminal transitions) -> not written, so a `running`-stamped
     # model/effort is preserved rather than blanked.

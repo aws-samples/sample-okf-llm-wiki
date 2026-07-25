@@ -57,7 +57,12 @@ Which driver has the most wins?,"SELECT d.forename, d.surname FROM ..."
   **DISCARDED** (see [Reading the results](#step-4--read-the-results)); it can't be
   graded, so it's excluded from the score. If you're porting a question set from a
   SQLite-based benchmark, translate the dialect first. (`benchmark/formula_1_questions_athena.csv`
-  in this repo is a worked example — a BIRD `formula_1` set translated to Trino.)
+  in this repo is a worked example — a BIRD `formula_1` set translated to Trino.
+  `benchmark/formula_1_questions_athena_hints.csv` is the same set with each
+  question carrying its BIRD `evidence` hint inline, for runs where the agent
+  should see the external knowledge the BIRD authors assumed. Both are generated
+  by `benchmark/translate_gold_to_athena.py` — edit the source CSV or the
+  translator, not these outputs.)
 
 The gold SQL only needs to return the **right answer**; it doesn't need to match
 how the wiki would phrase a query.

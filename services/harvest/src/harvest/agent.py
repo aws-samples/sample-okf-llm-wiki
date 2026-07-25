@@ -7,14 +7,16 @@ Wires together, per the design:
 - ``GlueAthenaSource`` LIVE tools (sample_rows / run_sql); static Glue metadata is
   snapshotted to the read-only ``.metadata/`` dir before the run and read with the
   built-in file tools (see ``metadata_export``);
-- a per-session ``LinkGraph`` with ``get_backlinks``/``get_links`` tools;
+- a per-session ``LinkGraph`` with ``get_backlinks``/``get_links``/
+  ``cluster_concepts`` tools;
 - ``OKFGuardMiddleware`` (frontmatter + augmentation guard, timestamp auto-fill,
   graph dirty-flag) — attached to the main agent AND the per-table sub-agent
   (sub-agent middleware/tools REPLACE, so we pass them explicitly);
 - four dynamic sub-agents the supervisor fans out via ``task()``: ``table-author``
   (one per table), ``reference-author`` (one per cross-cutting reference — metric,
   named-set, glossary term, known-issue, or the usage-guardrails contract),
-  ``reviewer`` (one per authored doc, adversarial read-only verification), and
+  ``reviewer`` (one per link-cluster of ≤5 authored docs from
+  ``cluster_concepts``, adversarial read-only verification), and
   ``context-extractor`` (read-only; mines the uploaded ``.context/`` docs for
   verified facts and returns a routed digest — fanned out one-per-doc/group for a
   large ``.context/`` so the heavy reading happens once);
@@ -38,7 +40,7 @@ from typing import Any
 from harvest.fsutil import mkdirs
 from harvest.graph_tools import make_graph_tools
 from harvest.guard_engine import OKFGuardEngine
-from harvest.okf_guard import OKFGuardMiddleware
+from harvest.okf_guard import OKFGuardMiddleware, ToolErrorMiddleware
 from harvest.prompts import (
     build_context_extractor_prompt,
     build_reference_author_prompt,
@@ -503,6 +505,8 @@ def build_harvest_agent(
     effort: str = DEFAULT_EFFORT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     subagent_concurrency: int = DEFAULT_SUBAGENT_CONCURRENCY,
+    subagent_config: dict[str, Any] | None = None,
+    reviewer_config: dict[str, Any] | None = None,
     sandbox: Any = None,
     step_emitter: Any = None,
     ri_config: dict[str, Any] | None = None,
@@ -511,6 +515,20 @@ def build_harvest_agent(
     persist_kpi: Any = None,
     persist_review: Any = None,
 ) -> HarvestAgent:
+    """Build the harvest deep agent (see the module docstring for the wiring).
+
+    ``model``/``effort``/``max_tokens`` configure the SUPERVISOR's model.
+    ``subagent_config`` (optional ``{model, effort, max_tokens}``, resolved by
+    ``resolve_model_config`` upstream) configures the model the dispatched
+    sub-agents run on — table-author, reference-author, context-extractor, AND
+    the benchmark solver/adjudicator. When None, the sub-agents use the
+    supervisor's config. ``reviewer_config`` does the same for the adversarial
+    ``reviewer`` ONLY — reviewing with a different model family than the one
+    that authored improves coverage (a fresh model doesn't share the author's
+    blind spots); when None the reviewer uses the sub-agents' config. Each
+    scope runs on a SEPARATE model instance so token usage meters per scope
+    (supervisor / subagents / reviewer — see steps.UsageForwarder).
+    """
     from deepagents import create_deep_agent
     from deepagents.backends import (
         CompositeBackend,
@@ -521,8 +539,9 @@ def build_harvest_agent(
     # QuickJS code interpreter → enables DYNAMIC subagents: the agent can write JS
     # that calls the task({description, subagentType}) global to fan out + collect
     # in parallel (loops, Promise.all). We use it for adversarial REVIEW: after
-    # authoring, fan out one independent `reviewer` per doc to verify claims
-    # against live data, then fix only confirmed findings. Optional — if the
+    # authoring, fan out one independent `reviewer` per link-cluster of ≤5 docs
+    # (from cluster_concepts) to verify claims against live data, then fix only
+    # confirmed findings. Optional — if the
     # interpreter package isn't present, fall back to the static `task` tool.
     #
     # Bound how many task() dispatches run concurrently BEFORE building the
@@ -540,21 +559,49 @@ def build_harvest_agent(
     except Exception:  # noqa: BLE001 - dynamic dispatch is a nice-to-have
         interpreter_mw = None
 
-    # Opus 4.8 with adaptive thinking; the thinking config rides on the model.
-    # A UsageForwarder on the MODEL INSTANCE meters token usage for every turn —
-    # including QuickJS task() sub-agents, which inherit this same model but run
-    # on their own asyncio tasks and never reach the run-config StepEmitter. This
-    # is the one metering path (see steps.record_usage). Best-effort: if steps
-    # can't be imported, the model is built without it (usage just isn't tracked).
-    model_callbacks = None
-    if step_emitter is not None:
+    # Adaptive thinking rides on the model instances. A scope-tagged
+    # UsageForwarder on each MODEL INSTANCE meters token usage for every turn —
+    # including QuickJS task() sub-agents, which run on their own asyncio tasks
+    # and never reach the run-config StepEmitter. TWO instances are always built:
+    # the supervisor's, and the sub-agents' (which the four dynamic sub-agents
+    # are pinned to via their spec's "model", and the benchmark solver/
+    # adjudicator reuse). Separate instances are what make the per-scope usage
+    # split exact — attribution is by instance, no callback discrimination — and
+    # what lets a run give sub-agents a DIFFERENT model/effort (subagent_config)
+    # than the supervisor. Best-effort: if steps can't be imported, the models
+    # are built without metering (usage just isn't tracked).
+    def _usage_callbacks(scope: str):
+        if step_emitter is None:
+            return None
         try:
             from harvest.steps import UsageForwarder
 
-            model_callbacks = [UsageForwarder(step_emitter)]
+            return [UsageForwarder(step_emitter, scope=scope)]
         except Exception:  # noqa: BLE001 - usage metering is an enhancement
-            model_callbacks = None
-    chat_model = _build_model(model, effort, max_tokens, callbacks=model_callbacks)
+            return None
+
+    chat_model = _build_model(
+        model, effort, max_tokens, callbacks=_usage_callbacks("supervisor")
+    )
+    sub_cfg = subagent_config or {}
+    subagent_chat_model = _build_model(
+        sub_cfg.get("model") or model,
+        sub_cfg.get("effort") or effort,
+        sub_cfg.get("max_tokens") or max_tokens,
+        callbacks=_usage_callbacks("subagents"),
+    )
+    # The adversarial reviewer gets a THIRD instance. Fallback chain: its own
+    # override -> the shared sub-agent config -> the supervisor's. A separate
+    # instance even without an override keeps the review pass's token spend
+    # visible as its own scope.
+    rev_cfg = reviewer_config or {}
+    reviewer_model_id = rev_cfg.get("model") or sub_cfg.get("model") or model
+    reviewer_chat_model = _build_model(
+        reviewer_model_id,
+        rev_cfg.get("effort") or sub_cfg.get("effort") or effort,
+        rev_cfg.get("max_tokens") or sub_cfg.get("max_tokens") or max_tokens,
+        callbacks=_usage_callbacks("reviewer"),
+    )
 
     dataset_root = Path(dataset_root)
     mkdirs(dataset_root)  # NFS-resilient (tolerates transient ESTALE on the mount)
@@ -577,6 +624,12 @@ def build_harvest_agent(
         read_current=_make_read_current(dataset_root),
         benchmark_budget=benchmark_budget,
     )
+    # Tool-boundary safety net: a raising tool (e.g. a PermissionError from the
+    # S3 Files mount mid-write) becomes a ToolMessage(status="error") the model
+    # can react to, instead of an exception that aborts the whole run. Stateless,
+    # so one instance is shared; attached to the MAIN agent and EVERY sub-agent
+    # below (sub-agent middleware REPLACES — same footgun as the guard).
+    tool_errors = ToolErrorMiddleware()
 
     source_tools = make_source_tools(source)
     graph_tools = make_graph_tools(link_graph)
@@ -599,16 +652,18 @@ def build_harvest_agent(
         run_code_tool = make_run_code_tool(sandbox)
         all_tools.append(run_code_tool)
 
-    # Build the benchmark session now that chat_model + tools exist. The solver
-    # reuses chat_model (tokens meter for free) bundle-blind; the adjudicator reuses
-    # chat_model + read-only mount file tools (wiki/.metadata/.context) + the source
-    # tools (run_sql/sample_rows) + run_code for raw-data-vs-wiki gap diagnosis.
+    # Build the benchmark session now that the models + tools exist. The solver
+    # and adjudicator run on the SUB-AGENT model (tokens meter into the subagents
+    # scope for free — the benchmark is dispatched work, not the supervisor):
+    # solver bundle-blind; adjudicator with read-only mount file tools
+    # (wiki/.metadata/.context) + the source tools (run_sql/sample_rows) +
+    # run_code for raw-data-vs-wiki gap diagnosis.
     if ri.is_enabled(ri_config) and benchmark_questions:
         benchmark_session = _build_benchmark_session(
             ri_config=ri_config,
             run=benchmark_run or {},
             questions=benchmark_questions,
-            chat_model=chat_model,
+            chat_model=subagent_chat_model,
             source=source,
             source_tools=source_tools,
             dataset_root=dataset_root,
@@ -662,19 +717,31 @@ def build_harvest_agent(
     # adapter, resource form) — a Redshift run must not be told to write Glue types.
     prompt_profile = source.prompt_profile
 
+    # And for THIS agent's model family: a GPT model gets the GPT-family
+    # addendum (persistence / context-gathering / output discipline — see
+    # prompts._GPT_ADDENDUM). Keyed PER SCOPE because the supervisor and the
+    # sub-agents can now run different families.
+    supervisor_gpt = _is_openai_model(model)
+    subagent_gpt = _is_openai_model(sub_cfg.get("model") or model)
+    reviewer_gpt = _is_openai_model(reviewer_model_id)
+
     # One dynamic sub-agent, dispatched once per table. Its tools + middleware
     # REPLACE the defaults, so we pass the guard and the same source/graph tools
     # explicitly (the sub-agent does the writing). Sub-agents inherit the skills
-    # made available on the agent's backend.
+    # made available on the agent's backend. Every sub-agent spec pins "model"
+    # to the SUB-AGENT model instance (its own config + its own usage scope) —
+    # otherwise it would inherit the supervisor's instance and the per-scope
+    # token split (and any per-scope model choice) would be lost.
     table_author = {
         "name": "table-author",
         "description": (
             "Enrich exactly one source table and write its OKF markdown doc. "
             "Pass the table's concept id, e.g. 'tables/races'."
         ),
-        "system_prompt": build_table_author_prompt(prompt_profile),
+        "system_prompt": build_table_author_prompt(prompt_profile, gpt=subagent_gpt),
         "tools": all_tools,
-        "middleware": [guard],
+        "middleware": [guard, tool_errors],
+        "model": subagent_chat_model,
     }
 
     # Dynamic sub-agent, dispatched once per CROSS-CUTTING reference item (a
@@ -694,26 +761,32 @@ def build_harvest_agent(
             "(references/usage_guardrails.md). Pass the concept id + fact type + a "
             "grounding brief. NOT for per-table enums/joins (table-author owns those)."
         ),
-        "system_prompt": build_reference_author_prompt(prompt_profile),
+        "system_prompt": build_reference_author_prompt(prompt_profile, gpt=subagent_gpt),
         "tools": all_tools,
-        "middleware": [guard],
+        "middleware": [guard, tool_errors],
+        "model": subagent_chat_model,
     }
 
-    # Adversarial reviewer — READ-ONLY. Verifies an authored doc's load-bearing
-    # claims (the stated grain, join keys, gotchas, SQL) against LIVE data via
+    # Adversarial reviewer — READ-ONLY. Verifies a link-cluster of authored docs'
+    # load-bearing claims (the stated grain, join keys, gotchas, SQL — plus
+    # cross-doc contradictions within the cluster) against LIVE data via
     # run_sql/sample_rows, and reports only findings it could reproduce. No guard
     # (it never writes); the supervisor applies the confirmed fixes.
     reviewer = {
         "name": "reviewer",
         "description": (
-            "Adversarially verify one authored OKF concept doc against live data. "
-            "Pass the concept id (e.g. 'tables/races') and what to scrutinize. "
-            "Returns confirmed findings (wrong grain, bad join key, mis-stated "
-            "gotcha, SQL that errors/returns wrong rows) with the query that "
-            "proves each — or 'no issues found'."
+            "Adversarially verify a CLUSTER of related authored OKF concept docs "
+            "(1-5 ids, grouped by the cluster_concepts tool) against live data. "
+            "Pass the concept ids (e.g. 'tables/races, references/joins/"
+            "circuits__races') and what to scrutinize. Returns confirmed findings "
+            "grouped by doc (wrong grain, bad join key, mis-stated gotcha, "
+            "cross-doc contradiction, SQL that errors/returns wrong rows) with "
+            "the query that proves each — or 'no issues found'."
         ),
-        "system_prompt": build_reviewer_prompt(prompt_profile),
+        "system_prompt": build_reviewer_prompt(prompt_profile, gpt=reviewer_gpt),
         "tools": all_tools,  # source + graph tools; read_file comes from the backend
+        "middleware": [tool_errors],
+        "model": reviewer_chat_model,
     }
 
     # Context fact-extractor — READ-ONLY. Reads the uploaded `.context/` docs once
@@ -734,11 +807,13 @@ def build_harvest_agent(
             "docs are read once, not re-read by every table-author. READ-ONLY — "
             "returns plain-text findings, writes nothing."
         ),
-        "system_prompt": build_context_extractor_prompt(prompt_profile),
+        "system_prompt": build_context_extractor_prompt(prompt_profile, gpt=subagent_gpt),
         "tools": all_tools,  # source + graph + run_code; read_file from the backend
+        "middleware": [tool_errors],
+        "model": subagent_chat_model,
     }
 
-    main_middleware = [guard]
+    main_middleware = [guard, tool_errors]
     if interpreter_mw is not None:
         main_middleware.append(interpreter_mw)
     # Compel the in-run benchmark loop: if RI is enabled, hook after_model on the
@@ -767,6 +842,7 @@ def build_harvest_agent(
         system_prompt=build_supervisor_prompt(
             recursive_improvement=benchmark_session is not None,
             profile=prompt_profile,
+            gpt=supervisor_gpt,
         ),
         middleware=main_middleware,
         subagents=[table_author, reference_author, reviewer, context_extractor],

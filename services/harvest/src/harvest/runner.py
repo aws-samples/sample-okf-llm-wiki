@@ -32,6 +32,13 @@ from harvest.finalize import finalize_bundle, mark_in_progress
 from harvest.fsutil import clean_authored_output, write_text
 from harvest.metadata_export import export_metadata
 from harvest.prompts import build_annotation_prompt
+
+
+def _prompt_is_gpt(model: str | None) -> bool:
+    """Whether ``model`` selects the GPT-family prompt addendum (see prompts)."""
+    from harvest.agent import _is_openai_model
+
+    return bool(model) and _is_openai_model(model)
 from harvest.source_base import Source
 from harvest.status import (
     build_registry_client,
@@ -299,6 +306,8 @@ def run_full_harvest(
     data_domain: str,
     dataset: str,
     model_config: dict[str, Any] | None = None,
+    subagent_model_config: dict[str, Any] | None = None,
+    reviewer_model_config: dict[str, Any] | None = None,
     recursion_limit: int = 1000,
     domain_description: str | None = None,
     domain_context: str | None = None,
@@ -349,6 +358,10 @@ def run_full_harvest(
             status="running",
             model=resolved_config.get("model"),
             effort=resolved_config.get("effort"),
+            subagent_model=(subagent_model_config or {}).get("model"),
+            subagent_effort=(subagent_model_config or {}).get("effort"),
+            reviewer_model=(reviewer_model_config or {}).get("model"),
+            reviewer_effort=(reviewer_model_config or {}).get("effort"),
         )
 
         tables = source.table_names()
@@ -425,6 +438,8 @@ def run_full_harvest(
                 sandbox=sandbox,
                 step_emitter=emitter,
                 **ri_kwargs,
+                subagent_config=subagent_model_config,
+                reviewer_config=reviewer_model_config,
                 **resolved_config,
             )
             config = _invoke_config(effective_limit, emitter)
@@ -483,6 +498,8 @@ def run_incremental_harvest(
     changed_table: str,
     diff: dict[str, Any] | None = None,
     model_config: dict[str, Any] | None = None,
+    subagent_model_config: dict[str, Any] | None = None,
+    reviewer_model_config: dict[str, Any] | None = None,
     recursion_limit: int = 400,
     domain_description: str | None = None,
     domain_context: str | None = None,
@@ -516,6 +533,10 @@ def run_incremental_harvest(
             status="running",
             model=resolved_config.get("model"),
             effort=resolved_config.get("effort"),
+            subagent_model=(subagent_model_config or {}).get("model"),
+            subagent_effort=(subagent_model_config or {}).get("effort"),
+            reviewer_model=(reviewer_model_config or {}).get("model"),
+            reviewer_effort=(reviewer_model_config or {}).get("effort"),
         )
 
         # Refresh the read-only .metadata/ snapshot so the changed table's current
@@ -574,6 +595,8 @@ def run_incremental_harvest(
                 sandbox=sandbox,
                 step_emitter=emitter,
                 **ri_kwargs,
+                subagent_config=subagent_model_config,
+                reviewer_config=reviewer_model_config,
                 **resolved_config,
             )
             config = _invoke_config(effective_limit, emitter)
@@ -712,6 +735,8 @@ def run_annotation_harvest(
     user_sub: str,
     annotations: list[dict[str, Any]],
     model_config: dict[str, Any] | None = None,
+    subagent_model_config: dict[str, Any] | None = None,
+    reviewer_model_config: dict[str, Any] | None = None,
     recursion_limit: int = 400,
     domain_description: str | None = None,
     domain_context: str | None = None,
@@ -774,6 +799,10 @@ def run_annotation_harvest(
             status="running",
             model=resolved_config.get("model"),
             effort=resolved_config.get("effort"),
+            subagent_model=(subagent_model_config or {}).get("model"),
+            subagent_effort=(subagent_model_config or {}).get("effort"),
+            reviewer_model=(reviewer_model_config or {}).get("model"),
+            reviewer_effort=(reviewer_model_config or {}).get("effort"),
         )
 
         # Refresh the read-only .metadata/ snapshot so the agent verifies each
@@ -796,6 +825,9 @@ def run_annotation_harvest(
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
             profile=source.prompt_profile,
+            # The annotation job is the SUPERVISOR's user prompt — key the
+            # GPT-family addendum to the supervisor's resolved model.
+            gpt=_prompt_is_gpt(resolved_config.get("model")),
         )
         emitter = _build_emitter(
             data_domain=data_domain, dataset=dataset, session_id=session_id
@@ -816,6 +848,8 @@ def run_annotation_harvest(
                 sandbox=sandbox,
                 step_emitter=emitter,
                 **ri_kwargs,
+                subagent_config=subagent_model_config,
+                reviewer_config=reviewer_model_config,
                 **resolved_config,
             )
             config = _invoke_config(effective_limit, emitter)

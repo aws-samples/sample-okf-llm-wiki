@@ -12,10 +12,36 @@ import pytest
 from okf_core import harvest_models as hm
 
 
-def test_default_catalog_has_both_providers():
+def test_default_catalog_offers_the_full_model_set():
     models = [e["model"] for e in hm.DEFAULT_CATALOG]
     assert "global.anthropic.claude-opus-4-8" in models
     assert "openai.gpt-5.6-sol" in models
+    assert "global.anthropic.claude-opus-5" in models
+    assert "global.anthropic.claude-sonnet-5" in models
+    assert "openai.gpt-5.6-terra" in models
+    # Opus 4.8 stays FIRST — the first entry is the UI picker's default; the
+    # others are additional offerings, not a new default.
+    assert models[0] == "global.anthropic.claude-opus-4-8"
+    # Every entry offers the full effort ladder with the xhigh default.
+    for entry in hm.DEFAULT_CATALOG:
+        assert entry["efforts"] == ["low", "medium", "high", "xhigh", "max"]
+        assert entry["default_effort"] == "xhigh"
+
+
+def test_opus_5_offers_full_effort_ladder():
+    cat = hm.DEFAULT_CATALOG
+    assert hm.allowed_efforts(cat, "global.anthropic.claude-opus-5") == (
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    )
+    assert hm.default_effort_for(cat, "global.anthropic.claude-opus-5") == "xhigh"
+    assert hm.validate_model_effort(cat, "global.anthropic.claude-opus-5", None) == (
+        "global.anthropic.claude-opus-5",
+        "xhigh",
+    )
 
 
 def test_parse_catalog_empty_falls_back_to_default():

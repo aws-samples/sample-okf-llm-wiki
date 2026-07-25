@@ -61,18 +61,28 @@ def report_status(
     only_if_active: bool = False,
     model: str | None = None,
     effort: str | None = None,
+    subagent_model: str | None = None,
+    subagent_effort: str | None = None,
+    reviewer_model: str | None = None,
+    reviewer_effort: str | None = None,
 ) -> None:
     """Best-effort transition of the harvest status row to ``status``.
 
     ``registry`` is the (client, table) tuple from :func:`build_registry_client`
     (or None — then this is a no-op). Only ``status`` / ``updated_at`` (/ optional
-    ``detail`` / ``model`` / ``effort``) are written; ``mode`` / ``started_at`` /
-    ``runtime_session_id`` set at ``queued`` time are preserved. Never raises.
+    ``detail`` / ``model`` / ``effort`` / ``subagent_model`` / ``subagent_effort``)
+    are written; ``mode`` / ``started_at`` / ``runtime_session_id`` set at
+    ``queued`` time are preserved. Never raises.
 
     ``model``/``effort`` record the RESOLVED LLM config actually used for this run
     (override or deploy-time default) so the UI can show what a harvest ran on.
     Written on the ``running`` transition (the runner knows the resolved config by
     then); passing them on other transitions just re-stamps the same values.
+    ``subagent_model``/``subagent_effort`` record the separate sub-agent override
+    when one was chosen — absent means the sub-agents ran on the supervisor's
+    config, and nothing is written (the UI reads absence as "same as harvester").
+    ``reviewer_model``/``reviewer_effort`` do the same for the adversarial
+    reviewer's own override (absence = same as the sub-agents).
 
     ``only_if_active`` guards the write with a condition that the row is still
     ``queued`` or ``running`` — used for the terminal ``complete``/``failed``
@@ -106,6 +116,18 @@ def report_status(
             expr += ", #e = :e"
             names["#e"] = "effort"
             values[":e"] = {"S": effort}
+        if subagent_model:
+            expr += ", subagent_model = :sm"
+            values[":sm"] = {"S": subagent_model}
+        if subagent_effort:
+            expr += ", subagent_effort = :se"
+            values[":se"] = {"S": subagent_effort}
+        if reviewer_model:
+            expr += ", reviewer_model = :rm"
+            values[":rm"] = {"S": reviewer_model}
+        if reviewer_effort:
+            expr += ", reviewer_effort = :re"
+            values[":re"] = {"S": reviewer_effort}
         kwargs: dict[str, Any] = {
             "TableName": table,
             "Key": {

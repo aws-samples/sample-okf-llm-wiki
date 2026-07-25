@@ -81,7 +81,20 @@ KIND_SUBAGENT = "subagent"
 # LangChain's normalized `usage_metadata` (same names sparky's stream uses):
 # {input, output, cache_read, cache_write, total}. `cache_write` is LangChain's
 # `cache_creation` (Anthropic prompt-cache WRITE); `cache_read` is a cache HIT.
+# The snapshot ALSO carries `by`: the same counters split per METERING SCOPE —
+# `supervisor` (the top-level agent's own turns), `subagents` (the dispatched
+# authors/extractors AND the benchmark solver/adjudicator), and `reviewer` (the
+# adversarial review fan-out, which can run on its own model for cross-model
+# coverage). Attribution is by MODEL INSTANCE: each scope runs on a separate
+# instance carrying its own scope-tagged UsageForwarder, so no per-callback
+# discrimination is needed. The top-level counters stay the sum of the scopes
+# (older UIs keep working; new UIs render the drill-down from `by`).
 KIND_USAGE = "usage"
+
+# Usage metering scopes (the keys of the KIND_USAGE snapshot's `by` object).
+SCOPE_SUPERVISOR = "supervisor"
+SCOPE_SUBAGENTS = "subagents"
+SCOPE_REVIEWER = "reviewer"
 # Recursive-improvement benchmark events. KIND_BENCHMARK_PROGRESS is a live
 # in-round update (phase + an N/M counter) the UI renders as a progress row that
 # updates in place, keyed by (iteration, phase). KIND_BENCHMARK is the per-round
@@ -289,11 +302,25 @@ def _usage_from_message(message: Any) -> dict[str, int] | None:
     def _int(v: Any) -> int:
         return v if isinstance(v, int) and not isinstance(v, bool) else 0
 
+    # Cache WRITES: normally input_token_details.cache_creation — but
+    # langchain_aws's Converse path ZEROES cache_creation whenever Bedrock
+    # returns a per-TTL cacheDetails breakdown (Anthropic models do) and
+    # reports the writes only as ephemeral_{5m,1h}_input_tokens buckets, which
+    # made Anthropic runs show no cache writes at all. langchain_anthropic
+    # (native) emits BOTH (cache_creation = the total, the buckets = its
+    # per-TTL split), so SUMMING them would double-count there — max() reads
+    # the true write count from every shape.
+    cache_write = max(
+        _int(details.get("cache_creation")),
+        _int(details.get("ephemeral_5m_input_tokens"))
+        + _int(details.get("ephemeral_1h_input_tokens")),
+    )
+
     delta = {
         "input": _int(um.get("input_tokens")),
         "output": _int(um.get("output_tokens")),
         "cache_read": _int(details.get("cache_read")),
-        "cache_write": _int(details.get("cache_creation")),
+        "cache_write": cache_write,
     }
     if not any(delta.values()):
         return None
@@ -362,7 +389,14 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         # sub-agent (sub-agents emit no feed row but dominate the spend, so they
         # must count). Guarded by the same lock as _seq since sub-agent turns end
         # on pool threads. Snapshotted into a KIND_USAGE event on each metered turn.
+        # `_usage` is the run total; `_usage_by` splits it per metering scope
+        # (supervisor vs subagents — see the KIND_USAGE comment).
         self._usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+        self._usage_by = {
+            SCOPE_SUPERVISOR: dict(self._usage),
+            SCOPE_SUBAGENTS: dict(self._usage),
+            SCOPE_REVIEWER: dict(self._usage),
+        }
 
     # -- emission ----------------------------------------------------------- #
 
@@ -496,27 +530,37 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
             event["full"] = full[:_AGENT_FULL_MAX]
         self._emit(event)
 
-    def record_usage(self, message: Any) -> None:
-        """Fold one model turn's ``usage_metadata`` into the running total and emit
-        a cumulative ``KIND_USAGE`` snapshot.
+    def record_usage(self, message: Any, scope: str = SCOPE_SUPERVISOR) -> None:
+        """Fold one model turn's ``usage_metadata`` into the running totals and
+        emit a cumulative ``KIND_USAGE`` snapshot.
 
         Called from the MODEL-instance callback (UsageForwarder), NOT the
         run-config callback — that is the whole point: it fires for EVERY turn on
         EVERY dispatch path (supervisor, static-`task` sub-agents, AND QuickJS
         `task()` sub-agents that never reach the parent run's callbacks), so the
-        total reflects the real spend. No-op for turns with no usage (thinking-
-        only / provider omission). The snapshot carries absolute cumulative
-        counts — the UI renders the latest one, so a missed/out-of-order poll
-        can't corrupt a client-side running sum. Thread-safe: sub-agent turns
-        end on pool threads, so the accumulate + snapshot is under the lock."""
+        total reflects the real spend. ``scope`` names which metering bucket the
+        turn belongs to (the forwarder's tag — supervisor vs subagents; each
+        model instance carries its own tagged forwarder, so attribution is by
+        instance). No-op for turns with no usage (thinking-only / provider
+        omission). The snapshot carries absolute cumulative counts — the UI
+        renders the latest one, so a missed/out-of-order poll can't corrupt a
+        client-side running sum. Thread-safe: sub-agent turns end on pool
+        threads, so the accumulate + snapshot is under the lock."""
         delta = _usage_from_message(message)
         if delta is None:
             return
+        bucket_key = scope if scope in self._usage_by else SCOPE_SUPERVISOR
         with self._lock:
+            bucket = self._usage_by[bucket_key]
             for k, v in delta.items():
                 self._usage[k] += v
+                bucket[k] += v
             snapshot = dict(self._usage)
+            by = {s: dict(counts) for s, counts in self._usage_by.items()}
         snapshot["total"] = snapshot["input"] + snapshot["output"]
+        for counts in by.values():
+            counts["total"] = counts["input"] + counts["output"]
+        snapshot["by"] = by
         self._emit({"kind": KIND_USAGE, "usage": snapshot})
 
     @staticmethod
@@ -671,28 +715,34 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
 class UsageForwarder(BaseCallbackHandler):  # type: ignore[misc]
     """A model-instance callback that meters token usage on EVERY model turn.
 
-    Attached to the shared chat-model instance — ``ChatBedrockConverse`` (Claude)
-    or ``ChatOpenAI`` on Bedrock Mantle (GPT), whichever the model id selected —
-    which all sub-agents inherit, NOT to the run config. That distinction is the
-    fix: LangChain normalizes ``usage_metadata`` across both providers, and fires
-    a model's *local* (instance) callbacks on every invocation of that model
-    object regardless of which graph/thread drives it — including the QuickJS
-    ``task()`` sub-agents that run on their own asyncio tasks and never reach the
-    parent run's ``config["callbacks"]``. So this sees the supervisor's turns AND
-    every sub-agent's, giving a complete running total. It only forwards usage to
+    Attached to a chat-model INSTANCE — ``ChatBedrockConverse`` (Claude) or
+    ``ChatOpenAI`` on Bedrock Mantle (GPT), whichever the model id selected —
+    NOT to the run config. That distinction is the fix: LangChain normalizes
+    ``usage_metadata`` across both providers, and fires a model's *local*
+    (instance) callbacks on every invocation of that model object regardless of
+    which graph/thread drives it — including the QuickJS ``task()`` sub-agents
+    that run on their own asyncio tasks and never reach the parent run's
+    ``config["callbacks"]``.
+
+    ``scope`` tags every turn this instance's forwarder sees into one metering
+    bucket (supervisor vs subagents). The harvest builds TWO model instances —
+    the supervisor's and the sub-agents' (also used by the benchmark
+    solver/adjudicator) — each with its own scoped forwarder, so the run total
+    stays complete AND splits cleanly per scope. It only forwards usage to
     ``StepEmitter.record_usage``; the narrative feed still comes from the
     StepEmitter on the run config. Best-effort: never raises into the model call.
     """
 
     ignore_agent = False
 
-    def __init__(self, emitter: "StepEmitter"):
+    def __init__(self, emitter: "StepEmitter", scope: str = SCOPE_SUPERVISOR):
         super().__init__()
         self._emitter = emitter
+        self._scope = scope
 
     def on_llm_end(self, response: Any, *, run_id: Any = None, **kwargs: Any) -> None:
         try:
-            self._emitter.record_usage(_message_of(response))
+            self._emitter.record_usage(_message_of(response), scope=self._scope)
         except Exception:  # noqa: BLE001 - metering must never break a model call
             log.debug("usage forward failed (continuing)", exc_info=True)
 
