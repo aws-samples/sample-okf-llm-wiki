@@ -57,6 +57,42 @@ def test_supervisor_review_covers_whole_bundle_not_a_subset():
     assert "must match" in low or "these MUST match" in p
 
 
+def test_supervisor_reviews_in_link_clusters_not_per_doc():
+    # The fan-out is one reviewer per link-cluster (≤5 docs, grouped by the
+    # cluster_concepts tool), not one per doc — fewer subagents, and a reviewer
+    # holding the related set can catch cross-doc contradictions.
+    p = prompts.SUPERVISOR_PROMPT
+    assert "cluster_concepts" in p
+    assert "per cluster" in p.lower()
+    assert "AT MOST 5" in p or "at most 5" in p.lower()
+    # The JS example dispatches over clusters, not a flat doc list.
+    assert "clusters.map" in p
+
+
+def test_supervisor_eval_is_task_only_clusters_come_from_a_direct_tool_call():
+    # A live run showed eval() exposes ONLY the task() global — the old JS
+    # example called glob(...) inside eval and it didn't exist, forcing the
+    # agent to improvise. The prompt must state the task-only rule, and the
+    # example must NOT call tools from JS: cluster_concepts is called directly
+    # (step 1) and its result inlined as a literal (step 2).
+    p = prompts.SUPERVISOR_PROMPT
+    assert "ONLY the `task()` global" in p
+    assert "await cluster_concepts" not in p
+    assert "await glob" not in p
+    assert "VERBATIM" in p  # the inlined literal is the tool's output, complete
+
+
+def test_reviewer_reviews_a_cluster_with_cross_doc_checks():
+    # The reviewer receives 1-5 related concept ids: every doc gets the full
+    # checklist, findings come back grouped by doc, and the docs are checked
+    # against EACH OTHER (the consistency bugs per-doc review can't see).
+    p = prompts.REVIEWER_PROMPT
+    assert "CLUSTER" in p
+    assert "EVERY doc" in p
+    assert "cross-doc" in p.lower()
+    assert "grouped by concept id" in p.lower()
+
+
 def test_reviewer_flags_volatile_stats_and_missing_joins():
     # The reviewer enforces the two new authoring bars: no decaying stats baked in,
     # and joins the doc failed to discover/verify.

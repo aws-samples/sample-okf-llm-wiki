@@ -78,3 +78,72 @@ def test_link_graph_ignores_out_of_subtree_links(tmp_path):
     _write(tmp_path, "tables/a.md", "A", "[out](../../other/x.md)\n")
     g = LinkGraph(tmp_path)
     assert g.get_links("tables/a") == []
+
+
+def test_link_graph_excludes_dot_dirs(tmp_path):
+    # .metadata/.context/.harvest hold authoring inputs, not bundle concepts —
+    # they must never become graph nodes (nor land in review clusters).
+    _write(tmp_path, "tables/a.md", "A", "no links\n")
+    _write(tmp_path, ".metadata/tables/a.md", "A sheet", "raw metadata\n")
+    _write(tmp_path, ".context/notes.md", "Notes", "uploaded doc\n")
+    g = LinkGraph(tmp_path)
+    assert set(g.cluster()[0]) == {"tables/a"}
+    assert ".metadata/tables/a" not in g.graph
+    assert ".context/notes" not in g.graph
+
+
+def test_cluster_groups_linked_docs_and_covers_every_doc_once(tmp_path):
+    # A hub table with its spoke references clusters together; every doc lands
+    # in exactly one cluster and none exceeds max_size.
+    _write(tmp_path, "tables/races.md", "Races", "see [join](../references/joins/j.md)\n")
+    _write(tmp_path, "references/joins/j.md", "J", "[races](../../tables/races.md)\n")
+    _write(tmp_path, "references/enums/status.md", "S", "[races](../../tables/races.md)\n")
+    _write(tmp_path, "tables/lonely.md", "Lonely", "no links\n")
+    _write(tmp_path, "index.md", "Index", "reserved\n")
+    clusters = LinkGraph(tmp_path).cluster(max_size=5)
+    flat = [c for cluster in clusters for c in cluster]
+    assert sorted(flat) == [
+        "references/enums/status",
+        "references/joins/j",
+        "tables/lonely",
+        "tables/races",
+    ]  # each doc exactly once; index.md excluded
+    # The linked trio stays together in one cluster.
+    trio = {"tables/races", "references/joins/j", "references/enums/status"}
+    assert any(trio <= set(cluster) for cluster in clusters)
+    assert all(len(cluster) <= 5 for cluster in clusters)
+
+
+def test_cluster_respects_max_size_on_large_components(tmp_path):
+    # One hub linked by 9 spokes: a single component larger than max_size must
+    # split into clusters that each stay within the cap.
+    spokes = [f"references/glossary/t{i}.md" for i in range(9)]
+    for s in spokes:
+        _write(tmp_path, s, s, "[hub](../../tables/hub.md)\n")
+    _write(tmp_path, "tables/hub.md", "Hub", "no links\n")
+    clusters = LinkGraph(tmp_path).cluster(max_size=5)
+    assert sorted(c for cluster in clusters for c in cluster) == sorted(
+        ["tables/hub"] + [s[:-3] for s in spokes]
+    )
+    assert all(1 <= len(cluster) <= 5 for cluster in clusters)
+    # 10 docs at ≤5 per cluster packs into exactly 2 clusters.
+    assert len(clusters) == 2
+
+
+def test_cluster_packs_singletons_together(tmp_path):
+    # Unlinked docs don't each cost their own cluster — they pack up to max_size.
+    for i in range(7):
+        _write(tmp_path, f"tables/t{i}.md", f"T{i}", "no links\n")
+    clusters = LinkGraph(tmp_path).cluster(max_size=5)
+    assert len(clusters) == 2
+    assert sorted(len(cluster) for cluster in clusters) == [2, 5]
+
+
+def test_cluster_is_deterministic(tmp_path):
+    _write(tmp_path, "tables/a.md", "A", "[b](b.md)\n")
+    _write(tmp_path, "tables/b.md", "B", "no links\n")
+    _write(tmp_path, "tables/c.md", "C", "no links\n")
+    g = LinkGraph(tmp_path)
+    first = g.cluster(max_size=2)
+    g.mark_dirty()
+    assert g.cluster(max_size=2) == first

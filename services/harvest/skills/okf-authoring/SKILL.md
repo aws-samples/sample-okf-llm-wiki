@@ -274,24 +274,38 @@ doc is *true*. A grain stated but never measured, a join copied from a context d
 that actually fans out, an enum decoded from the wrong column, an SQL snippet that
 errors — all pass conformance and all mislead a consumer. So when your runtime can
 dispatch independent verifiers (reviewer sub-agents), run an adversarial review
-over the finished bundle before declaring done.
+over the finished bundle before declaring done. Run it ONCE: apply the confirmed
+findings and finish — do not loop review → fix → review, and do not stack further
+verification passes on top of it.
 
 - **Independence is the point.** The author of a doc carries the author's bias —
   it will rationalize the grain it already stated and re-run the same query that
   "confirmed" it. Route review through a SEPARATE agent given only the finished
-  doc and the live source, prompted to REFUTE the load-bearing claims (grain,
+  docs and the live source, prompted to REFUTE the load-bearing claims (grain,
   join keys + cardinality, enum decodings, gotchas, every SQL snippet) against
   live data. A finding is only real if a query reproduces it; fix only confirmed
   findings.
-- **Cover the WHOLE bundle, not a subset.** Build the review list by enumerating
-  the actual authored docs on disk, not from memory — one reviewer per
-  `tables/*`, per `references/**/*` (joins, metrics, enums, named_sets, glossary,
-  known_issues), and the `datasets/*` overview. Exclude only reserved generated
-  files (`index.md`, `log.md`). Reviewing only the tables, a "representative"
-  sample, or only the docs you think are risky is a spot check, not a review — the
-  bugs you miss are precisely the ones in the docs you skipped. If you must bound
-  the pass, say which docs went unreviewed rather than letting a partial pass read
-  as a complete one.
+- **Review in link-based clusters, not one doc at a time.** Group the docs into
+  small clusters of RELATED docs (at most ~5 per cluster) and dispatch one
+  reviewer per cluster. Relatedness comes from the link graph — a table with the
+  `references/joins/*` and `references/enums/*` docs that link to it belongs in
+  one cluster (if your runtime provides a clustering tool over the link graph,
+  use it; otherwise derive clusters from the docs' links/backlinks). Clustering
+  is not just cheaper than one reviewer per doc: a reviewer holding the whole
+  related set can also catch **cross-doc contradictions** — a join doc whose keys
+  or cardinality disagree with its table docs, an enum doc that contradicts the
+  schema row linking it — which per-doc review structurally cannot see. Every
+  doc in a cluster gets the full checklist; a doc skimmed because it shared a
+  reviewer is a doc that ships unverified.
+- **Cover the WHOLE bundle, not a subset.** Build the cluster set by enumerating
+  the actual authored docs on disk, not from memory — every `tables/*`, every
+  `references/**/*` (joins, metrics, enums, named_sets, glossary, known_issues),
+  and the `datasets/*` overview lands in exactly one cluster. Exclude only
+  reserved generated files (`index.md`, `log.md`). Reviewing only the tables, a
+  "representative" sample, or only the docs you think are risky is a spot check,
+  not a review — the bugs you miss are precisely the ones in the docs you
+  skipped. If you must bound the pass, say which docs went unreviewed rather
+  than letting a partial pass read as a complete one.
 
 ## Frontmatter
 
@@ -375,6 +389,12 @@ Concept-type templates are in `references/templates.md`.
 
 Keep bodies clean: no preamble, no apologies, no reasoning narration. The body
 must be valid markdown a human or downstream agent consumes directly.
+
+Right-size every body: match a doc's length to what its content needs — cover
+the substance, then stop. Do not pad with filler sections, restated overviews,
+or boilerplate, and omit a conventional heading entirely when the concept has
+nothing real to say under it (a `# Gotchas` with no gotcha is noise). A short,
+dense doc serves a reader better than a long, padded one.
 
 ## Cross-linking
 

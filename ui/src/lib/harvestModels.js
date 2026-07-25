@@ -21,6 +21,12 @@ const FALLBACK_CATALOG = [
     efforts: ["low", "medium", "high", "xhigh"],
     default_effort: "xhigh",
   },
+  {
+    model: "global.anthropic.claude-opus-5",
+    label: "Claude Opus 5",
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+    default_effort: "xhigh",
+  },
 ]
 
 function decodeCatalog(raw) {

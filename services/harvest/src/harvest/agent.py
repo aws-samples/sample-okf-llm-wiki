@@ -7,14 +7,16 @@ Wires together, per the design:
 - ``GlueAthenaSource`` LIVE tools (sample_rows / run_sql); static Glue metadata is
   snapshotted to the read-only ``.metadata/`` dir before the run and read with the
   built-in file tools (see ``metadata_export``);
-- a per-session ``LinkGraph`` with ``get_backlinks``/``get_links`` tools;
+- a per-session ``LinkGraph`` with ``get_backlinks``/``get_links``/
+  ``cluster_concepts`` tools;
 - ``OKFGuardMiddleware`` (frontmatter + augmentation guard, timestamp auto-fill,
   graph dirty-flag) — attached to the main agent AND the per-table sub-agent
   (sub-agent middleware/tools REPLACE, so we pass them explicitly);
 - four dynamic sub-agents the supervisor fans out via ``task()``: ``table-author``
   (one per table), ``reference-author`` (one per cross-cutting reference — metric,
   named-set, glossary term, known-issue, or the usage-guardrails contract),
-  ``reviewer`` (one per authored doc, adversarial read-only verification), and
+  ``reviewer`` (one per link-cluster of ≤5 authored docs from
+  ``cluster_concepts``, adversarial read-only verification), and
   ``context-extractor`` (read-only; mines the uploaded ``.context/`` docs for
   verified facts and returns a routed digest — fanned out one-per-doc/group for a
   large ``.context/`` so the heavy reading happens once);
@@ -521,8 +523,9 @@ def build_harvest_agent(
     # QuickJS code interpreter → enables DYNAMIC subagents: the agent can write JS
     # that calls the task({description, subagentType}) global to fan out + collect
     # in parallel (loops, Promise.all). We use it for adversarial REVIEW: after
-    # authoring, fan out one independent `reviewer` per doc to verify claims
-    # against live data, then fix only confirmed findings. Optional — if the
+    # authoring, fan out one independent `reviewer` per link-cluster of ≤5 docs
+    # (from cluster_concepts) to verify claims against live data, then fix only
+    # confirmed findings. Optional — if the
     # interpreter package isn't present, fall back to the static `task` tool.
     #
     # Bound how many task() dispatches run concurrently BEFORE building the
@@ -699,18 +702,21 @@ def build_harvest_agent(
         "middleware": [guard],
     }
 
-    # Adversarial reviewer — READ-ONLY. Verifies an authored doc's load-bearing
-    # claims (the stated grain, join keys, gotchas, SQL) against LIVE data via
+    # Adversarial reviewer — READ-ONLY. Verifies a link-cluster of authored docs'
+    # load-bearing claims (the stated grain, join keys, gotchas, SQL — plus
+    # cross-doc contradictions within the cluster) against LIVE data via
     # run_sql/sample_rows, and reports only findings it could reproduce. No guard
     # (it never writes); the supervisor applies the confirmed fixes.
     reviewer = {
         "name": "reviewer",
         "description": (
-            "Adversarially verify one authored OKF concept doc against live data. "
-            "Pass the concept id (e.g. 'tables/races') and what to scrutinize. "
-            "Returns confirmed findings (wrong grain, bad join key, mis-stated "
-            "gotcha, SQL that errors/returns wrong rows) with the query that "
-            "proves each — or 'no issues found'."
+            "Adversarially verify a CLUSTER of related authored OKF concept docs "
+            "(1-5 ids, grouped by the cluster_concepts tool) against live data. "
+            "Pass the concept ids (e.g. 'tables/races, references/joins/"
+            "circuits__races') and what to scrutinize. Returns confirmed findings "
+            "grouped by doc (wrong grain, bad join key, mis-stated gotcha, "
+            "cross-doc contradiction, SQL that errors/returns wrong rows) with "
+            "the query that proves each — or 'no issues found'."
         ),
         "system_prompt": build_reviewer_prompt(prompt_profile),
         "tools": all_tools,  # source + graph tools; read_file comes from the backend

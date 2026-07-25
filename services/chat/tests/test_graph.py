@@ -45,6 +45,18 @@ def test_prompt_mentions_charts_without_the_authoring_details():
     assert "renderChart(el, spec)" not in SYSTEM_PROMPT
 
 
+def test_prompt_carries_opus5_verbosity_and_correction_tuning():
+    # Opus 5 defaults to longer user-facing responses and narrates corrections
+    # more; the prompt must calibrate both — a conciseness instruction paired
+    # with a short reminder near the end (<tone_preference>), and correction
+    # narration limited to errors that change the reader's conclusions.
+    assert "<tone_preference>" in SYSTEM_PROMPT
+    assert SYSTEM_PROMPT.rstrip().endswith("</tone_preference>")
+    low = SYSTEM_PROMPT.lower()
+    assert "concise" in low
+    assert "correct an earlier statement" in low
+
+
 def test_sql_variant_extends_base_and_mentions_run_sql():
     # The SQL prompt is the base plus a run_sql block — so the base agent never
     # advertises a tool it doesn't have, and the SQL agent keeps every base rule.

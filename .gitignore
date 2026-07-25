@@ -35,6 +35,10 @@ benchmark/mini_dev/evaluation/
 # Report: keep the PDF + generator (build_report.py); the HTML is regenerated output
 benchmark/mini_dev/report.html
 
+# Local roadmap / planning doc (engagement-internal, not published)
+Roadmap.md
+opus-5-prompting.md
+
 # OS
 .DS_Store
 
