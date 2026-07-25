@@ -389,18 +389,40 @@ def process_stream_data(
         if not isinstance(chunk, AIMessageChunk):
             return None
 
+        chunks: list[dict[str, Any]] = []
+
+        # Tool-call START, announced EARLY: the FIRST streamed fragment of a
+        # tool call carries its name + id (later fragments are partial-JSON arg
+        # deltas with name=None, so this naturally fires once per call). The
+        # args-complete "tool" start still comes from the updates mode when the
+        # model turn ends — but for calls with LARGE args (render_chart's args
+        # ARE the chart code) that lands seconds later, and the UI would show
+        # nothing while the model generates them. tool_pending is the model's
+        # "I am invoking <tool> now" — the UI opens the chart placeholder on
+        # it immediately. Ephemeral by design: never checkpointed, so history
+        # reloads are unaffected; a resume replays it from the live buffer.
+        for tc in getattr(chunk, "tool_call_chunks", None) or []:
+            name = (
+                tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+            )
+            if not name:
+                continue
+            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+            chunks.append(
+                {"type": "tool_pending", "id": tc_id or "", "tool_name": name}
+            )
+
         content = chunk.content
         # String content = plain answer text.
         if isinstance(content, str):
-            return {"type": "text", "content": content} if content else None
-
+            if content:
+                chunks.append({"type": "text", "content": content})
         # List content = structured blocks. Two provider shapes:
         #  - Converse (Claude): {"type":"reasoning_content","reasoning_content":{text}}
         #  - GPT/Responses v1:  {"type":"reasoning","summary":[{"type":"summary_text",
         #                        "text":…}, …]} (summary is a LIST; streaming deltas
         #                        may carry a single {"text":…} or an "index"+text).
-        if isinstance(content, list):
-            chunks: list[dict[str, Any]] = []
+        elif isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
                     continue
@@ -413,9 +435,9 @@ def process_stream_data(
                     text = _reasoning_text(block)
                     if text:
                         chunks.append({"type": "think", "content": text})
-            if len(chunks) == 1:
-                return chunks[0]
-            return chunks or None
+        if len(chunks) == 1:
+            return chunks[0]
+        return chunks or None
 
     return None
 
@@ -843,38 +865,40 @@ def read_history(
     checkpointer: Any,
     internal_thread_id: str,
     *,
-    drop_inflight: bool = False,
+    inflight_user_message: str | None = None,
 ) -> dict[str, Any]:
     """Return ``{"history": [chatTurns]}`` for a conversation (empty if none).
 
     Builds a throwaway graph bound to the checkpointer and reads its persisted
     state. Model/effort don't matter for a read, so use safe defaults.
 
-    ``drop_inflight`` (set when a LIVE run is active for this thread) drops the
-    trailing in-flight turn so the ``resume`` path can render it fresh from the
-    live buffer instead of showing it from the checkpoint AND replaying it (which
-    would duplicate). The in-flight turn is one that has NOT committed a final
-    answer yet — it may already carry checkpointed reasoning or a tool call
-    (LangGraph checkpoints at each node boundary, so a turn stopped mid-tool has
-    an AIMessage(tool_calls) with no text), but no assistant TEXT. A turn that DID
-    produce answer text is a completed turn and is always kept — this also avoids
-    dropping a prior completed turn when the active run's own human message hasn't
-    been checkpointed yet.
+    ``inflight_user_message`` is the ACTIVE live run's user message (None/empty
+    when nothing is in flight). When the trailing turn's user message matches
+    it, that turn is the one the run is still producing, and it is dropped so
+    the client's follow-up ``resume()`` renders it fresh from the live buffer
+    (which leads with the same user message) instead of showing it from the
+    checkpoint AND replaying it. Matching by IDENTITY rather than by shape
+    ("no answer text yet") is what handles multi-step turns: LangGraph
+    checkpoints at every node boundary, so an in-flight turn may already carry
+    committed answer TEXT (prose emitted before/between tool calls) — the old
+    shape heuristic kept those half-turns and the resume replay duplicated
+    them. An ``answer_human`` continuation runs with ``user_message=""`` and
+    drops nothing: its question bubble belongs to the original turn, whose
+    checkpointed prefix must stay in history while the buffer appends only the
+    continuation.
     """
     graph = build_agent("us.anthropic.claude-opus-4-8", "high", None, checkpointer)
     cfg = {"configurable": {"thread_id": internal_thread_id}}
     state = graph.get_state(cfg)
     messages = (state.values or {}).get("messages", []) if state else []
     turns = _messages_to_turns(messages)
-    if drop_inflight and turns:
+    if inflight_user_message and turns:
         last = turns[-1]
-        # No committed answer text → this is the turn the live run is still
-        # producing (empty, reasoning-only, or stopped mid-tool). resume() rebuilds
-        # it in full from the buffer, so drop it here to avoid a duplicate.
-        has_answer_text = any(
-            e.get("type") == "text" for e in last.get("aiMessage", [])
-        )
-        if not has_answer_text:
+        # `userMessage` is scope-stripped on fold; the live registry stores the
+        # raw prompt (scoping is applied later, server-side), so the two compare
+        # directly. No match ⇒ the active run's human message hasn't
+        # checkpointed yet and the trailing turn is a prior completed one — keep.
+        if last.get("userMessage") == inflight_user_message:
             turns = turns[:-1]
     out: dict[str, Any] = {"history": turns}
     # If the graph is PAUSED at an ask_human interrupt, surface it so a page reload
@@ -1318,13 +1342,20 @@ def build_app(
         # Non-streaming control types return a JSON envelope (Sparky pattern).
         if req_type == "get_session_history":
             try:
-                # When a live run is in flight, drop its half-turn from history —
-                # the client's follow-up resume() renders it fresh from the buffer.
+                # When a live run is in flight, drop ITS turn from history by
+                # identity (the run's user message) — the client's follow-up
+                # resume() renders that turn fresh from the buffer.
+                live = live_streams.get(internal_id)
+                inflight = (
+                    live.user_message
+                    if live is not None and live_streams.is_active(internal_id)
+                    else None
+                )
                 data = read_history(
                     build_agent,
                     checkpointer,
                     internal_id,
-                    drop_inflight=live_streams.is_active(internal_id),
+                    inflight_user_message=inflight,
                 )
             except Exception as exc:  # noqa: BLE001
                 return JSONResponse(

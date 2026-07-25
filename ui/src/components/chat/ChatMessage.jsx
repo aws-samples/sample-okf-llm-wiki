@@ -26,7 +26,7 @@ function blockSig(block) {
   // on the tool CALL (not token-streamed), so a length signature is stable; the id
   // keeps two charts in one turn distinct so neither is skipped by the memo.
   if (block.type === "chart")
-    return `c:${block.id || ""}:${block.code?.length || 0}`
+    return `c:${block.id || ""}:${block.pending ? 1 : 0}:${block.code?.length || 0}`
   // think: signature over each segment. Include the segment INDEX and the tool
   // ID — otherwise two calls to the SAME tool (e.g. read_page twice) with no
   // reasoning text between them produce an identical signature, the memo skips
@@ -62,7 +62,14 @@ const Block = memo(
     // turn is streaming) drives ChartFrame's generating-animation → reveal, which
     // ChartFrame captures at mount — so history-loaded charts plot immediately.
     if (block.type === "chart") {
-      return <ChartFrame code={block.code} title={block.title} live={live} />
+      return (
+        <ChartFrame
+          code={block.code}
+          title={block.title}
+          live={live}
+          pending={Boolean(block.pending)}
+        />
+      )
     }
     // `streaming` (block still revealing) lets Markdown hold back / repair the
     // unstable tail — partial <cite prefixes and unbalanced bold/backtick

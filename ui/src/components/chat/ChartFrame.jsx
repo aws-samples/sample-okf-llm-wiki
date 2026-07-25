@@ -80,43 +80,139 @@ function readResolvedTheme() {
   return document.documentElement.classList.contains("dark") ? "dark" : "light"
 }
 
-// The "generating" placeholder shown before the chart reveals: a ghost bar
-// chart breathing — faint axes and a handful of primary-tinted bars that
-// slowly rise and fall, each on its own rhythm (.okf-chart-breathe in
-// index.css). Absolutely positioned over the (still invisible) iframe so the
-// reveal is an in-place cross-fade, not a layout jump; the bars freeze
-// mid-breath as the placeholder fades out.
+// The "generating" placeholder shown before the chart reveals: a halftone dot
+// cloud that breathes like fabric under at most THREE roaming peaks. Each peak
+// is a gaussian bump with its own random center, radius, and lifespan: it
+// grows from nothing, blooms, then REGRESSES until its whole area fades back
+// to the faint rest cloud — and the slot respawns somewhere else after a
+// random beat. Dots never move; a small rAF driver writes scale + opacity per
+// dot from the sum of the live peaks, so the fading logic is structural: a
+// gaussian's falloff guarantees that around a peaking dot the neighbors are
+// progressively smaller and fainter in every direction. The driver is seeded
+// with Math.random() PER LAUNCH (peaks start mid-life at random phases and at
+// random spots), so no two generations play the same show. The loop runs only
+// while the theater is active — on reveal it stops and the field freezes
+// mid-state for the cross-fade — and prefers-reduced-motion skips it
+// entirely, leaving the static cloud.
 //
-// Hand-tuned like the avatar's DOTS table: each bar's resting height (% of the
-// ghost plot area), breath duration, and starting phase. The phase becomes a
-// NEGATIVE animation-delay, so even the frozen (paused) field reads as varied
-// bar heights, never a flat row.
-const BREATHE_BARS = [
-  { h: 66, dur: 2.4, phase: 0.55 },
-  { h: 46, dur: 2.3, phase: 0.1 },
-  { h: 72, dur: 2.7, phase: 0.45 },
-  { h: 58, dur: 2.1, phase: 0.75 },
-  { h: 86, dur: 2.9, phase: 0.25 },
-  { h: 64, dur: 2.5, phase: 0.6 },
-  { h: 50, dur: 2.2, phase: 0.9 },
-  { h: 78, dur: 2.6, phase: 0.35 },
-]
+// The dot GRID itself stays deterministic (module-level, sin-hash jitter, no
+// Math.random) so renders/tests are stable: per dot, the elliptical falloff
+// from the cloud's center drives base size + opacity (the halftone ramp), and
+// edge dots below the alpha floor are skipped.
+const SKETCH_MAX_PEAKS = 3
+function buildSketchDots() {
+  const COLS = 30
+  const ROWS = 16
+  const CX = 0.46 // cloud center (normalized), slightly left of middle
+  const CY = 0.52
+  const hash = (i) => {
+    const s = Math.sin(i * 127.1 + 311.7) * 43758.5453
+    return s - Math.floor(s) // deterministic 0..1
+  }
+  const dots = []
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const i = r * COLS + c
+      const nx = (c + 0.5) / COLS
+      const ny = (r + 0.5) / ROWS
+      const d = Math.hypot((nx - CX) / 0.52, (ny - CY) / 0.5)
+      const base = Math.max(0, 1 - d) ** 1.4 * (0.85 + 0.3 * hash(i * 3 + 1))
+      if (base < 0.06) continue // skip dots the falloff fully dissolved
+      dots.push({
+        nx,
+        ny,
+        left: `${(nx * 100).toFixed(2)}%`,
+        top: `${(ny * 100 + (hash(i * 7 + 3) - 0.5) * 1.6).toFixed(2)}%`,
+        size: +(1.8 + 2.6 * base).toFixed(2),
+        base: +(0.2 + 0.6 * base).toFixed(3),
+      })
+    }
+  }
+  return dots
+}
+const SKETCH_DOTS = buildSketchDots()
+
+// Rest state (no peak nearby): dots sit small and faint but present, so the
+// cloud never blanks between peaks. A peak lifts a dot toward full size/alpha.
+const SKETCH_REST_SCALE = 0.55
+const SKETCH_REST_ALPHA = 0.22
 
 function ChartGenerating({ active }) {
+  const fieldRef = useRef(null)
+
+  useEffect(() => {
+    if (!active) return undefined // reveal started: freeze the field mid-state
+    const el = fieldRef.current
+    if (!el) return undefined
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) {
+      return undefined // static cloud only
+    }
+    const spans = Array.from(el.children) // aligned 1:1 with SKETCH_DOTS
+
+    // One peak slot: a gaussian bump living `dur` ms. `born` in the future is
+    // the between-peaks beat; the FIRST generation is back-dated so the show
+    // opens mid-life at random phases instead of three synchronized births.
+    const newPeak = (first) => ({
+      x: 0.18 + Math.random() * 0.58, // keep centers in the cloud's meat
+      y: 0.22 + Math.random() * 0.56,
+      sigma: 0.08 + Math.random() * 0.06,
+      dur: 2600 + Math.random() * 1900,
+      born: performance.now() + (first ? -Math.random() * 2600 : 400 + Math.random() * 1100),
+    })
+    const peaks = Array.from({ length: SKETCH_MAX_PEAKS }, () => newPeak(true))
+
+    let raf
+    let last = 0
+    const tick = (now) => {
+      raf = requestAnimationFrame(tick)
+      if (now - last < 33) return // ~30fps is plenty for slow swells
+      last = now
+      for (let k = 0; k < peaks.length; k++) {
+        if (now - peaks[k].born > peaks[k].dur) peaks[k] = newPeak(false)
+      }
+      for (let i = 0; i < spans.length; i++) {
+        const d = SKETCH_DOTS[i]
+        let v = 0
+        for (const p of peaks) {
+          const t = (now - p.born) / p.dur
+          if (t <= 0 || t >= 1) continue
+          const env = Math.sin(Math.PI * t) ** 2 // grow → bloom → regress to 0
+          const dx = d.nx - p.x
+          const dy = (d.ny - p.y) * 1.35 // wide card: weight y so bumps stay round
+          v += env * Math.exp(-(dx * dx + dy * dy) / (2 * p.sigma * p.sigma))
+        }
+        if (v > 1) v = 1
+        const s = spans[i].style
+        s.transform = `scale(${(SKETCH_REST_SCALE + (1.35 - SKETCH_REST_SCALE) * v).toFixed(3)})`
+        // Aggressive shading: the halftone base only sets the REST look; a
+        // peak lifts any dot it covers all the way to opacity 1 — full
+        // button-cyan at the crest — with the gaussian grading the ring.
+        const rest = d.base * SKETCH_REST_ALPHA
+        s.opacity = (rest + (1 - rest) * v).toFixed(3)
+      }
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [active])
+
   return (
     <div
       className="pointer-events-none absolute inset-0 transition-opacity duration-500"
       style={{ opacity: active ? 1 : 0 }}
       aria-hidden="true"
     >
-      <div className={cn("okf-chart-breathe", active && "is-active")}>
-        {BREATHE_BARS.map((b, i) => (
+      <div ref={fieldRef} className="okf-chart-sketch">
+        {SKETCH_DOTS.map((d, i) => (
           <span
             key={i}
+            className="okf-sketch-dot"
             style={{
-              height: `${b.h}%`,
-              animationDuration: `${b.dur}s`,
-              animationDelay: `${(-(b.phase * b.dur)).toFixed(2)}s`,
+              left: d.left,
+              top: d.top,
+              width: `${d.size}px`,
+              height: `${d.size}px`,
+              opacity: d.base * SKETCH_REST_ALPHA,
+              transform: `scale(${SKETCH_REST_SCALE})`,
             }}
           />
         ))}
@@ -124,7 +220,6 @@ function ChartGenerating({ active }) {
     </div>
   )
 }
-
 // How long the generating animation holds on a LIVE turn before the chart is
 // allowed to reveal. The code arrives whole and the frame draws in tens of ms,
 // so without this beat the skeleton would just flash.
@@ -186,6 +281,7 @@ function ChartFrameInner({ code, title, live }) {
   // re-render — the chat re-renders per streamed token). If buildChartSrcdoc throws,
   // the boundary catches it.
   const srcDoc = useMemo(() => {
+    if (!code) return null // pending: no document until the args arrive
     const palette = resolveChartPalette()
     const fontFamily =
       typeof document !== "undefined"
@@ -232,7 +328,7 @@ function ChartFrameInner({ code, title, live }) {
   // ever had a frame to report in — the "chart could not be generated (but
   // renders after refresh)" symptom.
   useEffect(() => {
-    if (status !== "loading") return undefined
+    if (status !== "loading" || !srcDoc) return undefined
     let t = null
     const fail = () => setStatus((s) => (s === "loading" ? "error" : s))
     const arm = () => {
@@ -272,6 +368,7 @@ function ChartFrameInner({ code, title, live }) {
       style={{ height: `${height}px`, transition: "height 0.4s ease" }}
     >
       {theater ? <ChartGenerating active={!showChart} /> : null}
+      {srcDoc == null ? null : (
       <iframe
         ref={iframeRef}
         title={title || "chart"}
@@ -292,6 +389,7 @@ function ChartFrameInner({ code, title, live }) {
           transition: "opacity 0.5s ease, transform 0.5s ease",
         }}
       />
+      )}
     </div>
   )
 }
@@ -300,13 +398,21 @@ function ChartFrameInner({ code, title, live }) {
 // from the render_chart tool call's args (see buildMessageBlocks chart block).
 // `live` = the block appeared mid-stream (drives the generating-animation hold);
 // history-loaded charts pass false and plot immediately.
-export function ChartFrame({ code, title, live = false }) {
-  if (!code || typeof code !== "string") {
+export function ChartFrame({ code, title, live = false, pending = false }) {
+  const codeStr = typeof code === "string" ? code : ""
+  if (!codeStr && !pending) {
     return <ChartError title={title} message="chart had no code to run" />
   }
+  // PENDING (no code yet — the model announced the call but is still
+  // generating its args): render the SAME inner frame with empty code. The
+  // element tree is identical to the filled state, so when the code lands
+  // React keeps the ChartFrameInner INSTANCE — the generating theater mounts
+  // exactly once and runs uninterrupted through pending → code → reveal (no
+  // re-animation at the payload seam). The inner frame builds no iframe until
+  // code exists.
   return (
     <ChartBoundary title={title}>
-      <ChartFrameInner code={code} title={title} live={live} />
+      <ChartFrameInner code={codeStr} title={title} live={live} />
     </ChartBoundary>
   )
 }
