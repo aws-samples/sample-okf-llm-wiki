@@ -80,7 +80,7 @@ def test_awrap_refuses_without_calling_handler(monkeypatch):
     monkeypatch.setattr(
         okf_guard,
         "ToolMessage",
-        lambda content, tool_call_id: {"content": content, "id": tool_call_id},
+        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
     )
     mw = _mw(_DenyEngine())
     req = _request(content="bad")
@@ -110,7 +110,7 @@ def test_metadata_dir_is_read_only(monkeypatch):
     monkeypatch.setattr(
         okf_guard,
         "ToolMessage",
-        lambda content, tool_call_id: {"content": content, "id": tool_call_id},
+        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
     )
     mw = _mw(_AllowEngine())  # engine would allow, but the path check fires first
     called = {"n": 0}
@@ -145,7 +145,7 @@ def test_benchmark_budget_allows_up_to_limit_then_refuses(monkeypatch):
     monkeypatch.setattr(
         okf_guard,
         "ToolMessage",
-        lambda content, tool_call_id: {"content": content, "id": tool_call_id},
+        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
     )
     mw = OKFGuardMiddleware(
         _AllowEngine(), read_current=lambda _p: None, benchmark_budget=3
@@ -186,7 +186,7 @@ def test_edit_into_metadata_dir_also_refused(monkeypatch):
     monkeypatch.setattr(
         okf_guard,
         "ToolMessage",
-        lambda content, tool_call_id: {"content": content, "id": tool_call_id},
+        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
     )
     mw = _mw(_AllowEngine())
     req = _request(
@@ -198,3 +198,98 @@ def test_edit_into_metadata_dir_also_refused(monkeypatch):
     result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
     assert isinstance(result, dict)
     assert "read-only" in result["content"]
+
+
+# --------------------------------------------------------------------------- #
+# ToolErrorMiddleware — a raising tool must become an error ToolMessage, not a
+# crashed harvest (the PermissionError-on-the-mount incident).
+# --------------------------------------------------------------------------- #
+
+from harvest.okf_guard import ToolErrorMiddleware  # noqa: E402
+
+
+def _tm_standin(monkeypatch):
+    monkeypatch.setattr(
+        okf_guard,
+        "ToolMessage",
+        lambda content, tool_call_id, status="success": {
+            "content": content,
+            "id": tool_call_id,
+            "status": status,
+        },
+    )
+
+
+def test_tool_raise_becomes_error_message_sync(monkeypatch):
+    _tm_standin(monkeypatch)
+    mw = ToolErrorMiddleware()
+    req = _request(name="write_file", content="x")
+
+    def handler(r):
+        raise PermissionError(13, "Permission denied", "/mnt/data/x.md")
+
+    result = mw.wrap_tool_call(req, handler)
+    assert result["status"] == "error"
+    assert "PermissionError" in result["content"]
+    assert "write_file" in result["content"]
+    assert result["id"] == "call-1"
+
+
+def test_tool_raise_becomes_error_message_async(monkeypatch):
+    # The QuickJS task() fan-out drives the ASYNC tool path — the safety net
+    # must cover it too (same requirement as the guard's awrap_tool_call).
+    _tm_standin(monkeypatch)
+    mw = ToolErrorMiddleware()
+    req = _request(name="edit_file", old_string="a", new_string="b")
+
+    async def handler(r):
+        raise OSError("stale file handle")
+
+    result = asyncio.run(mw.awrap_tool_call(req, handler))
+    assert result["status"] == "error"
+    assert "OSError" in result["content"]
+
+
+def test_tool_success_passes_through(monkeypatch):
+    _tm_standin(monkeypatch)
+    mw = ToolErrorMiddleware()
+    req = _request()
+    assert mw.wrap_tool_call(req, lambda r: "WROTE") == "WROTE"
+
+    async def handler(r):
+        return "WROTE"
+
+    assert asyncio.run(mw.awrap_tool_call(req, handler)) == "WROTE"
+
+
+def test_langgraph_control_flow_exceptions_propagate(monkeypatch):
+    # Interrupt/Command exceptions are the graph's own mechanics — converting
+    # one to a ToolMessage would break routing, so they must re-raise.
+    _tm_standin(monkeypatch)
+
+    class FakeInterrupt(Exception):
+        pass
+
+    FakeInterrupt.__module__ = "langgraph.errors"
+    mw = ToolErrorMiddleware()
+    req = _request()
+
+    def handler(r):
+        raise FakeInterrupt("interrupt")
+
+    try:
+        mw.wrap_tool_call(req, handler)
+        raise AssertionError("control-flow exception was swallowed")
+    except FakeInterrupt:
+        pass
+
+
+def test_guard_refusal_carries_error_status(monkeypatch):
+    # Guard rejections are failed calls the model must self-correct — they now
+    # carry status="error" so the model (and the feed's ok flag) treat them so.
+    _tm_standin(monkeypatch)
+    mw = _mw(_DenyEngine())
+    req = _request(content="bad")
+    result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+    assert result["status"] == "error"
+    assert "nope" in result["content"]

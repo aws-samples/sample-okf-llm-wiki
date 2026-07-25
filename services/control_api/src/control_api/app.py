@@ -453,31 +453,51 @@ def _r_delete_context(cfg, params, body, query, caller):
     )
 
 
+def _validated_model_pair(cfg, body, model_key, effort_key):
+    """Validate one (model, effort) pair from ``body`` against the catalog.
+
+    Returns ``(model, effort)`` (both None when ``model_key`` is absent — the
+    runtime then falls back to its default for that scope). An effort without a
+    model is ambiguous (which model's scale?) — reject rather than silently
+    applying it to the default model. Raises ApiError(400) on anything the
+    catalog does not offer.
+    """
+    if body.get(model_key):
+        from okf_core import harvest_models
+
+        try:
+            return harvest_models.validate_model_effort(
+                cfg.harvest_model_catalog, body.get(model_key), body.get(effort_key)
+            )
+        except harvest_models.ModelCatalogError as e:
+            raise ApiError(400, str(e)) from e
+    if body.get(effort_key):
+        raise ApiError(400, f"'{effort_key}' requires '{model_key}' to be specified")
+    return None, None
+
+
 def _r_trigger_harvest(cfg, params, body, query, caller):
     body = body or {}
     data_domain = handlers._require(body, "data_domain")
     dataset = handlers._require(body, "dataset")
     if not cfg.harvest_runtime_arn:
         raise ApiError(500, "OKF_HARVEST_RUNTIME_ARN not configured")
-    # Per-harvest model/effort selection (from the UI picker). Both optional: when
-    # a request omits `model`, the runtime falls back to its deploy-time default
-    # env var, so we only validate/forward when a model was chosen. This is the
-    # TRUST BOUNDARY — the value reaches bedrock:InvokeModel, so validate it
-    # against the catalog here (the runtime deliberately does not allow-list it).
-    model = effort = None
-    if body.get("model"):
-        from okf_core import harvest_models
-
-        try:
-            model, effort = harvest_models.validate_model_effort(
-                cfg.harvest_model_catalog, body.get("model"), body.get("effort")
-            )
-        except harvest_models.ModelCatalogError as e:
-            raise ApiError(400, str(e)) from e
-    elif body.get("effort"):
-        # effort without model is ambiguous (which model's scale?) — reject rather
-        # than silently applying it to the default model.
-        raise ApiError(400, "'effort' requires 'model' to be specified")
+    # Per-harvest model/effort selection (from the UI picker) — one pair for the
+    # SUPERVISOR (`model`/`effort`) and one for the SUB-AGENTS
+    # (`subagent_model`/`subagent_effort`; covers the authors, reviewers, and the
+    # benchmark solver/adjudicator). All optional: when a request omits `model`,
+    # the runtime falls back to its deploy-time default env var; when it omits
+    # `subagent_model`, the sub-agents run on the supervisor's config. This is
+    # the TRUST BOUNDARY — the values reach bedrock:InvokeModel, so validate each
+    # pair against the catalog here (the runtime deliberately does not
+    # allow-list them).
+    model, effort = _validated_model_pair(cfg, body, "model", "effort")
+    subagent_model, subagent_effort = _validated_model_pair(
+        cfg, body, "subagent_model", "subagent_effort"
+    )
+    reviewer_model, reviewer_effort = _validated_model_pair(
+        cfg, body, "reviewer_model", "reviewer_effort"
+    )
     # Pre-flight existence check is source-specific. For a GLUE dataset the runtime
     # resolves it to a same-named Glue database, so verify that exists now — a typo
     # fails fast with a 404 here instead of an EntityNotFoundException deep in the
@@ -509,6 +529,10 @@ def _r_trigger_harvest(cfg, params, body, query, caller):
         changed_table=body.get("changed_table"),
         model=model,
         effort=effort,
+        subagent_model=subagent_model,
+        subagent_effort=subagent_effort,
+        reviewer_model=reviewer_model,
+        reviewer_effort=reviewer_effort,
     )
 
 

@@ -18,8 +18,13 @@ Payload (from the Control API's InvokeAgentRuntime call):
     "user_sub": "<cognito sub>",      # annotated only (whose annotations)
     "annotations": [{...}],            # annotated only (the live feedback)
     "model": "openai.gpt-5.6-sol",    # optional per-harvest override; falls
-    "effort": "xhigh"                 # back to OKF_HARVEST_* env when omitted
-  }
+    "effort": "xhigh",                # back to OKF_HARVEST_* env when omitted
+    "subagent_model": "...",          # optional SUB-AGENT override (authors/
+    "subagent_effort": "high",        # extractors/benchmark); absent -> the
+                                      # supervisor's config
+    "reviewer_model": "...",          # optional REVIEWER-only override (cross-
+    "reviewer_effort": "high"         # model review); absent -> the sub-agents'
+  }                                    # config
 
 ``runtimeSessionId`` is set to the dataset id by the caller, giving one session
 per dataset as designed.
@@ -97,6 +102,18 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
     # backward compatible. We build the config here (not lower down) so both run
     # paths share it and max_tokens keys off the resolved model.
     model_config = _model_config_from_payload(payload)
+    # Separate SUB-AGENT model/effort override (subagent_model/subagent_effort in
+    # the payload — also catalog-validated by the Control API). Absent ⇒ the
+    # sub-agents run on the supervisor's config (prior behavior).
+    subagent_model_config = _model_config_from_payload(
+        payload, model_key="subagent_model", effort_key="subagent_effort"
+    )
+    # And a third override for the adversarial REVIEWER only (reviewer_model/
+    # reviewer_effort) — cross-model review improves coverage. Absent ⇒ the
+    # reviewer runs on the sub-agents' config.
+    reviewer_model_config = _model_config_from_payload(
+        payload, model_key="reviewer_model", effort_key="reviewer_effort"
+    )
 
     # session_id is the run's runtime_session_id — the SAME id on the DynamoDB
     # STATUS row and the OTEL baggage — so the live step feed's log lines can be
@@ -110,6 +127,8 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             changed_table=payload["changed_table"],
             diff=payload.get("diff"),
             model_config=model_config,
+            subagent_model_config=subagent_model_config,
+            reviewer_model_config=reviewer_model_config,
             domain_description=domain_description,
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
@@ -126,6 +145,8 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             user_sub=payload["user_sub"],
             annotations=payload.get("annotations") or [],
             model_config=model_config,
+            subagent_model_config=subagent_model_config,
+            reviewer_model_config=reviewer_model_config,
             domain_description=domain_description,
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
@@ -140,6 +161,8 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             data_domain=data_domain,
             dataset=dataset,
             model_config=model_config,
+            subagent_model_config=subagent_model_config,
+            reviewer_model_config=reviewer_model_config,
             domain_description=domain_description,
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
@@ -149,18 +172,23 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
         )
 
 
-def _model_config_from_payload(payload: dict) -> dict | None:
-    """Build a model_config override from payload ``model``/``effort``, or None.
+def _model_config_from_payload(
+    payload: dict, *, model_key: str = "model", effort_key: str = "effort"
+) -> dict | None:
+    """Build a model_config override from two payload keys, or None.
 
     Returns None when neither key is present so the runner falls back to the
-    env-var defaults (``resolve_model_config()``). When either is present we call
+    env-var defaults (``resolve_model_config()``) — or, for the sub-agent keys,
+    to the supervisor's config. When either is present we call
     ``resolve_model_config`` with the overrides so the SAME provider-aware
     max_tokens / concurrency defaulting still applies. The Control API already
-    validated the pair against the catalog; the runtime trusts it (consistent
-    with the runtime not allow-listing effort itself).
+    validated each pair against the catalog; the runtime trusts it (consistent
+    with the runtime not allow-listing effort itself). Called once with the
+    supervisor keys (``model``/``effort``) and once with the sub-agent keys
+    (``subagent_model``/``subagent_effort``).
     """
-    model = payload.get("model")
-    effort = payload.get("effort")
+    model = payload.get(model_key)
+    effort = payload.get(effort_key)
     if not model and not effort:
         return None
     from harvest.agent import resolve_model_config
@@ -178,6 +206,10 @@ def _safe(payload: dict) -> dict:
             "changed_table",
             "model",
             "effort",
+            "subagent_model",
+            "subagent_effort",
+            "reviewer_model",
+            "reviewer_effort",
             "domain_description",
             "domain_context",
             "user_sub",

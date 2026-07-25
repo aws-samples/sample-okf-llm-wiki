@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 import hljs from "highlight.js/lib/common"
 import ReactMarkdown from "react-markdown"
@@ -51,6 +51,8 @@ import {
   SelectContent,
   SelectGroup,
   SelectItem,
+  SelectLabel,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
@@ -90,7 +92,7 @@ import {
 import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
 import {
-  MODEL_CATALOG,
+  GROUPED_MODEL_CATALOG,
   defaultEffortFor,
   effortsFor,
   entryFor,
@@ -161,27 +163,87 @@ export default function HarvestView({ api, selection }) {
   const [pref] = useState(loadPreference)
   const [model, setModel] = useState(pref.model)
   const [effort, setEffortState] = useState(pref.effort)
+  // The SUB-AGENT pair (authors/extractors/benchmark). subModel === "" means
+  // "same as harvester": nothing is sent and the runtime reuses the harvester's
+  // config for the sub-agents.
+  const [subModel, setSubModel] = useState(pref.subagentModel)
+  const [subEffort, setSubEffortState] = useState(pref.subagentEffort)
+  // The adversarial REVIEWER's own pair. revModel === "" means "same as
+  // sub-agents" — a different model family here improves review coverage (a
+  // fresh model doesn't share the authoring model's blind spots).
+  const [revModel, setRevModel] = useState(pref.reviewerModel)
+  const [revEffort, setRevEffortState] = useState(pref.reviewerEffort)
 
   const setEffort = useCallback(
     (next) => {
       setEffortState(next)
-      savePreference(model, next)
+      savePreference(model, next, subModel, subEffort, revModel, revEffort)
     },
-    [model]
+    [model, subModel, subEffort, revModel, revEffort]
   )
   // When the model changes, snap effort to that model's default if the current
   // effort isn't one it offers (e.g. switching Claude->GPT drops "max"), and
   // persist the resulting pair.
-  const onModelChange = useCallback((next) => {
-    setModel(next)
-    setEffortState((cur) => {
-      const resolved = effortsFor(next).includes(cur)
-        ? cur
-        : defaultEffortFor(next)
-      savePreference(next, resolved)
-      return resolved
-    })
-  }, [])
+  const onModelChange = useCallback(
+    (next) => {
+      setModel(next)
+      setEffortState((cur) => {
+        const resolved = effortsFor(next).includes(cur)
+          ? cur
+          : defaultEffortFor(next)
+        savePreference(next, resolved, subModel, subEffort, revModel, revEffort)
+        return resolved
+      })
+    },
+    [subModel, subEffort, revModel, revEffort]
+  )
+  const setSubEffort = useCallback(
+    (next) => {
+      setSubEffortState(next)
+      savePreference(model, effort, subModel, next, revModel, revEffort)
+    },
+    [model, effort, subModel, revModel, revEffort]
+  )
+  // Same snap-to-default dance for the sub-agent pair; "" (same as harvester)
+  // clears the effort too.
+  const onSubModelChange = useCallback(
+    (next) => {
+      setSubModel(next)
+      setSubEffortState((cur) => {
+        const resolved = !next
+          ? ""
+          : effortsFor(next).includes(cur)
+            ? cur
+            : defaultEffortFor(next)
+        savePreference(model, effort, next, resolved, revModel, revEffort)
+        return resolved
+      })
+    },
+    [model, effort, revModel, revEffort]
+  )
+  const setRevEffort = useCallback(
+    (next) => {
+      setRevEffortState(next)
+      savePreference(model, effort, subModel, subEffort, revModel, next)
+    },
+    [model, effort, subModel, subEffort, revModel]
+  )
+  // And for the reviewer pair; "" (same as sub-agents) clears the effort too.
+  const onRevModelChange = useCallback(
+    (next) => {
+      setRevModel(next)
+      setRevEffortState((cur) => {
+        const resolved = !next
+          ? ""
+          : effortsFor(next).includes(cur)
+            ? cur
+            : defaultEffortFor(next)
+        savePreference(model, effort, subModel, subEffort, next, resolved)
+        return resolved
+      })
+    },
+    [model, effort, subModel, subEffort]
+  )
   const [events, setEvents] = useState([])
   // True while the feed is still pulling pages of a TERMINAL run (the endpoint
   // caps each response, so a completed harvest with a long history takes several
@@ -411,7 +473,17 @@ export default function HarvestView({ api, selection }) {
     if (!hasSelection) return
     setStarting(true)
     try {
-      await api.startHarvest(domain, dataset, "full", model, effort)
+      await api.startHarvest(
+        domain,
+        dataset,
+        "full",
+        model,
+        effort,
+        subModel,
+        subModel ? subEffort : "",
+        revModel,
+        revModel ? revEffort : ""
+      )
       toast.success(`Harvest queued for ${domain}/${dataset}`)
       // A fresh harvest starts a new run: clear the prior feed + rewind the
       // cursor so we don't show stale steps or skip the new run's early events.
@@ -651,6 +723,14 @@ export default function HarvestView({ api, selection }) {
             effort={effort}
             onModelChange={onModelChange}
             onEffortChange={setEffort}
+            subModel={subModel}
+            subEffort={subEffort}
+            onSubModelChange={onSubModelChange}
+            onSubEffortChange={setSubEffort}
+            revModel={revModel}
+            revEffort={revEffort}
+            onRevModelChange={onRevModelChange}
+            onRevEffortChange={setRevEffort}
             locked={running || starting}
             guidance={guidance}
             guidanceDraft={guidanceDraft}
@@ -747,6 +827,38 @@ export default function HarvestView({ api, selection }) {
                       <dd className="break-words">
                         {entryFor(inner.model)?.label || inner.model || "—"}
                         {inner.effort ? ` / ${inner.effort}` : ""}
+                      </dd>
+                    </div>
+                  )}
+                  {inner.subagent_model && (
+                    // Present only when the run chose a separate sub-agent
+                    // config; absent means the sub-agents ran on the model above.
+                    <div className="min-w-0">
+                      <dt className="text-xs text-muted-foreground">
+                        Sub-agent model
+                      </dt>
+                      <dd className="break-words">
+                        {entryFor(inner.subagent_model)?.label ||
+                          inner.subagent_model}
+                        {inner.subagent_effort
+                          ? ` / ${inner.subagent_effort}`
+                          : ""}
+                      </dd>
+                    </div>
+                  )}
+                  {inner.reviewer_model && (
+                    // Present only when the run gave the adversarial reviewer
+                    // its own config; absent = same as the sub-agents.
+                    <div className="min-w-0">
+                      <dt className="text-xs text-muted-foreground">
+                        Reviewer model
+                      </dt>
+                      <dd className="break-words">
+                        {entryFor(inner.reviewer_model)?.label ||
+                          inner.reviewer_model}
+                        {inner.reviewer_effort
+                          ? ` / ${inner.reviewer_effort}`
+                          : ""}
                       </dd>
                     </div>
                   )}
@@ -1499,6 +1611,27 @@ function AgentMessageDialog({ open, onOpenChange, text, improvements }) {
 // which are read at harvest start): edit + Save persists it (goes DIRTY); the
 // next full harvest, or an "Apply annotations + guidance" re-harvest, applies
 // it and clears dirty.
+// Sentinel for the sub-agent model Select's "same as harvester" item — Radix
+// forbids an empty-string item value, so "" (the state/preference encoding of
+// "same") maps to/from this sentinel at the Select boundary only.
+const SAME_AS_HARVESTER = "__same__"
+const SAME_AS_SUBAGENTS = "__same_sub__"
+
+// The model options shared by the three pickers: one labelled group per
+// provider family, most capable first (see GROUPED_MODEL_CATALOG).
+function ModelOptions() {
+  return GROUPED_MODEL_CATALOG.map((g) => (
+    <SelectGroup key={g.family}>
+      <SelectLabel>{g.family}</SelectLabel>
+      {g.models.map((m) => (
+        <SelectItem key={m.model} value={m.model}>
+          {m.label}
+        </SelectItem>
+      ))}
+    </SelectGroup>
+  ))
+}
+
 function HarvestSettingsSheet({
   open,
   onOpenChange,
@@ -1506,6 +1639,14 @@ function HarvestSettingsSheet({
   effort,
   onModelChange,
   onEffortChange,
+  subModel,
+  subEffort,
+  onSubModelChange,
+  onSubEffortChange,
+  revModel,
+  revEffort,
+  onRevModelChange,
+  onRevEffortChange,
   locked,
   guidance,
   guidanceDraft,
@@ -1515,6 +1656,8 @@ function HarvestSettingsSheet({
   onSaveGuidance,
 }) {
   const efforts = effortsFor(model)
+  const subEfforts = effortsFor(subModel)
+  const revEfforts = effortsFor(revModel)
   // The Select dropdown portals OUTSIDE the sheet, so clicking an item (or the
   // dropdown's own outside-click) looks like an "interact outside" and would
   // close the whole panel. Ignore dismissal events that originate from a Select
@@ -1542,11 +1685,11 @@ function HarvestSettingsSheet({
             Harvest settings
           </SheetTitle>
           <SheetDescription>
-            Model and reasoning effort for the next harvest, plus the guidance
-            that steers this dataset&apos;s authoring.
+            Model and reasoning effort for the next harvest.
           </SheetDescription>
         </SheetHeader>
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 pb-6">
+          <span className="text-sm font-medium">Harvester</span>
           <div className="flex flex-col gap-2">
             <Label htmlFor="harvest-model">Model</Label>
             <Select value={model} onValueChange={onModelChange} disabled={locked}>
@@ -1554,13 +1697,7 @@ function HarvestSettingsSheet({
                 <SelectValue placeholder="Select a model..." />
               </SelectTrigger>
               <SelectContent>
-                <SelectGroup>
-                  {MODEL_CATALOG.map((m) => (
-                    <SelectItem key={m.model} value={m.model}>
-                      {m.label}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
+                <ModelOptions />
               </SelectContent>
             </Select>
           </div>
@@ -1581,6 +1718,104 @@ function HarvestSettingsSheet({
               </SelectContent>
             </Select>
           </div>
+
+          <span className="text-sm font-medium">Sub-agents</span>
+          <p className="-mt-3 text-xs text-muted-foreground">
+            The table authors, reference authors, reviewers, and the benchmark
+            solver.
+          </p>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="harvest-sub-model">Model</Label>
+            <Select
+              value={subModel || SAME_AS_HARVESTER}
+              onValueChange={(v) =>
+                onSubModelChange(v === SAME_AS_HARVESTER ? "" : v)
+              }
+              disabled={locked}
+            >
+              <SelectTrigger id="harvest-sub-model" className="w-full">
+                <SelectValue placeholder="Select a model..." />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={SAME_AS_HARVESTER}>
+                  Same as harvester
+                </SelectItem>
+                <SelectSeparator />
+                <ModelOptions />
+              </SelectContent>
+            </Select>
+          </div>
+          {subModel ? (
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="harvest-sub-effort">Reasoning effort</Label>
+              <Select
+                value={subEffort}
+                onValueChange={onSubEffortChange}
+                disabled={locked}
+              >
+                <SelectTrigger id="harvest-sub-effort" className="w-full">
+                  <SelectValue placeholder="Select an effort..." />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {subEfforts.map((e) => (
+                      <SelectItem key={e} value={e}>
+                        {e}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
+          ) : null}
+          <span className="text-sm font-medium">Adversarial reviewer</span>
+          <p className="-mt-3 text-xs text-muted-foreground">
+            The review pass that verifies the authored docs.
+          </p>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="harvest-rev-model">Model</Label>
+            <Select
+              value={revModel || SAME_AS_SUBAGENTS}
+              onValueChange={(v) =>
+                onRevModelChange(v === SAME_AS_SUBAGENTS ? "" : v)
+              }
+              disabled={locked}
+            >
+              <SelectTrigger id="harvest-rev-model" className="w-full">
+                <SelectValue placeholder="Select a model..." />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={SAME_AS_SUBAGENTS}>
+                  Same as sub-agents
+                </SelectItem>
+                <SelectSeparator />
+                <ModelOptions />
+              </SelectContent>
+            </Select>
+          </div>
+          {revModel ? (
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="harvest-rev-effort">Reasoning effort</Label>
+              <Select
+                value={revEffort}
+                onValueChange={onRevEffortChange}
+                disabled={locked}
+              >
+                <SelectTrigger id="harvest-rev-effort" className="w-full">
+                  <SelectValue placeholder="Select an effort..." />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {revEfforts.map((e) => (
+                      <SelectItem key={e} value={e}>
+                        {e}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
+          ) : null}
           {locked ? (
             <p className="text-xs text-muted-foreground">
               A harvest is in flight — model and effort unlock when it finishes.
@@ -1608,8 +1843,7 @@ function HarvestSettingsSheet({
               ) : null}
             </div>
             <p className="text-xs text-muted-foreground">
-              Shared authoring instructions applied by the next full harvest or
-              an &quot;Apply annotations + guidance&quot; re-harvest.
+              Shared authoring instructions applied by the next harvest
             </p>
             {guidanceLoading ? (
               <Skeleton className="h-32 w-full" />
@@ -1778,40 +2012,97 @@ function StepRow({ step }) {
   )
 }
 
-// One label/value line in the usage breakdown popover. `sub` renders it as an
-// indented, smaller "of which…" child so cache lines read as a SUBSET of input
-// rather than additional tokens (see UsagePill).
-function UsageRow({ label, value, sub = false }) {
+// Scope palette for the drill-down: the distribution bar's segments and each
+// row's swatch share a class, so the bar doubles as the legend. Order matters
+// (it is the render + bar order).
+const SCOPE_STYLES = [
+  { key: "supervisor", label: "Harvester", swatch: "bg-primary" },
+  { key: "subagents", label: "Sub-agents", swatch: "bg-primary/60" },
+  { key: "reviewer", label: "Reviewers", swatch: "bg-primary/30" },
+]
+
+// One run-total stat tile (Input / Output). Compact value up front; the
+// precise count rides the tooltip.
+function UsageStat({ label, value }) {
   return (
     <div
-      className={cn(
-        "flex items-center justify-between gap-6",
-        sub && "pl-3 text-xs"
-      )}
+      className="rounded-lg border bg-muted/40 px-3 py-2"
+      title={`${value.toLocaleString()} tokens`}
     >
-      <span className="text-muted-foreground">{label}</span>
-      <span className="tabular-nums">{value.toLocaleString()}</span>
+      <div className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+        {label}
+      </div>
+      <div className="text-base font-semibold tabular-nums">
+        {fmtTokens(value)}
+      </div>
     </div>
   )
 }
 
+// One drill-down table row: swatch + scope name, then the four dimensions
+// (In / Cache R / Cache W / Out) as aligned numeric cells — everything small
+// (text-xs) so a whole scope fits on ONE line. Cache counts are a BREAKDOWN of
+// input (Bedrock/LangChain's `input` already includes cache_read +
+// cache_write) — the column placement between In and Out keeps them read as
+// such, and a zero renders as a muted dash. Numbers are compact (fmtTokens);
+// precise values ride the tooltip.
+function ScopeRow({ label, counts, swatch }) {
+  const input = counts?.input || 0
+  const output = counts?.output || 0
+  const cacheRead = counts?.cache_read || 0
+  const cacheWrite = counts?.cache_write || 0
+  const precise =
+    `${label}: ${input.toLocaleString()} in ` +
+    `(${cacheRead.toLocaleString()} cache read, ` +
+    `${cacheWrite.toLocaleString()} cache written) / ` +
+    `${output.toLocaleString()} out`
+  const cell = (v) =>
+    v ? (
+      <span className="justify-self-end text-xs tabular-nums">
+        {fmtTokens(v)}
+      </span>
+    ) : (
+      <span className="justify-self-end text-xs text-muted-foreground/60">
+        —
+      </span>
+    )
+  return (
+    <Fragment>
+      <span className="flex min-w-0 items-center gap-1.5 text-xs" title={precise}>
+        <span className={cn("size-1.5 shrink-0 rounded-full", swatch)} />
+        <span className="truncate">{label}</span>
+      </span>
+      {cell(input)}
+      {cell(cacheRead)}
+      {cell(cacheWrite)}
+      {cell(output)}
+    </Fragment>
+  )
+}
+
 // Running-total token chip shown in the feed header. `usage` is the latest
-// cumulative snapshot ({input, output, cache_read, cache_write, total}).
-//
-// IMPORTANT — Bedrock/LangChain semantics (langchain_aws _extract_usage_metadata):
-// `input` is the FULL input count and ALREADY INCLUDES cache_read + cache_write;
-// they are a breakdown of the input, not extra tokens (and `total` = input +
-// output). So we must NOT list cache as a sibling of Input (that double-counts
-// it, e.g. 4.09M input where 3.9M is cache reads reads as ~8M). Instead we show
-// cache read/write as indented "of which…" children under Input, and derive the
-// fresh (non-cached) input as input - cache_read - cache_write.
+// cumulative snapshot ({input, output, cache_read, cache_write, total}), plus
+// an optional `by` object splitting the same counters per metering scope
+// ({supervisor, subagents, reviewer}). The popover shows the run totals as two
+// Input/Output tiles (cache detail lives per scope), then the per-agent
+// drill-down: a thin distribution bar (share of total per scope) whose
+// segments match each scope row's swatch.
 function UsagePill({ usage }) {
   const input = usage.input || 0
   const output = usage.output || 0
-  const cacheRead = usage.cache_read || 0
-  const cacheWrite = usage.cache_write || 0
   const total = usage.total ?? input + output
-  const freshInput = Math.max(0, input - cacheRead - cacheWrite)
+  const by = usage.by
+  const scopes = by
+    ? SCOPE_STYLES.filter((s) => by[s.key]).map((s) => {
+        const counts = by[s.key]
+        return {
+          ...s,
+          counts,
+          total: counts.total ?? (counts.input || 0) + (counts.output || 0),
+        }
+      })
+    : []
+  const barTotal = scopes.reduce((n, s) => n + s.total, 0)
   return (
     <Popover>
       <PopoverTrigger asChild>
@@ -1829,7 +2120,7 @@ function UsagePill({ usage }) {
           </Badge>
         </button>
       </PopoverTrigger>
-      <PopoverContent align="end" className="w-60 gap-2">
+      <PopoverContent align="end" className="w-80 gap-3">
         <PopoverHeader>
           <PopoverTitle className="flex items-center gap-1.5 text-sm">
             <CoinsIcon className="size-3.5" />
@@ -1837,25 +2128,53 @@ function UsagePill({ usage }) {
           </PopoverTitle>
           <PopoverDescription>Cumulative for this run.</PopoverDescription>
         </PopoverHeader>
-        <div className="flex flex-col gap-1.5">
-          <UsageRow label="Input" value={input} />
-          {/* Cache lines are a breakdown of Input (indented), not additive. */}
-          {cacheRead ? (
-            <UsageRow sub label="from cache" value={cacheRead} />
-          ) : null}
-          {cacheWrite ? (
-            <UsageRow sub label="cache writes" value={cacheWrite} />
-          ) : null}
-          {cacheRead || cacheWrite ? (
-            <UsageRow sub label="fresh" value={freshInput} />
-          ) : null}
-          <UsageRow label="Output" value={output} />
-          <Separator className="my-0.5" />
-          <div className="flex items-center justify-between gap-6 font-medium">
-            <span>Total</span>
-            <span className="tabular-nums">{total.toLocaleString()}</span>
-          </div>
+        <div className="grid grid-cols-2 gap-2">
+          <UsageStat label="Input" value={input} />
+          <UsageStat label="Output" value={output} />
         </div>
+        {scopes.length ? (
+          <div className="flex flex-col gap-2">
+            {barTotal > 0 ? (
+              <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                {scopes.map((s) =>
+                  s.total > 0 ? (
+                    <div
+                      key={s.key}
+                      className={s.swatch}
+                      style={{ width: `${(s.total / barTotal) * 100}%` }}
+                    />
+                  ) : null
+                )}
+              </div>
+            ) : null}
+            {/* Aligned mini-table: one LINE per scope — label + the four
+                dimensions (In / Cache R / Cache W / Out) as columns, so the
+                drill-down scans vertically instead of reading as prose. */}
+            <div className="grid grid-cols-[minmax(0,1fr)_auto_auto_auto_auto] items-baseline gap-x-2.5 gap-y-1.5">
+              <span />
+              <span className="justify-self-end text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                In
+              </span>
+              <span className="justify-self-end text-right text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                Cache&nbsp;R
+              </span>
+              <span className="justify-self-end text-right text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                Cache&nbsp;W
+              </span>
+              <span className="justify-self-end text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                Out
+              </span>
+              {scopes.map((s) => (
+                <ScopeRow
+                  key={s.key}
+                  label={s.label}
+                  counts={s.counts}
+                  swatch={s.swatch}
+                />
+              ))}
+            </div>
+          </div>
+        ) : null}
       </PopoverContent>
     </Popover>
   )

@@ -1639,6 +1639,10 @@ def trigger_harvest(
     changed_table: str | None = None,
     model: str | None = None,
     effort: str | None = None,
+    subagent_model: str | None = None,
+    subagent_effort: str | None = None,
+    reviewer_model: str | None = None,
+    reviewer_effort: str | None = None,
 ) -> dict[str, Any]:
     """Invoke the harvest AgentCore runtime and write a ``queued`` status row.
 
@@ -1679,12 +1683,22 @@ def trigger_harvest(
     )
     if source:
         payload["source"] = source
-    # Per-harvest model/effort override (already validated against the catalog in
-    # the route adapter). Omitted -> the runtime uses its deploy-time env default.
+    # Per-harvest model/effort overrides (already validated against the catalog in
+    # the route adapter): the supervisor pair, and the separate sub-agent pair
+    # (authors/reviewers/benchmark). Omitted -> the runtime uses its deploy-time
+    # env default (supervisor) / the supervisor's config (sub-agents).
     if model:
         payload["model"] = model
     if effort:
         payload["effort"] = effort
+    if subagent_model:
+        payload["subagent_model"] = subagent_model
+    if subagent_effort:
+        payload["subagent_effort"] = subagent_effort
+    if reviewer_model:
+        payload["reviewer_model"] = reviewer_model
+    if reviewer_effort:
+        payload["reviewer_effort"] = reviewer_effort
     # Enrich the payload with the declared domain's description/context so the
     # harvester can produce domain-aware authoring. Best-effort: a missing META
     # row (e.g. a legacy mapping with no declaration) simply omits the context.
@@ -1811,9 +1825,15 @@ def get_harvest_status(
             "detail": _s(item.get("detail")),
             "runtime_session_id": _s(item.get("runtime_session_id")),
             # The resolved LLM the runtime actually used (stamped at `running`);
-            # empty until the runtime advances past `queued`.
+            # empty until the runtime advances past `queued`. The subagent pair
+            # is empty when no separate sub-agent override was chosen (the
+            # sub-agents then ran on the supervisor's config).
             "model": _s(item.get("model")),
             "effort": _s(item.get("effort")),
+            "subagent_model": _s(item.get("subagent_model")),
+            "subagent_effort": _s(item.get("subagent_effort")),
+            "reviewer_model": _s(item.get("reviewer_model")),
+            "reviewer_effort": _s(item.get("reviewer_effort")),
         }
     ready = is_bundle_ready(s3, bucket, data_domain, dataset)
     return {

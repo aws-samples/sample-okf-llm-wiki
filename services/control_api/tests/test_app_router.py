@@ -592,12 +592,163 @@ def test_post_harvest_effort_not_offered_400(cfg, agentcore):
     assert agentcore.calls == []
 
 
+def test_post_harvest_forwards_valid_reviewer_pair(cfg, agentcore):
+    # The reviewer's own config rides the payload as a third validated pair.
+    resp = app.route(
+        _event(
+            "POST",
+            "/harvest",
+            body={
+                "data_domain": "sales",
+                "dataset": "orders",
+                "subagent_model": "global.anthropic.claude-sonnet-5",
+                "reviewer_model": "openai.gpt-5.6-sol",
+                "reviewer_effort": "high",
+            },
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 200
+    payload = agentcore.last_payload()
+    assert payload["subagent_model"] == "global.anthropic.claude-sonnet-5"
+    assert payload["reviewer_model"] == "openai.gpt-5.6-sol"
+    assert payload["reviewer_effort"] == "high"
+
+
+def test_post_harvest_unknown_reviewer_model_400(cfg, agentcore):
+    resp = app.route(
+        _event(
+            "POST",
+            "/harvest",
+            body={
+                "data_domain": "sales",
+                "dataset": "orders",
+                "reviewer_model": "anthropic.made-up",
+            },
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 400
+    assert agentcore.calls == []
+
+
+def test_post_harvest_reviewer_effort_without_model_400(cfg, agentcore):
+    resp = app.route(
+        _event(
+            "POST",
+            "/harvest",
+            body={
+                "data_domain": "sales",
+                "dataset": "orders",
+                "reviewer_effort": "high",
+            },
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 400
+    assert agentcore.calls == []
+
+
 def test_post_harvest_effort_without_model_400(cfg, agentcore):
     resp = app.route(
         _event(
             "POST",
             "/harvest",
             body={"data_domain": "sales", "dataset": "orders", "effort": "high"},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 400
+    assert agentcore.calls == []
+
+
+def test_post_harvest_forwards_valid_subagent_pair(cfg, agentcore):
+    # A separate sub-agent config rides the payload next to the supervisor's;
+    # both pairs validate against the same catalog.
+    resp = app.route(
+        _event(
+            "POST",
+            "/harvest",
+            body={
+                "data_domain": "sales",
+                "dataset": "orders",
+                "model": "global.anthropic.claude-opus-4-8",
+                "effort": "xhigh",
+                "subagent_model": "openai.gpt-5.6-sol",
+                "subagent_effort": "high",
+            },
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 200
+    payload = agentcore.last_payload()
+    assert payload["model"] == "global.anthropic.claude-opus-4-8"
+    assert payload["subagent_model"] == "openai.gpt-5.6-sol"
+    assert payload["subagent_effort"] == "high"
+
+
+def test_post_harvest_omits_subagent_pair_by_default(cfg, agentcore):
+    # No subagent selection -> not in the payload (sub-agents run on the
+    # supervisor's config).
+    app.route(
+        _event(
+            "POST",
+            "/harvest",
+            body={
+                "data_domain": "sales",
+                "dataset": "orders",
+                "model": "openai.gpt-5.6-sol",
+            },
+        ),
+        cfg,
+    )
+    payload = agentcore.last_payload()
+    assert "subagent_model" not in payload and "subagent_effort" not in payload
+
+
+def test_post_harvest_subagent_defaults_effort_when_only_model_given(cfg, agentcore):
+    app.route(
+        _event(
+            "POST",
+            "/harvest",
+            body={
+                "data_domain": "sales",
+                "dataset": "orders",
+                "subagent_model": "openai.gpt-5.6-sol",
+            },
+        ),
+        cfg,
+    )
+    assert agentcore.last_payload()["subagent_effort"] == "xhigh"
+
+
+def test_post_harvest_unknown_subagent_model_400(cfg, agentcore):
+    resp = app.route(
+        _event(
+            "POST",
+            "/harvest",
+            body={
+                "data_domain": "sales",
+                "dataset": "orders",
+                "subagent_model": "anthropic.made-up",
+            },
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 400
+    assert agentcore.calls == []
+
+
+def test_post_harvest_subagent_effort_without_model_400(cfg, agentcore):
+    resp = app.route(
+        _event(
+            "POST",
+            "/harvest",
+            body={
+                "data_domain": "sales",
+                "dataset": "orders",
+                "subagent_effort": "high",
+            },
         ),
         cfg,
     )

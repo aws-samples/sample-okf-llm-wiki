@@ -97,16 +97,33 @@ export function makeApi(token) {
     deleteContext: (domain, dataset, filename) =>
       request(token, "DELETE", `/context/${domain}/${dataset}/${filename}`),
 
-    // Harvest. `model`/`effort` are the per-run picker selection (optional): when
-    // omitted the backend uses its deploy-time default. The Control API validates
-    // the pair against the model catalog and 400s an unknown model/effort.
-    startHarvest: (dataDomain, dataset, mode = "full", model, effort) =>
+    // Harvest. `model`/`effort` are the per-run picker selection for the
+    // HARVESTER (supervisor); `subagentModel`/`subagentEffort` the separate
+    // selection for its SUB-AGENTS (authors/reviewers/benchmark). All optional:
+    // omitted model → the backend's deploy-time default; omitted subagent pair →
+    // the sub-agents run on the harvester's config. The Control API validates
+    // each pair against the model catalog and 400s an unknown model/effort.
+    startHarvest: (
+      dataDomain,
+      dataset,
+      mode = "full",
+      model,
+      effort,
+      subagentModel,
+      subagentEffort,
+      reviewerModel,
+      reviewerEffort
+    ) =>
       request(token, "POST", "/harvest", {
         data_domain: dataDomain,
         dataset,
         mode,
         ...(model ? { model } : {}),
         ...(effort ? { effort } : {}),
+        ...(subagentModel ? { subagent_model: subagentModel } : {}),
+        ...(subagentEffort ? { subagent_effort: subagentEffort } : {}),
+        ...(reviewerModel ? { reviewer_model: reviewerModel } : {}),
+        ...(reviewerEffort ? { reviewer_effort: reviewerEffort } : {}),
       }),
     harvestStatus: (domain, dataset) =>
       request(token, "GET", `/harvest/${domain}/${dataset}`),

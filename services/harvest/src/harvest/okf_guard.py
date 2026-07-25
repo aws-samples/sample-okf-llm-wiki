@@ -1,10 +1,17 @@
-"""``OKFGuardMiddleware`` — the deepagents adapter over ``OKFGuardEngine``.
+"""``OKFGuardMiddleware`` — the deepagents adapter over ``OKFGuardEngine`` —
+and ``ToolErrorMiddleware``, the tool-boundary safety net.
 
-Intercepts ``write_file`` / ``edit_file`` on ``.md`` paths via ``wrap_tool_call``,
-consults the engine, and either short-circuits with an error ToolMessage (no
-disk write — the model self-corrects) or lets the write proceed (optionally
-with normalized frontmatter). Path containment is handled by the
-``FilesystemBackend``'s ``virtual_mode``, not here.
+The guard intercepts ``write_file`` / ``edit_file`` on ``.md`` paths via
+``wrap_tool_call``, consults the engine, and either short-circuits with an
+error ToolMessage (no disk write — the model self-corrects) or lets the write
+proceed (optionally with normalized frontmatter). Path containment is handled
+by the ``FilesystemBackend``'s ``virtual_mode``, not here.
+
+``ToolErrorMiddleware`` converts any exception a tool RAISES into a
+``ToolMessage(status="error")`` so a single failing call (a ``PermissionError``
+from the S3 Files mount mid-write, a transient ``OSError``) surfaces to the
+model as a recoverable tool error instead of aborting the whole agent graph
+and failing the harvest.
 
 Imports of ``langchain``/``deepagents`` are deferred so this module can be
 imported (and the engine tested) without those packages installed.
@@ -12,10 +19,13 @@ imported (and the engine tested) without those packages installed.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable
 
 from harvest.guard_engine import OKFGuardEngine
+
+log = logging.getLogger(__name__)
 
 try:  # deepagents / langchain are only present in the runtime image
     from langchain.agents.middleware import AgentMiddleware
@@ -165,4 +175,78 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
 
     def _refuse(self, request, message: str | None):
         msg = message or "Refused by OKF guard."
-        return ToolMessage(content=msg, tool_call_id=request.tool_call["id"])
+        # status="error" so the model treats it as a failed call to self-correct
+        # (and the step feed's tool_result row shows ok=False).
+        return ToolMessage(
+            content=msg, tool_call_id=request.tool_call["id"], status="error"
+        )
+
+
+def _is_control_flow(exc: Exception) -> bool:
+    """True for LangGraph control-flow exceptions (interrupts, Command routing).
+
+    Those are not failures — converting one to a ToolMessage would break the
+    graph's own mechanics, so they must keep propagating. Matched by module so
+    we don't import langgraph here (kept import-free for the test venv).
+    """
+    mod = getattr(type(exc), "__module__", "") or ""
+    return mod.startswith("langgraph")
+
+
+class ToolErrorMiddleware(AgentMiddleware):  # type: ignore[misc]
+    """Convert tool-raised exceptions into ``ToolMessage(status="error")``.
+
+    A tool that raises (a ``PermissionError`` from the S3 Files mount mid-write,
+    a transient mount ``OSError``, an SDK error a tool forgot to catch) would
+    otherwise propagate out of the tool node, abort the (sub-)agent graph, and
+    fail the whole harvest — hours of authoring lost to one bad call. This
+    middleware is the safety net at the tool boundary: the exception becomes an
+    error ToolMessage the model SEES and can react to — retry, route around it,
+    or report the failure — and the step feed marks the call ``ok=False``
+    (``StepEmitter.on_tool_end`` classifies ``status == "error"``).
+
+    Attach it to the MAIN agent AND to EVERY sub-agent's middleware list —
+    sub-agent middleware REPLACES rather than inherits (the same footgun as the
+    guard), and the read-only sub-agents (reviewer / context-extractor) carry
+    no guard, so each spec names this explicitly.
+
+    LangGraph control-flow exceptions are re-raised (see ``_is_control_flow``);
+    ``BaseException`` (cancellation, shutdown) is never caught.
+    """
+
+    def wrap_tool_call(self, request, handler):  # type: ignore[override]
+        try:
+            return handler(request)
+        except Exception as e:  # noqa: BLE001 - the conversion IS the feature
+            if _is_control_flow(e):
+                raise
+            return self._error_message(request, e)
+
+    async def awrap_tool_call(self, request, handler):  # type: ignore[override]
+        try:
+            return await handler(request)
+        except Exception as e:  # noqa: BLE001 - the conversion IS the feature
+            if _is_control_flow(e):
+                raise
+            return self._error_message(request, e)
+
+    def _error_message(self, request, exc: Exception):
+        name = request.tool_call.get("name", "?")
+        # Keep the full traceback in the runtime log for diagnosis; the model
+        # gets the one-line cause.
+        log.warning(
+            "Tool %s raised %s; returning error ToolMessage",
+            name,
+            type(exc).__name__,
+            exc_info=True,
+        )
+        return ToolMessage(
+            content=(
+                f"Tool `{name}` failed: {type(exc).__name__}: {exc}. The call had "
+                "no effect. Adjust and retry, or work around it; if it keeps "
+                "failing, continue with the rest of your work and report the "
+                "failure in your summary instead of silently dropping the work."
+            ),
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )

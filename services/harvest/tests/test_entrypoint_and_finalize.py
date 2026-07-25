@@ -28,6 +28,43 @@ def test_model_config_from_payload_builds_override(monkeypatch):
     assert cfg["effort"] == "high"
 
 
+def test_model_config_from_payload_reads_subagent_keys(monkeypatch):
+    # The same builder resolves the SUB-AGENT pair from its own payload keys —
+    # and ignores the supervisor's keys, so a supervisor-only override yields
+    # None (sub-agents then run on the supervisor's config).
+    monkeypatch.delenv("OKF_HARVEST_MAX_TOKENS", raising=False)
+    payload = {
+        "model": "global.anthropic.claude-opus-4-8",
+        "effort": "xhigh",
+        "subagent_model": "openai.gpt-5.6-sol",
+        "subagent_effort": "high",
+    }
+    cfg = ep._model_config_from_payload(
+        payload, model_key="subagent_model", effort_key="subagent_effort"
+    )
+    assert cfg["model"] == "openai.gpt-5.6-sol"
+    assert cfg["effort"] == "high"
+    assert (
+        ep._model_config_from_payload(
+            {"model": "openai.gpt-5.6-sol"},
+            model_key="subagent_model",
+            effort_key="subagent_effort",
+        )
+        is None
+    )
+
+
+def test_model_config_from_payload_reads_reviewer_keys(monkeypatch):
+    monkeypatch.delenv("OKF_HARVEST_MAX_TOKENS", raising=False)
+    cfg = ep._model_config_from_payload(
+        {"reviewer_model": "global.anthropic.claude-sonnet-5", "reviewer_effort": "high"},
+        model_key="reviewer_model",
+        effort_key="reviewer_effort",
+    )
+    assert cfg["model"] == "global.anthropic.claude-sonnet-5"
+    assert cfg["effort"] == "high"
+
+
 def test_cleanup_removes_domain_subtree(monkeypatch, tmp_path):
     # Seed a mount with two domains; cleanup must remove only the target one.
     mount = tmp_path / "mnt"

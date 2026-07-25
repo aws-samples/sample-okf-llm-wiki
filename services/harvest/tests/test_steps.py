@@ -428,13 +428,16 @@ def test_record_usage_emits_cumulative_snapshot():
     usage_events = [e for e in events if e["kind"] == KIND_USAGE]
     assert len(usage_events) == 1
     u = usage_events[0]["usage"]
-    assert u == {
+    assert {k: u[k] for k in ("input", "output", "cache_read", "cache_write", "total")} == {
         "input": 100,
         "output": 20,
         "cache_read": 0,
         "cache_write": 0,
         "total": 120,
     }
+    # The default scope is the supervisor; the subagents bucket stays zero.
+    assert u["by"]["supervisor"]["total"] == 120
+    assert u["by"]["subagents"]["total"] == 0
 
 
 def test_record_usage_accumulates_across_turns():
@@ -445,13 +448,105 @@ def test_record_usage_accumulates_across_turns():
     snapshots = [e["usage"] for e in events if e["kind"] == KIND_USAGE]
     # Each snapshot is the running cumulative total (input+output summed).
     assert snapshots[0]["total"] == 120
-    assert snapshots[1] == {
-        "input": 150,
-        "output": 30,
-        "cache_read": 0,
-        "cache_write": 0,
-        "total": 180,
+    assert snapshots[1]["input"] == 150
+    assert snapshots[1]["output"] == 30
+    assert snapshots[1]["total"] == 180
+
+
+def test_record_usage_splits_per_scope():
+    # Two model instances forward with different scope tags (supervisor vs
+    # subagents); the snapshot's top-level counters stay the SUM of the scopes
+    # (back-compat) while `by` carries the drill-down.
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.record_usage(_FakeMessage("sup", usage_metadata=_usage(100, 20)), scope="supervisor")
+    em.record_usage(_FakeMessage("sub", usage_metadata=_usage(400, 80)), scope="subagents")
+    u = [e for e in events if e["kind"] == KIND_USAGE][-1]["usage"]
+    assert u["total"] == 600
+    assert u["by"]["supervisor"] == {
+        "input": 100, "output": 20, "cache_read": 0, "cache_write": 0, "total": 120,
     }
+    assert u["by"]["subagents"] == {
+        "input": 400, "output": 80, "cache_read": 0, "cache_write": 0, "total": 480,
+    }
+
+
+def test_record_usage_reviewer_scope_is_its_own_bucket():
+    # The adversarial reviewer runs on a third model instance; its turns land
+    # in the `reviewer` bucket, not `subagents`.
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.record_usage(_FakeMessage("rev", usage_metadata=_usage(200, 40)), scope="reviewer")
+    u = [e for e in events if e["kind"] == KIND_USAGE][0]["usage"]
+    assert u["by"]["reviewer"]["total"] == 240
+    assert u["by"]["subagents"]["total"] == 0
+    assert u["total"] == 240
+
+
+def test_record_usage_unknown_scope_folds_into_supervisor():
+    # A stray/unknown scope tag must not crash metering or drop tokens.
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.record_usage(_FakeMessage("x", usage_metadata=_usage(10, 5)), scope="mystery")
+    u = [e for e in events if e["kind"] == KIND_USAGE][0]["usage"]
+    assert u["total"] == 15
+    assert u["by"]["supervisor"]["total"] == 15
+
+
+def test_usage_forwarder_carries_its_scope():
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    fw = UsageForwarder(em, scope="subagents")
+    fw.on_llm_end(_FakeLLMResult(_FakeMessage("t", usage_metadata=_usage(30, 6))))
+    u = [e for e in events if e["kind"] == KIND_USAGE][0]["usage"]
+    assert u["by"]["subagents"]["total"] == 36
+    assert u["by"]["supervisor"]["total"] == 0
+
+
+def test_cache_write_read_from_converse_ephemeral_ttl_buckets():
+    # langchain_aws zeroes cache_creation when Bedrock returns a per-TTL
+    # cacheDetails breakdown and moves the writes into ephemeral_{5m,1h}
+    # buckets — the "Anthropic runs show no cache writes" bug. The extractor
+    # must read those buckets.
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    um = {
+        "input_tokens": 1000,
+        "output_tokens": 50,
+        "total_tokens": 1050,
+        "input_token_details": {
+            "cache_read": 600,
+            "cache_creation": 0,
+            "ephemeral_5m_input_tokens": 250,
+            "ephemeral_1h_input_tokens": 100,
+        },
+    }
+    em.record_usage(_FakeMessage("x", usage_metadata=um))
+    u = [e for e in events if e["kind"] == KIND_USAGE][0]["usage"]
+    assert u["cache_write"] == 350
+    assert u["cache_read"] == 600
+
+
+def test_cache_write_not_double_counted_when_both_shapes_present():
+    # langchain_anthropic (native) emits cache_creation = the TOTAL writes AND
+    # the ephemeral buckets as its per-TTL split — max(), not sum, so the two
+    # representations of the same tokens don't double-count.
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    um = {
+        "input_tokens": 1000,
+        "output_tokens": 50,
+        "total_tokens": 1050,
+        "input_token_details": {
+            "cache_read": 0,
+            "cache_creation": 350,
+            "ephemeral_5m_input_tokens": 250,
+            "ephemeral_1h_input_tokens": 100,
+        },
+    }
+    em.record_usage(_FakeMessage("x", usage_metadata=um))
+    u = [e for e in events if e["kind"] == KIND_USAGE][0]["usage"]
+    assert u["cache_write"] == 350
 
 
 def test_record_usage_maps_anthropic_cache_split():

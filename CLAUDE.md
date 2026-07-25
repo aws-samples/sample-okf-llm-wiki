@@ -101,5 +101,5 @@ Requires authenticated AWS CLI, Terraform, Docker (buildx for ARM64), node/npm, 
 
 - **CI-equivalent check** for a change: run `./scripts/run_tests.sh`, plus `cd ui && npm ci && npm run build`, plus `terraform validate` on both stacks (this is what CONTRIBUTING documents as the local suite).
 - The harvest model, thinking effort, timeouts, and subagent concurrency are all env-configurable (`OKF_HARVEST_*`) — see the env var table in CONVENTIONS.md before hardcoding anything.
-- The `OKFGuardMiddleware` must be attached to **every subagent's** middleware list, not just the main agent — subagent middleware replaces rather than inherits (a repeated footgun; see ARCHITECTURE.md and API_REFERENCE.md §1).
+- The `OKFGuardMiddleware` (authoring subagents) and `ToolErrorMiddleware` (every subagent — it converts a raising tool into a `ToolMessage(status="error")` so one bad call can't abort the run) must be attached to **every relevant subagent's** middleware list, not just the main agent — subagent middleware replaces rather than inherits (a repeated footgun; see ARCHITECTURE.md and API_REFERENCE.md §1).
 - Inbound MCP auth is **scope-based** (`okf-mcp/invoke`), not a client allowlist, so newly vended machine credentials work with no infra change. Cognito M2M `client_credentials` tokens carry no `aud`, which is why the authorizer can't use `allowedAudience`.

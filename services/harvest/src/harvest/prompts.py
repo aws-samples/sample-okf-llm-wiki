@@ -393,17 +393,20 @@ def build_supervisor_prompt(
     recursive_improvement: bool = False,
     *,
     profile: SourcePromptProfile | None = None,
+    gpt: bool = False,
 ) -> str:
     """The supervisor prompt for ``profile``'s source, with the RI section iff enabled.
 
     ``profile`` defaults to the Glue profile so the no-arg call (and legacy callers)
     still produce the Glue prompt. An RI run appends the benchmark-loop section.
+    ``gpt`` appends the GPT-family addendum (set iff the SUPERVISOR's resolved
+    model is an OpenAI GPT — see ``_GPT_ADDENDUM``).
     """
     profile = profile or GlueAthenaSource.prompt_profile
     prompt = _fill(_RUNTIME_TMPL + _SUPERVISOR_BODY, profile)
     if recursive_improvement:
-        return prompt + _RECURSIVE_IMPROVEMENT_SECTION
-    return prompt
+        prompt = prompt + _RECURSIVE_IMPROVEMENT_SECTION
+    return _with_gpt(prompt, gpt)
 
 
 _REVIEWER_BODY = """
@@ -610,6 +613,7 @@ def build_annotation_prompt(
     domain_context: str | None = None,
     dataset_guidance: str | None = None,
     profile: SourcePromptProfile | None = None,
+    gpt: bool = False,
 ) -> str:
     """The user prompt for an annotation-mode run (built for ``profile``'s source).
 
@@ -632,7 +636,10 @@ def build_annotation_prompt(
         )
     guidance_block = _dataset_guidance_block(dataset_guidance)
     annotation_prompt = _fill(_RUNTIME_TMPL + _ANNOTATION_BODY, profile)
-    job = annotation_prompt.replace("{results_rel}", results_rel)
+    # `gpt` is keyed to the SUPERVISOR's resolved model (this prompt is the
+    # supervisor's user message). The `{results_rel}` JSON results file is
+    # written via write_file, so the addendum's Markdown-reply rule holds.
+    job = _with_gpt(annotation_prompt.replace("{results_rel}", results_rel), gpt)
     listing = json.dumps(annotations, indent=2)
     if annotations:
         task = (
@@ -756,34 +763,110 @@ Return a one-line summary (the concept id, fact type, and what you verified).
 """
 
 
+# -- GPT-family runtime addendum ----------------------------------------------
+# Appended to a deepagents prompt when THAT agent's resolved model is an OpenAI
+# GPT model (okf_aws.model_factory.is_openai_model) — per the GPT-5.x prompting
+# guidance. The supervisor and the sub-agents can now run DIFFERENT model
+# families, so each prompt is flagged for the model that will actually read it.
+# The three blocks target the GPT behaviors that are wrong for this headless
+# authoring job out of the box:
+#   <persistence>       — GPT agents hand back at uncertainty; a harvest has no
+#                         user mid-run, so the agent must decide and continue.
+#   <context_gathering> — explicit stop criteria so exploration doesn't loop
+#                         (GPT-5 is thorough by default; the prescribed live-data
+#                         verifications are the depth bar, not a floor to exceed).
+#   <output_discipline> — GPT is trained to emit tool preambles and to NOT
+#                         format final answers as Markdown; both are inverted
+#                         here (no narration; everything is Markdown).
+# Deliberately NOT applied to the benchmark solver/adjudicator prompts: their
+# fenced SQL/JSON output contracts are explicit and must not be contradicted.
+_GPT_ADDENDUM = """
+## GPT-family runtime notes
+
+<persistence>
+You are an autonomous agent on a long-running headless job — there is NO user
+to hand back to mid-run. Keep going until your assigned work is COMPLETELY done
+before ending your turn. Never stop at uncertainty: decide the most reasonable
+interpretation from the data, proceed, and record the assumption in the doc or
+finding it affects.
+</persistence>
+
+<context_gathering>
+Gather context efficiently: batch independent reads and queries in parallel,
+never re-read a file you already read, and stop gathering as soon as you can
+act. The verification queries this job prescribes (grain, joins, enums against
+live data) are the depth bar — beyond them, prefer acting over more searching.
+</context_gathering>
+
+<output_discipline>
+Do not emit tool preambles or progress updates — never announce what you are
+about to do; go straight from deciding to the tool call. Everything you author
+or return is Markdown: bundle docs are markdown-with-frontmatter files, and
+your final reply (findings, digest, or summary) is plain Markdown prose — not
+JSON, not XML-tagged blocks.
+</output_discipline>
+"""
+
+
+def _with_gpt(prompt: str, gpt: bool) -> str:
+    """Append the GPT-family addendum when the reading model is a GPT."""
+    return prompt + _GPT_ADDENDUM if gpt else prompt
+
+
 # -- per-source sub-agent prompt builders ------------------------------------
 
 
-def build_reviewer_prompt(profile: SourcePromptProfile | None = None) -> str:
-    """The adversarial-reviewer sub-agent prompt for ``profile``'s source."""
-    return _fill(_RUNTIME_TMPL + _REVIEWER_BODY, profile or GlueAthenaSource.prompt_profile)
+def build_reviewer_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
+    """The adversarial-reviewer sub-agent prompt for ``profile``'s source.
+
+    ``gpt`` appends the GPT-family addendum (set iff the SUB-AGENT model — which
+    the reviewer runs on — is an OpenAI GPT). Same on the other sub-agent
+    builders below.
+    """
+    return _with_gpt(
+        _fill(_RUNTIME_TMPL + _REVIEWER_BODY, profile or GlueAthenaSource.prompt_profile),
+        gpt,
+    )
 
 
-def build_context_extractor_prompt(profile: SourcePromptProfile | None = None) -> str:
+def build_context_extractor_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
     """The context-extractor sub-agent prompt for ``profile``'s source."""
-    return _fill(
-        _RUNTIME_TMPL + _CONTEXT_EXTRACTOR_BODY,
-        profile or GlueAthenaSource.prompt_profile,
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _CONTEXT_EXTRACTOR_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
     )
 
 
-def build_table_author_prompt(profile: SourcePromptProfile | None = None) -> str:
+def build_table_author_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
     """The table-author sub-agent prompt for ``profile``'s source."""
-    return _fill(
-        _RUNTIME_TMPL + _TABLE_AUTHOR_BODY, profile or GlueAthenaSource.prompt_profile
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _TABLE_AUTHOR_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
     )
 
 
-def build_reference_author_prompt(profile: SourcePromptProfile | None = None) -> str:
+def build_reference_author_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
     """The reference-author sub-agent prompt for ``profile``'s source."""
-    return _fill(
-        _RUNTIME_TMPL + _REFERENCE_AUTHOR_BODY,
-        profile or GlueAthenaSource.prompt_profile,
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _REFERENCE_AUTHOR_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
     )
 
 

@@ -37,7 +37,7 @@ benchmark/mini_dev/report.html
 
 # Local roadmap / planning doc (engagement-internal, not published)
 Roadmap.md
-opus-5-prompting.md
+prompts/
 
 # OS
 .DS_Store

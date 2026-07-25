@@ -472,15 +472,36 @@ the mount (uid 1000 safe) and returns synchronously.
 `model` and `effort` are optional per-harvest overrides for the LLM (chosen in
 the UI's harvest-settings picker; `full`/`incremental` only). When present the
 runtime uses them; when absent it falls back to the deploy-time `OKF_HARVEST_MODEL`
-/ `OKF_HARVEST_EFFORT` env. The Control API **validates the pair against the model
-catalog** (`OKF_HARVEST_MODEL_CATALOG`, from `var.harvest_model_catalog`) before
+/ `OKF_HARVEST_EFFORT` env. `subagent_model` and `subagent_effort` are the same
+kind of override for the run's SUB-AGENTS — the table/reference authors,
+reviewers, context-extractors, and the recursive-improvement benchmark
+solver/adjudicator; when absent the sub-agents run on the supervisor's config.
+The Control API **validates each pair against the model catalog**
+(`OKF_HARVEST_MODEL_CATALOG`, from `var.harvest_model_catalog`) before
 invoking — an unknown model or an effort not offered for that model is a `400`,
-and `effort` without `model` is a `400`. This is the trust boundary: `model`
-reaches `bedrock:InvokeModel`, and the runtime deliberately does not allow-list
-effort itself. The catalog (a JSON array of `{model, label, efforts,
+and an effort without its model key is a `400`. This is the trust boundary: both
+model values reach `bedrock:InvokeModel`, and the runtime deliberately does not
+allow-list effort itself. The catalog (a JSON array of `{model, label, efforts,
 default_effort}`) is the single source of truth, shared by the Control API
 (validation, raw JSON env) and the UI (`VITE_HARVEST_MODEL_CATALOG`, base64 —
 see below) and defined in `okf_core.harvest_models`.
+
+`reviewer_model` and `reviewer_effort` are a third override for the adversarial
+`reviewer` sub-agent ONLY — cross-model review improves coverage (a fresh model
+family doesn't share the authoring model's blind spots). Absent ⇒ the reviewer
+runs on the sub-agents' config (which itself falls back to the supervisor's).
+
+The runtime always builds **three model instances** — the supervisor's, the
+sub-agents' (authors/extractors + the benchmark solver/adjudicator), and the
+reviewer's (identical configs when no overrides were sent) — each carrying its
+own scope-tagged usage callback. That is what makes the step feed's `usage`
+snapshot splittable: it carries the cumulative run totals plus a `by` object
+(`{supervisor: {...}, subagents: {...}, reviewer: {...}}`, same counter names)
+the UI renders as the per-agent token drill-down. The resolved supervisor pair
+is stamped on the status row as `model`/`effort` at the `running` transition;
+`subagent_model`/`subagent_effort` and `reviewer_model`/`reviewer_effort` are
+stamped only when the respective override was chosen (absence means "same as
+the tier above").
 
 Build `runtimeSessionId` with `okf_core.runtime_session_id(...)`, not a bare
 `"<domain>__<dataset>"` — AgentCore requires 33–256 characters, so the helper
