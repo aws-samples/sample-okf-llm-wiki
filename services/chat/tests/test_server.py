@@ -100,6 +100,30 @@ def _updates_with_tool_call():
     return ("updates", {"model": {"messages": [msg]}})
 
 
+def test_process_stream_data_tool_pending_from_first_fragment():
+    # The FIRST streamed fragment of a tool call carries name+id; the server
+    # must announce the call immediately (tool_pending) so the UI can react at
+    # invocation start — for render_chart the args ARE the chart code and take
+    # seconds to generate, and the args-complete start (updates mode) only
+    # lands after that. Later fragments carry name=None -> no re-announce.
+    from langchain_core.messages import AIMessageChunk
+
+    first = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            {"name": "render_chart", "args": '{"co', "id": "call_1", "index": 0}
+        ],
+    )
+    out = server.process_stream_data("messages", (first, {}))
+    assert out == {"type": "tool_pending", "id": "call_1", "tool_name": "render_chart"}
+
+    delta = AIMessageChunk(
+        content="",
+        tool_call_chunks=[{"name": None, "args": 'de":', "id": None, "index": 0}],
+    )
+    assert server.process_stream_data("messages", (delta, {})) is None
+
+
 def test_process_stream_data_tool_start_from_updates():
     mode, data = _updates_with_tool_call()
     out = server.process_stream_data(mode, data)
@@ -743,8 +767,8 @@ def test_resume_inactive_thread_emits_no_active_marker():
 
 
 def test_read_history_drops_inflight_half_turn_when_live():
-    # With a live run active, get_session_history(drop_inflight=True) must remove a
-    # trailing turn whose assistant reply is still empty — resume renders it instead.
+    # With a live run active, history must remove the trailing turn whose user
+    # message matches the run's — resume renders it fresh from the buffer.
     from langchain_core.messages import AIMessage, HumanMessage
 
     class _Graph:
@@ -761,12 +785,12 @@ def test_read_history_drops_inflight_half_turn_when_live():
             return _S()
 
     build_agent = lambda *a, **k: _Graph()  # noqa: E731
-    # Without drop: both turns (the in-flight one has only an end sentinel).
+    # Without an active run: both turns (the in-flight one has only an end sentinel).
     full = server.read_history(build_agent, object(), "alice:c")["history"]
     assert [t["userMessage"] for t in full] == ["q1", "q2-inflight"]
-    # With drop: the in-flight half-turn is removed.
+    # With the matching active run: the in-flight half-turn is removed.
     dropped = server.read_history(
-        build_agent, object(), "alice:c", drop_inflight=True
+        build_agent, object(), "alice:c", inflight_user_message="q2-inflight"
     )["history"]
     assert [t["userMessage"] for t in dropped] == ["q1"]
 
@@ -774,8 +798,7 @@ def test_read_history_drops_inflight_half_turn_when_live():
 def test_read_history_drops_inflight_turn_stopped_mid_tool():
     # LangGraph checkpoints at each node boundary, so a turn interrupted after the
     # model issued a tool call (but before an answer) has an AIMessage(tool_calls)
-    # with NO text. drop_inflight must still drop it (resume replays it in full) —
-    # dropping only zero-event turns would keep it AND let resume duplicate it.
+    # with NO text. The identity match must still drop it (resume replays it).
     from langchain_core.messages import AIMessage, HumanMessage
 
     class _Graph:
@@ -801,12 +824,107 @@ def test_read_history_drops_inflight_turn_stopped_mid_tool():
 
     build_agent = lambda *a, **k: _Graph()  # noqa: E731
     dropped = server.read_history(
-        build_agent, object(), "alice:c", drop_inflight=True
+        build_agent, object(), "alice:c", inflight_user_message="q2-inflight"
     )["history"]
     assert [t["userMessage"] for t in dropped] == ["q1"]
-    # A completed turn (has answer text) is never dropped, even with a tool call.
+    # Without an active run the turn is kept (nothing will replay it).
     full = server.read_history(build_agent, object(), "alice:c")["history"]
     assert [t["userMessage"] for t in full] == ["q1", "q2-inflight"]
+
+
+def test_read_history_drops_inflight_turn_with_committed_text():
+    # THE refresh-duplicate bug: a multi-step in-flight turn can already have
+    # committed answer TEXT in the checkpoint (prose emitted before/between tool
+    # calls — LangGraph checkpoints at node boundaries). The old shape heuristic
+    # ("has text = completed") kept it in history while resume replayed the same
+    # turn from the buffer → shown twice. Identity matching drops it regardless
+    # of how much of the turn has checkpointed.
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    class _Graph:
+        def get_state(self, cfg):
+            class _S:
+                values = {
+                    "messages": [
+                        HumanMessage(content="q1"),
+                        AIMessage(content="a1"),
+                        HumanMessage(content="q2-inflight"),
+                        # mid-run: prose + a tool call already checkpointed, the
+                        # run is still producing the rest of the turn
+                        AIMessage(
+                            content="Here is the trend so far...",
+                            tool_calls=[
+                                {"name": "render_chart", "args": {},
+                                 "id": "call_1", "type": "tool_call"}
+                            ],
+                        ),
+                    ]
+                }
+
+            return _S()
+
+    build_agent = lambda *a, **k: _Graph()  # noqa: E731
+    dropped = server.read_history(
+        build_agent, object(), "alice:c", inflight_user_message="q2-inflight"
+    )["history"]
+    assert [t["userMessage"] for t in dropped] == ["q1"]
+
+
+def test_read_history_keeps_prior_turn_when_inflight_not_checkpointed():
+    # The active run's own human message may not have hit the checkpoint yet —
+    # the trailing turn is then a PRIOR completed turn and must be kept (no
+    # identity match), even though a run is active.
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    class _Graph:
+        def get_state(self, cfg):
+            class _S:
+                values = {
+                    "messages": [
+                        HumanMessage(content="q1"),
+                        AIMessage(content="a1"),
+                    ]
+                }
+
+            return _S()
+
+    build_agent = lambda *a, **k: _Graph()  # noqa: E731
+    kept = server.read_history(
+        build_agent, object(), "alice:c", inflight_user_message="q2-just-sent"
+    )["history"]
+    assert [t["userMessage"] for t in kept] == ["q1"]
+
+
+def test_read_history_answer_human_resume_drops_nothing():
+    # answer_human continuations run with user_message="" — the paused turn's
+    # checkpointed prefix (question + pre-interrupt content) must STAY in
+    # history; the buffer appends only the continuation. An empty in-flight
+    # message therefore never drops a turn.
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    class _Graph:
+        def get_state(self, cfg):
+            class _S:
+                values = {
+                    "messages": [
+                        HumanMessage(content="q1"),
+                        AIMessage(
+                            content="",
+                            tool_calls=[
+                                {"name": "ask_human", "args": {},
+                                 "id": "call_1", "type": "tool_call"}
+                            ],
+                        ),
+                    ]
+                }
+
+            return _S()
+
+    build_agent = lambda *a, **k: _Graph()  # noqa: E731
+    kept = server.read_history(
+        build_agent, object(), "alice:c", inflight_user_message=""
+    )["history"]
+    assert [t["userMessage"] for t in kept] == ["q1"]
 
 
 # --- optional SQL tool gating (deploy flag AND per-run opt-in) ---------------

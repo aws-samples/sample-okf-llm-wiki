@@ -97,8 +97,42 @@ export function buildMessageBlocks(events, isEnd) {
     toolSeen.add(toolId)
   }
 
+  // Pending chart blocks by tool id -> index into `blocks`, so the
+  // args-complete start can fill the SAME block in place (no reflow, and the
+  // placeholder keeps its slot). Set when a tool_pending for render_chart
+  // arrives — the model has STARTED the call but is still generating its args
+  // (the chart code), which for charts is the long part.
+  const chartPendingAt = new Map()
+
   for (const ev of events) {
     if (ev.end) continue
+
+    // render_chart announced EARLY (first streamed fragment of the call): open
+    // the chart block immediately, code-less — ChartFrame renders the
+    // generating theater for it while the model writes the code. Non-chart
+    // tool_pending events are ignored (the timeline waits for the reliable
+    // args-complete start from the updates stream).
+    if (ev.type === "tool_pending") {
+      if (
+        ev.tool_name === CHART_TOOL &&
+        ev.id &&
+        !chartSeen.has(ev.id) &&
+        !chartPendingAt.has(ev.id)
+      ) {
+        closeThink()
+        closeText()
+        chartPendingAt.set(ev.id, blocks.length)
+        blocks.push({
+          type: "chart",
+          id: ev.id,
+          pending: true,
+          code: "",
+          title: "",
+          isComplete: false,
+        })
+      }
+      continue
+    }
 
     // render_chart: the chart BREAKS the working timeline (and any open text run)
     // and renders as its own block, in order. The tool START carries the whole
@@ -107,16 +141,23 @@ export function buildMessageBlocks(events, isEnd) {
     if (ev.type === "tool" && ev.tool_name === CHART_TOOL) {
       if (ev.tool_start && ev.id && !chartSeen.has(ev.id)) {
         chartSeen.add(ev.id)
-        closeThink()
-        closeText()
         const args = ev.content && typeof ev.content === "object" ? ev.content : {}
-        blocks.push({
+        const filled = {
           type: "chart",
           id: ev.id,
           code: typeof args.code === "string" ? args.code : "",
           title: typeof args.title === "string" ? args.title : "",
           isComplete: Boolean(toolsById.get(ev.id)?.isComplete),
-        })
+        }
+        const at = chartPendingAt.get(ev.id)
+        if (at != null) {
+          blocks[at] = filled // fill the pending block in place
+          chartPendingAt.delete(ev.id)
+        } else {
+          closeThink()
+          closeText()
+          blocks.push(filled)
+        }
       }
       continue
     }

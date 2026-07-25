@@ -4,7 +4,9 @@
 
 .okf-codeview {
   margin: 8px 0;
-  max-width: 640px;
+  /* Never wider than the message column — long lines scroll INSIDE
+     .okf-codeview-scroll below instead of stretching the parent. */
+  max-width: min(640px, 100%);
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -31,8 +33,9 @@
 .okf-codeview-lang {
   font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  /* No uppercase transform: prettyLang already emits the display casing —
+     "Python", "JavaScript" — with acronyms (SQL, JSON) capitalized in data. */
   color: var(--muted-foreground);
 }
 
@@ -44,6 +47,15 @@
 .okf-codeview-pre {
   margin: 0;
   padding: 12px;
+  /* Flush against the header — square seam, no inner panel: the container owns
+     the border, radius, and background; the SCROLL WRAPPER owns overflow. Kept
+     explicit (not just the :not() scoping in index.css) so any future prose
+     rule can't reintroduce the leak. */
+  border: 0;
+  border-radius: 0;
+  overflow: visible;
+  width: max-content;
+  min-width: 100%;
   background: transparent;
   font-size: 12px;
   line-height: 1.55;
