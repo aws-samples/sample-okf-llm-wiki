@@ -72,7 +72,11 @@ data "aws_iam_policy_document" "control_api" {
     # chat checkpoint table for the delete-purge (Query/Scan the conversation's
     # checkpoint items + DeleteItem). The chat RUNTIME owns the writes to both;
     # the Control API only reads/renames/deletes for the sidebar.
-    actions = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
+    # BatchGetItem: the repromote convergence check reads the freshness table's
+    # VEC# rows for every touched key in one call — it is a SEPARATE IAM action
+    # from GetItem (moto doesn't enforce IAM, so only a live deploy catches it
+    # missing: the status GET 500s and the UI's progress poll never advances).
+    actions = ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
     resources = [
       local.d.registry_table_arn,
       local.d.freshness_table_arn,
@@ -82,7 +86,13 @@ data "aws_iam_policy_document" "control_api" {
     ]
   }
   statement {
-    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+    # GetObjectVersion + ListBucketVersions power the bundle version history /
+    # diff / repromote endpoints (CopyObject with a source VersionId authorizes
+    # as GetObjectVersion on the source + PutObject on the destination).
+    actions = [
+      "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
+      "s3:GetObjectVersion", "s3:ListBucketVersions",
+    ]
     resources = [local.d.bundle_bucket_arn, "${local.d.bundle_bucket_arn}/*"]
   }
   statement {

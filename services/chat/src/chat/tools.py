@@ -18,6 +18,7 @@ context, NOT a security boundary (the IAM role can read any bundle). Unscoped
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 from typing import Any, Callable
 
@@ -108,7 +109,91 @@ _TOOL_NAMES = (
     "glob",
     "grep",
     "semantic_search",
+    "get_bundle_diff",
 )
+
+
+def make_submit_annotation_tool(annotations_table, *, user_sub, dataset_scope=None):
+    """Build the per-run ``submit_annotation`` tool (agent files on the user's behalf).
+
+    ALWAYS available when a verified subject exists: ``user_sub`` is closed over
+    from the validated JWT and keys the annotation partition — identical
+    isolation to the UI path; the stored ``submitted_via="agent"`` is display
+    provenance, not authorization. Scoped runs drop ``data_domain``/``dataset``
+    from the model-facing schema and inject them (same convention as the read
+    tools); unscoped runs expose them as required args. Writes DynamoDB
+    in-process (the chat role has a scoped PutItem grant).
+    """
+    from langchain_core.tools import StructuredTool
+
+    from okf_core import annotations as anno
+    from okf_core.paths import parse_concept_id
+
+    _DOC = """File wiki feedback on the user's behalf when the conversation uncovers a
+        doc problem (a wrong join, a stale enum, a missing caveat). ALWAYS confirm
+        with the user first (ask_human or a direct question) before filing — this
+        writes feedback in their name. `note` is the feedback text (be specific:
+        what is wrong and what the data actually shows). `concept_id` targets one
+        page (e.g. `tables/races`); leave it empty for dataset-level feedback that
+        doesn't belong to a single page. The note enters the user's annotation
+        queue and steers the next annotation-mode re-harvest."""
+
+    def _file(note: str, data_domain: str, dataset: str, concept_id: str) -> str:
+        cleaned = (note or "").strip()
+        if not cleaned:
+            return json.dumps({"error": "note must not be empty"})
+        if not (data_domain or "").strip() or not (dataset or "").strip():
+            return json.dumps(
+                {"error": "data_domain and dataset are required (see list_domains)"}
+            )
+        cid = (concept_id or "").strip() or anno.DATASET_WIDE_CONCEPT
+        try:
+            parse_concept_id(cid)
+        except ValueError:
+            return json.dumps({"error": f"invalid concept_id: {cid!r}"})
+        try:
+            item = anno.new_annotation_item(
+                data_domain=data_domain.strip(),
+                dataset=dataset.strip(),
+                user_sub=user_sub,
+                concept_id=cid,
+                note=cleaned,
+                submitted_via=anno.SUBMITTED_VIA_AGENT,
+            )
+            annotations_table.put_item(Item=item)
+        except Exception as e:  # noqa: BLE001 - tool errors go back to the model
+            log.warning("submit_annotation failed: %s", e, exc_info=True)
+            return json.dumps({"error": f"could not file the annotation: {e}"})
+        return json.dumps(
+            {
+                "status": "filed",
+                "annotation_id": item["annotation_id"],
+                "concept_id": cid,
+                "dataset_wide": cid == anno.DATASET_WIDE_CONCEPT,
+            }
+        )
+
+    if dataset_scope:
+        dd = dataset_scope["data_domain"]
+        ds = dataset_scope["dataset"]
+
+        def submit_annotation(note: str, concept_id: str = "") -> str:
+            return _file(note, dd, ds, concept_id)
+
+    else:
+
+        def submit_annotation(
+            note: str, data_domain: str, dataset: str, concept_id: str = ""
+        ) -> str:
+            """`data_domain`/`dataset` name the dataset the feedback is about."""
+            return _file(note, data_domain, dataset, concept_id)
+
+    submit_annotation.__doc__ = _DOC
+    return StructuredTool.from_function(
+        func=submit_annotation,
+        name="submit_annotation",
+        description=_DOC,
+    )
 
 
 def make_agent_tools(

@@ -458,9 +458,27 @@ data "aws_iam_policy_document" "chat" {
   # checkov:skip=CKV_AWS_108:Only when var.enable_chat_sql — TableDataRead s3:GetObject must be "*" because a Glue table's storage location can be any bucket; read-only (no Put to source) and off by default.
   # checkov:skip=CKV_AWS_111:Only when var.enable_chat_sql — Athena/S3 write is scoped to the dedicated results bucket; the remaining broad grants are read/list metadata actions that don't support ARN scoping. See the block comment on ChatSqlGlueRead.
   # checkov:skip=CKV_AWS_356:glue list + athena:* are catalog/workgroup-level actions that cannot be pinned to one resource ARN (same residual as harvest_data); the runtime's read-only query guard bounds them.
+  # submit_annotation: the chat agent files feedback ON THE USER'S BEHALF —
+  # the item's partition key embeds the run's verified Cognito sub, so the
+  # write is as isolated as the Control API path. PutItem only: the agent can
+  # create notes, never read/modify/delete others (the reconcile UpdateItem
+  # stays with the harvest role, the sweep with the Control API).
   statement {
-    sid       = "BundleBucketRead"
-    actions   = ["s3:GetObject", "s3:ListBucket"]
+    sid       = "AnnotationSubmit"
+    actions   = ["dynamodb:PutItem"]
+    resources = [local.d.annotations_table_arn]
+  }
+
+  statement {
+    sid = "BundleBucketRead"
+    # Version-read actions power the CHAT agent's get_bundle_diff tool (reads
+    # prior object versions of bundle docs; still no write access). The
+    # consumption MCP role deliberately does NOT get these — the diff tool is
+    # not exposed to external agents.
+    actions = [
+      "s3:GetObject", "s3:ListBucket",
+      "s3:GetObjectVersion", "s3:ListBucketVersions",
+    ]
     resources = [local.d.bundle_bucket_arn, "${local.d.bundle_bucket_arn}/*"]
   }
 

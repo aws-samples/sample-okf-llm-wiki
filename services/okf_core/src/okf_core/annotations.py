@@ -49,6 +49,19 @@ STATUS_OPEN = "open"
 STATUS_IN_REVIEW = "in_review"
 STATUS_RESOLVED = "resolved"
 
+# Provenance: how the annotation was filed. The chat agent files on the USER'S
+# behalf (their sub is still the partition key — this field is display
+# provenance, never authorization).
+SUBMITTED_VIA_UI = "ui"
+SUBMITTED_VIA_AGENT = "agent"
+
+# Sentinel concept id for DATASET-LEVEL feedback (a general note with no single
+# page to anchor to). Underscore-prefixed like the `_domain` pseudo-dataset, so
+# it passes parse_concept_id yet can never collide with an authored doc (the
+# layout only writes tables/, references/, datasets/, index.md). Dataset-wide
+# notes have no doc and no quote: they never orphan while the dataset exists.
+DATASET_WIDE_CONCEPT = "_dataset"
+
 # Set alongside STATUS_RESOLVED. APPLIED: the agent judged the feedback factually
 # grounded and edited the bundle. REJECTED: the agent assessed it and declined
 # (not grounded, out of scope, duplicate — the comment says which). ORPHANED: the
@@ -203,9 +216,13 @@ def is_orphaned(doc_text: str | None, quote: str) -> bool:
     (``None`` — the whole concept was dropped from the bundle) orphans every
     annotation on it; otherwise match ``quote`` against the annotatable BODY
     (:func:`annotatable_text`), since that's the only surface a selection covers.
+    An UNANCHORED note (empty ``quote`` — page-level general feedback) has no
+    passage to re-find: it orphans only when the doc itself is gone.
     """
     if doc_text is None:
         return True
+    if not (quote or "").strip():
+        return False
     return not find_quote(annotatable_text(doc_text), quote)
 
 
@@ -216,3 +233,66 @@ def is_orphaned(doc_text: str | None, quote: str) -> bool:
 
 def is_terminal_outcome(outcome: str | None) -> bool:
     return outcome in _TERMINAL_OUTCOMES
+
+
+# Length caps mirroring the Control API's boundary caps (DynamoDB 400KB item /
+# harvest payload bounds). Applied by new_annotation_item so every writer —
+# the Control API's typed put and the chat agent's in-process put — bounds
+# identically.
+NOTE_MAX_CHARS = 4000
+QUOTE_MAX_CHARS = 2000
+CONTEXT_MAX_CHARS = 200
+
+
+def new_annotation_item(
+    *,
+    data_domain: str,
+    dataset: str,
+    user_sub: str,
+    concept_id: str,
+    note: str,
+    quote: str = "",
+    prefix: str = "",
+    suffix: str = "",
+    block_line: int | None = None,
+    author: str = "",
+    submitted_via: str = SUBMITTED_VIA_UI,
+    annotation_id: str | None = None,
+    now_iso: str | None = None,
+) -> dict:
+    """Build one OPEN annotation item as a plain dict (boto3 resource style).
+
+    The single item-shape authority for non-Control-API writers (the chat
+    agent's ``submit_annotation``). Isolation invariant: ``user_sub`` keys the
+    partition — the caller must pass the VERIFIED subject, never client input.
+    An empty ``quote`` is an unanchored note; ``concept_id`` may be the
+    :data:`DATASET_WIDE_CONCEPT` sentinel for dataset-level feedback.
+    """
+    import uuid
+    from datetime import datetime, timezone
+
+    aid = annotation_id or uuid.uuid4().hex
+    now = now_iso or datetime.now(timezone.utc).isoformat()
+    item: dict = {
+        "pk": annotation_pk(data_domain, dataset, user_sub),
+        "sk": annotation_sk(concept_id, aid),
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "concept_id": concept_id,
+        "annotation_id": aid,
+        "quote": (quote or "").strip()[:QUOTE_MAX_CHARS],
+        "note": (note or "").strip()[:NOTE_MAX_CHARS],
+        "status": STATUS_OPEN,
+        "submitted_via": submitted_via or SUBMITTED_VIA_UI,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if author:
+        item["author"] = author
+    if prefix:
+        item["prefix"] = prefix[:CONTEXT_MAX_CHARS]
+    if suffix:
+        item["suffix"] = suffix[:CONTEXT_MAX_CHARS]
+    if block_line is not None:
+        item["block_line"] = int(block_line)
+    return item

@@ -22,6 +22,7 @@ from typing import Any
 from datetime import timedelta
 
 from okf_aws import bundle_prefix, is_bundle_ready, parse_bundle_key, state_marker_key
+from okf_aws import s3_versions
 from okf_core import annotations as anno
 from okf_core import chat_threads as ct
 from okf_core import guidance as gd
@@ -2260,31 +2261,49 @@ def list_bundle_files(
 
 
 def _validate_bundle_key(key: str, *, data_domain: str, dataset: str) -> str:
-    """Ensure ``key`` is a real ``.md`` concept under this dataset's prefix.
+    """Ensure ``key`` is served bundle content under this dataset's prefix.
 
     Guards the "read one file" endpoint so a caller cannot pass an arbitrary key
-    (e.g. another dataset's ``.context/`` upload or ``../`` traversal) and read
-    it back. We accept only keys that parse as a concept in *this* bundle.
+    (another dataset's file, a ``.context/`` upload, ``../`` traversal) and read
+    it back. Any non-dot ``.md`` under the prefix qualifies — INCLUDING
+    ``index.md``/``log.md``, which are published content (the version-diff UI
+    reads them) even though they are not concepts; dot-prefixed dirs
+    (``.context``/``.harvest``/``.metadata``) remain authoring state and are
+    rejected (a ``..`` segment starts with a dot, so traversal is covered too).
     """
-    loc = parse_bundle_key(key)
     prefix = bundle_prefix(data_domain, dataset)
-    if loc is None or not key.startswith(prefix):
-        raise ApiError(400, f"key is not a concept under this bundle: {key!r}")
-    if loc.data_domain != data_domain or loc.dataset != dataset:
-        raise ApiError(400, f"key is not a concept under this bundle: {key!r}")
-    return key
+    if key.startswith(prefix) and key.endswith(".md"):
+        parts = key[len(prefix) :].split("/")
+        if all(p and not p.startswith(".") for p in parts):
+            return key
+    raise ApiError(400, f"key is not bundle content under this bundle: {key!r}")
 
 
 def read_bundle_file(
-    s3, *, bucket: str, data_domain: str, dataset: str, key: str
+    s3,
+    *,
+    bucket: str,
+    data_domain: str,
+    dataset: str,
+    key: str,
+    version_id: str = "",
 ) -> dict[str, Any]:
-    """Return one bundle ``.md`` file's raw text after validating the key."""
+    """Return one bundle ``.md`` file's raw text after validating the key.
+
+    ``version_id`` (optional) reads a specific S3 object version — how the
+    version-diff UI fetches both sides of a file for the rendered rich view;
+    it also works under a delete marker (a removed file's old content stays
+    readable). Empty = the live latest, exactly as before.
+    """
     key = _validate_bundle_key(key, data_domain=data_domain, dataset=dataset)
+    kwargs: dict[str, Any] = {"Bucket": bucket, "Key": key}
+    if version_id:
+        kwargs["VersionId"] = version_id
     try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-    except Exception as e:  # noqa: BLE001 - map missing object to 404
+        obj = s3.get_object(**kwargs)
+    except Exception as e:  # noqa: BLE001 - map missing object/version to 404
         code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
-        if code in ("NoSuchKey", "404", "NotFound"):
+        if code in ("NoSuchKey", "404", "NotFound", "NoSuchVersion", "InvalidArgument"):
             raise ApiError(404, f"no such bundle file: {key}") from e
         raise
     text = obj["Body"].read().decode("utf-8")
@@ -2354,6 +2373,416 @@ def bundle_graph(s3, *, bucket: str, data_domain: str, dataset: str) -> dict[str
 
 
 # --------------------------------------------------------------------------- #
+# Bundle versions, diff & repromote (S3 object-version history)
+# --------------------------------------------------------------------------- #
+#
+# A bundle version = one `complete` write of `.harvest/state.json`; identity is
+# that marker object's S3 VersionId (see okf_aws.s3_versions + CONVENTIONS.md).
+# Repromote rewrites the live prefix to equal a chosen version via CopyObject
+# with source VersionIds — append-only (new head, fresh complete marker carrying
+# repromoted_from/by) — and the untouched reindex pipeline re-converges the
+# vector index from the resulting object events. The status GET reads
+# convergence off the freshness table's VEC# rows, which reindex advances only
+# AFTER the vector work succeeds.
+
+REPROMOTE_MODE = "repromote"
+
+# A repromote runs synchronously inside this 30s-capped Lambda, so — unlike a
+# real harvest, which legitimately runs for hours (HARVEST_LEASE_STALE_SECONDS
+# = 8h) — a repromote row still `queued` after this window is provably dead.
+# The lease takeover clause + the status GET's stalled_lease/can_retry both key
+# off it, giving the UI one-click retry instead of an 8h wedge.
+REPROMOTE_LEASE_STALE_SECONDS = 120
+
+# EventBridge->SQS->reindex normally converges in seconds; past this we stop
+# claiming "converging" and surface `stalled` (an event may have been dropped —
+# the honest recovery is re-running the idempotent repromote).
+REPROMOTE_STALL_SECONDS = 600
+
+# Convergence compares this Lambda's clock (repromote started_at) against the
+# reindex Lambda's clock (freshness updated_at); a small epsilon absorbs skew.
+_CONVERGE_EPSILON = timedelta(seconds=2)
+
+
+def list_bundle_versions(
+    s3, *, bucket: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """The bundle's published versions, newest first (empty list = never harvested)."""
+    markers = s3_versions.list_complete_markers(
+        s3, bucket=bucket, data_domain=data_domain, dataset=dataset
+    )
+    return {"versions": [{**m.descriptor(), "tables": m.tables} for m in markers]}
+
+
+def get_bundle_diff(
+    s3,
+    *,
+    bucket: str,
+    data_domain: str,
+    dataset: str,
+    from_version: str = "",
+    to_version: str = "",
+) -> dict[str, Any]:
+    """Diff two versions (defaults: previous -> current; `to=live` = working state)."""
+    try:
+        return s3_versions.bundle_diff(
+            s3,
+            bucket=bucket,
+            data_domain=data_domain,
+            dataset=dataset,
+            from_version=from_version,
+            to_version=to_version,
+        )
+    except ValueError as e:
+        raise ApiError(400, str(e)) from e
+
+
+def acquire_repromote_lease(
+    ddb,
+    *,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    detail: str,
+    target_version_id: str = "",
+) -> str | None:
+    """Take the harvest lease for a repromote. Returns ``started_at`` or None.
+
+    Same conditional PutItem as :func:`acquire_harvest_lease` — repromote rides
+    the existing ``queued -> complete|failed`` lifecycle (no new status value) —
+    plus ONE extra takeover clause: a prior ``mode=repromote`` row still
+    ``queued`` after :data:`REPROMOTE_LEASE_STALE_SECONDS` is a dead run (the
+    writer is a 30s-capped Lambda), so a retry may steal it immediately instead
+    of waiting out the 8h harvest staleness. Harvest rows are unaffected.
+    """
+    now = _now_iso()
+    stale_cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=HARVEST_LEASE_STALE_SECONDS)
+    ).isoformat()
+    repromote_cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=REPROMOTE_LEASE_STALE_SECONDS)
+    ).isoformat()
+    try:
+        ddb.put_item(
+            TableName=registry_table,
+            Item={
+                "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+                "sk": {"S": "STATUS"},
+                "status": {"S": "queued"},
+                "mode": {"S": REPROMOTE_MODE},
+                "started_at": {"S": now},
+                "updated_at": {"S": now},
+                "runtime_session_id": {"S": f"repromote-{uuid.uuid4().hex}"},
+                "detail": {"S": detail[:1024]},
+                # Persisted so a DEAD repromote's one-click retry knows which
+                # version to re-POST (the status GET echoes it on stalled_lease).
+                "repromote_target": {"S": target_version_id},
+            },
+            ConditionExpression=(
+                "attribute_not_exists(pk) "
+                "OR NOT (#s = :queued OR #s = :running) "
+                "OR started_at < :stale "
+                "OR (#m = :rmode AND #s = :queued AND started_at < :rstale)"
+            ),
+            ExpressionAttributeNames={"#s": "status", "#m": "mode"},
+            ExpressionAttributeValues={
+                ":queued": {"S": "queued"},
+                ":running": {"S": "running"},
+                ":stale": {"S": stale_cutoff},
+                ":rmode": {"S": REPROMOTE_MODE},
+                ":rstale": {"S": repromote_cutoff},
+            },
+        )
+        return now
+    except Exception as e:  # noqa: BLE001 - a lost condition means "already leased"
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            return None
+        raise
+
+
+def repromote_bundle(
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    version_id: str,
+    requested_by: str,
+) -> dict[str, Any]:
+    """Make an older bundle version the new head. Synchronous; seconds.
+
+    Flow: validate the target -> take the harvest lease (mode=repromote; a
+    concurrent harvest gets its usual 409, concurrent incremental events degrade
+    to skipped_locked) -> write an ``in_progress`` marker so ``is_bundle_ready``
+    honestly reports not-ready during the copy window -> restore the snapshot
+    (CopyObject + delete markers; append-only, idempotent) -> write a FRESH
+    ``complete`` marker carrying ``repromoted_from``/``repromoted_by`` -> record
+    the touched vector keys in the REPROMOTE registry item (the convergence
+    manifest; deleted keys are unlistable after the fact, so this must be
+    captured at write time) -> release the lease as ``complete``.
+
+    Deliberately does NOT touch the freshness table's Glue-version rows:
+    repromote is a content rollback, not a pin — the next genuine catalog
+    change may legitimately harvest over it (documented in CONVENTIONS.md and
+    the UI confirm dialog). Failure mid-write releases the lease as ``failed``
+    and leaves the marker ``in_progress`` — the same posture as a crashed
+    harvest; the recovery is retrying (idempotent) or re-harvesting.
+    """
+    markers = s3_versions.list_complete_markers(
+        s3, bucket=bucket, data_domain=data_domain, dataset=dataset
+    )
+    if not markers:
+        raise ApiError(404, f"no published versions for {data_domain}/{dataset}")
+    target = next((m for m in markers if m.version_id == version_id), None)
+    if target is None:
+        raise ApiError(400, f"unknown bundle version: {version_id}")
+    if target.is_current:
+        raise ApiError(409, "that version is already current")
+
+    label = target.completed_at or target.version_id[:8]
+    started_at = acquire_repromote_lease(
+        ddb,
+        registry_table=registry_table,
+        data_domain=data_domain,
+        dataset=dataset,
+        detail=f"repromote to {label}",
+        target_version_id=target.version_id,
+    )
+    if started_at is None:
+        raise ApiError(
+            409,
+            f"a harvest for {data_domain}/{dataset} is already queued or running",
+        )
+
+    marker_key = state_marker_key(data_domain, dataset)
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=marker_key,
+            Body=(
+                json.dumps(
+                    {
+                        "status": "in_progress",
+                        "data_domain": data_domain,
+                        "dataset": dataset,
+                        "started_at": started_at,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        snapshot = s3_versions.snapshot_at(
+            s3, bucket=bucket, data_domain=data_domain, dataset=dataset, marker=target
+        )
+        live = s3_versions.live_snapshot(
+            s3, bucket=bucket, data_domain=data_domain, dataset=dataset
+        )
+        copied, deleted = s3_versions.restore_snapshot(
+            s3,
+            bucket=bucket,
+            data_domain=data_domain,
+            dataset=dataset,
+            snapshot=snapshot,
+            live=live,
+        )
+        completed_at = _now_iso()
+        put = s3.put_object(
+            Bucket=bucket,
+            Key=marker_key,
+            Body=(
+                json.dumps(
+                    {
+                        "status": "complete",
+                        "data_domain": data_domain,
+                        "dataset": dataset,
+                        "tables": target.tables,
+                        "completed_at": completed_at,
+                        "table_versions": target.table_versions,
+                        "repromoted_from": target.version_id,
+                        "repromoted_by": requested_by or "",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        new_version_id = put.get("VersionId", "")
+        # index.md/log.md copies never index (reserved files), so they are not
+        # part of the convergence set.
+        copied_vkeys = [
+            loc.vector_key for k in copied if (loc := parse_bundle_key(k)) is not None
+        ]
+        deleted_vkeys = [
+            loc.vector_key for k in deleted if (loc := parse_bundle_key(k)) is not None
+        ]
+        ddb.put_item(
+            TableName=registry_table,
+            Item={
+                "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+                "sk": {"S": "REPROMOTE"},
+                "started_at": {"S": started_at},
+                "completed_at": {"S": completed_at},
+                "target_version_id": {"S": target.version_id},
+                "new_version_id": {"S": new_version_id},
+                "requested_by": {"S": requested_by or ""},
+                "copied": {"L": [{"S": k} for k in copied_vkeys]},
+                "deleted": {"L": [{"S": k} for k in deleted_vkeys]},
+                "total": {"N": str(len(copied_vkeys) + len(deleted_vkeys))},
+            },
+        )
+        _set_status_row(
+            ddb,
+            registry_table=registry_table,
+            data_domain=data_domain,
+            dataset=dataset,
+            status="complete",
+            detail=f"repromoted to {label}",
+        )
+        return {
+            "status": "complete",
+            "copied": len(copied),
+            "deleted": len(deleted),
+            "target_version_id": target.version_id,
+            "new_version_id": new_version_id,
+            "converged": False,
+        }
+    except ValueError as e:  # oversized restore refused — release + 400
+        _set_status_row(
+            ddb,
+            registry_table=registry_table,
+            data_domain=data_domain,
+            dataset=dataset,
+            status="failed",
+            detail=f"repromote failed: {e}",
+        )
+        raise ApiError(400, str(e)) from e
+    except Exception as e:  # noqa: BLE001 - release the lease, surface a 502
+        _set_status_row(
+            ddb,
+            registry_table=registry_table,
+            data_domain=data_domain,
+            dataset=dataset,
+            status="failed",
+            detail=f"repromote failed: {type(e).__name__}",
+        )
+        raise ApiError(502, f"repromote failed: {e}") from e
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_repromote_status(
+    ddb,
+    *,
+    registry_table: str,
+    freshness_table: str,
+    data_domain: str,
+    dataset: str,
+) -> dict[str, Any]:
+    """Convergence poll for the last repromote (+ dead-lease detection).
+
+    The product-level "repromote is done" is the vector index serving the
+    promoted content: a touched key is converged when its ``VEC#<key>``
+    freshness row's ``updated_at`` (advanced by reindex only AFTER the vector
+    work succeeds) is >= the repromote's ``started_at`` minus a clock-skew
+    epsilon. Also detects a repromote that died mid-write (status row stuck
+    ``queued`` with ``mode=repromote`` past the writer's possible lifetime) and
+    answers ``stalled_lease`` + ``can_retry`` so the UI offers one-click retry —
+    the retry POST steals the dead lease via the takeover clause.
+    """
+    pk = f"HARVEST#{data_domain}#{dataset}"
+    now = datetime.now(timezone.utc)
+
+    status_item = ddb.get_item(
+        TableName=registry_table, Key={"pk": {"S": pk}, "sk": {"S": "STATUS"}}
+    ).get("Item")
+    if (
+        status_item
+        and _s(status_item.get("mode")) == REPROMOTE_MODE
+        and _s(status_item.get("status")) == "queued"
+    ):
+        started_raw = _s(status_item.get("started_at")) or ""
+        started = _parse_iso(started_raw)
+        if started and (now - started).total_seconds() > REPROMOTE_LEASE_STALE_SECONDS:
+            return {
+                "state": "stalled_lease",
+                "can_retry": True,
+                "started_at": started_raw,
+                "target_version_id": _s(status_item.get("repromote_target")) or "",
+                "detail": "a repromote died mid-write; retry to take over its lease",
+            }
+        return {"state": "running", "can_retry": False, "started_at": started_raw}
+
+    rep = ddb.get_item(
+        TableName=registry_table, Key={"pk": {"S": pk}, "sk": {"S": "REPROMOTE"}}
+    ).get("Item")
+    if not rep:
+        raise ApiError(404, f"no repromote recorded for {data_domain}/{dataset}")
+
+    started_at = _s(rep.get("started_at")) or ""
+    copied = [v.get("S", "") for v in rep.get("copied", {}).get("L", [])]
+    deleted = [v.get("S", "") for v in rep.get("deleted", {}).get("L", [])]
+    keys = [k for k in copied + deleted if k]
+    started_dt = _parse_iso(started_at)
+    cutoff = (started_dt - _CONVERGE_EPSILON).isoformat() if started_dt else started_at
+
+    # Freshness rows for every touched key (BatchGetItem pages at 100). Rows
+    # left in UnprocessedKeys after the retries count as pending — honest
+    # "don't know yet" beats claiming convergence.
+    pending: list[str] = []
+    for i in range(0, len(keys), 100):
+        batch = keys[i : i + 100]
+        request: dict[str, Any] = {
+            freshness_table: {
+                "Keys": [
+                    {"pk": {"S": f"VEC#{k}"}, "sk": {"S": "SEQ"}} for k in batch
+                ],
+                "ConsistentRead": True,
+            }
+        }
+        rows: dict[str, str] = {}
+        for _ in range(3):
+            resp = ddb.batch_get_item(RequestItems=request)
+            for item in resp.get("Responses", {}).get(freshness_table, []):
+                rows[_s(item.get("pk")) or ""] = _s(item.get("updated_at")) or ""
+            request = resp.get("UnprocessedKeys") or {}
+            if not request.get(freshness_table):
+                break
+        for k in batch:
+            if rows.get(f"VEC#{k}", "") < cutoff:
+                pending.append(k)
+
+    if not pending:
+        state = "converged"
+    elif started_dt and (now - started_dt).total_seconds() > REPROMOTE_STALL_SECONDS:
+        state = "stalled"
+    else:
+        state = "converging"
+    return {
+        "state": state,
+        "can_retry": state == "stalled",
+        "done": len(keys) - len(pending),
+        "total": len(keys),
+        "pending": pending[:20],
+        "started_at": started_at,
+        "completed_at": _s(rep.get("completed_at")),
+        "target_version_id": _s(rep.get("target_version_id")),
+        "new_version_id": _s(rep.get("new_version_id")),
+        "requested_by": _s(rep.get("requested_by")),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Wiki annotations (user-scoped feedback -> annotation-mode re-harvest)
 # --------------------------------------------------------------------------- #
 #
@@ -2411,6 +2840,8 @@ def _annotation_to_dict(item: dict[str, Any]) -> dict[str, Any]:
         # Tolerate a corrupt N so one bad row can't 500 the whole list read.
         "block_line": _int_or_none(item.get("block_line", {}).get("N")),
         "note": _s(item.get("note")),
+        # "ui" (default) or "agent" — the chat agent filing on the user's behalf.
+        "submitted_via": _s(item.get("submitted_via")) or anno.SUBMITTED_VIA_UI,
         "status": _s(item.get("status")),
         "outcome": _s(item.get("outcome")),
         "resolution": _s(item.get("resolution")),
@@ -2428,11 +2859,12 @@ def create_annotation(
     user_sub: str | None,
     author: str | None,
     concept_id: str,
-    quote: str,
-    note: str,
+    quote: str = "",
+    note: str = "",
     prefix: str = "",
     suffix: str = "",
     block_line: int | None = None,
+    submitted_via: str = "",
 ) -> dict[str, Any]:
     """Persist one open annotation, scoped to the caller.
 
@@ -2440,6 +2872,13 @@ def create_annotation(
     ``suffix`` are the minimal disambiguating context the UI captured; ``note`` is
     the user's feedback. ``author`` is the human-facing label for display only —
     ISOLATION is via ``user_sub`` in the partition key, never ``author``.
+
+    ``quote`` is OPTIONAL: an empty quote is an UNANCHORED note — page-level
+    general feedback, or dataset-level when ``concept_id`` is the
+    ``anno.DATASET_WIDE_CONCEPT`` sentinel. Unanchored notes skip quote
+    re-anchoring in the harvest sweep (they orphan only if the doc vanishes;
+    dataset-wide never). ``submitted_via`` records provenance ("ui" default,
+    "agent" when the chat agent files on the user's behalf).
     """
     user_sub = _require_user_sub(user_sub)
     if not concept_id:
@@ -2452,10 +2891,10 @@ def create_annotation(
         raise ApiError(400, f"invalid concept_id: {concept_id!r}") from e
     quote = (quote or "").strip()
     note = (note or "").strip()
-    if not quote:
-        raise ApiError(400, "missing required field: quote")
     if not note:
         raise ApiError(400, "missing required field: note")
+    if submitted_via not in ("", anno.SUBMITTED_VIA_UI, anno.SUBMITTED_VIA_AGENT):
+        raise ApiError(400, f"invalid submitted_via: {submitted_via!r}")
 
     annotation_id = uuid.uuid4().hex
     now = _now_iso()
@@ -2469,6 +2908,7 @@ def create_annotation(
         "quote": {"S": quote[:_ANNO_QUOTE_MAX]},
         "note": {"S": note[:_ANNO_NOTE_MAX]},
         "status": {"S": anno.STATUS_OPEN},
+        "submitted_via": {"S": submitted_via or anno.SUBMITTED_VIA_UI},
         "created_at": {"S": now},
         "updated_at": {"S": now},
     }
@@ -2820,6 +3260,11 @@ def trigger_annotation_harvest(
         for it in actionable:
             concept_id = _s(it.get("concept_id")) or ""
             quote = _s(it.get("quote")) or ""
+            # Dataset-wide notes anchor to the dataset itself, not a doc: the
+            # sweep only runs on a registered dataset, so they never orphan.
+            if concept_id == anno.DATASET_WIDE_CONCEPT:
+                survivors.append(it)
+                continue
             body = _load_body(concept_id)
             if anno.is_orphaned(body, quote):
                 _resolve_annotation(

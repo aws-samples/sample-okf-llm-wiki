@@ -2,14 +2,22 @@ import { Fragment, useCallback, useEffect, useMemo, useState } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import {
+  AlertTriangleIcon,
   ChevronRightIcon,
   FileTextIcon,
   FolderIcon,
   FolderOpenIcon,
+  HistoryIcon,
   MessageSquareTextIcon,
+  XIcon,
 } from "lucide-react"
 
 import { CodeView } from "@/components/chat/CodeView"
+import {
+  useVersionHistory,
+  VersionDiffPane,
+  VersionFilePane,
+} from "@/components/VersionHistory"
 import { buildTree, parseDocument, resolveConceptLink } from "@/lib/bundle"
 import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -111,6 +119,15 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange, picker }) {
     setSelectedId(concept || null)
   }, [concept])
 
+  // Version-history pane state: null = normal doc view; {} opens it on the
+  // default last-harvest diff; { to: "live" } opens it comparing the last good
+  // version against the working files (the interrupted-harvest review).
+  const [versionMode, setVersionMode] = useState(null)
+  // Harvest status (ready + last status row) for the interrupted-harvest
+  // banner: cancelled/failed with ready=false means the live bundle is a
+  // half-written state no complete marker ever blessed.
+  const [bundleState, setBundleState] = useState(null)
+
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -122,6 +139,11 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange, picker }) {
     } finally {
       setLoading(false)
     }
+    // Best-effort, non-blocking: the banner degrades off if this fails.
+    api
+      .harvestStatus(domain, dataset)
+      .then(setBundleState)
+      .catch(() => setBundleState(null))
   }, [api, domain, dataset])
 
   useEffect(() => {
@@ -176,11 +198,30 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange, picker }) {
   // (instant tree highlight + fetch) AND the URL (for history/back-forward).
   const openConcept = useCallback(
     (conceptId) => {
+      setVersionMode(null) // picking a doc always returns to the doc view
       setSelectedId(conceptId)
       onConceptChange?.(conceptId)
     },
     [onConceptChange]
   )
+
+  const interrupted = Boolean(
+    bundleState &&
+      bundleState.ready === false &&
+      ["cancelled", "failed"].includes(bundleState.status?.status)
+  )
+
+  // Version-history state, shared by BOTH panes while versionMode is open:
+  // the left pane lists the changed files (with status filters), the right
+  // pane owns the pickers/restore controls and the selected file's diff.
+  const vh = useVersionHistory({
+    api,
+    domain,
+    dataset,
+    active: Boolean(versionMode),
+    initialTo: versionMode?.to,
+    onRestored: load,
+  })
 
   // Annotations for this dataset (user-scoped server-side). Shared by the
   // in-doc selection popover and the slide-in sidebar so both stay in sync.
@@ -206,6 +247,28 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange, picker }) {
     // split by a border, the tree pane tinted so the halves read apart);
     // annotations live in a slide-in Sheet.
     <div className="flex min-h-0 flex-1 flex-col md:h-full">
+      {interrupted && !versionMode ? (
+        <Alert className="mb-3">
+          <AlertTriangleIcon />
+          <AlertTitle>Interrupted harvest</AlertTitle>
+          <AlertDescription className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <span>
+              The last harvest was {bundleState.status.status} mid-write, so the
+              published docs may be a half-written state. Review what it changed
+              and restore the last good version.
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="shrink-0"
+              onClick={() => setVersionMode({ to: "live" })}
+            >
+              <HistoryIcon className="size-3.5" />
+              Review &amp; restore
+            </Button>
+          </AlertDescription>
+        </Alert>
+      ) : null}
       <Card className="grid min-h-0 flex-1 grid-cols-1 gap-0 overflow-hidden py-0 md:grid-rows-1 md:grid-cols-[minmax(240px,320px)_1fr]">
         <div className="flex min-h-0 flex-col border-b bg-muted/40 max-md:h-[40vh] md:border-r md:border-b-0">
           {/* Equal-height header rows (h-12) in BOTH panes + the same fade
@@ -213,12 +276,16 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange, picker }) {
           <div className="flex h-12 shrink-0 items-center justify-between gap-2 px-4">
             {picker ?? <CardTitle className="text-sm">Concepts</CardTitle>}
             <span className="shrink-0 text-xs text-muted-foreground">
-              {files.length} file{files.length === 1 ? "" : "s"}
+              {versionMode
+                ? `${vh.files.length} changed`
+                : `${files.length} file${files.length === 1 ? "" : "s"}`}
             </span>
           </div>
           <div className="h-px shrink-0 bg-gradient-to-r from-transparent via-border/60 to-transparent" />
-          <div className="min-h-0 flex-1">
-          {error ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+          {versionMode ? (
+            <VersionFilePane vh={vh} />
+          ) : error ? (
             <div className="p-4">
               <Alert variant="destructive">
                 <AlertTitle>Failed to list bundle</AlertTitle>
@@ -265,35 +332,65 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange, picker }) {
             the track shrink so the inner ScrollArea + label-grid/CodeView scroll. */}
         <div className="flex min-h-0 min-w-0 flex-col max-md:h-[60vh]">
           <div className="flex h-12 shrink-0 flex-row items-center justify-between gap-2 px-4">
-          {selectedId ? (
+          {versionMode ? (
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <HistoryIcon className="size-4 text-muted-foreground" />
+              Version history
+            </CardTitle>
+          ) : selectedId ? (
             <ConceptBreadcrumb conceptId={selectedId} />
           ) : (
             <CardTitle className="text-sm text-muted-foreground">
               No file selected
             </CardTitle>
           )}
-          {/* Open the annotations panel. The badge shows how many of the
-              caller's notes are still open (unresolved) for this dataset. */}
-          <Button
-            variant="outline"
-            size="sm"
-            className="shrink-0"
-            onClick={() => setAnnotationsOpen(true)}
-          >
-            <MessageSquareTextIcon className="size-3.5" />
-            Annotations
-            {openCount > 0 && (
-              <Badge variant="secondary" className="ml-1">
-                {openCount}
-              </Badge>
+          <div className="flex shrink-0 items-center gap-2">
+            {versionMode ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setVersionMode(null)}
+              >
+                <XIcon className="size-3.5" />
+                Close
+              </Button>
+            ) : (
+              <>
+                {/* Compare/restore published bundle versions. */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setVersionMode({})}
+                >
+                  <HistoryIcon className="size-3.5" />
+                  History
+                </Button>
+                {/* Open the annotations panel. The badge shows how many of the
+                    caller's notes are still open (unresolved) for this dataset. */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setAnnotationsOpen(true)}
+                >
+                  <MessageSquareTextIcon className="size-3.5" />
+                  Annotations
+                  {openCount > 0 && (
+                    <Badge variant="secondary" className="ml-1">
+                      {openCount}
+                    </Badge>
+                  )}
+                </Button>
+              </>
             )}
-          </Button>
+          </div>
           </div>
           <div className="h-px shrink-0 bg-gradient-to-r from-transparent via-border/60 to-transparent" />
           <div className="min-h-0 flex-1">
             <ScrollArea className="okf-doc-scroll h-full">
             <div className="min-w-0 p-5">
-              {loadingDoc ? (
+              {versionMode ? (
+                <VersionDiffPane vh={vh} />
+              ) : loadingDoc ? (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Spinner />
                   Loading…

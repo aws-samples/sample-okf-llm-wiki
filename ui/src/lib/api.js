@@ -151,14 +151,47 @@ export function makeApi(token) {
     // Bundle browsing
     listBundle: (domain, dataset) =>
       request(token, "GET", `/bundle/${domain}/${dataset}`),
-    readBundleFile: (domain, dataset, key) =>
+    // `version` (optional) reads a specific S3 object version — the rich diff
+    // view fetches both sides of a file this way (works under a delete marker,
+    // so a removed file's old content stays readable).
+    readBundleFile: (domain, dataset, key, version) =>
       request(
         token,
         "GET",
-        `/bundle/${domain}/${dataset}/file?key=${encodeURIComponent(key)}`
+        `/bundle/${domain}/${dataset}/file?key=${encodeURIComponent(key)}` +
+          (version ? `&version=${encodeURIComponent(version)}` : "")
       ),
     bundleGraph: (domain, dataset) =>
       request(token, "GET", `/bundle/${domain}/${dataset}/graph`),
+
+    // Bundle version history (reconstructed server-side from S3 object
+    // versions; a version = one completed harvest/repromote). Diff selectors
+    // are marker version_ids from listBundleVersions; both optional (default:
+    // previous -> current). `to` may be the sentinel "live" to inspect what an
+    // interrupted harvest half-wrote.
+    listBundleVersions: (domain, dataset) =>
+      request(token, "GET", `/bundle/${domain}/${dataset}/versions`),
+    bundleDiff: (domain, dataset, from, to) => {
+      const qs = new URLSearchParams()
+      if (from) qs.set("from", from)
+      if (to) qs.set("to", to)
+      const q = qs.toString()
+      return request(
+        token,
+        "GET",
+        `/bundle/${domain}/${dataset}/diff${q ? `?${q}` : ""}`
+      )
+    },
+    // Make an older version the new head (append-only restore; 409 while a
+    // harvest holds the dataset lease). Poll repromoteStatus until
+    // state === "converged" — the vector index serves the promoted content
+    // only then. stalled_lease/stalled + can_retry mean re-POST repromote.
+    repromote: (domain, dataset, versionId) =>
+      request(token, "POST", `/bundle/${domain}/${dataset}/repromote`, {
+        version_id: versionId,
+      }),
+    repromoteStatus: (domain, dataset) =>
+      request(token, "GET", `/bundle/${domain}/${dataset}/repromote`),
 
     // Annotations (user-scoped feedback on concept docs). All calls are scoped
     // server-side to the caller's Cognito sub — you only ever see/act on your

@@ -515,6 +515,10 @@ def build_deps(config: Any = None):
         "ddb": boto3.resource("dynamodb", region_name=region).Table(
             consumption_config.registry_table
         ),
+        # The agent's submit_annotation writes here on the user's behalf.
+        "annotations": boto3.resource("dynamodb", region_name=region).Table(
+            chat_config.annotations_table
+        ),
     }
     # Athena client for the optional read-only SQL tool — only built when the
     # deploy flag is on (else the role has no Glue/Athena grants anyway).
@@ -591,6 +595,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     # flags are on (build_deps).
     athena_client = clients.pop("athena", None)
     redshift_data_client = clients.pop("redshift_data", None)
+    annotations_table = clients.pop("annotations", None)
     tools_impl = build_consumption_tools(config=consumption_config, **clients)
 
     def _sql_engine() -> AthenaSQL | None:
@@ -667,6 +672,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         scope: dict | None,
         checkpointer: Any,
         features: set[str] | None = None,
+        user_sub: str = "",
     ):
         chat_model = build_chat_model(chat_config, model, effort)
         agent_tools = make_agent_tools(tools_impl, dataset_scope=scope)
@@ -680,6 +686,20 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # the tool is inert and AskHumanMiddleware owns the interrupt. The <asking_the_user>
         # prompt block covers when to use it, so the base prompt already knows about it.
         agent_tools = [*agent_tools, make_ask_human_tool()]
+        # submit_annotation: available on EVERY run with a verified subject —
+        # the tool files feedback in the user's name (their sub keys the
+        # partition). Scoped runs inject data_domain/dataset like the read
+        # tools; unscoped runs expose them as required args. Its description
+        # instructs the model to confirm with the user before filing.
+        if annotations_table is not None and user_sub:
+            from chat.tools import make_submit_annotation_tool
+
+            agent_tools = [
+                *agent_tools,
+                make_submit_annotation_tool(
+                    annotations_table, user_sub=user_sub, dataset_scope=scope
+                ),
+            ]
         # Optional read-only SQL: both the deploy flag (engine present) and the
         # per-run opt-in (features) are required. system_prompt gains a block so
         # the model knows the tool exists this turn. The ENGINE is picked by the
@@ -806,11 +826,20 @@ def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
     turns: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     turn_scope: dict[str, str] | None = None
+    turn_stats: dict[str, int] = {}
+
+    def _end_event() -> dict[str, Any]:
+        # Checkpointed AIMessages retain their usage_metadata, so a reloaded
+        # turn carries the SAME token_stats the live end chunk had — the UI's
+        # usage gauge works identically on history.
+        return {"end": True, "token_stats": turn_stats} if turn_stats else {"end": True}
+
     for msg in messages:
         if isinstance(msg, HumanMessage):
             if current:
-                current["aiMessage"].append({"end": True})
+                current["aiMessage"].append(_end_event())
                 turns.append(current)
+            turn_stats = {}
             # Recover the turn's dataset scope from the stored [Scope: …] preamble
             # BEFORE stripping it, so this turn's tool events can name the dataset
             # (the stored tool_call args lack it — see _with_scope).
@@ -826,6 +855,8 @@ def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
             # Reasoning + answer text in content order (reasoning first), then the
             # tool starts this message issued — mirrors the live stream order so a
             # reloaded turn renders identically (reasoning included).
+            if getattr(msg, "usage_metadata", None):
+                _add_usage(turn_stats, msg.usage_metadata)
             current["aiMessage"].extend(_ai_events(msg.content))
             for tc in msg.tool_calls or []:
                 name = (
@@ -855,9 +886,36 @@ def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
                 }
             )
     if current:
-        current["aiMessage"].append({"end": True})
+        current["aiMessage"].append(_end_event())
         turns.append(current)
     return turns
+
+
+def _add_usage(stats: dict[str, int], u: dict) -> None:
+    """Fold one message's ``usage_metadata`` into a turn's token_stats.
+
+    Single accumulation authority for the live stream and the history fold.
+    langchain_aws quirk (same fix as harvest.steps): with per-TTL cacheDetails
+    present, ``cache_creation`` is ZEROED and the real counts sit in the
+    ephemeral buckets — max() covers both shapes without double-counting the
+    native langchain_anthropic shape.
+    """
+    details = u.get("input_token_details", {}) or {}
+    stats["input_tokens"] = stats.get("input_tokens", 0) + (u.get("input_tokens") or 0)
+    stats["output_tokens"] = stats.get("output_tokens", 0) + (
+        u.get("output_tokens") or 0
+    )
+    stats["cache_read_input_tokens"] = stats.get("cache_read_input_tokens", 0) + (
+        details.get("cache_read") or 0
+    )
+    cache_write = max(
+        int(details.get("cache_creation") or 0),
+        int(details.get("ephemeral_5m_input_tokens") or 0)
+        + int(details.get("ephemeral_1h_input_tokens") or 0),
+    )
+    stats["cache_creation_input_tokens"] = (
+        stats.get("cache_creation_input_tokens", 0) + cache_write
+    )
 
 
 def read_history(
@@ -989,7 +1047,9 @@ async def _produce_run_chunks(
                 dataset_scope=scope,
             )
 
-        graph = build_agent(model, effort, scope, checkpointer, features=features)
+        graph = build_agent(
+            model, effort, scope, checkpointer, features=features, user_sub=user_sub
+        )
         on_graph(graph)
 
         # Resume a paused ask_human interrupt with the user's answers, OR start a
@@ -1027,20 +1087,7 @@ async def _produce_run_chunks(
             if mode == "messages":
                 chunk = data[0] if isinstance(data, (list, tuple)) else data
                 if isinstance(chunk, AIMessageChunk) and chunk.usage_metadata:
-                    u = chunk.usage_metadata
-                    details = u.get("input_token_details", {}) or {}
-                    token_stats["input_tokens"] = token_stats.get("input_tokens", 0) + (
-                        u.get("input_tokens") or 0
-                    )
-                    token_stats["output_tokens"] = token_stats.get("output_tokens", 0) + (
-                        u.get("output_tokens") or 0
-                    )
-                    token_stats["cache_read_input_tokens"] = token_stats.get(
-                        "cache_read_input_tokens", 0
-                    ) + (details.get("cache_read") or 0)
-                    token_stats["cache_creation_input_tokens"] = token_stats.get(
-                        "cache_creation_input_tokens", 0
-                    ) + (details.get("cache_creation") or 0)
+                    _add_usage(token_stats, chunk.usage_metadata)
 
             produced = process_stream_data(mode, data, scope)
             if not produced:

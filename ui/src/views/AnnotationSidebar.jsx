@@ -217,15 +217,29 @@ function AnnotationCard({ ann, onOpenConcept, onDelete, deleting }) {
     // note reads as a distinct object.
     <li className="flex flex-col gap-1.5 rounded-xl border border-border/60 bg-card p-3 text-sm shadow-sm">
       <div className="flex items-center justify-between gap-2">
-        <OutcomeBadge status={ann.status} outcome={ann.outcome} />
-        <button
-          type="button"
-          className="truncate font-mono text-xs text-muted-foreground hover:text-foreground hover:underline"
-          title={ann.concept_id}
-          onClick={() => onOpenConcept?.(ann.concept_id)}
-        >
-          {ann.concept_id}
-        </button>
+        <span className="flex items-center gap-1.5">
+          <OutcomeBadge status={ann.status} outcome={ann.outcome} />
+          {/* Filed by the chat agent on the user's behalf (provenance). */}
+          {ann.submitted_via === "agent" && (
+            <Badge variant="outline" className="text-[10px]">
+              agent
+            </Badge>
+          )}
+        </span>
+        {ann.concept_id === "_dataset" ? (
+          <span className="truncate font-mono text-xs text-muted-foreground">
+            whole dataset
+          </span>
+        ) : (
+          <button
+            type="button"
+            className="truncate font-mono text-xs text-muted-foreground hover:text-foreground hover:underline"
+            title={ann.concept_id}
+            onClick={() => onOpenConcept?.(ann.concept_id)}
+          >
+            {ann.concept_id}
+          </button>
+        )}
       </div>
       {ann.quote && (
         <blockquote className="border-l-2 border-border pl-2 text-xs text-muted-foreground italic">
@@ -309,6 +323,26 @@ export function AnnotationSidebar({
     [api, domain, dataset, reload]
   )
 
+  // Dataset-level general feedback: a note with no selection to anchor to. It
+  // files under the `_dataset` sentinel concept and rides the same annotation
+  // queue -> annotation-harvest loop as anchored notes.
+  const [generalNote, setGeneralNote] = useState("")
+  const [filing, setFiling] = useState(false)
+  const fileGeneral = useCallback(async () => {
+    const note = generalNote.trim()
+    if (!note) return
+    setFiling(true)
+    try {
+      await api.createAnnotation(domain, dataset, "_dataset", note, {})
+      setGeneralNote("")
+      reload()
+    } catch (e) {
+      toast.error(`Could not save feedback: ${e.message || e}`)
+    } finally {
+      setFiling(false)
+    }
+  }, [api, domain, dataset, generalNote, reload])
+
   const renderList = (items, emptyCopy) =>
     items.length === 0 ? (
       <Alert>
@@ -351,6 +385,31 @@ export function AnnotationSidebar({
 
   return (
     <Tabs defaultValue="open" className="flex h-full min-h-0 flex-col gap-3">
+      {/* General feedback: no selection needed — files a dataset-level note
+          (the `_dataset` sentinel) into the same queue as anchored ones. */}
+      <div className="flex flex-col gap-1.5 rounded-xl border border-border/60 bg-card p-2 shadow-sm">
+        <textarea
+          value={generalNote}
+          onChange={(e) => setGeneralNote(e.target.value)}
+          rows={2}
+          placeholder="General feedback about this dataset's docs…"
+          className="w-full resize-none rounded-md bg-transparent px-1.5 py-1 text-sm outline-none placeholder:text-muted-foreground"
+        />
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[11px] text-muted-foreground">
+            Applies to the whole dataset
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-xs"
+            disabled={filing || !generalNote.trim()}
+            onClick={fileGeneral}
+          >
+            {filing ? "Saving…" : "Add feedback"}
+          </Button>
+        </div>
+      </div>
       <TabsList className="w-full">
         <TabsTrigger value="open" className="flex-1">
           Open

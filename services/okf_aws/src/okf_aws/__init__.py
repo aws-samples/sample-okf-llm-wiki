@@ -27,6 +27,16 @@ from okf_aws.s3_bundle import (
     parse_bundle_key,
     state_marker_key,
 )
+from okf_aws.s3_versions import (
+    LIVE_SENTINEL,
+    MarkerVersion,
+    bundle_diff,
+    diff_snapshots,
+    list_complete_markers,
+    live_snapshot,
+    restore_snapshot,
+    snapshot_at,
+)
 
 __all__ = [
     "build_hierarchy_filter",
@@ -48,4 +58,12 @@ __all__ = [
     "is_bundle_ready",
     "parse_bundle_key",
     "state_marker_key",
+    "LIVE_SENTINEL",
+    "MarkerVersion",
+    "bundle_diff",
+    "diff_snapshots",
+    "list_complete_markers",
+    "live_snapshot",
+    "restore_snapshot",
+    "snapshot_at",
 ]

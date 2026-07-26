@@ -44,15 +44,24 @@ def s3_event_record(
     key: str,
     *,
     detail_type: str = "Object Created",
-    sequencer: str = "00000000000000AAAA",
+    sequencer: str | None = "00000000000000AAAA",
     message_id: str = "m1",
     bucket: str = BUNDLE_BUCKET,
+    deletion_type: str | None = None,
 ) -> dict[str, Any]:
-    """Build an SQS record whose body wraps an S3 EventBridge event."""
-    detail = {
-        "bucket": {"name": bucket},
-        "object": {"key": key, "size": 123, "sequencer": sequencer},
-    }
+    """Build an SQS record whose body wraps an S3 EventBridge event.
+
+    ``deletion_type`` mirrors EventBridge's ``detail.deletion-type`` on
+    "Object Deleted" events ("Delete Marker Created" | "Permanently Deleted");
+    ``sequencer=None`` omits the field (lifecycle-expiration deletes are not
+    guaranteed to carry one).
+    """
+    obj: dict[str, Any] = {"key": key, "size": 123}
+    if sequencer is not None:
+        obj["sequencer"] = sequencer
+    detail: dict[str, Any] = {"bucket": {"name": bucket}, "object": obj}
+    if deletion_type is not None:
+        detail["deletion-type"] = deletion_type
     eb_event = {
         "version": "0",
         "source": "aws.s3",
