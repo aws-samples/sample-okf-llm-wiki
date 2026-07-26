@@ -76,6 +76,16 @@ convergence poll). The built-in chat agent additionally gets a
 registered on the consumption MCP server, so external agents see only the
 published bundle, never its history.
 
+**Repromote and the S3 Files mount.** The repromote's two ``state.json``
+writes (``in_progress`` + the fresh ``complete`` marker) are plain ``PutObject``
+calls from the Control API — they carry none of the POSIX file-mode metadata
+the harvest runtime's S3 Files mount stores on mount-written objects, so the
+mount presents the marker READ-ONLY afterward. ``harvest.fsutil.write_text``
+heals this (EACCES → unlink + rewrite; the parent dir is mount-created and
+writable), so the next harvest of a repromoted dataset proceeds normally.
+Restored docs are unaffected: ``CopyObject`` preserves the source object's
+metadata.
+
 **Repromote is append-only**: every file of the target version is
 `CopyObject`-ed from its source `VersionId` onto the same key (S3 mints NEW
 current versions — old ids are never resurrected), live docs absent from the

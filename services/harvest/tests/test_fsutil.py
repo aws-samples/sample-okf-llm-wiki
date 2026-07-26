@@ -110,3 +110,17 @@ def test_clean_on_fresh_dataset_removes_nothing(tmp_path):
     (root / ".harvest" / "state.json").write_text('{"status":"in_progress"}\n')
     assert fsutil.clean_authored_output(root) == []
     assert (root / ".harvest" / "state.json").exists()
+
+
+def test_write_text_heals_read_only_file(tmp_path):
+    """A file the S3 Files mount presents READ-ONLY (its object was written
+    outside the mount — the Control API's repromote rewrites state.json) must
+    not wedge the next harvest: write_text unlinks and rewrites it."""
+    target = tmp_path / ".harvest" / "state.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"status": "complete"}', encoding="utf-8")
+    target.chmod(0o444)  # read-only presentation, writable parent dir
+
+    fsutil.write_text(target, '{"status": "in_progress"}')
+
+    assert target.read_text(encoding="utf-8") == '{"status": "in_progress"}'

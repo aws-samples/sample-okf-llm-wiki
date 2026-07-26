@@ -67,10 +67,24 @@ def mkdirs(path: str | Path) -> Path:
 
 
 def write_text(path: str | Path, text: str) -> None:
-    """``write_text`` that tolerates transient ESTALE and ensures the parent dir."""
+    """``write_text`` that tolerates transient ESTALE and ensures the parent dir.
+
+    Also heals EACCES on files whose S3 object was written OUTSIDE the mount:
+    S3 Files maps object metadata to POSIX permissions, and an object PUT by
+    another principal (the Control API's repromote rewrites
+    ``.harvest/state.json``) carries none of the mount's file-mode metadata, so
+    the mount presents it READ-ONLY — open-for-write raises PermissionError
+    even though the runtime's S3 role may write the key. The enclosing dir was
+    mount-created (writable), so unlink the read-only presentation and rewrite;
+    the fresh file gets normal mount metadata again.
+    """
     p = Path(path)
     mkdirs(p.parent)
-    _retry(lambda: p.write_text(text, encoding="utf-8"), what=f"write {p}")
+    try:
+        _retry(lambda: p.write_text(text, encoding="utf-8"), what=f"write {p}")
+    except PermissionError:
+        p.unlink(missing_ok=True)
+        _retry(lambda: p.write_text(text, encoding="utf-8"), what=f"rewrite {p}")
 
 
 def clean_authored_output(dataset_root: str | Path) -> list[str]:
