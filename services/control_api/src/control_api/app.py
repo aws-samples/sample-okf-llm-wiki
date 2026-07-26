@@ -589,7 +589,8 @@ def _r_create_annotation(cfg, params, body, query, caller):
         user_sub=caller.sub,
         author=caller.ident,
         concept_id=handlers._require(body, "concept_id"),
-        quote=handlers._require(body, "quote"),
+        # Optional: empty/missing = an UNANCHORED (page- or dataset-level) note.
+        quote=str(body.get("quote") or ""),
         note=handlers._require(body, "note"),
         prefix=body.get("prefix") or "",
         suffix=body.get("suffix") or "",
@@ -800,6 +801,7 @@ def _r_bundle_file(cfg, params, body, query, caller):
         data_domain=params["domain"],
         dataset=params["dataset"],
         key=key,
+        version_id=query.get("version") or "",
     )
 
 
@@ -807,6 +809,51 @@ def _r_bundle_graph(cfg, params, body, query, caller):
     return 200, handlers.bundle_graph(
         cfg.s3,
         bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_bundle_versions(cfg, params, body, query, caller):
+    return 200, handlers.list_bundle_versions(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_bundle_diff(cfg, params, body, query, caller):
+    # Both selectors optional: defaults answer "what changed in the last
+    # harvest"; `to=live` diffs against the working state (interrupted runs).
+    return 200, handlers.get_bundle_diff(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        from_version=query.get("from") or "",
+        to_version=query.get("to") or "",
+    )
+
+
+def _r_repromote_bundle(cfg, params, body, query, caller):
+    return 200, handlers.repromote_bundle(
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        version_id=str(handlers._require(body, "version_id")),
+        requested_by=caller.ident,
+    )
+
+
+def _r_repromote_status(cfg, params, body, query, caller):
+    return 200, handlers.get_repromote_status(
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        freshness_table=cfg.freshness_table,
         data_domain=params["domain"],
         dataset=params["dataset"],
     )
@@ -867,6 +914,12 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("DELETE", "/chat/threads/{thread_id}", _r_delete_chat_thread),
     ("GET", "/bundle/{domain}/{dataset}/graph", _r_bundle_graph),
     ("GET", "/bundle/{domain}/{dataset}/file", _r_bundle_file),
+    # Bundle version history (reconstructed from S3 object versions), diff, and
+    # repromote; POST repromotes, GET polls its vector-index convergence.
+    ("GET", "/bundle/{domain}/{dataset}/versions", _r_bundle_versions),
+    ("GET", "/bundle/{domain}/{dataset}/diff", _r_bundle_diff),
+    ("POST", "/bundle/{domain}/{dataset}/repromote", _r_repromote_bundle),
+    ("GET", "/bundle/{domain}/{dataset}/repromote", _r_repromote_status),
     ("GET", "/bundle/{domain}/{dataset}", _r_list_bundle),
 ]
 

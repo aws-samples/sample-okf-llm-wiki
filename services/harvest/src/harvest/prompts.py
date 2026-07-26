@@ -541,6 +541,11 @@ EACH annotation:
    (use `prefix`/`suffix` to pick the right occurrence if it appears more than
    once; `block_line` is only a hint). If the exact text moved or was reworded,
    locate the passage it's about by meaning — the feedback is about that content.
+   **Unanchored feedback:** an EMPTY `quote` is page-level general feedback —
+   read the whole doc for `concept_id` and judge where it applies. A
+   `concept_id` of `_dataset` is DATASET-level feedback with no single home:
+   verify it against the data, then edit WHEREVER it implicates (the dataset
+   doc, a table doc, a reference — possibly several).
 2. **Assess it against LIVE data.** Treat `note` as a hypothesis and CONFIRM or
    REFUTE it with `run_sql` / `sample_rows` (and `.metadata/`), per the skill's
    ⟪DIALECT⟫ rules. "The grain is per-race not per-result" → measure it. "Status

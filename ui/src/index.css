@@ -646,6 +646,72 @@
   100% { background-position: -150% 0; }
 }
 
+/* @git-diff-view ships GitHub's palette, whose dark surfaces are distinctly
+   BLUE (#0d1117 line background, #131d2e/#0c2d6b hunk rows) and clash with the
+   app's neutral dark theme. Re-skin every neutral surface onto the app tokens
+   (both themes, so light's blue hunk rows go too); the green/red add/del tints
+   are kept — they ARE the app's diff color coding. The extra .okf-diffview
+   ancestor wins the specificity tie against the library stylesheet, which
+   loads after index.css in the bundle. */
+.okf-diffview .diff-tailwindcss-wrapper[data-theme="light"] .diff-style-root,
+.okf-diffview .diff-tailwindcss-wrapper[data-theme="dark"] .diff-style-root {
+  --diff-border--: var(--border);
+  --diff-plain-content--: transparent;
+  --diff-empty-content--: color-mix(in oklch, var(--foreground) 3%, transparent);
+  --diff-expand-content--: color-mix(in oklch, var(--foreground) 3%, transparent);
+  --diff-plain-lineNumber--: color-mix(in oklch, var(--foreground) 3%, transparent);
+  --diff-expand-lineNumber--: color-mix(
+    in oklch,
+    var(--foreground) 3%,
+    transparent
+  );
+  --diff-plain-lineNumber-color--: var(--muted-foreground);
+  --diff-expand-lineNumber-color--: var(--muted-foreground);
+  --diff-hunk-content--: color-mix(in oklch, var(--foreground) 5%, transparent);
+  --diff-hunk-lineNumber--: color-mix(in oklch, var(--foreground) 8%, transparent);
+  --diff-hunk-lineNumber-hover--: var(--primary);
+  --diff-hunk-content-color--: var(--muted-foreground);
+}
+/* The library hard-codes `color: white` for dark-mode text; use the theme's
+   foreground so the diff text matches the rest of the app. */
+.okf-diffview .diff-tailwindcss-wrapper[data-theme="dark"] [data-state="diff"],
+.okf-diffview .diff-tailwindcss-wrapper[data-theme="dark"] [data-state="plain"],
+.okf-diffview .diff-tailwindcss-wrapper[data-theme="dark"] [data-state="hunk"] {
+  color: var(--foreground);
+}
+
+/* Rendered ("rich") markdown diff (VersionHistory RichDiff): htmldiff-js marks
+   changes with <ins>/<del> inside the merged rendered document. Translucent
+   overlays work on both themes; del keeps its strikethrough for scannability.
+   Injected HTML bypasses the react-markdown component overrides, so bare
+   tables get minimal styling of their own here. */
+.okf-richdiff ins {
+  text-decoration: none;
+  border-radius: 2px;
+  padding: 0 1px;
+  background-color: rgba(16, 185, 129, 0.16);
+}
+.okf-richdiff del {
+  border-radius: 2px;
+  padding: 0 1px;
+  background-color: rgba(244, 63, 94, 0.14);
+}
+.okf-richdiff table {
+  margin: 0.75rem 0;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.okf-richdiff th,
+.okf-richdiff td {
+  border: 1px solid var(--border);
+  padding: 0.375rem 0.625rem;
+  text-align: left;
+}
+.okf-richdiff th {
+  background-color: color-mix(in oklch, var(--foreground) 4%, transparent);
+  font-weight: 600;
+}
+
 /* Chat transcript top/bottom fade. shadcn's `scroll-fade-*` utilities (built on
    the scroll-timeline API) get split into a lazy CSS chunk by Vite and don't
    reliably land on the chat viewport, so we own an explicit, always-emitted mask

@@ -104,6 +104,30 @@ class FakeConsumptionTools:
         )
         return []
 
+    def get_bundle_diff(
+        self,
+        data_domain: str,
+        dataset: str,
+        from_version: str = "",
+        to_version: str = "",
+        max_files: int = 20,
+    ) -> dict:
+        """Diff two published versions of this dataset's docs."""
+        self._record(
+            "get_bundle_diff",
+            data_domain=data_domain,
+            dataset=dataset,
+            from_version=from_version,
+            to_version=to_version,
+            max_files=max_files,
+        )
+        return {
+            "summary": {"added": 0, "removed": 0, "modified": 0, "unchanged": 0},
+            "files": [],
+            "truncated": False,
+            "versions": [],
+        }
+
 
 CHAT_CATALOG = [
     {

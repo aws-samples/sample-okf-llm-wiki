@@ -134,3 +134,17 @@ variable "chat_checkpoint_offload_expire_days" {
   description = "Days before offloaded chat-checkpoint blobs in S3 expire. Keep >= the chat checkpoint TTL (compute var.chat_checkpoint_ttl_seconds) so live threads never lose offloaded state; orphans from deleted threads age out with the same rule."
   default     = 90
 }
+
+variable "bundle_version_retention_days" {
+  type        = number
+  description = <<-EOT
+    Days a NONCURRENT bundle object version is retained before lifecycle expiry.
+    This is the REPROMOTE WINDOW: versions older than this silently drop out of
+    the version history and become un-restorable (the 3 newest noncurrent
+    versions of every key are always kept regardless of age, so even dormant
+    datasets retain a few repromote targets). Raising it keeps more history at
+    more storage cost; versions expired by this rule are gone — no code guard
+    can bring them back.
+  EOT
+  default     = 90
+}

@@ -371,7 +371,7 @@ def test_stream_run_emits_typed_chunks_and_end_marker():
     cp = InMemorySaver()
     seen = {}
 
-    def build_agent(model, effort, scope, checkpointer, features=None):
+    def build_agent(model, effort, scope, checkpointer, features=None, user_sub=""):
         seen["model"], seen["effort"], seen["scope"] = model, effort, scope
         seen["features"] = features
         return _scripted_graph(checkpointer)
@@ -635,7 +635,7 @@ def test_read_history_folds_messages_into_turns():
 
     cp = InMemorySaver()
 
-    def build_agent(model, effort, scope, checkpointer, features=None):
+    def build_agent(model, effort, scope, checkpointer, features=None, user_sub=""):
         return _scripted_graph(checkpointer)
 
     # Run one turn to populate the checkpoint, then read it back.
@@ -1131,3 +1131,71 @@ def test_sql_glue_scope_still_gets_athena_engine(monkeypatch):
     assert "run_sql" in cap["tools"]
     assert "Athena" in cap["tool_descriptions"]["run_sql"]
     assert "run_sql" in cap["prompt"] and "Redshift" not in cap["prompt"]
+
+
+def test_read_history_end_event_carries_token_stats():
+    """Checkpointed AIMessages retain usage_metadata; the fold sums it per turn
+    onto the end event — so the UI's usage gauge works on reloaded history,
+    including the cacheDetails shape that zeroes cache_creation."""
+    import asyncio as _asyncio
+
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import START, MessagesState, StateGraph
+
+    cp = InMemorySaver()
+
+    def _respond(state):
+        return {
+            "messages": [
+                AIMessage(
+                    content="a1",
+                    usage_metadata={
+                        "input_tokens": 100,
+                        "output_tokens": 10,
+                        "total_tokens": 110,
+                        "input_token_details": {
+                            "cache_read": 40,
+                            "cache_creation": 0,
+                            "ephemeral_5m_input_tokens": 25,
+                            "ephemeral_1h_input_tokens": 5,
+                        },
+                    },
+                ),
+                AIMessage(
+                    content="a2",
+                    usage_metadata={
+                        "input_tokens": 50,
+                        "output_tokens": 7,
+                        "total_tokens": 57,
+                        "input_token_details": {"cache_read": 10, "cache_creation": 3},
+                    },
+                ),
+            ]
+        }
+
+    g = StateGraph(MessagesState)
+    g.add_node("respond", _respond)
+    g.add_edge(START, "respond")
+    graph = g.compile(checkpointer=cp)
+    _asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage(content="q")]},
+            {"configurable": {"thread_id": "alice:conv-u"}},
+        )
+    )
+
+    def build_agent(model, effort, scope, checkpointer, features=None, user_sub=""):
+        return graph
+
+    out = server.read_history(build_agent, cp, "alice:conv-u")
+    turns = out["history"]
+    assert len(turns) == 1
+    end = turns[0]["aiMessage"][-1]
+    assert end["end"] is True
+    stats = end["token_stats"]
+    assert stats["input_tokens"] == 150
+    assert stats["output_tokens"] == 17
+    assert stats["cache_read_input_tokens"] == 50
+    # 25+5 (ephemeral buckets beat the zeroed cache_creation) + 3 (native shape)
+    assert stats["cache_creation_input_tokens"] == 33

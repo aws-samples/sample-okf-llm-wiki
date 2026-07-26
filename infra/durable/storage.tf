@@ -49,6 +49,43 @@ resource "aws_s3_bucket_notification" "bundles" {
   eventbridge = true
 }
 
+# Bound version-history growth: noncurrent bundle versions (old harvests /
+# repromotes) expire after the retention window — this IS the repromote window
+# (see var.bundle_version_retention_days) — but the 3 newest noncurrent versions
+# of every key are ALWAYS kept, so a dormant dataset never loses its last few
+# restore targets to the age rule. A second rule sweeps expired-object delete
+# markers so fully-aged-out keys leave no marker litter.
+#
+# SAFETY COUPLING: expiring a noncurrent version emits "Object Deleted" with
+# deletion-type "Permanently Deleted" for a key whose LIVE doc is untouched.
+# The reindex worker MUST filter those out (services/reindex/handler.py does —
+# only "Delete Marker Created" reaches DeleteVectors) or this rule would delete
+# live docs' vectors daily. Do not enable this rule against an older reindex.
+resource "aws_s3_bucket_lifecycle_configuration" "bundles" {
+  bucket = aws_s3_bucket.bundles.id
+  rule {
+    id     = "expire-noncurrent-bundle-versions"
+    status = "Enabled"
+    filter {
+      prefix = "okf/"
+    }
+    noncurrent_version_expiration {
+      noncurrent_days           = var.bundle_version_retention_days
+      newer_noncurrent_versions = 3
+    }
+  }
+  rule {
+    id     = "sweep-expired-delete-markers"
+    status = "Enabled"
+    filter {
+      prefix = "okf/"
+    }
+    expiration {
+      expired_object_delete_marker = true
+    }
+  }
+}
+
 # --- Bundle-write restriction (threat #26) -----------------------------------
 # OPT-IN (var.restrict_bundle_writers, default OFF). Denies PutObject/DeleteObject
 # under the authored prefix okf/* to any principal NOT in var.bundle_writer_role_arns

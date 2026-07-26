@@ -16,7 +16,7 @@ def _by_name(tools):
     return {t.name: t for t in tools}
 
 
-def test_unscoped_exposes_all_nine_tools_with_location_args():
+def test_unscoped_exposes_all_ten_tools_with_location_args():
     tools = _by_name(make_agent_tools(FakeConsumptionTools()))
     assert set(tools) == {
         "list_domains",
@@ -28,6 +28,7 @@ def test_unscoped_exposes_all_nine_tools_with_location_args():
         "glob",
         "grep",
         "semantic_search",
+        "get_bundle_diff",
     }
     # read_page keeps its location args when unscoped.
     assert set(tools["read_page"].args) == {
@@ -144,3 +145,74 @@ def test_tool_error_handling_works_scoped_too():
     )
     out = tools["read_page"].invoke({"concept_id": "tables/x"})
     assert isinstance(out, str) and out.startswith("Error:")
+
+
+# --- submit_annotation (agent files on the user's behalf) ---------------------
+
+
+class _FakeTable:
+    def __init__(self):
+        self.items = []
+
+    def put_item(self, Item):
+        self.items.append(Item)
+
+
+def test_submit_annotation_files_in_users_partition_with_agent_provenance():
+    import json as _json
+
+    from chat.tools import make_submit_annotation_tool
+
+    table = _FakeTable()
+    tool = make_submit_annotation_tool(
+        table,
+        dataset_scope={"data_domain": "sales", "dataset": "orders"},
+        user_sub="sub-123",
+    )
+    out = _json.loads(
+        tool.func(note="join cardinality is wrong", concept_id="tables/races")
+    )
+    assert out["status"] == "filed" and out["dataset_wide"] is False
+    item = table.items[0]
+    assert item["pk"] == "ANNO#sales#orders#sub-123"  # isolation via verified sub
+    assert item["submitted_via"] == "agent"
+    assert item["quote"] == ""  # agent notes are unanchored
+    assert item["status"] == "open"
+
+
+def test_submit_annotation_defaults_to_dataset_wide_sentinel():
+    import json as _json
+
+    from chat.tools import make_submit_annotation_tool
+
+    table = _FakeTable()
+    tool = make_submit_annotation_tool(
+        table,
+        dataset_scope={"data_domain": "sales", "dataset": "orders"},
+        user_sub="sub-123",
+    )
+    out = _json.loads(tool.func(note="docs miss the late-arriving-data caveat"))
+    assert out["dataset_wide"] is True and out["concept_id"] == "_dataset"
+    assert table.items[0]["sk"].startswith("_dataset#")
+    # Bad input comes back as a tool-result error, never a raise.
+    err = _json.loads(tool.func(note="x", concept_id="bad##id"))
+    assert "invalid concept_id" in err["error"]
+    assert len(table.items) == 1
+
+
+def test_submit_annotation_unscoped_takes_dataset_args():
+    import json as _json
+
+    from chat.tools import make_submit_annotation_tool
+
+    table = _FakeTable()
+    tool = make_submit_annotation_tool(table, user_sub="sub-9")
+    # The model must name the dataset explicitly when the run isn't scoped.
+    assert {"note", "data_domain", "dataset", "concept_id"} <= set(tool.args)
+    out = _json.loads(
+        tool.func(note="stale enum", data_domain="sales", dataset="orders")
+    )
+    assert out["status"] == "filed"
+    assert table.items[0]["pk"] == "ANNO#sales#orders#sub-9"
+    err = _json.loads(tool.func(note="x", data_domain="", dataset="orders"))
+    assert "required" in err["error"]

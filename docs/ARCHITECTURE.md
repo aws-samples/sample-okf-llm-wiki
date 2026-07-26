@@ -25,6 +25,25 @@ float32, non-filterable `title`/`description`/`s3_key`) are immutable in S3
 Vectors, so they live in one place — `okf_core/embedding.py` and
 `infra/durable/storage.tf` — and changing them means a `-replace`.
 
+**Bundle versions are reconstructed, not recorded.** Because `finalize_bundle`
+writes the `.harvest/state.json` commit marker LAST on a versioned bucket, each
+`complete` marker version already delimits one published bundle version — so the
+version history / diff / repromote feature (`okf_aws/s3_versions.py`, the
+`/bundle/{d}/{ds}/versions|diff|repromote` endpoints, the Browse History pane)
+reconstructs snapshots from `list_object_versions` instead of writing a manifest
+at finalize. That makes all pre-feature history browsable retroactively and lets
+lifecycle-expired versions drop out cleanly (nothing dangles). Repromote is
+append-only — `CopyObject` from source `VersionId`s mints a new head, a fresh
+marker records `repromoted_from`/`repromoted_by` — and the untouched reindex
+pipeline re-converges the vector index from the resulting object events; the
+Control API reads convergence off the freshness table's `VEC#` rows and the UI
+declares success only when the index has caught up. Repromote does not pin
+against Glue drift on purpose: the catalog stays upstream truth, and the next
+real schema change may harvest over a restored version. The one reindex-side
+obligation is filtering `Object Deleted` events by deletion-type, since the
+retention lifecycle rule permanently expires noncurrent versions of keys whose
+live docs are untouched (see CONVENTIONS.md "Bundle versions & repromote").
+
 **One harvest runtime, one `okf/`-rooted S3 Files mount, per-dataset containment
 via `virtual_mode`.** `harvest/agent.py` builds a
 `FilesystemBackend(root_dir=/mnt/data/<domain>/<dataset>, virtual_mode=True)`

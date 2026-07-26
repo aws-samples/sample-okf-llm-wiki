@@ -111,6 +111,12 @@ function ChatMessageImpl({ turn, streaming, datasetScope }) {
   // Show the action bar only once the turn is finished (not mid-stream) and it
   // actually produced an answer.
   const showActions = !streaming && isEnd && answerText.length > 0
+  // The terminal end chunk carries the turn's token_stats (live turns only —
+  // history reloads rebuild events from checkpoints, which don't store usage).
+  const tokenStats = useMemo(
+    () => aiEvents.find((e) => e.end && e.token_stats)?.token_stats ?? null,
+    [aiEvents]
+  )
 
   return (
     <div className="flex flex-col gap-5">
@@ -153,7 +159,9 @@ function ChatMessageImpl({ turn, streaming, datasetScope }) {
               />
             )
           })}
-          {showActions ? <ResponseActions text={answerText} /> : null}
+          {showActions ? (
+            <ResponseActions text={answerText} stats={tokenStats} />
+          ) : null}
         </div>
       </div>
     </div>

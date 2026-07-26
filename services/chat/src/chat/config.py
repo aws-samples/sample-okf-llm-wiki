@@ -78,6 +78,11 @@ class ChatConfig:
     # Model selection.
     catalog: list[dict[str, Any]]
     default_model: str = DEFAULT_MODEL
+
+    # Wiki annotations (the agent's submit_annotation writes on the user's
+    # behalf). Same table the Control API + harvest reconcile use. Defaulted
+    # (dataclass ordering) but always set from OKF_ANNOTATIONS_TABLE in from_env.
+    annotations_table: str = "okf-annotations"
     default_effort: str = DEFAULT_EFFORT
     default_max_tokens: int = DEFAULT_MAX_TOKENS
 
@@ -125,6 +130,7 @@ class ChatConfig:
             vector_bucket=env["OKF_VECTOR_BUCKET"],
             vector_index=env["OKF_VECTOR_INDEX"],
             registry_table=env.get("OKF_REGISTRY_TABLE", "okf-registry"),
+            annotations_table=env.get("OKF_ANNOTATIONS_TABLE", "okf-annotations"),
             checkpoint_table=env.get("OKF_CHAT_CHECKPOINT_TABLE", "okf-chat-checkpoints"),
             threads_table=env.get("OKF_CHAT_THREADS_TABLE", "okf-chat"),
             catalog=parse_catalog(env.get("OKF_CHAT_MODEL_CATALOG")),

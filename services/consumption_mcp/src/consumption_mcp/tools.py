@@ -43,6 +43,12 @@ _RESERVED_FILES = {"index.md", "log.md"}
 # DoS bounds on client-supplied search inputs (threats #13, #21).
 _GREP_PATTERN_MAX_LEN = 1000  # reject absurdly long regexes outright
 _SEMANTIC_TOP_K_MAX = 20  # cap fan-out per semantic_search (Titan embed + query)
+
+# get_bundle_diff output bounds (agent context is the scarce resource): at most
+# this many per-file entries, each diff capped in lines. Both surface honest
+# `truncated` / `diff_truncated` flags so the agent can narrow, mirroring grep.
+_DIFF_MAX_FILES_CAP = 50
+_DIFF_MAX_LINES_PER_FILE = 100
 _GREP_MAX_RESULTS_CAP = 1000  # hard ceiling on returned grep matches
 
 # Catastrophic-backtracking heuristic (threat #21): the standard ``re`` engine is
@@ -670,3 +676,54 @@ class ConsumptionTools:
                 }
             )
         return results
+
+    # -- get_bundle_diff -------------------------------------------------
+
+    def get_bundle_diff(
+        self,
+        data_domain: str,
+        dataset: str,
+        from_version: str = "",
+        to_version: str = "",
+        max_files: int = 20,
+    ) -> dict[str, Any]:
+        """What changed between two published versions of this dataset's docs.
+
+        DELIBERATELY NOT exposed over the MCP server (no wrapper in
+        server.register_tools): version history is an operator concern, so only
+        the built-in chat agent gets this tool (chat/tools.py _TOOL_NAMES) —
+        external MCP agents see the published bundle only.
+
+        A *version* is one completed harvest (or repromote) of the dataset —
+        identified by an opaque ``version_id``. Both selectors are optional:
+        omitted, the diff answers "what changed in the last harvest" (previous
+        version -> current). Pass version ids from the ``versions`` list this
+        tool returns (newest first, so you can self-serve identifiers without a
+        second call), or ``to_version="live"`` to compare against the current
+        working files. Returns per-file unified diffs with ``summary`` counts;
+        output is bounded — ``max_files`` entries (server cap 50, ``truncated``
+        flag set beyond: narrow with explicit versions) and 100 diff lines per
+        file (``diff_truncated``).
+        """
+        from okf_aws import s3_versions
+
+        max_files = max(1, min(int(max_files), _DIFF_MAX_FILES_CAP))
+        result = s3_versions.bundle_diff(
+            self.s3,
+            bucket=self.config.bundle_bucket,
+            data_domain=data_domain,
+            dataset=dataset,
+            from_version=from_version or "",
+            to_version=to_version or "",
+            max_files=max_files,
+            max_lines_per_file=_DIFF_MAX_LINES_PER_FILE,
+        )
+        markers = s3_versions.list_complete_markers(
+            self.s3,
+            bucket=self.config.bundle_bucket,
+            data_domain=data_domain,
+            dataset=dataset,
+            limit=5,
+        )
+        result["versions"] = [m.descriptor() for m in markers]
+        return result

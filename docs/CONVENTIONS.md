@@ -53,6 +53,48 @@ the dataset listing by `is_domain_dataset()`. Vector key:
 - A bundle is consumable only once `.harvest/state.json` exists with
   `status == "complete"`.
 
+## Bundle versions & repromote
+
+The bundle bucket is versioned, and `finalize_bundle` writes `.harvest/state.json`
+LAST — so version history needs no manifest: a **bundle version** is one
+`status: "complete"` object version of that marker, identified by the marker's
+own S3 `VersionId` and labeled by its `completed_at`. The file set of a version
+is reconstructed on read (`okf_aws.s3_versions`): for every non-dot `.md` under
+the dataset prefix, the newest object version with `LastModified <=` the
+marker's (absent if that entry is a delete marker). `in_progress` marker writes
+delimit nothing and are filtered out — an interrupted (cancelled/crashed)
+harvest therefore never becomes a version; its half-written live state is
+inspectable via the diff `to=live` sentinel and rolled back by repromoting the
+last good version.
+
+Endpoints (Control API): `GET /bundle/{d}/{ds}/versions`,
+`GET /bundle/{d}/{ds}/diff?from=&to=` (both optional — defaults answer "what
+changed in the last harvest"; `to=live` compares against the working files),
+`POST /bundle/{d}/{ds}/repromote {version_id}`, and `GET .../repromote` (the
+convergence poll). The built-in chat agent additionally gets a
+`get_bundle_diff` tool (same module, agent-bounded output) — deliberately NOT
+registered on the consumption MCP server, so external agents see only the
+published bundle, never its history.
+
+**Repromote is append-only**: every file of the target version is
+`CopyObject`-ed from its source `VersionId` onto the same key (S3 mints NEW
+current versions — old ids are never resurrected), live docs absent from the
+target get a delete marker, and a FRESH `complete` marker is written carrying
+`repromoted_from` (the restored marker VersionId) + `repromoted_by` (caller
+identity). The untouched reindex pipeline converges the vector index from the
+resulting object events. Repromote deliberately does NOT touch the freshness
+table's Glue-version rows: it is a content rollback, not a pin — the next
+genuine catalog change (or manual harvest) legitimately overwrites it.
+
+**Retention**: `var.bundle_version_retention_days` (durable stack, default 90)
+lifecycle-expires noncurrent bundle versions — this IS the repromote window —
+while always keeping the 3 newest noncurrent versions per key. Expired versions
+simply drop out of the reconstructed list (nothing dangles). SAFETY COUPLING:
+lifecycle expiry emits `Object Deleted` events with deletion-type
+`"Permanently Deleted"` for keys whose live doc is untouched; the reindex
+worker MUST keep filtering those (only `"Delete Marker Created"` reaches
+`DeleteVectors`) or daily expiry would delete live docs' vectors.
+
 ## S3 Vectors (one bucket, one index)
 
 See `okf_core.embedding`.
@@ -183,6 +225,41 @@ the other writes them). A lease older than 8 hours
 (`HARVEST_LEASE_STALE_SECONDS`, the AgentCore session cap) can be taken over, so
 a dead job whose final status write was lost doesn't wedge the dataset forever. A
 failed invoke marks the row `failed` to release the lease.
+
+**Annotations: unanchored + agent-submitted.** `quote` is OPTIONAL on an
+annotation item: empty = an UNANCHORED note (page-level general feedback),
+which the orphan sweep resolves only if its doc is gone. `concept_id` may be
+the `_dataset` sentinel (underscore-pseudo, like `_domain`) for DATASET-level
+feedback — never orphaned while the dataset exists. `submitted_via` records
+provenance: `"ui"` (default) or `"agent"` — the chat agent's per-run
+`submit_annotation` tool files on the user's behalf (the run's verified sub
+keys the partition; chat role has PutItem-only on the annotations table).
+
+A **repromote** (bundle version restore, below) takes this SAME lease with
+`mode = "repromote"` and rides the existing `queued → complete | failed`
+lifecycle — no new status value. Its acquire adds one extra takeover clause:
+
+```
+OR (mode = "repromote" AND status = queued AND started_at < <now − 120s>)
+```
+
+A repromote runs synchronously inside the 30s-capped Control API Lambda, so a
+repromote row still `queued` after 120s (`REPROMOTE_LEASE_STALE_SECONDS`) is
+provably dead and a retry may take it over immediately — harvest rows are
+unaffected. The row also carries `repromote_target` (the marker VersionId being
+restored) so the status GET's `stalled_lease` answer can offer one-click retry.
+
+**Repromote convergence manifest.** `pk = "HARVEST#<data_domain>#<dataset>"`,
+`sk = "REPROMOTE"`, attrs `{started_at, completed_at, target_version_id,
+new_version_id, requested_by, copied: [vector_key...], deleted: [vector_key...],
+total}` — written once per repromote (overwriting the previous one) after the S3
+writes land. It exists because deleted keys are unlistable after the fact: the
+convergence check needs the exact touched-key set captured at write time.
+`GET /bundle/{d}/{ds}/repromote` reports a key converged when its `VEC#<key>`
+freshness row's `updated_at` (which reindex advances only AFTER the vector work
+succeeds) is `>= started_at − 2s`; the UI declares a repromote done only when
+every key converged — matching the definition that *current is what the vector
+index serves*.
 
 **Harvest live step feed.** Separate from the coarse status row, the harvest
 runtime narrates its progress at message granularity. As the agent runs, a

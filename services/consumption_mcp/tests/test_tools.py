@@ -426,3 +426,90 @@ def test_semantic_search_floors_top_k_at_one(aws, config):
     )
     tools.semantic_search("q", top_k=0)
     assert s3v.queries[0]["topK"] == 1
+
+
+# --- get_bundle_diff ----------------------------------------------------------
+
+
+def _publish_second_harvest(s3):
+    """Enable versioning and publish a second harvest over the seeded bundle.
+
+    The seeded objects (written unversioned) carry VersionId "null" and act as
+    version 1; a >1s tick separates the phases because S3/moto LastModified is
+    second-granular (real harvests are minutes apart).
+    """
+    import time
+
+    s3.put_bucket_versioning(
+        Bucket=BUNDLE_BUCKET, VersioningConfiguration={"Status": "Enabled"}
+    )
+    time.sleep(1.05)
+    prefix = f"okf/{DOMAIN}/{DATASET}/"
+    s3.delete_object(Bucket=BUNDLE_BUCKET, Key=f"{prefix}tables/results.md")
+    s3.put_object(
+        Bucket=BUNDLE_BUCKET,
+        Key=f"{prefix}tables/races.md",
+        Body=(
+            "---\ntype: Glue Table\ntitle: Races\ndescription: race rows\n"
+            "timestamp: t\n---\n\n# Overview\n\nRaces table, REWRITTEN.\n"
+        ).encode(),
+    )
+    s3.put_object(
+        Bucket=BUNDLE_BUCKET,
+        Key=f"{prefix}tables/sprints.md",
+        Body=(
+            "---\ntype: Glue Table\ntitle: Sprints\ndescription: s\n"
+            "timestamp: t\n---\n\n# Overview\n\nSprint races.\n"
+        ).encode(),
+    )
+    import json as _json
+
+    resp = s3.put_object(
+        Bucket=BUNDLE_BUCKET,
+        Key=f"{prefix}.harvest/state.json",
+        Body=_json.dumps(
+            {
+                "status": "complete",
+                "data_domain": DOMAIN,
+                "dataset": DATASET,
+                "tables": ["races", "sprints"],
+                "completed_at": "2026-02-01T00:00:00+00:00",
+                "table_versions": {},
+            }
+        ).encode(),
+    )
+    return resp["VersionId"]
+
+
+def test_get_bundle_diff_defaults_to_last_harvest(tools, aws):
+    v2 = _publish_second_harvest(aws["s3"])
+    out = tools.get_bundle_diff(DOMAIN, DATASET)
+    assert out["to"]["version_id"] == v2 and out["to"]["current"]
+    statuses = {f["key"]: f["status"] for f in out["files"]}
+    prefix = f"okf/{DOMAIN}/{DATASET}/"
+    assert statuses[f"{prefix}tables/sprints.md"] == "added"
+    assert statuses[f"{prefix}tables/results.md"] == "removed"
+    assert statuses[f"{prefix}tables/races.md"] == "modified"
+    assert out["summary"]["unchanged"] >= 1  # untouched docs counted, not listed
+    # The versions header lets the agent self-serve explicit selectors.
+    assert [v["version_id"] for v in out["versions"]][0] == v2
+    assert len(out["versions"]) <= 5
+
+
+def test_get_bundle_diff_clamps_max_files_and_flags_truncation(tools, aws):
+    from consumption_mcp import tools as toolmod
+
+    _publish_second_harvest(aws["s3"])
+    out = tools.get_bundle_diff(DOMAIN, DATASET, max_files=1)
+    assert len(out["files"]) == 1 and out["truncated"] is True
+    # Server-side cap: an absurd max_files is clamped, not honored.
+    out = tools.get_bundle_diff(DOMAIN, DATASET, max_files=10_000_000)
+    assert len(out["files"]) <= toolmod._DIFF_MAX_FILES_CAP
+
+
+def test_get_bundle_diff_unknown_version_raises_value_error(tools, aws):
+    _publish_second_harvest(aws["s3"])
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="unknown bundle version"):
+        tools.get_bundle_diff(DOMAIN, DATASET, to_version="nope")

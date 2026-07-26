@@ -190,9 +190,13 @@ def test_annotatable_text_falls_back_on_malformed_doc():
     assert anno.annotatable_text("just some text") == "just some text"
 
 
-def test_empty_quote_never_matches():
+def test_empty_quote_is_unanchored_not_orphaned():
+    # find_quote itself still never matches empty input...
     assert not anno.find_quote("some body text", "")
-    assert anno.is_orphaned("some body text", "")
+    # ...but an UNANCHORED note (page-level feedback) is NOT orphaned while its
+    # doc exists — it orphans only when the doc is gone.
+    assert not anno.is_orphaned("some body text", "")
+    assert anno.is_orphaned(None, "")
 
 
 def test_repeated_quote_is_present_existence_only():

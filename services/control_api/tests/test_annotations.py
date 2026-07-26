@@ -466,3 +466,39 @@ def test_run_rejects_too_many_annotations(cfg, monkeypatch):
     # No survivor was flipped to in_review (cap check precedes the flip).
     items = _json(app.route(_event("GET", "/annotations/sales/orders"), cfg))
     assert all(a["status"] == "open" for a in items)
+
+
+def test_create_unanchored_and_dataset_wide_annotations(cfg):
+    # Page-level: no quote is now legal (unanchored general feedback).
+    resp = app.route(
+        _event(
+            "POST",
+            "/annotations/sales/orders",
+            body={"concept_id": "tables/orders", "note": "misses the caveat"},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 200
+    out = json.loads(resp["body"])
+    assert out["quote"] == "" and out["submitted_via"] == "ui"
+    # Dataset-level: the `_dataset` sentinel passes concept validation.
+    resp = app.route(
+        _event(
+            "POST",
+            "/annotations/sales/orders",
+            body={"concept_id": "_dataset", "note": "docs are stale overall"},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"])["concept_id"] == "_dataset"
+    # A note is still required.
+    resp = app.route(
+        _event(
+            "POST",
+            "/annotations/sales/orders",
+            body={"concept_id": "tables/orders"},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 400

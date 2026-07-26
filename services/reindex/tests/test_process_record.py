@@ -102,6 +102,68 @@ def test_deleted_removes_vector(aws):
     assert br.calls == []
 
 
+def test_delete_marker_creation_removes_vector(aws):
+    """A delete marker changes the key's live view -> the vector goes."""
+    key = "okf/na_mi/formula_1/tables/races.md"
+    s3v, br = FakeS3Vectors(), FakeBedrock()
+
+    status = _process(
+        s3_event_record(
+            key, detail_type="Object Deleted", deletion_type="Delete Marker Created"
+        ),
+        aws,
+        s3v,
+        br,
+    )
+
+    assert status == "deleted"
+    assert s3v.deleted[0]["keys"] == ["na_mi/formula_1/tables/races"]
+
+
+def test_permanent_version_delete_never_touches_the_vector(aws):
+    """Expiring a NONCURRENT version (the bundle lifecycle rule does this daily)
+    emits Object Deleted with deletion-type "Permanently Deleted" while the LIVE
+    doc is untouched — acting on it would delete a live doc's vector."""
+    key = "okf/na_mi/formula_1/tables/races.md"
+    s3v, br = FakeS3Vectors(), FakeBedrock()
+
+    status = _process(
+        s3_event_record(
+            key, detail_type="Object Deleted", deletion_type="Permanently Deleted"
+        ),
+        aws,
+        s3v,
+        br,
+    )
+
+    assert status == "skipped"
+    assert s3v.deleted == [] and s3v.put == []
+    # And the dedup marker is untouched — nothing happened.
+    assert _seq_row(aws, "na_mi/formula_1/tables/races") is None
+
+
+def test_permanent_delete_without_sequencer_still_skips_cleanly(aws):
+    """Lifecycle-expiration deletes aren't guaranteed a sequencer; they must
+    skip (message deleted) rather than raise into the DLQ forever."""
+    key = "okf/na_mi/formula_1/tables/races.md"
+    s3v, br = FakeS3Vectors(), FakeBedrock()
+
+    status = _process(
+        s3_event_record(
+            key,
+            detail_type="Object Deleted",
+            deletion_type="Permanently Deleted",
+            sequencer=None,
+        ),
+        aws,
+        s3v,
+        br,
+    )
+
+    assert status == "skipped"
+    assert s3v.deleted == [] and s3v.put == []
+
+
 # --- non-concept keys are ignored --------------------------------------------
 
 

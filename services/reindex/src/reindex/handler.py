@@ -62,6 +62,15 @@ from okf_core.embedding import (
 _CREATED = "Object Created"
 _DELETED = "Object Deleted"
 
+# "Object Deleted" events carry a ``detail.deletion-type`` that distinguishes a
+# delete marker (the key's LIVE view changed — soft delete on the versioned
+# bundle bucket) from the permanent removal of ONE version. Only the former may
+# touch the vector index: a permanent delete of a NONCURRENT version (the
+# lifecycle rule expiring old bundle versions does this daily) leaves the live
+# doc untouched, so acting on it would delete a live doc's vector.
+_DELETION_MARKER_CREATED = "Delete Marker Created"
+_DELETION_PERMANENT = "Permanently Deleted"
+
 
 class SkippedRecord(Exception):
     """Raised internally to signal a record was intentionally not processed.
@@ -80,6 +89,7 @@ class ParsedEvent:
     key: str
     sequencer: str
     detail_type: str  # "Object Created" | "Object Deleted"
+    deletion_type: str = ""  # "" for creates / legacy events without the field
 
 
 def _now_iso() -> str:
@@ -103,10 +113,21 @@ def _parse_sqs_record(record: dict[str, Any]) -> ParsedEvent:
     obj = detail.get("object") or {}
     key = obj.get("key")
     sequencer = obj.get("sequencer")
-    if not bucket or not key or not sequencer:
+    deletion_type = detail.get("deletion-type") or ""
+    # A permanent version delete is skipped before any work (see process_record),
+    # so it must parse even without a sequencer — lifecycle-expiration events are
+    # not guaranteed to carry one, and failing them here would only churn the DLQ.
+    permanent_delete = (
+        detail_type == _DELETED and deletion_type == _DELETION_PERMANENT
+    )
+    if not bucket or not key or (not sequencer and not permanent_delete):
         raise ValueError("S3 event missing bucket.name / object.key / object.sequencer")
     return ParsedEvent(
-        bucket=bucket, key=key, sequencer=sequencer, detail_type=detail_type
+        bucket=bucket,
+        key=key,
+        sequencer=sequencer or "",
+        detail_type=detail_type,
+        deletion_type=deletion_type,
     )
 
 
@@ -235,6 +256,14 @@ def process_record(
     record to ``batchItemFailures`` and let SQS redrive it.
     """
     event = _parse_sqs_record(record)
+
+    # Permanent version deletes never change the key's LIVE view: expiring a
+    # NONCURRENT version (the bundle lifecycle rule, daily) or sweeping an
+    # expired delete marker leaves what a plain GET returns exactly as it was.
+    # Acting on one would DeleteVectors for a doc that still exists. Only a
+    # delete-marker creation (or a legacy event without the field) proceeds.
+    if event.detail_type == _DELETED and event.deletion_type == _DELETION_PERMANENT:
+        return "skipped"
 
     location = parse_bundle_key(event.key)
     if location is None:
