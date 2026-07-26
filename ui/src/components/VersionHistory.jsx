@@ -39,6 +39,7 @@ import {
   Component,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -586,7 +587,38 @@ function RichDiff({ vh, file }) {
   )
 }
 
+// Size the diff scroll box to EXACTLY the remaining viewport below its own
+// top edge (the .okf-diff-scroll CSS calc is only the pre-measure fallback —
+// a fixed offset can't know how much chrome sits above). Re-measures on
+// window resize and on ancestor scrolls (capture phase catches the Browse
+// pane's own ScrollArea moving the box).
+function useViewportFill(deps) {
+  const ref = useRef(null)
+  const [maxH, setMaxH] = useState(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return undefined
+    const measure = () => {
+      const top = el.getBoundingClientRect().top
+      // 44px clears the pane's bottom padding + card border below the box,
+      // so the page itself never gains a scrollbar.
+      setMaxH(Math.max(240, window.innerHeight - top - 44))
+    }
+    measure()
+    window.addEventListener("resize", measure)
+    window.addEventListener("scroll", measure, true)
+    return () => {
+      window.removeEventListener("resize", measure)
+      window.removeEventListener("scroll", measure, true)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps)
+  return [ref, maxH]
+}
+
 function SelectedFileDiff({ vh, file, mode, theme }) {
+  const [scrollRef, maxH] = useViewportFill([file.key, mode])
+  const scrollStyle = maxH != null ? { maxHeight: `${maxH}px` } : undefined
   const hunks = useMemo(() => toHunks(file.diff), [file.diff])
   const meta = STATUS_META[file.status] || STATUS_META.modified
   return (
@@ -609,10 +641,11 @@ function SelectedFileDiff({ vh, file, mode, theme }) {
         </Badge>
       </div>
       {mode === "rich" ? (
-        <div className="max-h-[32rem] overflow-auto">
+        <div ref={scrollRef} style={scrollStyle} className="okf-diff-scroll">
           <RichDiff vh={vh} file={file} />
         </div>
       ) : hunks.length ? (
+        <div ref={scrollRef} style={scrollStyle} className="okf-diff-scroll">
         <DiffBoundary raw={file.diff}>
           <DiffView
             key={`${file.key}:${theme}`}
@@ -630,6 +663,7 @@ function SelectedFileDiff({ vh, file, mode, theme }) {
             diffViewFontSize={12}
           />
         </DiffBoundary>
+        </div>
       ) : (
         <p className="p-3 text-xs text-muted-foreground">
           Diff omitted (response size cap) — compare fewer versions apart.

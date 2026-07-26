@@ -646,6 +646,15 @@
   100% { background-position: -150% 0; }
 }
 
+/* The diff body (source AND rich views) is a self-contained scroll box: at
+   most the viewport height minus the chrome stacked above it (app + pane
+   headers, version pickers, summary line, file-card header), floored for tiny
+   windows. Long diffs scroll in here — never the surrounding pane or page. */
+.okf-diff-scroll {
+  max-height: max(16rem, calc(100vh - 19rem));
+  overflow: auto;
+}
+
 /* @git-diff-view ships GitHub's palette, whose dark surfaces are distinctly
    BLUE (#0d1117 line background, #131d2e/#0c2d6b hunk rows) and clash with the
    app's neutral dark theme. Re-skin every neutral surface onto the app tokens
