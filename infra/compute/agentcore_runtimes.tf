@@ -270,6 +270,21 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     # is off -> a Redshift-scoped run gets no SQL tool (never Athena fallback).
     OKF_REDSHIFT_ENABLED = var.enable_redshift ? "true" : ""
 
+    # Public web search via the AgentCore Gateway web-search connector
+    # (var.enable_web_search, see web_search.tf). The gateway is in us-east-1 —
+    # the connector's only region — so the runtime signs its SigV4 for THAT
+    # region, not var.region. Both the flag and the URL must be present for the
+    # runtime to offer the tool; with the flag off the role has no InvokeGateway
+    # grant anyway. The tool name carries the target prefix AgentCore adds
+    # (`<target>___WebSearch`); the runtime falls back to tools/list if it's empty.
+    OKF_WEB_SEARCH_ENABLED = tostring(local.web_search_enabled)
+    OKF_WEB_SEARCH_GATEWAY_URL = try(
+      aws_bedrockagentcore_gateway.web_search[0].gateway_url, ""
+    )
+    OKF_WEB_SEARCH_REGION      = local.web_search_enabled ? "us-east-1" : ""
+    OKF_WEB_SEARCH_TOOL_NAME   = local.web_search_enabled ? local.web_search_tool_name : ""
+    OKF_WEB_SEARCH_MAX_RESULTS = tostring(var.web_search_max_results)
+
     OTEL_RESOURCE_ATTRIBUTES = "service.name=${var.name_prefix}_chat"
 
     # LangChain/LangGraph spans via the langsmith SDK's native OTEL bridge (same

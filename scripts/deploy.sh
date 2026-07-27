@@ -242,6 +242,12 @@ stage_compute() {
   "$ROOT/scripts/build_lambdas.sh"
   tf "$ROOT/infra/compute" init -reconfigure -input=false \
     -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+  # control_api_provisioned_concurrency: pass the -var ONLY when the operator
+  # explicitly set CONTROL_API_PROVISIONED_CONCURRENCY (env or config file), so
+  # the Terraform default governs otherwise. The old `:-0` fallback silently
+  # overrode the variable's default with an explicit 0 on every deploy —
+  # provisioned concurrency could never turn on without a config line few knew
+  # about. ${VAR:+...} expands to nothing when the var is unset/empty.
   tf "$ROOT/infra/compute" apply -auto-approve -input=false \
     -var="region=$AWS_REGION" \
     -var="name_prefix=${NAME_PREFIX:-okf}" \
@@ -249,7 +255,7 @@ stage_compute() {
     -var="harvest_image_uri=${HARVEST_IMAGE_URI:-}" \
     -var="consumption_image_uri=${CONSUMPTION_IMAGE_URI:-}" \
     -var="chat_image_uri=${CHAT_IMAGE_URI:-}" \
-    -var="control_api_provisioned_concurrency=${CONTROL_API_PROVISIONED_CONCURRENCY:-0}"
+    ${CONTROL_API_PROVISIONED_CONCURRENCY:+-var="control_api_provisioned_concurrency=$CONTROL_API_PROVISIONED_CONCURRENCY"}
   ok "Compute stack applied."
 }
 

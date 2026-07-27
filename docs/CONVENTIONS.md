@@ -645,6 +645,11 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_USER_POOL_ID` | Cognito user pool id (the Control API vends and revokes M2M app clients in this pool) |
 | `OKF_MCP_SCOPE` | the custom scope (`okf-mcp/invoke`) granted to vended M2M clients; must match the consumption authorizer's `allowed_scopes` |
 | `OKF_HARVEST_LOG_GROUP` | the harvest runtime's CloudWatch log group the Control API reads to serve the live step feed (`GET /harvest/{domain}/{dataset}/events`). Derived by Terraform as `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT` (overridable via `var.harvest_log_group`). Unset/incorrect → the feed returns an empty batch; status polling is unaffected |
+| `OKF_WEB_SEARCH_ENABLED` | (chat runtime) `"true"` → offer the agent the public `web_search` tool. Set from `var.enable_web_search`. Requires `OKF_WEB_SEARCH_GATEWAY_URL` too: with either missing the tool is simply not wired (and the role carries no `bedrock-agentcore:InvokeGateway` grant anyway) |
+| `OKF_WEB_SEARCH_GATEWAY_URL` | the AgentCore Gateway MCP endpoint fronting the built-in `web-search` connector (`https://<gateway-id>.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp`). `/mcp` is appended if absent. The runtime speaks MCP JSON-RPC to it (`initialize` → `tools/call`) signed with SigV4 |
+| `OKF_WEB_SEARCH_REGION` | region the gateway lives in, i.e. the region `web_search`'s SigV4 is signed for (default `us-east-1`). **Independent of `AWS_REGION`** — the web-search connector is only offered in us-east-1, so a query leaves the deployment's region (it never leaves AWS) |
+| `OKF_WEB_SEARCH_TOOL_NAME` | the gateway-side tool name, `<target-name>___WebSearch` (AgentCore prefixes every tool with its target's name, joined by THREE underscores). Set by Terraform to save a round trip; empty → the runtime discovers it via `tools/list` and caches it |
+| `OKF_WEB_SEARCH_MAX_RESULTS` | default results per search when the agent doesn't pick a count via the tool's `max_results` arg (default `10`; 1–25). There is no date parameter — the connector ranks by relevance and the agent steers time through the query text, reading each result's `publishedDate` |
 
 ## HTTP and auth
 

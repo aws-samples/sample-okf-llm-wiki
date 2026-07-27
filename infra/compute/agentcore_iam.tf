@@ -660,6 +660,19 @@ data "aws_iam_policy_document" "chat" {
       resources = local.redshift_secret_resources
     }
   }
+
+  # Public web search (var.enable_web_search): the runtime calls the gateway's MCP
+  # endpoint with SigV4, so this ONE action is the whole outbound grant — the
+  # gateway's own service role holds InvokeWebSearch, not this role. Scoped to
+  # THIS gateway's ARN, which lives in us-east-1 (the connector's only region).
+  dynamic "statement" {
+    for_each = local.web_search_enabled ? [1] : []
+    content {
+      sid       = "ChatWebSearchGateway"
+      actions   = ["bedrock-agentcore:InvokeGateway"]
+      resources = [aws_bedrockagentcore_gateway.web_search[0].gateway_arn]
+    }
+  }
 }
 
 resource "aws_iam_role" "chat" {

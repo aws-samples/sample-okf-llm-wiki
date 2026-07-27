@@ -170,12 +170,20 @@ resource "aws_wafv2_web_acl" "ui" {
 # does not let the frame reach the app DOM, the network, or the Cognito token — it
 # only permits inline <script> execution. To keep a stricter app-wide script-src,
 # serve the chart frame from a separate origin with its own CSP header instead.
+# img-src also allows any https: image, for ONE reason — SOURCE FAVICONS. When the
+# chat cites a web page (web_search), the UI shows that site's favicon in the
+# result card and the citation badge, fetched from the site's own origin
+# (https://<host>/favicon.ico — see ui/src/lib/sources.faviconUrl; no third-party
+# icon service, so no one is told which domains our users read). Images can't
+# execute, the requests carry referrerPolicy="no-referrer", and a blocked/missing
+# icon degrades to a monogram tile. Tighten to 'self' data: (and accept monograms
+# everywhere) if arbitrary https image loads aren't acceptable in a deployment.
 locals {
   csp_default = join("; ", [
     "default-src 'self'",
     "script-src 'self' 'unsafe-inline'",
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data:",
+    "img-src 'self' data: https:",
     "font-src 'self' data:",
     "connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com",
     "frame-ancestors 'none'",

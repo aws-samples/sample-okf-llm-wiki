@@ -121,6 +121,18 @@ class ChatConfig:
     # (it must never silently fall back to Athena — wrong backend).
     redshift_enabled: bool = False
 
+    # Public web search via the AgentCore Gateway web-search connector (see
+    # chat/web_search.py). Deploy-gated by OKF_WEB_SEARCH_ENABLED **and** a
+    # gateway URL — no per-run opt-in (it reads no source data). The gateway
+    # lives in web_search_region (the connector is us-east-1 only), which may
+    # differ from the runtime's own region. web_search_tool_name is the
+    # gateway-side name (`<target>___WebSearch`); empty = discover via tools/list.
+    web_search_enabled: bool = False
+    web_search_gateway_url: str = ""
+    web_search_region: str = "us-east-1"
+    web_search_tool_name: str = ""
+    web_search_max_results: int = 10
+
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ChatConfig":
         env = env if env is not None else dict(os.environ)
@@ -163,6 +175,12 @@ class ChatConfig:
             sql_max_rows=_int_env("OKF_CHAT_SQL_MAX_ROWS", 200, env),
             redshift_enabled=env.get("OKF_REDSHIFT_ENABLED", "").lower()
             in ("true", "1", "yes"),
+            web_search_enabled=env.get("OKF_WEB_SEARCH_ENABLED", "").lower()
+            in ("true", "1", "yes"),
+            web_search_gateway_url=env.get("OKF_WEB_SEARCH_GATEWAY_URL", ""),
+            web_search_region=env.get("OKF_WEB_SEARCH_REGION") or "us-east-1",
+            web_search_tool_name=env.get("OKF_WEB_SEARCH_TOOL_NAME", ""),
+            web_search_max_results=_int_env("OKF_WEB_SEARCH_MAX_RESULTS", 10, env),
         )
 
     def resolve_model_effort(

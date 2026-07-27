@@ -4,15 +4,17 @@
 // icon + reasoning prose) or a tool step (wrench icon + status text, expandable
 // to raw args/result). A completion check caps a finished block.
 //
-// Trimmed to the wiki chat's vocabulary: all our tools are generic wiki reads
-// (read_page/grep/semantic_search/…), shown with a formatted name + status +
-// expandable args/result. No web-search/sub-agent/browser/canvas categories.
+// Trimmed to the wiki chat's vocabulary: mostly wiki reads
+// (read_page/grep/semantic_search/…) plus run_sql and web_search, each shown with
+// a formatted name + status + expandable args/result (see wikiTools.js). No
+// sub-agent/browser/canvas categories.
 
 import { ChevronDown, CircleCheck, ClockFading, Code2, Table2 } from "lucide-react"
 import { memo, useCallback, useMemo, useState } from "react"
 
 import { CodeView } from "@/components/chat/CodeView"
 import { Markdown } from "@/components/chat/Markdown"
+import { SourceIcon } from "@/components/chat/SourceIcon"
 import { buildTimelineSteps, mergeThinkingSteps } from "@/components/chat/timelineParser"
 import {
   parseToolResult,
@@ -108,6 +110,32 @@ function ToolResultDetail({ view, rawContent }) {
     )
   }
 
+  // web_search: the sources the agent actually read, as rows of favicon + title +
+  // host — each one a link out (Claude/ChatGPT's search card). A row is the unit
+  // of provenance, so the whole row is the hit area, and the host sits right-
+  // aligned where it's scannable down the column.
+  if (view.kind === "sources") {
+    if (!view.items.length) return null
+    return (
+      <div className="okf-source-list">
+        {view.items.map((it, i) => (
+          <a
+            key={i}
+            href={it.url || undefined}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="okf-source-row"
+            title={it.url}
+          >
+            <SourceIcon url={it.url} size={15} />
+            <span className="okf-source-title">{it.title || it.url}</span>
+            <span className="okf-source-host">{it.host}</span>
+          </a>
+        ))}
+      </div>
+    )
+  }
+
   if (view.kind === "chips") {
     if (!view.items.length) return null
     return (
@@ -171,7 +199,11 @@ function SqlResultTabs({ sql, resultNode }) {
 // chevron when there's detail. (The tool's icon lives on the timeline marker,
 // not in the header.)
 function ToolResultIndicator({ toolName, input, content, isComplete, error }) {
-  const [expanded, setExpanded] = useState(false)
+  // web_search opens EXPANDED: the sources are the substance of that step (which
+  // pages the answer's external claims rest on), not a detail to drill into —
+  // same call ChatGPT/Claude make with their search cards. Everything else stays
+  // collapsed so the timeline reads as a list of steps.
+  const [expanded, setExpanded] = useState(toolName === "web_search")
 
   const view = useMemo(
     () => (isComplete && !error ? parseToolResult(toolName, content) : null),
@@ -196,6 +228,7 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error }) {
   const hasDetail =
     isComplete &&
     ((view && view.kind === "table" && view.rows?.length) ||
+      (view && view.kind === "sources" && view.items?.length) ||
       (view && view.kind === "chips" && view.items?.length) ||
       (view && view.kind === "raw" && content != null) ||
       Boolean(sqlQuery) ||

@@ -1,8 +1,8 @@
 // Per-tool presentation for the wiki chat — the analog of Sparky's
 // toolClassification.js (which renders web_search vs web_extract vs generic
-// distinctly). Our tools are all well-defined wiki reads with known return
-// shapes (see services/consumption_mcp/tools.py), so we render each one
-// meaningfully instead of dumping raw JSON:
+// distinctly). Every tool here has a known return shape (the wiki reads in
+// services/consumption_mcp/tools.py, plus run_sql and web_search), so we render
+// each one meaningfully instead of dumping raw JSON:
 //
 //   - a status LABEL keyed off the tool + its args ("Searching “races”",
 //     "Reading tables/races", "Grep “winner”"), shimmering while it runs;
@@ -18,6 +18,7 @@ import {
   BookOpenIcon,
   DatabaseIcon,
   FolderTreeIcon,
+  GlobeIcon,
   Link2Icon,
   ListTreeIcon,
   ScanSearchIcon,
@@ -26,6 +27,8 @@ import {
   TextSearchIcon,
   WrenchIcon,
 } from "lucide-react"
+
+import { hostOf } from "@/lib/sources"
 
 const ICONS = {
   list_domains: DatabaseIcon,
@@ -40,6 +43,9 @@ const ICONS = {
   grep: TextSearchIcon,
   // run_sql = a live query against the catalog (terminal/prompt glyph)
   run_sql: TerminalIcon,
+  // web_search = the one tool that reads OUTSIDE the org (globe, deliberately
+  // distinct from the wiki's own search glyphs)
+  web_search: GlobeIcon,
   // render_chart is lifted into its own inline chart block and never appears in
   // the timeline (see buildMessageBlocks) — but keep an icon + label so an edge
   // case (e.g. a raw tool listing) doesn't fall through to raw.
@@ -112,6 +118,14 @@ export function toolLabel(toolName, args, running) {
       const label = t ? `“${t}”` : ""
       return running ? `Charting ${label}`.trim() : `Charted ${label}`.trim()
     }
+    case "web_search": {
+      // Any period lives in the query text itself (the tool has no date args —
+      // it steers time by query), so the query IS the whole label.
+      const q = s(a.query)
+      const quoted = q ? `“${q}”` : ""
+      const verb = running ? "Searching the web" : "Web search"
+      return `${verb} ${quoted}`.trim()
+    }
     default: {
       const name = prettyName(toolName)
       return running ? `Running ${name}` : name
@@ -145,11 +159,13 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many || one + "s"}`
 
 // Parse a completed tool result into a structured view the detail renderer can
 // show: { summary, kind, ... }.
-//   table — { columns:[{key,header,mono?,wrap?}], rows:[{<key>:value}] }
-//           (the primary shape: every list tool renders as a real table)
-//   chips — compact monospace pills (list_directory entries)
-//   none  — summary only, no expandable body (read_page / index dir)
-//   raw   — JSON fallback for anything unrecognized
+//   table   — { columns:[{key,header,mono?,wrap?}], rows:[{<key>:value}] }
+//             (the primary shape: every list tool renders as a real table)
+//   sources — { items:[{url,title,host,publishedDate}] } — web_search: favicon +
+//             title + host rows, each a link out
+//   chips   — compact monospace pills (list_directory entries)
+//   none    — summary only, no expandable body (read_page / index dir)
+//   raw     — JSON fallback for anything unrecognized
 export function parseToolResult(toolName, rawContent) {
   const content = coerce(rawContent)
 
@@ -297,6 +313,23 @@ export function parseToolResult(toolName, rawContent) {
           for (const name of cols) out[name] = r[name] == null ? "NULL" : r[name]
           return out
         }),
+      }
+    }
+    case "web_search": {
+      // { query, as_of, result_count, results:[{title,url,published_date,text}] }.
+      // Rendered as the `sources` view (not a table): favicon + title + host per
+      // row, each row a link. Provenance is the point of this card — the answer's
+      // external claims have to be traceable to these pages, one click away.
+      const results = Array.isArray(content?.results) ? content.results : []
+      return {
+        summary: plural(results.length, "result"),
+        kind: "sources",
+        items: results.map((r) => ({
+          url: s(r.url),
+          title: s(r.title),
+          host: hostOf(r.url),
+          publishedDate: s(r.published_date),
+        })),
       }
     }
     default:

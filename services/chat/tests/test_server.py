@@ -950,6 +950,7 @@ def _factory_tool_names(
     has_redshift_data=False,
     scope=None,
     registry_item=None,
+    web_search=False,
 ):
     """Build a graph via make_agent_factory, capturing the tool names it wired.
 
@@ -1000,6 +1001,19 @@ def _factory_tool_names(
 
     monkeypatch.setattr(chat_graph_mod, "build_graph", _fake_build_graph)
 
+    # Web search is deploy-gated only; stub the engine build so no gateway client
+    # (or SigV4 transport) is constructed here.
+    import chat.web_search as chat_web_search_mod
+
+    monkeypatch.setattr(
+        chat_web_search_mod,
+        "build_web_search_engine",
+        lambda cfg: object() if web_search else None,
+    )
+    monkeypatch.setattr(
+        chat_web_search_mod, "make_web_search_tool", lambda engine: _T("web_search")
+    )
+
     clients = {"s3": object(), "s3vectors": object(), "bedrock_runtime": object(), "ddb": object()}
     if has_athena:
         clients["athena"] = object()
@@ -1019,19 +1033,53 @@ def test_sql_tool_added_when_enabled_and_opted_in(monkeypatch):
 
 
 def test_sql_tool_absent_without_opt_in(monkeypatch):
+    from chat.graph import SYSTEM_PROMPT
+
     cap = _factory_tool_names(monkeypatch, sql_enabled=True, features=set())
     assert "run_sql" not in cap["tools"]
-    assert cap["prompt"] is None  # default prompt (no SQL mention)
+    assert cap["prompt"] == SYSTEM_PROMPT  # base prompt: no SQL block appended
 
 
 def test_sql_tool_absent_when_deploy_disabled(monkeypatch):
+    from chat.graph import SYSTEM_PROMPT
+
     # Opted in by the client, but the deploy flag is off (and no athena client) —
     # the tool must NOT be wired (the browser can't self-grant SQL).
     cap = _factory_tool_names(
         monkeypatch, sql_enabled=False, features={"sql"}, has_athena=False
     )
     assert "run_sql" not in cap["tools"]
-    assert cap["prompt"] is None
+    assert cap["prompt"] == SYSTEM_PROMPT
+
+
+def test_web_search_tool_wired_on_every_run_when_deploy_enabled(monkeypatch):
+    from chat.graph import WEB_SEARCH_BLOCK
+
+    # Deploy-gated ONLY: no features opt-in, yet the tool + its prompt block ride
+    # the run (unlike run_sql, it reads no source data).
+    cap = _factory_tool_names(
+        monkeypatch, sql_enabled=False, features=set(), web_search=True
+    )
+    assert "web_search" in cap["tools"]
+    assert WEB_SEARCH_BLOCK in cap["prompt"]
+
+
+def test_web_search_tool_absent_when_no_gateway(monkeypatch):
+    cap = _factory_tool_names(monkeypatch, sql_enabled=False, features=set())
+    assert "web_search" not in cap["tools"]
+    assert "web_search" not in cap["prompt"]
+
+
+def test_web_search_block_precedes_the_sql_block(monkeypatch):
+    from chat.graph import SQL_BLOCK, WEB_SEARCH_BLOCK
+
+    # Order is a prompt-CACHING property: the deployment-constant block must come
+    # before the per-run one so base+web stays a shared prefix across turns.
+    cap = _factory_tool_names(
+        monkeypatch, sql_enabled=True, features={"sql"}, web_search=True
+    )
+    assert {"web_search", "run_sql"} <= set(cap["tools"])
+    assert cap["prompt"].index(WEB_SEARCH_BLOCK) < cap["prompt"].index(SQL_BLOCK)
 
 
 def test_ask_human_tool_and_middleware_always_wired(monkeypatch):
@@ -1098,7 +1146,7 @@ def test_sql_redshift_scope_without_redshift_deploy_gets_no_tool(monkeypatch):
         registry_item=_RS_ITEM,
     )
     assert "run_sql" not in cap["tools"]
-    assert cap["prompt"] is None
+    assert "run_sql" not in cap["prompt"]  # no SQL block either
 
 
 def test_sql_redshift_scope_with_incomplete_mapping_gets_no_tool(monkeypatch):

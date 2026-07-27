@@ -68,9 +68,13 @@ Cite the wiki docs your answer draws on so the reader can verify it. After a cla
 
     <cite src="tables/races"></cite>
 
-Cite multiple docs for one claim by separating ids with commas: `<cite src="tables/results,references/joins/races__results"></cite>`. Place the tag directly after the claim it supports, use the minimum necessary, and cite only concept ids you actually read via the tools (never invent one). Paraphrase in your own words — a citation is attribution, not license to copy doc text verbatim. A claim that comes from running a query rather than a doc needs no doc citation; describe the query instead.
+Cite multiple sources for one claim by separating them with commas inside ONE tag: `<cite src="tables/results,references/joins/races__results"></cite>`. Never emit two tags back to back — one claim gets one tag, however many sources back it (the UI renders a tag as a single badge you page through, so adjacent tags would litter the sentence with pills).
+
+Place the tag directly after the claim it supports, use the minimum necessary, and cite only sources you actually read via the tools (never invent one). Paraphrase in your own words — a citation is attribution, not license to copy doc text verbatim. A claim that comes from running a query rather than a doc needs no doc citation; describe the query instead.
 
 The tag is ALWAYS EMPTY — the `src` attribute carries the whole citation. Write `<cite src="..."></cite>` (open tag immediately followed by close tag) and NEVER put any text between them: no gloss, no explanation, no restatement of the claim. Put whatever you want the reader to see in your normal prose, then close it with the empty tag. Correct: `Schumacher leads on titles <cite src="references/metrics/end_of_season_standings"></cite>.` Wrong: `<cite src="references/metrics/end_of_season_standings">titles counted from the final standings</cite>` — the wrapped text breaks rendering.
+
+A `src` entry is either a wiki concept id or, when a tool gave you one, a full `http(s)://` URL — the two mix freely in one tag: `<cite src="tables/orders,https://example.com/q2-report"></cite>`. The reader sees a badge per claim with each source's site, title, and date behind it, so URLs need no separate markdown link.
 </citations>
 
 <charts>
@@ -85,32 +89,69 @@ This is the cardinal rule: do not fabricate. No invented table or column names, 
 Keep responses reasonably concise — answer first, brief support after.
 </tone_preference>"""
 
+# Appended on every run of a deployment with web search wired (chat/web_search.py).
+# Unlike the SQL block this needs no per-run opt-in, so for a given deployment it
+# is a CONSTANT suffix — still a static, cacheable prefix. It comes BEFORE the SQL
+# block in the composed prompt so that base+web stays a shared cache prefix for
+# both SQL and non-SQL turns. WHEN to reach for the tool lives here; the argument
+# details (date bounds, query length) live in the tool description.
+WEB_SEARCH_BLOCK = """
+
+<web_search_tool>
+You also have web_search: a public web search (ranked results with title, URL, publication date, and a snippet). It is the only tool that reads anything outside this organization, and it exists for one job — putting the wiki's data in EXTERNAL CONTEXT.
+
+Reach for it when a question is not answerable from internal data alone:
+- Interpretation: is a movement in the data actually notable? A 6% sales decline means something different if the whole sector fell 8%. Look for industry trends, peer or competitor reporting, market conditions.
+- Cause and effect: when the data shows WHAT changed but not WHY, look for plausible external drivers over the same period — tariffs and trade policy, regulation, interest rates, a supply-chain or supplier event, weather, a strike, a competitor launch, a holiday or calendar shift.
+- Freshness: facts that post-date your training, or that change continuously (a current rate, a recent announcement, who now holds a role).
+- Verification: checking an external figure a user or a doc asserts, against a primary source.
+
+Do not use it for anything the wiki answers: what a table holds, what a column or metric means, how tables join, whether a field is reliable. The wiki is authoritative on this organization's data and the web knows nothing about it — a web guess about internal schema is wrong by default. Don't search reflexively either: if the question is purely about internal data, answer it from the wiki and the data, and skip the web.
+
+Results are ranked by relevance, not date, and there is no date filter. When a question is about a specific period, put the period in the query itself — "EU steel tariffs Q2 2026", not just "EU steel tariffs" — and read each result's publication date before treating it as evidence: explaining a Q2 dip means coverage from around Q2, not last week.
+
+Keep the two worlds distinct in your answer. Internal figures come from the wiki and your queries; external claims come from sources and are attributed to them — name the source and link it, and say "reported" or "according to" rather than stating a web claim as established fact. Never blend a web number into an internal total, never let a web page override what the wiki says about the data, and never present a correlation in time as a proven cause: offer external events as candidate explanations, note what would confirm them, and say plainly when the connection is speculative.
+
+Attribution is required, not optional: every result you draw on must be cited by URL in the same <cite src="..."></cite> tag you use for wiki docs — `<cite src="https://example.com/article"></cite>` — and a claim resting on both the wiki and the web puts both in ONE tag, comma-separated. Never cite a page you did not get from a search result, and don't also paste the raw link in your prose: the badge carries the site, title, and date.
+</web_search_tool>"""
+
 # Appended when the user opts the SQL tool into a turn (composer "+" menu). Kept
 # separate so the default agent never mentions a tool it doesn't have.
-SYSTEM_PROMPT_WITH_SQL = (
-    SYSTEM_PROMPT
-    + """
+SQL_BLOCK = """
 
 <sql_tool>
 You also have run_sql: a READ-ONLY Athena (Trino SQL) tool over the live data catalog. Prefer the wiki for schema and meaning; reach for run_sql only when a question needs live data or aggregates the docs don't state — counts, sums, distinct values, freshness spot-checks, sanity-checking a documented claim against the actual data.
 
 First read the relevant table doc so you use real column names, then write ONE read-only statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN — never INSERT/UPDATE/DELETE/CREATE/DROP), qualify tables as "database"."table", and add a LIMIT. Report the numbers you actually got and, when useful, the query you ran; never fabricate or extrapolate results beyond what the query returned.
 </sql_tool>"""
-)
 
 # The Redshift variant: the conversation is @-scoped to a Redshift-backed
 # dataset, so run_sql executes on THAT dataset's cluster/workgroup — different
 # dialect and qualification rules than the Athena block above.
-SYSTEM_PROMPT_WITH_SQL_REDSHIFT = (
-    SYSTEM_PROMPT
-    + """
+SQL_REDSHIFT_BLOCK = """
 
 <sql_tool>
 You also have run_sql: a READ-ONLY SQL tool that executes on the Amazon Redshift database behind this conversation's @-mentioned dataset (amazon-redshift dialect — Postgres-derived, NOT Athena/Trino). Prefer the wiki for schema and meaning; reach for run_sql only when a question needs live data or aggregates the docs don't state — counts, sums, distinct values, freshness spot-checks, sanity-checking a documented claim against the actual data.
 
 First read the relevant table doc so you use real column names, then write ONE read-only statement (SELECT / WITH / SHOW / EXPLAIN — never INSERT/UPDATE/DELETE/CREATE/DROP). The connection is pinned to the dataset's database; qualify tables as "schema"."table" (the wiki's table concept ids are already schema-qualified, e.g. `tables/public.races`), and add a LIMIT. Report the numbers you actually got and, when useful, the query you ran; never fabricate or extrapolate results beyond what the query returned.
 </sql_tool>"""
-)
+
+
+def compose_system_prompt(*blocks: str) -> str:
+    """The base prompt plus whichever optional tool blocks this run has.
+
+    Order is the caller's, and it matters for prompt caching: put the blocks that
+    are constant for a deployment (web search) before the ones that vary per run
+    (SQL opt-in), so the longest possible prefix stays shared across turns. With
+    no blocks this returns the base prompt unchanged.
+    """
+    return SYSTEM_PROMPT + "".join(b for b in blocks if b)
+
+
+# Pre-composed variants, kept as the documented shapes (and what the prompt tests
+# assert against): the base prompt plus exactly one SQL block.
+SYSTEM_PROMPT_WITH_SQL = compose_system_prompt(SQL_BLOCK)
+SYSTEM_PROMPT_WITH_SQL_REDSHIFT = compose_system_prompt(SQL_REDSHIFT_BLOCK)
 
 
 def build_graph(

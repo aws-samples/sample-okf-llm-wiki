@@ -200,23 +200,52 @@
     background-color: color-mix(in oklch, var(--primary) 12%, transparent);
     border: 1px solid color-mix(in oklch, var(--primary) 22%, transparent);
   }
-  /* Citation chip — a small source LABEL the agent emits after a claim
-     (<cite src="tables/races">), shown as the doc's short name with a hover popup
-     (kind + full path + dataset). Sits inline with a small gap so it never crowds
-     the preceding word or the next chip. Muted-primary pill, mono, no icon. */
+  /* Citation badge — ONE pill per claim, whatever backs it: the agent emits a
+     single <cite src="a,b,https://c"> and Markdown merges adjacent tags, so a
+     claim never trails a row of chips. Layout is icon + short label (+N), and
+     clicking opens the paginated source card (components/chat/Citation.jsx).
+     NEUTRAL surface, not the primary tint the doc-only chip used to have: these
+     now carry real FAVICONS, and a coloured wash muddied them. The icon is what
+     signals the kind (favicon = web, glyph = wiki doc). */
   .okf-prose .okf-cite {
-    @apply mx-0.5 inline-flex cursor-default items-center rounded-md align-baseline font-mono font-medium whitespace-nowrap;
-    font-size: 0.7em;
-    padding: 0.15em 0.45em;
+    @apply mx-0.5 inline-flex cursor-pointer items-center gap-1 rounded-md border align-baseline font-medium whitespace-nowrap;
+    font-size: 0.72em;
+    padding: 0.15em 0.42em;
+    /* The app's cyan (primary) flavour, same recipe as the concept-id labels —
+       citations are part of the same source-reference color language, in both
+       modes. The primary-tinted mixes have real contrast against the page in
+       light AND dark (unlike --muted, which matches the light page's lightness). */
     color: var(--primary);
     background-color: color-mix(in oklch, var(--primary) 10%, transparent);
-    border: 1px solid color-mix(in oklch, var(--primary) 22%, transparent);
+    border-color: color-mix(in oklch, var(--primary) 22%, transparent);
+    line-height: 1.5;
   }
   .okf-prose .okf-cite:hover,
   .okf-prose .okf-cite:focus-visible {
     background-color: color-mix(in oklch, var(--primary) 18%, transparent);
+    border-color: color-mix(in oklch, var(--primary) 32%, transparent);
     outline: none;
   }
+  /* The label truncates rather than wrapping: a long headline or concept path must
+     not stretch the pill across the paragraph (the full text is in the card). */
+  .okf-prose .okf-cite-label {
+    @apply inline-block overflow-hidden align-bottom;
+    max-width: 12em;
+    text-overflow: ellipsis;
+  }
+  /* "+2" — the other sources behind this claim, page through them in the card.
+     Slightly quieter than the label, but still in the cyan family. */
+  .okf-prose .okf-cite-more {
+    @apply font-semibold tabular-nums;
+    color: color-mix(in oklch, var(--primary) 65%, var(--muted-foreground));
+  }
+  .okf-prose .okf-cite-icon {
+    @apply align-middle;
+  }
+  /* NOTE: no `.okf-cite svg { color: … }` rule here — it would sit in @layer
+     components and LOSE to the icon's text-muted-foreground utility (utilities
+     layer comes later; layer order beats specificity). The doc glyph's cyan is
+     applied as `text-primary` at the component instead (Citation.jsx). */
   /* Markdown's BARE fenced blocks only — CodeView brings its own chrome
      (header + scroll container), so its pre must not inherit this panel
      styling (the leak gave it rounded top corners under the header and a
@@ -271,6 +300,13 @@
   }
   .okf-prose td { @apply border px-3 py-1.5 align-top; }
   .okf-prose img { @apply my-3 max-w-full rounded-md border; }
+  /* ...but a citation badge's favicon is UI CHROME, not prose imagery. The rule
+     above would give an 11px icon 12px of vertical margin plus a border ring,
+     which inflates the badge's line box into a chunky block twice the height of
+     the doc badges beside it. Higher specificity, so it wins without !important. */
+  .okf-prose .okf-cite img {
+    @apply m-0 rounded-[3px] border-0 align-middle;
+  }
 
   /* Inline markdown for a single feed row: keep GFM inline formatting (bold,
      code, links) but flatten block structure so it stays on one line and can be
