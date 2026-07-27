@@ -5,7 +5,13 @@ variant must extend (not replace) the base and mention run_sql.
 
 from __future__ import annotations
 
-from chat.graph import SYSTEM_PROMPT, SYSTEM_PROMPT_WITH_SQL
+from chat.graph import (
+    SQL_BLOCK,
+    SYSTEM_PROMPT,
+    SYSTEM_PROMPT_WITH_SQL,
+    WEB_SEARCH_BLOCK,
+    compose_system_prompt,
+)
 
 
 def test_prompt_is_static_no_interpolation():
@@ -23,6 +29,16 @@ def test_prompt_covers_the_load_bearing_instructions():
     assert '<cite src="' in SYSTEM_PROMPT
     # read-only posture
     assert "read-only" in p
+
+
+def test_prompt_groups_sources_into_one_tag_and_allows_urls():
+    # The UI renders ONE badge per <cite> tag (paged when it holds several), so a
+    # claim with two sources must be one tag — adjacent tags would litter the
+    # sentence with pills. URLs are first-class src entries alongside concept ids.
+    low = SYSTEM_PROMPT.lower()
+    assert "never emit two tags back to back" in low
+    assert "http(s)://" in SYSTEM_PROMPT
+    assert 'src="tables/orders,https://' in SYSTEM_PROMPT
 
 
 def test_prompt_forbids_content_bearing_cite_tags():
@@ -65,3 +81,34 @@ def test_sql_variant_extends_base_and_mentions_run_sql():
     assert "run_sql" not in SYSTEM_PROMPT
     # read-only SQL is spelled out (the write verbs are explicitly forbidden)
     assert "SELECT" in SYSTEM_PROMPT_WITH_SQL and "never" in SYSTEM_PROMPT_WITH_SQL.lower()
+
+
+def test_web_search_block_documents_when_to_reach_for_it():
+    # The base agent must not advertise a tool a deployment may not have.
+    assert "web_search" not in SYSTEM_PROMPT
+    low = WEB_SEARCH_BLOCK.lower()
+    assert "web_search" in low
+    # The reason it exists: external context around internal numbers (the
+    # "is this decline actually bad / what caused it" case, incl. tariffs).
+    assert "tariff" in low
+    assert "external" in low
+    # It must NOT be used for what the data means — the wiki owns that.
+    assert "wiki is authoritative" in low
+    # Time is steered by the QUERY (the tool has no date filter — deliberately),
+    # and attribution rides the SAME <cite src> tag as wiki docs (the UI renders
+    # one grouped badge per tag), not loose markdown links.
+    assert "no date filter" in low
+    assert "put the period in the query" in low
+    assert '<cite src="https://' in WEB_SEARCH_BLOCK
+    assert "one tag" in low
+    # Correlation is not causation: candidate explanations, not proven causes.
+    assert "speculative" in low
+
+
+def test_compose_system_prompt_appends_blocks_in_order():
+    assert compose_system_prompt() == SYSTEM_PROMPT
+    both = compose_system_prompt(WEB_SEARCH_BLOCK, SQL_BLOCK)
+    assert both.startswith(SYSTEM_PROMPT)
+    assert both.index(WEB_SEARCH_BLOCK) < both.index(SQL_BLOCK)
+    # Empty/absent blocks are skipped, not rendered as gaps.
+    assert compose_system_prompt("", SQL_BLOCK) == SYSTEM_PROMPT_WITH_SQL

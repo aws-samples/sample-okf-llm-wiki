@@ -86,3 +86,10 @@ output "ui_env" {
     VITE_REDSHIFT_ENABLED = tostring(var.enable_redshift)
   }
 }
+
+# The web-search gateway's MCP endpoint (empty when var.enable_web_search = false).
+# Not consumed by the UI — the browser never talks to the gateway — but useful for
+# verifying the deploy and for hand-testing a tools/list with awscurl.
+output "web_search_gateway_url" {
+  value = try(aws_bedrockagentcore_gateway.web_search[0].gateway_url, "")
+}

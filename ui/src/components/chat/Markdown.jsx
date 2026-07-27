@@ -19,13 +19,10 @@ import { useMemo } from "react"
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown"
 import remarkGfm from "remark-gfm"
 
+import { CitationGroup } from "@/components/chat/Citation"
 import { CodeView } from "@/components/chat/CodeView"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
+import { TooltipProvider } from "@/components/ui/tooltip"
+import { parseCiteList } from "@/lib/sources"
 
 const REMARK = [remarkGfm]
 
@@ -37,20 +34,19 @@ function urlTransform(url) {
   return defaultUrlTransform(url)
 }
 
-// A concept id's top-level kind → a human label for the citation popup.
-const CITE_KIND = {
-  tables: "Table",
-  references: "Reference",
-  datasets: "Dataset",
-}
-
-// Citations: the agent emits `<cite src="tables/races,references/joins/x"></cite>`
-// after a claim (see the chat system prompt's <citations> block). We rewrite each
-// tag into one markdown link per concept id using an internal `okf-cite:` scheme,
-// then render those links as compact citation chips (the `a` component below).
+// Citations: the agent emits `<cite src="tables/races,https://example.com/x"></cite>`
+// after a claim (see the chat system prompt's <citations> block). Sources are wiki
+// concept ids and/or web URLs. We rewrite each tag into ONE markdown link carrying
+// the whole source list, using an internal `okf-cite:` scheme, then render that
+// link as a single grouped citation badge (the `a` component below → CitationGroup).
 // This rides the existing markdown link path — no rehype-raw / HTML-in-markdown
 // dependency. A trailing INCOMPLETE tag (mid-stream, e.g. `<cite src="tab`) is
 // stripped so it never flashes as raw text while tokens arrive.
+//
+// ONE badge per claim is the point: the model is told to put every source for a
+// claim in a single tag, but it still sometimes emits back-to-back tags, so
+// mergeAdjacentCites folds those into one before any link is generated. A row of
+// separate pills after one sentence is exactly what we're avoiding.
 //
 // The tag is SUPPOSED to be empty (`<cite src="…"></cite>`), but the model
 // sometimes wraps gloss text: `<cite src="…">titles counted from …</cite>`. We must
@@ -95,28 +91,55 @@ function stripStreamTail(md) {
   return out
 }
 
-// Turn a comma-separated `src` into clustered citation-chip markdown links (one per
-// concept id). Empty → "" (drops a src-less tag entirely).
-function citeChips(src) {
-  const ids = src
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-  if (ids.length === 0) return ""
-  // One link per id; the label IS the id (the chip shows a compact form). No
-  // separators so the chips cluster tightly after the claim.
-  return ids.map((id) => `[${id}](${CITE_SCHEME}${encodeURIComponent(id)})`).join("")
+// Turn a `src` list into ONE citation-badge markdown link carrying every source.
+// Empty → "" (drops a src-less tag entirely).
+//
+// encodeURIComponent does NOT escape parentheses, and an unescaped ")" would
+// TERMINATE the markdown link early — so a perfectly ordinary source URL like
+// `…/wiki/Golf_(car)` would render as broken half-link plus literal text. Escape
+// them explicitly (decodeURIComponent reverses %28/%29 on the way out).
+function encodeCiteHref(list) {
+  return encodeURIComponent(list).replace(/\(/g, "%28").replace(/\)/g, "%29")
+}
+
+function citeBadge(src) {
+  const items = parseCiteList(src)
+  if (items.length === 0) return ""
+  // The link TEXT is unused (CitationGroup renders its own label) but must be
+  // non-empty for react-markdown to emit an anchor at all.
+  return `[cite](${CITE_SCHEME}${encodeCiteHref(items.join(","))})`
+}
+
+// Fold back-to-back cite tags (separated by nothing, spaces, or a stray comma)
+// into ONE tag with the source lists concatenated — so a claim the model backed
+// with two adjacent tags still renders as a single badge. Runs BEFORE the tag→link
+// rewrites, and loops because each merge can create a new adjacency (a,b,c).
+const CITE_ADJACENT_RE =
+  /<cite\s+src="([^"]*)"\s*>\s*(?:<\/cite\s*>)?[\s,]*(?=<cite\s+src=")/gi
+function mergeAdjacentCites(md) {
+  let out = md
+  for (let pass = 0; pass < 8; pass++) {
+    const next = out.replace(CITE_ADJACENT_RE, (_m, src) => `<cite src="${src},`)
+    // The replacement above leaves `<cite src="a,<cite src="b">` — collapse the
+    // inner opener so the two srcs share one tag.
+    const joined = next.replace(/<cite\s+src="([^"]*),<cite\s+src="/gi, '<cite src="$1,')
+    if (joined === out) break
+    out = joined
+  }
+  return out
 }
 
 function preprocessCitations(md) {
   // Guard on any `cite` tag — opener OR orphan closer (`</cite>` contains `</cite`,
   // NOT `<cite`, so an `indexOf("<cite")` alone would skip a stray closer).
   if (!md || md.indexOf("cite") === -1) return md || ""
-  // 1) Content-bearing tags first: `<cite src="…">gloss</cite>` → chips (gloss dropped,
+  // 0) Adjacent tags become one, so one claim yields one badge.
+  let out = mergeAdjacentCites(md)
+  // 1) Content-bearing tags first: `<cite src="…">gloss</cite>` → badge (gloss dropped,
   //    closer consumed). Non-greedy so adjacent cites aren't swallowed as one span.
-  let out = md.replace(CITE_TAG_CONTENT_RE, (_m, src) => citeChips(src))
+  out = out.replace(CITE_TAG_CONTENT_RE, (_m, src) => citeBadge(src))
   // 2) Empty / self-adjacent tags: `<cite src="…"></cite>` or `<cite src="…">`.
-  out = out.replace(CITE_TAG_EMPTY_RE, (_m, src) => citeChips(src))
+  out = out.replace(CITE_TAG_EMPTY_RE, (_m, src) => citeBadge(src))
   // 3) Drop a dangling partial OPENER/CLOSER at the very end (still streaming, e.g. `<cite src="tab`).
   out = out.replace(CITE_PARTIAL_RE, "")
   // 4) Belt-and-suspenders: strip any orphan `</cite>` left with no matching opener
@@ -124,44 +147,6 @@ function preprocessCitations(md) {
   //    malformed tag) so a bare `</cite>` never renders as literal text.
   out = out.replace(CITE_ORPHAN_CLOSE_RE, "")
   return out
-}
-
-// The compact label for a citation chip: the last path segment (e.g.
-// "references/metrics/race_wins" → "race_wins"), which reads cleanly inline; the
-// full id + dataset live in the hover popup.
-function citeLabel(id) {
-  const parts = id.split("/")
-  return parts[parts.length - 1] || id
-}
-
-// A citation chip: a small source pill naming a wiki doc, with a hover popup that
-// shows the doc kind, its full concept-id path, and (when the conversation is
-// scoped) which dataset it belongs to. Not a link — the chat isn't a doc browser.
-function Citation({ id, datasetScope }) {
-  const kind = CITE_KIND[id.split("/")[0]] || "Doc"
-  const dataset = datasetScope
-    ? `${datasetScope.data_domain}/${datasetScope.dataset}`
-    : null
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span className="okf-cite" tabIndex={0}>
-          {citeLabel(id)}
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="top" align="start" className="max-w-xs flex-col items-start gap-1">
-        <span className="text-[10px] font-medium tracking-wide uppercase opacity-70">
-          {kind}
-        </span>
-        <span className="font-mono text-xs break-all">{id}</span>
-        {dataset ? (
-          <span className="text-[11px] opacity-80">
-            in <span className="font-mono">{dataset}</span>
-          </span>
-        ) : null}
-      </TooltipContent>
-    </Tooltip>
-  )
 }
 
 // A concept id: one of the OKF bundle's top-level dirs (datasets/tables/
@@ -182,17 +167,23 @@ function textOf(children) {
   return String(children)
 }
 
-// Components depend on datasetScope (for the citation popup), so build them per
-// scope. Memoized in Markdown so the object is stable across streaming re-renders.
-function makeComponents(datasetScope) {
+// Components depend on datasetScope + the turn's web-source index (both feed the
+// citation cards), so build them per turn. Memoized in Markdown so the object is
+// stable across streaming re-renders.
+function makeComponents(datasetScope, webSources) {
   return {
   a({ href, children, ...props }) {
-    // Citation chip — an `okf-cite:<encoded id>` link (from preprocessCitations),
-    // rendered as a source pill with a hover popup (kind + path + dataset). Not a
-    // navigable link (the chat isn't a doc browser).
+    // Citation badge — an `okf-cite:<encoded source list>` link (from
+    // preprocessCitations), rendered as ONE grouped pill with a paginated card.
     if (typeof href === "string" && href.startsWith(CITE_SCHEME)) {
-      const id = decodeURIComponent(href.slice(CITE_SCHEME.length))
-      return <Citation id={id} datasetScope={datasetScope} />
+      const list = decodeURIComponent(href.slice(CITE_SCHEME.length))
+      return (
+        <CitationGroup
+          sources={parseCiteList(list)}
+          datasetScope={datasetScope}
+          webSources={webSources}
+        />
+      )
     }
     return (
       <a href={href} target="_blank" rel="noreferrer noopener" {...props}>
@@ -250,14 +241,19 @@ function makeComponents(datasetScope) {
   }
 }
 
-export function Markdown({ children, datasetScope = null, streaming = false }) {
+export function Markdown({
+  children,
+  datasetScope = null,
+  streaming = false,
+  webSources = null,
+}) {
   const scopeKey = datasetScope
     ? `${datasetScope.data_domain}/${datasetScope.dataset}`
     : ""
   const components = useMemo(
-    () => makeComponents(datasetScope),
+    () => makeComponents(datasetScope, webSources),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [scopeKey]
+    [scopeKey, webSources]
   )
   const source = preprocessCitations(
     streaming ? stripStreamTail(children) : children

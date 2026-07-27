@@ -728,6 +728,117 @@ paused; `loadHistory` restores it, so a page refresh re-renders the QA form and 
 user can still answer later. No new env, no infra change; server-side pure
 `langchain_core` + `langgraph`.
 
+## 14e. Public web search (`web_search`) — BUILT
+
+Lets the agent put internal numbers in **external context**: is a decline unusual
+for the sector, did a tariff / regulation / supply shock / weather event land in
+the same period, what has been published since the model's training cutoff. It is
+the only chat tool that reads anything outside the organization.
+
+**Deploy-gated only — no per-run opt-in** (`var.enable_web_search`, default
+`true`). That's a deliberate asymmetry with `run_sql`: web search touches no
+source data, and the turns where it earns its keep ("hmm, is that drop actually
+bad?") are exactly the ones a user can't anticipate when picking tools from the
+composer. When the flag is off, nothing is created and the tool isn't offered.
+
+**Why a Gateway.** Web Search on AgentCore exists *only* as a built-in connector
+target on an AgentCore **Gateway**, which speaks MCP — there is no direct search
+API. So `services/chat/src/chat/web_search.py` is a small MCP client:
+`initialize` → `Mcp-Session-Id` → `tools/call`, POSTed with **SigV4** (the
+gateway's inbound authorizer is `AWS_IAM`, so the runtime's own execution role is
+the credential — nothing to vend or rotate). The JSON-RPC is hand-rolled on
+botocore rather than pulling in the async `mcp` SDK: the surface we need is two
+POSTs, LangChain tools here are synchronous, and botocore is already a dependency.
+The session id is cached per process (the engine is built once in
+`make_agent_factory`, not per run) and re-established transparently on a 4xx.
+
+**Terraform (`infra/compute/web_search.tf`) — the one non-native resource in the
+repo.** The gateway itself is `aws_bedrockagentcore_gateway`, but
+`aws_bedrockagentcore_gateway_target` has **no `connector` block** in
+`hashicorp/aws` 6.54–6.56 (only lambda / api_gateway / mcp_server / open_api_schema
+/ smithy_model). `AWS::BedrockAgentCore::GatewayTarget` in the CloudFormation
+registry does support `Mcp.Connector` and is `FULLY_MUTABLE`, so the target is an
+`aws_cloudcontrolapi_resource` — same provider, still declarative, still no console
+steps. Swap it for the native resource when the provider grows the block.
+
+**Region is not the deployment's.** The connector is offered in `us-east-1` only,
+so the gateway, its service role, and the target all use the existing
+`aws.us_east_1` provider alias whatever `var.region` is, and the runtime signs for
+us-east-1 (`OKF_WEB_SEARCH_REGION`). A query never leaves AWS — the gateway serves
+it internally, not via a third-party engine — but it *does* leave the deployment's
+region. That, per-query billing, and the attribution duty below are why the flag
+exists.
+
+**Two roles, not one.** The *gateway service role* holds
+`bedrock-agentcore:InvokeWebSearch` on the service-owned ARN
+`arn:aws:bedrock-agentcore:us-east-1:aws:tool/web-search.v1` (account field is
+literally `aws`) plus `InvokeGateway`. The *chat role* gains exactly one action:
+`bedrock-agentcore:InvokeGateway` on this gateway's ARN.
+
+**No date filter — deliberately.** `WebSearch` accepts only `query` (≤200 chars)
+and `maxResults` (1–25, agent-selectable, default 10 via
+`var.web_search_max_results`) — there is no recency parameter — while each result
+carries an optional `publishedDate`. An earlier revision added
+`published_after`/`published_before` wrapper args that filtered client-side; they
+were **removed**: filtering a relevance-ranked top-N after the fact can only
+subtract results, never surface period-relevant pages the ranking missed, so it
+added argument surface without adding recall. Instead the agent anchors time in
+the query itself ("EU steel tariffs Q2 2026") and reads each result's publication
+date — which is why the tool **description carries today's date** (the system
+prompt is deliberately static, a cacheable prefix, so the description is the one
+place a per-run date belongs). An optional server-side domain denylist
+(`var.web_search_excluded_domains`) is invisible to the model.
+
+**Prompt.** `graph.WEB_SEARCH_BLOCK` documents *when* to reach for it
+(interpretation, cause-and-effect, freshness, verification), when not to (anything
+the wiki answers — the wiki is authoritative on this organization's data and a web
+guess about internal schema is wrong by default), that correlation in time is a
+*candidate* explanation and must be labelled speculative, and that every result
+used must appear as a **markdown link** (wiki claims use `<cite src>`; web claims
+use links). That last one is also AWS's acceptable-use requirement: source
+citations and links must be retained in output shown to end users.
+
+Prompt blocks are now **composed** (`graph.compose_system_prompt`) rather than
+picked from pre-built variants: the deployment-constant web-search block comes
+*before* the per-run SQL block so `base + web` stays a shared cache prefix across
+turns that do and don't opt into SQL.
+
+New env: `OKF_WEB_SEARCH_ENABLED`, `OKF_WEB_SEARCH_GATEWAY_URL`,
+`OKF_WEB_SEARCH_REGION`, `OKF_WEB_SEARCH_TOOL_NAME`, `OKF_WEB_SEARCH_MAX_RESULTS`.
+No new UI env — there's no affordance to gate, only rendering (below).
+
+### 14e.1 UI: source cards, favicons, and GROUPED citations
+
+Three UI pieces, modelled on how Claude and ChatGPT present sources:
+
+**The search step shows its sources.** `web_search` results render as the
+`sources` view (`wikiTools.js` → `UnifiedThinkingBlock`): one row per result —
+favicon, title, host right-aligned — each row a link out, and the step opens
+EXPANDED (unlike every other tool step) because the sources *are* the substance of
+that step, not a detail to drill into.
+
+**Favicons** (`components/chat/SourceIcon.jsx`, `lib/sources.faviconUrl`) come from
+the SOURCE ORIGIN (`https://<host>/favicon.ico`), not a third-party icon service:
+Google's/DuckDuckGo's endpoints are more reliable but would tell a third party every
+domain our users' agents read. Missing icons are NORMAL and degrade to a monogram
+tile (host initial over a hue hashed from the host, so a list stays scannable). This
+is the one reason the CloudFront CSP allows `img-src … https:` (see `ui.tf`).
+
+**Citations are ONE badge per claim, and they take URLs.** `<cite src>` entries may
+now be concept ids *or* `http(s)://` URLs, freely mixed in a single tag, and
+`Markdown.preprocessCitations` additionally MERGES adjacent tags — so a claim backed
+by three sources renders as one pill (`favicon · host +2`), never a row of chips.
+Clicking pages through the sources with ← / → and an `i/N` counter
+(`components/chat/Citation.jsx`): a web source shows favicon + host, title, date and
+snippet, and links out; a wiki doc shows its kind, full concept path, and dataset.
+Web metadata comes from the turn's own `web_search` results, indexed by
+`lib/sources.collectWebSources` and memoized on a result signature so the streaming
+per-block memo still holds. Two encoding traps handled there: a URL may contain a
+comma (`parseCiteList` re-joins fragments that aren't valid sources), and
+`encodeURIComponent` does NOT escape parentheses — an unescaped `)` in
+`…/wiki/Golf_(car)` would terminate the internal markdown link early, so those are
+escaped explicitly.
+
 ## 15. Open items / risks
 
 - **O1 — `DynamoDBSaver` table schema. RESOLVED** (§7.1): `PK`(HASH,S)+`SK`(RANGE,S),

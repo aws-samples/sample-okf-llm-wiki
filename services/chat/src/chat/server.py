@@ -572,7 +572,13 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     ``features`` (default empty) is the per-run set of opted-in optional tools
     (e.g. ``{"sql"}`` from the composer's "+" menu). The read-only SQL tool is
     added only when the deploy flag is on AND the run opted in — see
-    :func:`make_agent_tools_with_features`.
+    :func:`make_agent_tools_with_features`. Web search is deploy-gated only (no
+    opt-in): it reads no source data, so it rides every run of a deployment that
+    has a gateway wired.
+
+    Each optional tool contributes a prompt BLOCK; the run's system prompt is the
+    base plus the blocks for the tools actually wired, so the agent is never told
+    about a tool it doesn't have this turn.
 
     NOTE: this returns the RAW compiled LangGraph graph (no AG-UI wrapper) —
     ``stream_run`` drives ``.astream`` on it directly.
@@ -584,12 +590,15 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     from chat.charts import make_chart_tool
     from chat.config import build_chat_model
     from chat.graph import (
-        SYSTEM_PROMPT_WITH_SQL,
-        SYSTEM_PROMPT_WITH_SQL_REDSHIFT,
+        SQL_BLOCK,
+        SQL_REDSHIFT_BLOCK,
+        WEB_SEARCH_BLOCK,
         build_graph,
+        compose_system_prompt,
     )
     from chat.sql import AthenaSQL, RedshiftDataSQL, make_sql_tool
     from chat.tools import build_consumption_tools, make_agent_tools
+    from chat.web_search import build_web_search_engine, make_web_search_tool
 
     # The Athena / Redshift Data API clients are present only when their deploy
     # flags are on (build_deps).
@@ -597,6 +606,11 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     redshift_data_client = clients.pop("redshift_data", None)
     annotations_table = clients.pop("annotations", None)
     tools_impl = build_consumption_tools(config=consumption_config, **clients)
+
+    # The web search client is built ONCE per process (not per run): it caches the
+    # gateway's MCP session id, so a fresh client per turn would pay an extra
+    # handshake round trip on every search. None when not deploy-enabled.
+    web_search_engine = build_web_search_engine(chat_config)
 
     def _sql_engine() -> AthenaSQL | None:
         if not (chat_config.sql_enabled and athena_client is not None):
@@ -700,6 +714,17 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                     annotations_table, user_sub=user_sub, dataset_scope=scope
                 ),
             ]
+        # The prompt blocks for the optional tools wired below, in the order they
+        # are appended to the base prompt (see graph.compose_system_prompt: the
+        # deployment-constant ones go first so the cached prefix stays long).
+        blocks: list[str] = []
+        # Public web search: DEPLOY-gated only (no per-run opt-in). Unlike run_sql
+        # it reads no source data, and its value is exactly in the turns where a
+        # question unexpectedly turns outward ("is that decline actually bad?") —
+        # a turn the user can't foresee when picking tools.
+        if web_search_engine is not None:
+            agent_tools = [*agent_tools, make_web_search_tool(web_search_engine)]
+            blocks.append(WEB_SEARCH_BLOCK)
         # Optional read-only SQL: both the deploy flag (engine present) and the
         # per-run opt-in (features) are required. system_prompt gains a block so
         # the model knows the tool exists this turn. The ENGINE is picked by the
@@ -709,7 +734,6 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # Redshift scope on a deployment without Redshift enabled gets NO SQL
         # tool — running the dataset's queries through Athena would silently hit
         # the wrong backend/dialect.
-        prompt = None
         if features and "sql" in features:
             scoped = _sql_scope(scope)
             scoped_source = (scoped or {}).get("source") or {}
@@ -720,7 +744,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                         *agent_tools,
                         make_sql_tool(engine, dataset_scope=scoped),
                     ]
-                    prompt = SYSTEM_PROMPT_WITH_SQL_REDSHIFT
+                    blocks.append(SQL_REDSHIFT_BLOCK)
             else:
                 engine = _sql_engine()
                 if engine is not None:
@@ -728,7 +752,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                         *agent_tools,
                         make_sql_tool(engine, dataset_scope=scoped),
                     ]
-                    prompt = SYSTEM_PROMPT_WITH_SQL
+                    blocks.append(SQL_BLOCK)
         # Bedrock prompt caching (Sparky's setup): the middleware passes cache
         # settings via model_settings and ChatBedrockConverse inserts the
         # cachePoint blocks at request time — so the tool schemas + the static
@@ -737,13 +761,12 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # non-Bedrock model (a Mantle GPT catalog entry).
         # AskHumanMiddleware owns the human-in-the-loop interrupt for ask_human.
         middleware = [BedrockPromptCachingMiddleware(), AskHumanMiddleware()]
-        if prompt is not None:
-            return build_graph(
-                chat_model, agent_tools, checkpointer,
-                system_prompt=prompt, middleware=middleware,
-            )
         return build_graph(
-            chat_model, agent_tools, checkpointer, middleware=middleware
+            chat_model,
+            agent_tools,
+            checkpointer,
+            system_prompt=compose_system_prompt(*blocks),
+            middleware=middleware,
         )
 
     return build_agent

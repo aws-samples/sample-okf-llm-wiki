@@ -118,6 +118,61 @@ don't drift. Sources are at the end of each section.
   `lifecycle_configuration { idle_runtime_session_timeout max_lifetime }`. The
   nested configs are HCL blocks; `environment_variables` and `tags` are maps.
 
+### 2b. AgentCore Gateway + the web-search connector (chat `web_search`)
+
+A **Gateway** is an MCP front end for tools AgentCore hosts. Web Search is
+reachable *only* this way — there is no direct search API — so the chat agent
+gets it by talking MCP to a gateway whose single target is the built-in
+`web-search` connector.
+
+- **Gateway (Terraform, native):** `aws_bedrockagentcore_gateway` with
+  `name role_arn protocol_type = "MCP"` and `authorizer_type = "AWS_IAM"`
+  (valid: `CUSTOM_JWT`, `AWS_IAM`; `authorizer_configuration { custom_jwt_authorizer {
+  discovery_url … } }` is required only for `CUSTOM_JWT`). Exports `gateway_id`,
+  `gateway_arn`, and `gateway_url` — the `…/mcp` endpoint.
+- **Connector target — NOT natively supported.** `aws_bedrockagentcore_gateway_target`'s
+  `target_configuration.mcp` accepts `lambda` / `api_gateway` / `mcp_server` /
+  `open_api_schema` / `smithy_model` but **no `connector` block** (verified against
+  provider 6.54/6.56). `AWS::BedrockAgentCore::GatewayTarget` in the CloudFormation
+  registry *does* support `Mcp.Connector` and is `FULLY_MUTABLE`, so we declare the
+  target with `aws_cloudcontrolapi_resource` (same provider, still declarative):
+  ```hcl
+  desired_state = jsonencode({
+    Name = "<target>", GatewayIdentifier = "<gateway_id>"
+    TargetConfiguration = { Mcp = { Connector = {
+      Source         = { ConnectorId = "web-search" }
+      Configurations = [{ Name = "WebSearch", ParameterValues = {
+        domainFilter = { exclude = ["blocked.example"] } } }]   # optional denylist
+    } } }
+    CredentialProviderConfigurations = [{ CredentialProviderType = "GATEWAY_IAM_ROLE" }]
+  })
+  ```
+  Connector targets need **no** `iamCredentialProvider` (the connector's service is
+  known to the gateway); MCP-server and OpenAPI targets do.
+- **IAM, two roles.** The *gateway service role* (trust
+  `bedrock-agentcore.amazonaws.com`) needs `bedrock-agentcore:InvokeGateway` on
+  `…:gateway/*` **and** `bedrock-agentcore:InvokeWebSearch` on the service-owned
+  ARN `arn:aws:bedrock-agentcore:us-east-1:aws:tool/web-search.v1` (account field
+  is literally `aws`). The *caller* (our chat runtime) needs only
+  `bedrock-agentcore:InvokeGateway` on the gateway ARN.
+- **Invoke (MCP over HTTPS, SigV4 service `bedrock-agentcore`):** POST JSON-RPC to
+  `gateway_url`. `initialize` (`protocolVersion` `"2025-06-18"`) returns an
+  `Mcp-Session-Id` header to echo on subsequent calls; then
+  `tools/call {name, arguments}`. Send `Accept: application/json, text/event-stream`
+  — the reply may be either plain JSON or SSE `data:` frames.
+- **Tool naming:** `${target_name}___${tool_name}` (three underscores), e.g.
+  `okf-web-search___WebSearch`.
+- **`WebSearch` I/O:** input is `{query (≤200 chars, required), maxResults (1–25,
+  default 10)}` — **no date/recency parameter**. The result is an MCP tool result
+  whose text block is JSON: `{id, results:[{text, url, title, publishedDate}]}`
+  (`url`/`title`/`publishedDate` all optional). Our wrapper deliberately adds no
+  client-side date filter either — the agent puts the period in the query and
+  reads `publishedDate` (`services/chat/src/chat/web_search.py`).
+- **Region + acceptable use:** connector available in `us-east-1` only. Queries are
+  served inside AWS (not handed to a third-party engine), but AWS's terms require
+  retaining the source citations/links in anything shown to end users, and forbid
+  bulk extraction or building a competing index.
+
 ## 3. S3 Vectors — `boto3.client("s3vectors")`
 
 - `create_vector_bucket(vectorBucketName=...)`.

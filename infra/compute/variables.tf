@@ -236,6 +236,52 @@ variable "chat_sql_max_rows" {
   description = "Max rows the chat run_sql tool returns per query (the rest are truncated to bound a turn's token cost). Only used when var.enable_chat_sql = true."
 }
 
+# --- Chat web search (optional) ----------------------------------------------
+
+variable "enable_web_search" {
+  type        = bool
+  default     = true
+  description = <<-EOT
+    Give the chat agent a public web_search tool, so it can put internal numbers in
+    external context (is a decline unusual for the sector? did a tariff, regulation,
+    or supply event land in the same quarter?) and answer questions about facts newer
+    than the model's training. Provisions an AgentCore Gateway with the built-in
+    web-search connector plus its service role, and grants the chat runtime
+    bedrock-agentcore:InvokeGateway on it.
+
+    Three things to weigh before leaving this on:
+      * REGION — the connector exists only in us-east-1, so the gateway is created
+        there whatever var.region is. Queries are served inside AWS (never handed to
+        a third-party search engine) but they DO leave the deployment's region.
+      * COST — searches are billed per query, on top of the tokens the results add
+        to a turn's context.
+      * ATTRIBUTION — AWS's acceptable use requires that source citations and links
+        be retained in anything shown to end users; the agent's prompt makes linking
+        every used result mandatory, and the UI renders those links.
+
+    Unlike run_sql this needs NO per-conversation opt-in: it reads no source data,
+    and the turns it helps with are exactly the ones a user can't predict when
+    choosing tools. Set to false to withhold the tool and create nothing.
+  EOT
+}
+
+variable "web_search_excluded_domains" {
+  type        = list(string)
+  default     = []
+  description = <<-EOT
+    Optional domain denylist for web_search (e.g. ["example.com"]). Enforced
+    SERVER-SIDE by the connector and invisible to the model — the agent isn't told
+    about the restriction, it simply never receives results from these hosts. Only
+    used when var.enable_web_search = true.
+  EOT
+}
+
+variable "web_search_max_results" {
+  type        = number
+  default     = 10
+  description = "Default number of web_search results per query when the agent doesn't ask for a specific count (the agent can pick 1-25 per call). Higher = more context per search and more tokens per turn."
+}
+
 variable "enable_code_interpreter" {
   type        = bool
   default     = true
@@ -314,8 +360,8 @@ variable "redshift_secret_name_prefix" {
 
 variable "control_api_provisioned_concurrency" {
   type        = number
-  description = "Pre-warmed execution environments for the control API Lambda, to minimize cold starts on the browser-facing plane. 0 disables it."
-  default     = 10
+  description = "Pre-warmed execution environments for the control API Lambda, to minimize cold starts on the browser-facing plane. 0 disables it. Deployments override via CONTROL_API_PROVISIONED_CONCURRENCY in scripts/.deployment.config (deploy.sh passes the -var only when set)."
+  default     = 4
 }
 
 variable "athena_output_location" {

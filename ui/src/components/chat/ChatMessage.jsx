@@ -16,6 +16,7 @@ import { Markdown } from "@/components/chat/Markdown"
 import { ResponseActions } from "@/components/chat/ResponseActions"
 import { UnifiedThinkingBlock } from "@/components/chat/UnifiedThinkingBlock"
 import { buildMessageBlocks } from "@/lib/buildMessageBlocks"
+import { collectWebSources, webSourcesSignature } from "@/lib/sources"
 
 // A stable content signature for a block, so the memo can skip re-rendering when
 // nothing about the block actually changed (buildMessageBlocks returns fresh
@@ -48,7 +49,7 @@ function blockSig(block) {
 // its own content changes — not when a sibling block streams. During a stream
 // only the last (growing) block re-parses; earlier blocks are skipped.
 const Block = memo(
-  function Block({ block, complete, live, datasetScope }) {
+  function Block({ block, complete, live, datasetScope, webSources }) {
     if (block.type === "think") {
       return (
         <UnifiedThinkingBlock
@@ -75,7 +76,11 @@ const Block = memo(
     // unstable tail — partial <cite prefixes and unbalanced bold/backtick
     // markers otherwise flash as literal ghost text while tokens arrive.
     return (
-      <Markdown datasetScope={datasetScope} streaming={!complete}>
+      <Markdown
+        datasetScope={datasetScope}
+        streaming={!complete}
+        webSources={webSources}
+      >
         {block.content}
       </Markdown>
     )
@@ -84,6 +89,10 @@ const Block = memo(
     prev.complete === next.complete &&
     prev.live === next.live &&
     prev.datasetScope === next.datasetScope &&
+    // Reference-compared: the index is memoized on a result signature in
+    // ChatMessageImpl, so it only changes when a search actually returned
+    // something new — not on every streamed token.
+    prev.webSources === next.webSources &&
     blockSig(prev.block) === blockSig(next.block)
 )
 
@@ -93,6 +102,17 @@ function ChatMessageImpl({ turn, streaming, datasetScope }) {
   const blocks = useMemo(
     () => buildMessageBlocks(aiEvents, isEnd),
     [aiEvents, isEnd]
+  )
+
+  // URL → {title, publishedDate, text} for every page this turn's web_search
+  // calls returned, so a `<cite src="https://…">` badge can show the page rather
+  // than a bare link. Memoized on a RESULT signature (not the events array, whose
+  // identity changes every flush) to keep the reference stable for Block's memo.
+  const webSig = webSourcesSignature(aiEvents)
+  const webSources = useMemo(
+    () => collectWebSources(aiEvents),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [webSig]
   )
 
   // The answer's plain text (all text blocks joined) — what the copy button
@@ -156,6 +176,7 @@ function ChatMessageImpl({ turn, streaming, datasetScope }) {
                 complete={complete}
                 live={streaming}
                 datasetScope={datasetScope}
+                webSources={webSources}
               />
             )
           })}

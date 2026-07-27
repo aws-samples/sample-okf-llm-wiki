@@ -42,6 +42,10 @@ def test_from_env_defaults():
     assert cfg.checkpoint_ttl_seconds is None
     # SQL is OFF by default (deploy-gated) — the browser can't self-enable it.
     assert cfg.sql_enabled is False
+    # So is web search, and it defaults to the connector's only region.
+    assert cfg.web_search_enabled is False
+    assert cfg.web_search_gateway_url == ""
+    assert cfg.web_search_region == "us-east-1"
     assert [e["model"] for e in cfg.catalog] == [
         "us.anthropic.claude-opus-4-8",
         "openai.gpt-5.6-sol",
@@ -61,6 +65,23 @@ def test_from_env_sql_flag_and_athena():
     assert cfg.athena_workgroup == "primary"
     assert cfg.athena_output == "s3://results/chat/"
     assert cfg.sql_max_rows == 50
+
+
+def test_from_env_web_search():
+    cfg = ChatConfig.from_env(
+        _env(
+            OKF_WEB_SEARCH_ENABLED="true",
+            OKF_WEB_SEARCH_GATEWAY_URL="https://gw.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp",
+            OKF_WEB_SEARCH_TOOL_NAME="okf-web-search___WebSearch",
+            OKF_WEB_SEARCH_MAX_RESULTS="12",
+        )
+    )
+    assert cfg.web_search_enabled is True
+    assert cfg.web_search_gateway_url.endswith("/mcp")
+    assert cfg.web_search_tool_name == "okf-web-search___WebSearch"
+    assert cfg.web_search_max_results == 12
+    # The gateway region is independent of the runtime's (connector = us-east-1).
+    assert cfg.web_search_region == "us-east-1"
 
 
 def test_from_env_overrides():
