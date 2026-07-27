@@ -402,7 +402,12 @@ function helperSource() {
           data: s.data || [],
           borderColor: rgb(seriesColor(i)),
           backgroundColor: (sType === "bar") ? rgb(seriesColor(i)) : rgb(seriesColor(i), sIsArea ? 0.2 : 1),
-          borderWidth: 2,
+          // Bars get NO border: borderColor == fill so it adds nothing, and
+          // Chart.js paints a bar border as a second fill whose antialiased
+          // seam lets the page background bleed through as a thin inset line
+          // (visible on dark fills, worse at the elevated zoom ratios the
+          // crispness re-raster uses). Lines keep 2 — that IS the stroke.
+          borderWidth: (sType === "bar") ? 0 : 2,
           borderRadius: (sType === "bar") ? 4 : 0,
           tension: 0.3,
           pointRadius: (sType === "line") ? 2 : 0
@@ -423,10 +428,20 @@ function helperSource() {
   // when the effective ratio changes (page zoom on the desktop bumps
   // window.devicePixelRatio; pinch-zoom bumps visualViewport.scale) so it re-rasters
   // sharp at the new zoom instead of upscaling the old bitmap.
+  // Pinch-zoom scale forwarded by the HOST page (see the "zoom" message below):
+  // pinch zoom is a visual-viewport scale only the TOP-LEVEL window can see —
+  // in this frame devicePixelRatio is unchanged and visualViewport.scale reads 1.
+  var _hostScale = 1;
   function targetRatio() {
     var base = window.devicePixelRatio || 1;
     var vp = (window.visualViewport && window.visualViewport.scale) || 1;
-    return Math.min(4, Math.max(2, base * vp));
+    if (_hostScale > vp) vp = _hostScale; // max, not product — never double-count
+    // Ceiling 8 = crisp up to 400% browser zoom on a 2x display. The cost is
+    // backing-store memory (CSS w x h x ratio^2 x 4B — ~70MB for a chat-sized
+    // chart at 8) but it's TRANSIENT: zooming back down re-rasters smaller.
+    // A cap of 4 looked identical at 300%+ zoom no matter how faithfully the
+    // ratio watchers re-rendered — the clamp, not stale rasters, was the blur.
+    return Math.min(8, Math.max(2, base * vp));
   }
   var _lastRatio = 0;
   var _lastSpec = null;
@@ -475,6 +490,38 @@ function helperSource() {
       window.visualViewport.addEventListener("resize", onZoom);
       window.visualViewport.addEventListener("scroll", onZoom);
     }
+    // Desktop Cmd+/- zoom changes devicePixelRatio WITHOUT firing either
+    // listener above inside this frame (the frame's CSS-px size is unchanged),
+    // and dPR changes emit no event of their own — so the chart stayed at its
+    // birth raster and the browser upscaled the bitmap (blurry). The standard
+    // detector: a one-shot matchMedia on the CURRENT resolution fires when it
+    // stops matching; re-register at each new ratio to keep watching.
+    (function watchDpr() {
+      try {
+        var mq = window.matchMedia("(resolution: " + (window.devicePixelRatio || 1) + "dppx)");
+        var rearm = function () {
+          onZoom();
+          watchDpr();
+        };
+        if (mq.addEventListener) mq.addEventListener("change", rearm, { once: true });
+        else if (mq.addListener) mq.addListener(rearm); // older WebKit
+      } catch (e) {}
+    })();
+    // Pinch zoom: invisible to every watcher above (dPR unchanged, THIS frame's
+    // visualViewport.scale stays 1, and nothing resizes — pinch doesn't reflow).
+    // The host page watches its top-level visualViewport and forwards the scale
+    // (ChartFrame's pinch-zoom bridge). Only the parent window is trusted — a
+    // sibling chart frame reaching us via window.parent.frames fails the
+    // e.source check, and the model's own code already runs in-frame anyway.
+    window.addEventListener("message", function (e) {
+      if (e.source !== window.parent) return;
+      var d = e.data;
+      if (!d || d.source !== "okf-chart-host" || d.type !== "zoom") return;
+      var s = Number(d.scale);
+      if (!isFinite(s) || s <= 0 || Math.abs(s - _hostScale) < 0.01) return;
+      _hostScale = s;
+      onZoom();
+    });
   })();
   `
 }

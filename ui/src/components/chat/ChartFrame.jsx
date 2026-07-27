@@ -319,6 +319,31 @@ function ChartFrameInner({ code, title, live }) {
     return () => window.removeEventListener("message", onMessage)
   }, [])
 
+  // Pinch-zoom bridge: pinch zoom is a VISUAL-VIEWPORT scale only this
+  // top-level window can observe — inside the frame devicePixelRatio is
+  // unchanged, visualViewport.scale reads 1, and nothing resizes (pinch
+  // doesn't reflow), so the frame's own crisp-on-zoom watchers are blind to
+  // it. Forward the page's scale; the frame folds it into its render ratio
+  // and re-rasters (the "zoom" message in chartIframe.js). Re-keyed on status
+  // so the current scale is re-sent once the frame reports in — the mount-time
+  // send can land before the frame's listener exists.
+  useEffect(() => {
+    const vv = window.visualViewport
+    if (!vv) return undefined
+    const send = () => {
+      const w = iframeRef.current?.contentWindow
+      if (w) {
+        w.postMessage(
+          { source: "okf-chart-host", type: "zoom", scale: vv.scale || 1 },
+          "*"
+        )
+      }
+    }
+    send() // frame may mount while the page is already pinch-zoomed
+    vv.addEventListener("resize", send)
+    return () => vv.removeEventListener("resize", send)
+  }, [status])
+
   // A frame that never reports back (blocked/blank) shouldn't spin forever — after
   // a grace period with no "ok"/"error", treat it as failed so the user sees the
   // contained error rather than an empty box.
