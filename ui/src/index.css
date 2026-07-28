@@ -79,6 +79,12 @@
     --chart-3: oklch(0.62 0.14 238); /* sky blue */
     --chart-4: oklch(0.45 0.1 214); /* deep teal-cyan */
     --chart-5: oklch(0.78 0.1 230); /* pale cyan */
+    /* GraphView cross-dataset (external/) node cards: a faint brand-cyan wash
+       on the white card surface. An explicit per-mode token (see .dark) rather
+       than a runtime color-mix: mixing the cyan accents with white IN OKLCH
+       hue-rotates through rose (white's explicit hue is 0), which is exactly
+       the pink-card bug this replaces. Keep in the brand cyan family. */
+    --xref-node-bg: oklch(0.965 0.018 220);
     --radius: 0.625rem;
     /* Dark sidebar (#2E2E2E) against the light content area. Its sub-tokens are
        flipped to light-on-dark so nav text, hover/active states, and borders
@@ -122,6 +128,10 @@
     --chart-3: oklch(0.7 0.14 238); /* sky blue */
     --chart-4: oklch(0.6 0.11 212); /* deep cyan */
     --chart-5: oklch(0.85 0.08 230); /* pale cyan */
+    /* GraphView cross-dataset node cards, dark variant: one step lighter than
+       --card (0.218) with a touch more cyan chroma, so the wash reads on the
+       dark surface without glowing. Same hue family as the light token. */
+    --xref-node-bg: oklch(0.27 0.028 222);
     /* Darker sidebar (#161616) in dark mode — reads as a recessed panel against
        the lighter content bg. Hover accent is a lighter gray so it stays
        visible on the near-black surface. */

@@ -37,6 +37,15 @@ REDSHIFT_TABLE_TYPE = "Redshift Table"
 #: A Spectrum / federated / Glue-backed external table (data outside Redshift).
 REDSHIFT_EXTERNAL_TABLE_TYPE = "Redshift External Table"
 
+# -- cross-dataset concept types (authored by harvest cross mode) ------------
+
+#: A doc under ``external/<domain>/<dataset>/`` representing knowledge that
+#: spans THIS dataset and one counterpart (a verified cross-dataset join, a
+#: cross-dataset metric, the pair overview). Deliberately NOT schema-bearing:
+#: cross docs are re-authored wholesale by each cross run, so the augmentation
+#: guard's never-shrink rule does not apply to them.
+CROSS_DATASET_REFERENCE_TYPE = "Cross-Dataset Reference"
+
 # -- schema-bearing types ----------------------------------------------------
 
 #: Concept types whose ``# Schema`` field set and ``# Citations`` entries are

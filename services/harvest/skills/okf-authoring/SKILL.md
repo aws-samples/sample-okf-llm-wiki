@@ -415,6 +415,20 @@ the link itself.
 - One link per concept-mention per section is enough. Don't over-link, and don't
   link from headings, fenced code blocks, or schema field-name listings.
 
+## Cross-dataset reference docs
+
+When the task is to document knowledge that SPANS two datasets — verified
+cross-dataset joins, conformed dimensions, cross-dataset metrics, a pair
+overview — the rules change in specific ways. Above all: it is a BUSINESS
+question first — understand both wikis and find genuine shared entities before
+any column matching or SQL, and treat "these datasets don't relate" as a valid,
+common outcome that authors nothing. Then: symmetric prose, qualified
+identifiers everywhere, a per-candidate verification bar, links to the table
+docs on BOTH sides (home file-relative + the bundle-escaping counterpart
+address, which may dangle — accepted), refuted candidates recorded as caveats.
+Read `references/cross-dataset.md` for the full methodology; SKILL.md's
+quality bars all still apply on top of it.
+
 ## Citations
 
 When a body makes claims, list what backs them under a `# Citations` heading at
@@ -478,4 +492,5 @@ citations point to sources you actually used.
 - `references/spec-condensed.md` — the normative OKF v0.1 rules, condensed.
 - `references/templates.md` — copy-paste frontmatter+body templates per concept type.
 - `references/fact-types.md` — the fact-extraction checklist: ~20 fact types (business terms, metrics, joins, code/enum legends, caveats, units, named sets, canonical recipes, …), the cue phrases to find each in docs, and where each lands in the bundle. Read it in Pass 3 (folding in uploaded context) and when mining the source for gotchas/enums.
+- `references/cross-dataset.md` — the cross-dataset methodology: understand both wikis FIRST (business convergence + the plausibility gate — unrelated pairs author nothing), then the column-evidence lenses (shared/near-synonym keys, conformed dimensions, shared enum vocabularies, joined-only metrics), the per-candidate SQL verification bar (overlap, measured cardinality, orphans, format agreement), and the doc conventions for pair docs that are read by consumers of both datasets. Read it when a task names a counterpart dataset to document relationships against.
 - `references/sources/` — per-backend adapters (Athena+Glue, Redshift, …): source-specific schema extraction, `type`/`resource`/dialect conventions, type vocabulary, idioms, and gotchas. See `references/sources/index.md` to pick one or add a new one.

@@ -43,6 +43,9 @@ from harvest.guard_engine import OKFGuardEngine
 from harvest.okf_guard import OKFGuardMiddleware, ToolErrorMiddleware
 from harvest.prompts import (
     build_context_extractor_prompt,
+    build_cross_author_prompt,
+    build_cross_reviewer_prompt,
+    build_cross_supervisor_prompt,
     build_reference_author_prompt,
     build_reviewer_prompt,
     build_supervisor_prompt,
@@ -514,8 +517,15 @@ def build_harvest_agent(
     benchmark_run: dict[str, Any] | None = None,
     persist_kpi: Any = None,
     persist_review: Any = None,
+    cross_target: dict[str, Any] | None = None,
 ) -> HarvestAgent:
     """Build the harvest deep agent (see the module docstring for the wiring).
+
+    ``cross_target`` (``{data_domain, dataset}``) switches the build into
+    CROSS-DATASET mode: the supervisor gets the cross prompt, the authoring
+    fan-out is a single ``cross-author`` sub-agent (plus the reviewer), and the
+    guard confines every write to the pair subtree
+    ``external/<target_domain>/<target_dataset>/``. None = a normal build.
 
     ``model``/``effort``/``max_tokens`` configure the SUPERVISOR's model.
     ``subagent_config`` (optional ``{model, effort, max_tokens}``, resolved by
@@ -619,10 +629,24 @@ def build_harvest_agent(
     if ri.is_enabled(ri_config):
         benchmark_budget = ri_config.get(ri.FIELD_MAX_ITERATIONS, ri.MAX_ITERATIONS)
 
+    # Cross-dataset mode: confine every write to the pair subtree. The prefix is
+    # built here (not passed in) so the guard and the prompts can never disagree
+    # about where the run may write. external_pair_prefix VALIDATES both
+    # segments — a "/", "..", or "#" in a target name must never become part of
+    # a write-confinement prefix.
+    writable_prefix = None
+    if cross_target:
+        from okf_core.paths import external_pair_prefix
+
+        writable_prefix = external_pair_prefix(
+            cross_target["data_domain"], cross_target["dataset"]
+        )
+
     guard = OKFGuardMiddleware(
         engine,
         read_current=_make_read_current(dataset_root),
         benchmark_budget=benchmark_budget,
+        writable_prefix=writable_prefix,
     )
     # Tool-boundary safety net: a raising tool (e.g. a PermissionError from the
     # S3 Files mount mid-write) becomes a ToolMessage(status="error") the model
@@ -813,6 +837,26 @@ def build_harvest_agent(
         "model": subagent_chat_model,
     }
 
+    # Cross-dataset mode's single authoring sub-agent: one per VERIFIED
+    # cross-dataset relationship. Shares the guard (so the pair-subtree
+    # confinement applies to it too) and the same source/graph tools — verifying
+    # a cross join is qualified run_sql, no new tool surface.
+    cross_author = {
+        "name": "cross-author",
+        "description": (
+            "Author exactly one CROSS-DATASET reference doc and write its file "
+            "under the run's pair folder (external/<target_domain>/<target_"
+            "dataset>/...): a verified cross-dataset join (joins/*), metric "
+            "(metrics/*), or other canonical fact type spanning the two "
+            "datasets. Pass the concept id + a grounding brief (verifying "
+            "queries, measured cardinality/overlap)."
+        ),
+        "system_prompt": build_cross_author_prompt(prompt_profile, gpt=subagent_gpt),
+        "tools": all_tools,
+        "middleware": [guard, tool_errors],
+        "model": subagent_chat_model,
+    }
+
     main_middleware = [guard, tool_errors]
     if interpreter_mw is not None:
         main_middleware.append(interpreter_mw)
@@ -836,16 +880,43 @@ def build_harvest_agent(
             BenchmarkCompletionMiddleware(policy, benchmark_session)
         )
 
-    agent = create_deep_agent(
-        model=chat_model,
-        tools=all_tools,
-        system_prompt=build_supervisor_prompt(
+    # Cross mode swaps the supervisor prompt and the authoring fan-out. The
+    # reviewer keeps its name/description/tools but differs in two ways:
+    # (1) the GUARD IS ATTACHED — deepagents hands every sub-agent the
+    # backend's write_file/edit_file, and in cross mode the reviewer reads a
+    # verbatim copy of ANOTHER dataset's wiki (an injection surface), so the
+    # pair-subtree confinement must hold on its write path too (the guard is
+    # inert for reads); (2) it runs the CROSS reviewer prompt — the standard
+    # table-doc checklist ("probe for a join the doc misses") makes cross
+    # reviewers re-do discovery with many slow cross-database queries; the
+    # cross body verifies what the pair docs CLAIM on a two-queries-per-doc
+    # budget instead.
+    if cross_target:
+        system_prompt = build_cross_supervisor_prompt(
+            prompt_profile, gpt=supervisor_gpt
+        )
+        cross_reviewer = {
+            **reviewer,
+            "system_prompt": build_cross_reviewer_prompt(
+                prompt_profile, gpt=reviewer_gpt
+            ),
+            "middleware": [guard, tool_errors],
+        }
+        subagents = [cross_author, cross_reviewer]
+    else:
+        system_prompt = build_supervisor_prompt(
             recursive_improvement=benchmark_session is not None,
             profile=prompt_profile,
             gpt=supervisor_gpt,
-        ),
+        )
+        subagents = [table_author, reference_author, reviewer, context_extractor]
+
+    agent = create_deep_agent(
+        model=chat_model,
+        tools=all_tools,
+        system_prompt=system_prompt,
         middleware=main_middleware,
-        subagents=[table_author, reference_author, reviewer, context_extractor],
+        subagents=subagents,
         backend=backend,
         skills=skills_arg,
     )

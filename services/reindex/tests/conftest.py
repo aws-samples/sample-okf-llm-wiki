@@ -10,7 +10,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from fakes import BUNDLE_BUCKET, FRESHNESS_TABLE, REGION
+from fakes import BUNDLE_BUCKET, FRESHNESS_TABLE, REGION, REGISTRY_TABLE
 
 
 @pytest.fixture(autouse=True)
@@ -27,16 +27,17 @@ def aws(_aws_env):
         s3.create_bucket(Bucket=BUNDLE_BUCKET)
 
         ddb = boto3.resource("dynamodb", region_name=REGION)
-        ddb.create_table(
-            TableName=FRESHNESS_TABLE,
-            KeySchema=[
-                {"AttributeName": "pk", "KeyType": "HASH"},
-                {"AttributeName": "sk", "KeyType": "RANGE"},
-            ],
-            AttributeDefinitions=[
-                {"AttributeName": "pk", "AttributeType": "S"},
-                {"AttributeName": "sk", "AttributeType": "S"},
-            ],
-            BillingMode="PAY_PER_REQUEST",
-        )
+        for name in (FRESHNESS_TABLE, REGISTRY_TABLE):
+            ddb.create_table(
+                TableName=name,
+                KeySchema=[
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"},
+                ],
+                AttributeDefinitions=[
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "S"},
+                ],
+                BillingMode="PAY_PER_REQUEST",
+            )
         yield {"s3": s3, "ddb": ddb}

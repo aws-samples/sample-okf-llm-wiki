@@ -18,7 +18,12 @@ import {
   VersionDiffPane,
   VersionFilePane,
 } from "@/components/VersionHistory"
-import { buildTree, parseDocument, resolveConceptLink } from "@/lib/bundle"
+import {
+  buildTree,
+  parseDocument,
+  resolveConceptLink,
+  resolveCrossBundleLink,
+} from "@/lib/bundle"
 import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -72,6 +77,7 @@ export default function BrowseView({
   selection,
   concept,
   onConceptChange,
+  onOpenCross,
   picker,
 }) {
   const domain = selection?.data_domain
@@ -98,11 +104,20 @@ export default function BrowseView({
       dataset={dataset}
       concept={concept}
       onConceptChange={onConceptChange}
+      onOpenCross={onOpenCross}
     />
   )
 }
 
-function FilesPane({ api, domain, dataset, concept, onConceptChange, picker }) {
+function FilesPane({
+  api,
+  domain,
+  dataset,
+  concept,
+  onConceptChange,
+  onOpenCross,
+  picker,
+}) {
   const [files, setFiles] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -418,6 +433,9 @@ function FilesPane({ api, domain, dataset, concept, onConceptChange, picker }) {
                     conceptId={selectedId}
                     text={content}
                     onNavigate={openConcept}
+                    domain={domain}
+                    dataset={dataset}
+                    onNavigateCross={onOpenCross}
                   />
                 </SelectionAnnotator>
               )}
@@ -585,7 +603,19 @@ function ConceptBreadcrumb({ conceptId }) {
 // as a compact header, then render the body as GFM markdown. Intra-bundle
 // links (relative `.md`) are rewritten to full concept ids and intercepted so
 // clicking one opens that concept in place instead of navigating the browser.
-function ConceptDoc({ conceptId, text, onNavigate }) {
+// Bundle-ESCAPING `.md` links (a cross-dataset reference doc addressing the
+// counterpart's docs — see CONVENTIONS.md "Cross-dataset references") are
+// resolved against the shared okf/ tree and navigate into THAT dataset's
+// Browse view via `onNavigateCross`; the address may dangle, in which case the
+// target view reports the missing doc.
+function ConceptDoc({
+  conceptId,
+  text,
+  onNavigate,
+  domain,
+  dataset,
+  onNavigateCross,
+}) {
   const { frontmatter, body } = useMemo(() => parseDocument(text), [text])
 
   const components = useMemo(() => {
@@ -664,6 +694,31 @@ function ConceptDoc({ conceptId, text, onNavigate }) {
             </a>
           )
         }
+        // A bundle-escaping .md link: a cross-dataset ADDRESS into another
+        // dataset's bundle. Navigate there in-app (switch selection + open the
+        // concept); Back returns here.
+        const cross =
+          href && onNavigateCross
+            ? resolveCrossBundleLink(href, conceptId, {
+                data_domain: domain,
+                dataset,
+              })
+            : null
+        if (cross) {
+          return (
+            <a
+              href={`#${cross.dataDomain}/${cross.dataset}/${cross.conceptId}`}
+              title={`${cross.dataDomain}/${cross.dataset} · ${cross.conceptId}`}
+              onClick={(e) => {
+                e.preventDefault()
+                onNavigateCross(cross.dataDomain, cross.dataset, cross.conceptId)
+              }}
+              {...props}
+            >
+              {children}
+            </a>
+          )
+        }
         // External / non-concept link: open safely in a new tab.
         return (
           <a href={href} target="_blank" rel="noreferrer noopener" {...props}>
@@ -672,7 +727,7 @@ function ConceptDoc({ conceptId, text, onNavigate }) {
         )
       },
     }
-  }, [conceptId, onNavigate])
+  }, [conceptId, onNavigate, domain, dataset, onNavigateCross])
 
   const title = frontmatter.title
   const type = frontmatter.type

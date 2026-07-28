@@ -146,7 +146,7 @@ variable "harvest_model_catalog" {
 variable "chat_model" {
   type        = string
   description = "Deploy-time DEFAULT chat model, used when a conversation omits a model. An anthropic.* Converse profile runs on the Converse API; an openai.* id runs on Bedrock Mantle in chat_mantle_region."
-  default     = "global.anthropic.claude-opus-4-8"
+  default     = "global.anthropic.claude-opus-5"
 }
 
 variable "chat_effort" {
@@ -196,13 +196,14 @@ variable "chat_model_catalog" {
     default_effort = string
   }))
   description = "Catalog of (model, allowed efforts) the chat UI offers and the chat runtime validates against."
-  # Chat is pinned to Opus 4.8 — a single-entry catalog (no model choice in the
-  # UI; the runtime rejects anything else). GPT-5.6 on Bedrock Mantle didn't
-  # return reasoning summaries and behaved inconsistently, so it's dropped here.
+  # Chat is pinned to Opus 5 — a single-entry catalog (no model choice in the
+  # UI; the runtime rejects anything else). Needs langchain-aws >= 1.6.4, the
+  # first release that streams Opus 5. GPT-5.6 on Bedrock Mantle didn't return
+  # reasoning summaries and behaved inconsistently, so it's dropped here.
   default = [
     {
-      model          = "global.anthropic.claude-opus-4-8"
-      label          = "Claude Opus 4.8"
+      model          = "global.anthropic.claude-opus-5"
+      label          = "Claude Opus 5"
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "high"
     },

@@ -446,3 +446,38 @@ def test_repromote_status_edge_states(cfg, aws):
     resp = app.route(_event("GET", f"/bundle/{DOMAIN}/{DATASET}/repromote"), cfg)
     status = _json(resp)
     assert status["state"] == "converged" and status["done"] == 1
+
+
+def test_cancelled_harvest_leaves_no_current_and_allows_restore(cfg, aws):
+    # The rollback path CONVENTIONS documents for an interrupted harvest: the
+    # cancel leaves the live marker at in_progress (uncommitted working files).
+    # The newest published version must NOT be labeled current then — that
+    # label made repromote refuse it ("already current"), leaving no way to
+    # restore the last good state.
+    v1, v2 = _write_history(aws["s3"])
+    time.sleep(1.05)
+    _mark(aws["s3"], "in_progress", started_at="2026-01-03T00:00:00+00:00")
+
+    versions = _json(
+        app.route(_event("GET", f"/bundle/{DOMAIN}/{DATASET}/versions"), cfg)
+    )["versions"]
+    assert [v["version_id"] for v in versions] == [v2, v1]
+    assert all(v["current"] is False for v in versions)
+
+    # Restoring the last good version is now accepted (was a 409).
+    resp = app.route(
+        _event(
+            "POST",
+            f"/bundle/{DOMAIN}/{DATASET}/repromote",
+            body={"version_id": v2},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 200
+    # The repromote finished by writing a fresh complete marker: the bundle is
+    # published again and the restored head is current.
+    versions = _json(
+        app.route(_event("GET", f"/bundle/{DOMAIN}/{DATASET}/versions"), cfg)
+    )["versions"]
+    assert versions[0]["current"] is True
+    assert versions[0]["repromoted_from"] == v2

@@ -17,6 +17,9 @@ BUNDLE_BUCKET = "okf-bundle-test"
 VECTOR_BUCKET = "okf-vectors-test"
 VECTOR_INDEX = "okf-index"
 FRESHNESS_TABLE = "okf-freshness"
+# The worker also maintains the derived cross-dataset reference signal (XREF#
+# rows) on the registry table — see handler._upsert_xref.
+REGISTRY_TABLE = "okf-registry"
 REGION = "us-east-1"
 
 # A minimal but valid concept doc (all required frontmatter keys present).

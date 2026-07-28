@@ -65,7 +65,8 @@ def test_reference_author_is_wired_as_a_subagent():
     src = inspect.getsource(ag.build_harvest_agent)
     assert '"name": "reference-author"' in src
     assert "reference_author" in src
+    # The standard (non-cross) build registers all four sub-agents.
     assert (
-        "subagents=[table_author, reference_author, reviewer, context_extractor]"
+        "subagents = [table_author, reference_author, reviewer, context_extractor]"
         in src
     )

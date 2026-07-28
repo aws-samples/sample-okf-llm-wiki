@@ -244,11 +244,18 @@ export function useVersionHistory({
 
   // Which version would "Restore" promote? Comparing TO an older version
   // promotes it; reviewing interrupted changes (to = live) restores the base.
+  // In live mode the AUTO base resolves to the newest version, and the restore
+  // is offered exactly when that version is NOT current (the live marker moved
+  // past it — a cancelled/crashed harvest left uncommitted working files);
+  // when it IS current, live == that version and a restore would be a no-op
+  // (the server refuses it with a 409 anyway).
   const restoreTarget =
     toId === LIVE
       ? fromId !== AUTO
         ? fromId
-        : ""
+        : versions?.[0] && !versions[0].current
+          ? versions[0].version_id
+          : ""
       : toId && toId !== currentId
         ? toId
         : ""

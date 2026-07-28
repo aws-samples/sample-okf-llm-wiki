@@ -3,7 +3,8 @@
 deepagents>=0.6.12,<0.8
 langchain>=1.3
 # ChatBedrockConverse (agent.py) — standalone partner package, declared explicitly.
-langchain-aws>=1.6
+# >=1.6.4 adds Claude Opus 5 streaming (kept in lockstep with the chat container).
+langchain-aws>=1.6.4
 # GPT on Bedrock Mantle (agent.py): ChatOpenAI against the OpenAI-compatible
 # endpoint + the bearer-token generator it authenticates with. Lazily imported.
 langchain-openai>=1.3

@@ -218,12 +218,29 @@ class ConsumptionTools:
         (fine at demo scale) — the registry is tiny.
 
         Filters out the ``_domain`` pseudo-dataset (the domain's concept doc) and
-        enriches each result with the declared domain's description (if available).
+        enriches each result with the declared domain's description (if available)
+        plus the CROSS-DATASET reference signal (below).
+
+        **Cross-dataset references.** Pair docs authored by a cross harvest live
+        in ONE bundle (the initiating dataset's, under
+        ``external/<other_domain>/<other_dataset>/``), so a consumer scoped to
+        the OTHER side would never see them by browsing. The reindex worker
+        derives ``XREF#`` rows from the bundle's object events (see
+        docs/CONVENTIONS.md), and they sit on the same ``DOMAIN#`` partitions
+        this scan already reads — so both directions are surfaced here for free:
+
+        * ``cross_references`` — datasets this one holds pair docs FOR (read them
+          under this dataset's ``external/<d>/<ds>/``).
+        * ``cross_referenced_by`` — datasets whose bundle holds pair docs about
+          THIS one (read them under ``<that dataset>/external/<this>/…``).
         """
         from boto3.dynamodb.conditions import Attr
 
         mappings: list[dict[str, Any]] = []
         meta_by_domain: dict[str, dict[str, str]] = {}
+        # (domain, dataset) -> sorted "<d>/<ds>" of the counterpart side.
+        references: dict[tuple[str, str], set[str]] = {}
+        referenced_by: dict[tuple[str, str], set[str]] = {}
         kwargs: dict[str, Any] = {
             "FilterExpression": Attr("pk").begins_with("DOMAIN#"),
         }
@@ -248,17 +265,35 @@ class ConsumptionTools:
                             "dataset": ds,
                         }
                     )
+                elif sk.startswith("XREF#"):
+                    src = (
+                        item.get("source_data_domain", ""),
+                        item.get("source_dataset", ""),
+                    )
+                    tgt = (
+                        item.get("target_data_domain", ""),
+                        item.get("target_dataset", ""),
+                    )
+                    if not all(src) or not all(tgt):
+                        continue  # malformed row — ignore rather than half-report
+                    references.setdefault(src, set()).add(f"{tgt[0]}/{tgt[1]}")
+                    referenced_by.setdefault(tgt, set()).add(f"{src[0]}/{src[1]}")
             token = resp.get("LastEvaluatedKey")
             if not token:
                 break
             kwargs["ExclusiveStartKey"] = token
 
-        # Enrich each mapping with domain-level description.
+        # Enrich each mapping with domain-level description + the cross signal.
         for m in mappings:
             domain = m["data_domain"]
             meta = meta_by_domain.get(domain)
             if meta:
                 m["domain_description"] = meta.get("description", "")
+            pair_key = (domain, m["dataset"])
+            if pair_key in references:
+                m["cross_references"] = sorted(references[pair_key])
+            if pair_key in referenced_by:
+                m["cross_referenced_by"] = sorted(referenced_by[pair_key])
 
         return mappings
 

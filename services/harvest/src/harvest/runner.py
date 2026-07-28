@@ -29,9 +29,9 @@ from harvest.annotations import (
 )
 from harvest.code_interpreter import build_sandbox
 from harvest.finalize import finalize_bundle, mark_in_progress
-from harvest.fsutil import clean_authored_output, write_text
-from harvest.metadata_export import export_metadata
-from harvest.prompts import build_annotation_prompt
+from harvest.fsutil import clean_authored_output, remove_tree, write_text
+from harvest.metadata_export import export_metadata, export_target_metadata
+from harvest.prompts import build_annotation_prompt, build_cross_run_prompt
 
 
 def _prompt_is_gpt(model: str | None) -> bool:
@@ -45,6 +45,7 @@ from harvest.status import (
     report_status,
     stamp_guidance_applied,
 )
+from okf_core.paths import external_pair_prefix
 
 log = logging.getLogger(__name__)
 
@@ -642,6 +643,238 @@ def run_incremental_harvest(
         version=dataset_guidance_version,
     )
     log.info("Incremental harvest complete: %s.%s", dataset, changed_table)
+    return state
+
+
+def _assert_target_ready(
+    target_root: Path, target_data_domain: str, target_dataset: str
+) -> None:
+    """Raise unless the target bundle's commit marker says ``complete``.
+
+    The Control API checked readiness at TRIGGER time, but no lease is held on
+    the target — a full harvest of it may have started since (flipping the
+    marker to ``in_progress`` before its clean wipe). Called before AND after
+    the snapshot copy so a wipe racing the copy fails this run loudly instead
+    of shipping pair docs authored against a half-wiped wiki.
+    """
+    marker = Path(target_root) / ".harvest" / "state.json"
+    try:
+        status = json.loads(marker.read_text(encoding="utf-8")).get("status")
+    except (OSError, ValueError):
+        status = None
+    if status != "complete":
+        raise RuntimeError(
+            f"target bundle {target_data_domain}/{target_dataset} is not "
+            f"published (marker status={status!r}) — a harvest of it may be in "
+            "flight; retry the cross run when it completes"
+        )
+
+
+def run_cross_harvest(
+    *,
+    source: Source,
+    dataset_root: str | Path,
+    data_domain: str,
+    dataset: str,
+    target_source: Source,
+    target_root: str | Path,
+    target_data_domain: str,
+    target_dataset: str,
+    model_config: dict[str, Any] | None = None,
+    subagent_model_config: dict[str, Any] | None = None,
+    reviewer_model_config: dict[str, Any] | None = None,
+    recursion_limit: int = 600,
+    domain_description: str | None = None,
+    domain_context: str | None = None,
+    target_domain_description: str | None = None,
+    target_domain_context: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Cross-dataset references: explore the target, verify, author ``external/``.
+
+    Roadmap §5's OSS (flat-trust) mode. The run holds THIS dataset's lease
+    throughout (it is a harvest of this dataset, taken by the Control API) and
+    reads the target ONLY via a start-time snapshot
+    (``.metadata/external/<td>/<tds>/`` — catalog + published docs). The agent
+    authors exclusively under ``external/<td>/<tds>/`` (guard-enforced).
+
+    The pair docs live ONLY here — nothing is ever written into the target's
+    bundle. That is deliberate: a mirrored copy would be a distributed fact
+    spread over two independently versioned, independently restorable bundles
+    (a full harvest or repromote of the target would silently break the pair
+    state). Instead the target side gets a DERIVED discovery signal: the
+    reindex worker maintains ``XREF#`` rows from this run's object events, and
+    ``list_domains`` surfaces "cross-referenced by" on the target (see
+    CONVENTIONS.md).
+
+    Deliberately NOT threaded through: ``dataset_guidance`` (dataset-scoped
+    authoring instructions do not apply to pair docs read from both sides) and
+    ``recursive_improvement``.
+
+    ORDERING IS LOAD-BEARING: all required inputs (the target-readiness checks
+    and the target snapshot) run BEFORE the first destructive step — a failure
+    there reports ``failed`` and leaves the bundle untouched and READY (prior
+    pair docs intact, complete marker intact). Only once the inputs are on disk
+    does the run flip the in-progress marker and clear the pair's prior output.
+    """
+    dataset_root = Path(dataset_root)
+    target_root = Path(target_root)
+    started = _now_iso()
+    registry = build_registry_client()
+    # external_pair_prefix VALIDATES both target segments (no "/", "..", "#" can
+    # reach a destructive path) — the runtime-side gate behind _validate.
+    pair_dir = dataset_root / external_pair_prefix(target_data_domain, target_dataset)
+    try:
+        resolved_config = model_config or resolve_model_config()
+        report_status(
+            registry,
+            data_domain=data_domain,
+            dataset=dataset,
+            status="running",
+            model=resolved_config.get("model"),
+            effort=resolved_config.get("effort"),
+            subagent_model=(subagent_model_config or {}).get("model"),
+            subagent_effort=(subagent_model_config or {}).get("effort"),
+            reviewer_model=(reviewer_model_config or {}).get("model"),
+            reviewer_effort=(reviewer_model_config or {}).get("effort"),
+        )
+
+        # This dataset's snapshot: best-effort, like every other mode.
+        try:
+            export_metadata(source, dataset_root)
+        except Exception:  # noqa: BLE001 - snapshot is an accelerator, not a hard dep
+            log.warning(
+                "Metadata snapshot failed for %s/%s (cross); continuing",
+                data_domain,
+                dataset,
+                exc_info=True,
+            )
+        # The TARGET's snapshot is REQUIRED: it is this mode's discovery surface
+        # (grep both columns.tsv files) AND its read path to the target's wiki —
+        # without it the run would author cross docs blind. Fail loud. The
+        # trigger-time readiness check only covered trigger time — re-check the
+        # target's commit marker around the copy so a full harvest of the target
+        # that started since (its clean wipe racing our copy) fails THIS run
+        # loudly instead of snapshotting a half-wiped wiki.
+        _assert_target_ready(target_root, target_data_domain, target_dataset)
+        snap = export_target_metadata(
+            target_source,
+            dataset_root,
+            target_data_domain=target_data_domain,
+            target_dataset=target_dataset,
+            target_bundle_root=target_root,
+        )
+        _assert_target_ready(target_root, target_data_domain, target_dataset)
+        log.info(
+            "Cross target snapshot written for %s/%s -> %s/%s: %d tables, %d docs",
+            data_domain,
+            dataset,
+            target_data_domain,
+            target_dataset,
+            snap["table_count"],
+            snap["docs_copied"],
+        )
+
+        # All required inputs are on disk — only NOW go destructive: flip the
+        # commit marker to in_progress and clear the pair's prior output (a
+        # re-run replaces the pair's docs wholesale — the scoped analogue of
+        # clean_authored_output: a join dropped since last time leaves no stale
+        # doc, and its vector is pruned via the S3 write-through ->
+        # ObjectRemoved -> reindex DeleteVectors. Other pairs' subtrees and the
+        # rest of the bundle are untouched).
+        mark_in_progress(
+            dataset_root, data_domain=data_domain, dataset=dataset, timestamp=started
+        )
+        if remove_tree(pair_dir):
+            log.info(
+                "Cross harvest %s/%s: cleared prior pair output external/%s/%s",
+                data_domain,
+                dataset,
+                target_data_domain,
+                target_dataset,
+            )
+
+        prompt = build_cross_run_prompt(
+            data_domain=data_domain,
+            dataset=dataset,
+            database=source.database,
+            target_data_domain=target_data_domain,
+            target_dataset=target_dataset,
+            target_database=target_source.database,
+            tables=source.table_names(),
+            target_tables=target_source.table_names(),
+            domain_description=domain_description,
+            domain_context=domain_context,
+            target_domain_description=target_domain_description,
+            target_domain_context=target_domain_context,
+        )
+        emitter = _build_emitter(
+            data_domain=data_domain, dataset=dataset, session_id=session_id
+        )
+        with _sandbox_for(dataset_root) as sandbox:
+            built = build_harvest_agent(
+                source,
+                dataset_root,
+                sandbox=sandbox,
+                step_emitter=emitter,
+                cross_target={
+                    "data_domain": target_data_domain,
+                    "dataset": target_dataset,
+                },
+                subagent_config=subagent_model_config,
+                reviewer_config=reviewer_model_config,
+                **resolved_config,
+            )
+            config = _invoke_config(recursion_limit, emitter)
+            _run_agent(built.agent, prompt, config, emitter)
+
+        state = finalize_bundle(
+            dataset_root,
+            data_domain=data_domain,
+            dataset=dataset,
+            tables=source.table_names(),
+            timestamp=_now_iso(),
+            table_versions=_table_versions(source),
+            extra={"cross_target": f"{target_data_domain}/{target_dataset}"},
+        )
+
+        # Count what the agent actually authored for the pair. Zero docs = the
+        # run found no genuine convergence (a valid, common outcome — see the
+        # skill's plausibility gate); the detail says so plainly. INSIDE the
+        # try: this walks the NFS mount, and a transient ESTALE here must
+        # report `failed` (releasing the lease) rather than skipping both
+        # terminal status writes and wedging the row at `running`.
+        authored = sorted(
+            str(p.relative_to(pair_dir))
+            for p in pair_dir.rglob("*.md")
+            if p.name != "index.md"
+        ) if pair_dir.is_dir() else []
+    except Exception as e:  # noqa: BLE001 - report failure, then re-raise
+        # only_if_active: don't clobber a `cancelled` row if a cancel raced ahead.
+        report_status(
+            registry,
+            data_domain=data_domain,
+            dataset=dataset,
+            status="failed",
+            detail=f"{type(e).__name__}: {e}",
+            only_if_active=True,
+        )
+        raise
+
+    detail = (
+        f"cross-dataset references to {target_data_domain}/{target_dataset}: "
+        f"{len(authored)} doc(s)"
+        + ("" if authored else " — no genuine convergence found")
+    )
+    report_status(
+        registry,
+        data_domain=data_domain,
+        dataset=dataset,
+        status="complete",
+        detail=detail,
+        only_if_active=True,
+    )
+    log.info("Cross harvest complete: %s/%s (%s)", data_domain, dataset, detail)
     return state
 
 

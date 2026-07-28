@@ -183,9 +183,10 @@ def test_delete_scoped_and_404_for_stranger(cfg):
 # --- the orphan sweep / annotated harvest trigger --------------------------
 
 
-def _run(cfg, claims=None):
+def _run(cfg, claims=None, body=None):
     return app.route(
-        _event("POST", "/harvest/sales/orders/annotations/run", claims=claims), cfg
+        _event("POST", "/harvest/sales/orders/annotations/run", body=body, claims=claims),
+        cfg,
     )
 
 
@@ -443,6 +444,75 @@ def test_run_reclaims_stranded_in_review_notes(cfg):
     # Reclaimed: it's a live survivor again and the run is dispatched for it.
     assert body["status"] == "queued" and body["annotations"] == 1
     assert len(cfg.agentcore.calls) == 1
+
+
+def test_run_applies_only_selected_annotation_ids(cfg):
+    # The UI's picker: an explicit annotation_ids list narrows the run to those
+    # notes. Unselected OPEN notes stay open for a later run.
+    _seed_doc(cfg, body="alpha beta gamma")
+    ids = {}
+    for word in ("alpha", "beta", "gamma"):
+        r = app.route(
+            _event(
+                "POST",
+                "/annotations/sales/orders",
+                body={"concept_id": "tables/races", "quote": word, "note": f"n-{word}"},
+            ),
+            cfg,
+        )
+        ids[word] = _json(r)["annotation_id"]
+    body = _json(_run(cfg, body={"annotation_ids": [ids["beta"]]}))
+    assert body["status"] == "queued" and body["annotations"] == 1
+    payload = json.loads(cfg.agentcore.calls[0]["payload"].decode())
+    assert [a["annotation_id"] for a in payload["annotations"]] == [ids["beta"]]
+    # Only the selected note was flipped; the others are untouched and reusable.
+    items = {a["quote"]: a for a in _json(app.route(_event("GET", "/annotations/sales/orders"), cfg))}
+    assert items["beta"]["status"] == "in_review"
+    assert items["alpha"]["status"] == "open"
+    assert items["gamma"]["status"] == "open"
+
+
+def test_run_unselected_in_review_straggler_reverts_to_open(cfg):
+    # An in_review straggler (dead prior run) that the user does NOT select must
+    # revert to open — dropping it silently would strand it forever, same
+    # invariant as the scope filter's straggler revert.
+    _seed_doc(cfg, body="alpha beta")
+    ids = {}
+    for word in ("alpha", "beta"):
+        r = app.route(
+            _event(
+                "POST",
+                "/annotations/sales/orders",
+                body={"concept_id": "tables/races", "quote": word, "note": "n"},
+            ),
+            cfg,
+        )
+        ids[word] = _json(r)["annotation_id"]
+    from okf_core import annotations as anno
+    cfg.ddb.update_item(
+        TableName=ANNOTATIONS,
+        Key={
+            "pk": {"S": anno.annotation_pk("sales", "orders", "user-1")},
+            "sk": {"S": anno.annotation_sk("tables/races", ids["alpha"])},
+        },
+        UpdateExpression="SET #s = :r",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":r": {"S": anno.STATUS_IN_REVIEW}},
+    )
+    body = _json(_run(cfg, body={"annotation_ids": [ids["beta"]]}))
+    assert body["annotations"] == 1
+    items = {a["quote"]: a for a in _json(app.route(_event("GET", "/annotations/sales/orders"), cfg))}
+    assert items["beta"]["status"] == "in_review"  # the selected one, dispatched
+    assert items["alpha"]["status"] == "open"  # straggler reclaimed, not stranded
+
+
+def test_run_rejects_bad_annotation_ids(cfg):
+    # Wrong shapes are a clean 400 before any lease/status work.
+    for bad in ("not-a-list", [1, 2], [""]):
+        r = _run(cfg, body={"annotation_ids": bad})
+        assert r["statusCode"] == 400, bad
+        assert "annotation_ids" in _json(r)["error"]
+    assert len(cfg.agentcore.calls) == 0
 
 
 def test_run_rejects_too_many_annotations(cfg, monkeypatch):

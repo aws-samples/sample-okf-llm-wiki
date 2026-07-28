@@ -29,7 +29,7 @@ from okf_core import guidance as gd
 from okf_core import recursive_improvement as ri
 from okf_core.domain import DOMAIN_DATASET
 from okf_core.links import extract_links_with_headings
-from okf_core.paths import parse_concept_id
+from okf_core.paths import is_external_concept_id, parse_concept_id
 from okf_core.session import HARVEST_LEASE_STALE_SECONDS, runtime_session_id
 from okf_core.sources import (
     REDSHIFT_CLUSTER_KEY,
@@ -308,25 +308,49 @@ def list_redshift_databases(
 
 def list_domains(ddb, *, registry_table: str) -> list[dict[str, Any]]:
     """All domain->dataset mappings: registry items with ``pk`` begins_with DOMAIN#
-    AND ``sk`` begins_with DATASET# (tightened so declared-domain META rows aren't
-    leaked into the mapping list).
+    AND ``sk`` begins_with DATASET# or XREF# (declared-domain META rows are still
+    excluded from the mapping list).
 
     Uses Scan with a ``begins_with`` filter because the registry is tiny (a
     handful of dataset mappings for the demo) and there is no GSI on the item
-    type. Returns the raw mapping attrs the UI needs.
+    type. Returns the raw mapping attrs the UI needs, plus the CROSS-DATASET
+    reference signal: ``cross_references`` (datasets this one holds
+    ``external/`` pair docs for) and ``cross_referenced_by`` (datasets whose
+    bundle holds pair docs about this one). The signal comes from reindex-derived
+    ``XREF#`` rows, which live on the SAME ``DOMAIN#`` partitions this scan
+    already reads (see docs/CONVENTIONS.md) — one pass, no extra call.
     """
     items: list[dict[str, Any]] = []
+    references: dict[tuple[str, str], set[str]] = {}
+    referenced_by: dict[tuple[str, str], set[str]] = {}
     kwargs: dict[str, Any] = {
         "TableName": registry_table,
-        "FilterExpression": "begins_with(pk, :d) AND begins_with(sk, :ds)",
+        "FilterExpression": (
+            "begins_with(pk, :d) AND (begins_with(sk, :ds) OR begins_with(sk, :x))"
+        ),
         "ExpressionAttributeValues": {
             ":d": {"S": "DOMAIN#"},
             ":ds": {"S": "DATASET#"},
+            ":x": {"S": "XREF#"},
         },
     }
     while True:
         resp = ddb.scan(**kwargs)
         for item in resp.get("Items", []):
+            if (_s(item.get("sk")) or "").startswith("XREF#"):
+                src = (
+                    _s(item.get("source_data_domain")),
+                    _s(item.get("source_dataset")),
+                )
+                tgt = (
+                    _s(item.get("target_data_domain")),
+                    _s(item.get("target_dataset")),
+                )
+                if not all(src) or not all(tgt):
+                    continue  # malformed row — ignore rather than half-report
+                references.setdefault(src, set()).add(f"{tgt[0]}/{tgt[1]}")
+                referenced_by.setdefault(tgt, set()).add(f"{src[0]}/{src[1]}")
+                continue
             items.append(
                 {
                     "data_domain": _s(item.get("data_domain")),
@@ -347,6 +371,12 @@ def list_domains(ddb, *, registry_table: str) -> list[dict[str, Any]]:
         if not start:
             break
         kwargs["ExclusiveStartKey"] = start
+    for m in items:
+        pair_key = (m["data_domain"], m["dataset"])
+        if pair_key in references:
+            m["cross_references"] = sorted(references[pair_key])
+        if pair_key in referenced_by:
+            m["cross_referenced_by"] = sorted(referenced_by[pair_key])
     return items
 
 
@@ -1534,6 +1564,7 @@ def acquire_harvest_lease(
     mode: str,
     session_id: str,
     detail: str | None = None,
+    cross_target: str | None = None,
 ) -> bool:
     """Try to take the per-dataset harvest lease (the ``HARVEST#.../STATUS`` row).
 
@@ -1567,6 +1598,10 @@ def acquire_harvest_lease(
     }
     if detail is not None:
         item["detail"] = {"S": detail}
+    if cross_target is not None:
+        # A cross-dataset discovery run records its counterpart so the status
+        # surface can show WHO the run is against (mirrors `repromote_target`).
+        item["cross_target"] = {"S": cross_target}
     try:
         ddb.put_item(
             TableName=registry_table,
@@ -1628,6 +1663,112 @@ def _apply_ri_settings(
         payload[ri.CONFIG_KEY] = validated
 
 
+def resolve_cross_target(
+    ddb,
+    s3,
+    glue,
+    *,
+    registry_table: str,
+    bucket: str,
+    data_domain: str,
+    dataset: str,
+    source: dict[str, Any] | None,
+    target_data_domain: str,
+    target_dataset: str,
+) -> dict[str, Any]:
+    """Validate a cross-mode target and build the payload's ``target`` block.
+
+    The trust boundary for ``mode="cross"`` (Roadmap §5, OSS flat-trust mode).
+    Enforced here, before any lease is taken:
+
+    * the target is not the dataset itself (400);
+    * the target is a REGISTERED dataset mapping (404) — the runtime builds a
+      source from this block, so an unregistered name must fail fast;
+    * both sides are GLUE-backed (400) — v1's verification path is qualified
+      Athena SQL spanning Glue databases; cross-source pairs (Redshift↔Glue)
+      have no common engine to verify against;
+    * the two sides resolve to DIFFERENT Glue databases (400) — registration
+      forces a glue dataset's name to equal its database, so the same dataset
+      name under two domains is the same physical data; "cross-referencing" a
+      database against itself would verify degenerate self-joins;
+    * the target's Glue database exists (404, same probe as the source side);
+    * BOTH bundles are ready (409): the run snapshots the target's published
+      wiki at start (read-only — nothing is ever written into the target's
+      bundle) — a mid-write or never-harvested bundle on either side has
+      nothing coherent to reference.
+
+    Returns ``{data_domain, dataset, source, domain_description?,
+    domain_context?}`` — the resolved block the runtime consumes verbatim.
+    """
+    if target_data_domain == data_domain and target_dataset == dataset:
+        raise ApiError(400, "cross mode target must differ from the dataset itself")
+
+    x_db = source_glue_database(source) if source is not None else dataset
+    if not x_db:
+        raise ApiError(
+            400,
+            "cross-dataset harvest supports Glue-backed datasets only "
+            f"({data_domain}/{dataset} is not glue-backed)",
+        )
+
+    target_source = get_dataset_source(
+        ddb,
+        registry_table=registry_table,
+        data_domain=target_data_domain,
+        dataset=target_dataset,
+    )
+    if target_source is None:
+        raise ApiError(
+            404, f"no such dataset: {target_data_domain}/{target_dataset}"
+        )
+    target_db = source_glue_database(target_source)
+    if not target_db:
+        raise ApiError(
+            400,
+            "cross-dataset harvest supports Glue-backed datasets only "
+            f"({target_data_domain}/{target_dataset} is not glue-backed)",
+        )
+    if target_db == x_db:
+        raise ApiError(
+            400,
+            f"cross target {target_data_domain}/{target_dataset} maps the SAME "
+            f"Glue database as {data_domain}/{dataset} ({x_db!r}) — a dataset "
+            "cannot cross-reference its own data",
+        )
+    assert_glue_database_exists(glue, target_db)
+
+    # Both bundles must be published (complete marker): the target's wiki is the
+    # run's discovery surface, and this dataset's docs are the context the cross
+    # docs complement.
+    if not is_bundle_ready(s3, bucket, data_domain, dataset):
+        raise ApiError(
+            409,
+            f"{data_domain}/{dataset} has no published bundle yet — run a full "
+            "harvest before a cross-dataset one",
+        )
+    if not is_bundle_ready(s3, bucket, target_data_domain, target_dataset):
+        raise ApiError(
+            409,
+            f"target {target_data_domain}/{target_dataset} has no published "
+            "bundle yet — harvest it before cross-referencing it",
+        )
+
+    target: dict[str, Any] = {
+        "data_domain": target_data_domain,
+        "dataset": target_dataset,
+        "source": target_source,
+    }
+    target_domain_meta = get_domain(
+        ddb, registry_table=registry_table, data_domain=target_data_domain
+    )
+    if target_domain_meta:
+        if target_domain_meta.get("description"):
+            target["domain_description"] = target_domain_meta["description"]
+        if target_domain_meta.get("context"):
+            target["domain_context"] = target_domain_meta["context"]
+    return target
+
+
 def trigger_harvest(
     agentcore,
     ddb,
@@ -1638,6 +1779,7 @@ def trigger_harvest(
     dataset: str,
     mode: str = "full",
     changed_table: str | None = None,
+    cross_target: dict[str, Any] | None = None,
     model: str | None = None,
     effort: str | None = None,
     subagent_model: str | None = None,
@@ -1715,24 +1857,31 @@ def trigger_harvest(
     # Dataset-level guidance (shared authoring instructions) — steers this harvest
     # and, on success, the runner stamps guidance_applied_version so it clears
     # dirty. Passed with its version so the stamp records exactly what was applied.
-    try:
-        g = get_dataset_guidance(
-            ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
-        )
-        if g.get("guidance"):
-            payload["dataset_guidance"] = g["guidance"]
-            payload["dataset_guidance_version"] = g["guidance_updated_at"]
-    except ApiError:
-        pass  # no mapping row yet (shouldn't happen at harvest time) — omit guidance
+    # DELIBERATELY omitted on a cross run: guidance is dataset-scoped authoring
+    # steering, and cross docs are shared verbatim with another dataset — one
+    # side's operator instructions must not silently shape the pair's docs.
+    if mode != "cross":
+        try:
+            g = get_dataset_guidance(
+                ddb, registry_table=registry_table,
+                data_domain=data_domain, dataset=dataset,
+            )
+            if g.get("guidance"):
+                payload["dataset_guidance"] = g["guidance"]
+                payload["dataset_guidance_version"] = g["guidance_updated_at"]
+        except ApiError:
+            pass  # no mapping row yet (shouldn't happen at harvest time) — omit
 
-    # Recursive-improvement settings (saved per dataset). When enabled, the block's
-    # PRESENCE is the runtime enable signal — it rides on every mode (full/
-    # incremental/annotated). Re-validated here (the trust boundary) so a
-    # hand-edited row can't push an out-of-range value to the runtime.
-    _apply_ri_settings(
-        payload, ddb, registry_table=registry_table,
-        data_domain=data_domain, dataset=dataset,
-    )
+        # Recursive-improvement settings (saved per dataset). When enabled, the
+        # block's PRESENCE is the runtime enable signal — it rides on every
+        # bundle-authoring mode (full/incremental/annotated), but NOT on a cross
+        # run (its benchmark loop measures the dataset's own wiki, not pair docs).
+        # Re-validated here (the trust boundary) so a hand-edited row can't push
+        # an out-of-range value to the runtime.
+        _apply_ri_settings(
+            payload, ddb, registry_table=registry_table,
+            data_domain=data_domain, dataset=dataset,
+        )
 
     if mode == "incremental":
         if not changed_table:
@@ -1741,9 +1890,15 @@ def trigger_harvest(
         # Incremental keeps per-dataset affinity (deterministic session).
         session_id = runtime_session_id(data_domain, dataset)
     else:
-        # A full harvest is one-shot: use a FRESH session per trigger so it gets
-        # a new microVM (with a clean S3 Files mount) instead of reattaching to a
-        # warm/stale one from a prior run.
+        if mode == "cross":
+            # The route adapter resolved + validated the target (see
+            # resolve_cross_target); the runtime consumes the block verbatim.
+            if not cross_target:
+                raise ApiError(400, "cross mode requires 'target_dataset'")
+            payload["target"] = cross_target
+        # A full (or cross) harvest is one-shot: use a FRESH session per trigger
+        # so it gets a new microVM (with a clean S3 Files mount) instead of
+        # reattaching to a warm/stale one from a prior run.
         session_id = runtime_session_id(
             data_domain, dataset, unique_token=uuid.uuid4().hex
         )
@@ -1759,6 +1914,11 @@ def trigger_harvest(
         dataset=dataset,
         mode=mode,
         session_id=session_id,
+        cross_target=(
+            f"{cross_target['data_domain']}/{cross_target['dataset']}"
+            if mode == "cross" and cross_target
+            else None
+        ),
     ):
         raise ApiError(
             409,
@@ -1835,6 +1995,10 @@ def get_harvest_status(
             "subagent_effort": _s(item.get("subagent_effort")),
             "reviewer_model": _s(item.get("reviewer_model")),
             "reviewer_effort": _s(item.get("reviewer_effort")),
+            # Cross-dataset discovery runs record their counterpart
+            # ("<domain>/<dataset>", stamped at lease time) so the UI can show
+            # WHO the run is against, not just the mode.
+            "cross_target": _s(item.get("cross_target")),
         }
     ready = is_bundle_ready(s3, bucket, data_domain, dataset)
     return {
@@ -3148,8 +3312,32 @@ def trigger_annotation_harvest(
     dataset: str,
     user_sub: str | None,
     domain_meta: dict[str, Any] | None = None,
+    scope: str | None = None,
+    annotation_ids: list[str] | None = None,
+    cross_target: str | None = None,
 ) -> dict[str, Any]:
     """Run the caller's open annotations through an annotation-mode re-harvest.
+
+    ``scope`` narrows WHICH annotations the run applies when the bundle carries
+    cross-dataset docs (an ``external/`` subtree): ``"dataset"`` = only notes on
+    the dataset's own docs, ``"cross"`` = only notes on ``external/`` docs.
+    None (the default, and the only case when no ``external/`` exists) applies
+    everything. A ``"cross"``-scoped run also IGNORES dataset guidance — cross
+    docs are authored without it by design (see ``mode="cross"``), so a dirty
+    guidance neither triggers nor rides a cross-scoped run.
+
+    ``annotation_ids`` narrows the run further to an EXPLICIT selection (the
+    UI's annotation picker — partial application). None applies every in-scope
+    note; a list applies only the listed ids. An empty list is valid: with a
+    dirty guidance the run still fires guidance-only, otherwise it short-
+    circuits like "nothing to apply".
+
+    ``cross_target`` (``"<domain>/<dataset>"``, cross scope only) names the
+    pair the UI's per-target scope was set to. It is merged into the run's
+    ``extra_glue_databases`` so the session policy covers the target even when
+    the selection carries no pair-doc note (e.g. only ``_dataset``-wide general
+    notes) — without it such a run could not verify anything against the
+    counterpart's data.
 
     Ordering is the whole point:
 
@@ -3215,6 +3403,10 @@ def trigger_annotation_harvest(
             )
         except ApiError:
             guidance = {"guidance": "", "guidance_updated_at": "", "guidance_dirty": False}
+        # A cross-scoped run never applies (or is triggered by) dataset guidance:
+        # cross docs are authored guidance-free by design.
+        if scope == "cross":
+            guidance = {"guidance": "", "guidance_updated_at": "", "guidance_dirty": False}
         guidance_dirty = bool(guidance.get("guidance_dirty"))
 
         # We reclaim BOTH open and in_review notes. An in_review note here is a
@@ -3233,6 +3425,58 @@ def trigger_annotation_harvest(
             )
             if _s(it.get("status")) in (anno.STATUS_OPEN, anno.STATUS_IN_REVIEW)
         ]
+        # Scope filter: notes on external/ (cross-dataset) docs vs the dataset's
+        # own docs. `_dataset`-WIDE notes are general feedback — valid steering
+        # for EITHER scope — so they pass both filters; whether one rides a
+        # given run is the picker's annotation_ids decision. An out-of-scope
+        # OPEN note stays open for a later run of the other scope — but an
+        # out-of-scope IN_REVIEW note is a straggler from a dead prior run (the
+        # lease we hold proves nothing is active), and simply dropping it would
+        # strand it forever: a user who always picks one scope would never
+        # gather it again. Revert those to open here, exactly as the reclaim
+        # invariant promises.
+        if scope in ("cross", "dataset"):
+            want_external = scope == "cross"
+            in_scope: list[dict[str, Any]] = []
+            for it in actionable:
+                cid = _s(it.get("concept_id")) or ""
+                if (
+                    cid == anno.DATASET_WIDE_CONCEPT
+                    or is_external_concept_id(cid) == want_external
+                ):
+                    in_scope.append(it)
+                elif _s(it.get("status")) == anno.STATUS_IN_REVIEW:
+                    _set_annotation_status(
+                        ddb,
+                        annotations_table=annotations_table,
+                        pk=_s(it.get("pk")),
+                        sk=_s(it.get("sk")),
+                        status=anno.STATUS_OPEN,
+                        now_iso=now,
+                    )
+            actionable = in_scope
+
+        # Explicit id selection (the UI's annotation picker). An unselected OPEN
+        # note simply stays open for a later run; an unselected IN_REVIEW note
+        # is a straggler from a dead prior run (the lease we hold proves nothing
+        # is active) and reverts to open — same stranding argument as the scope
+        # filter above, else a user who never ticks it would strand it forever.
+        if annotation_ids is not None:
+            wanted = set(annotation_ids)
+            selected: list[dict[str, Any]] = []
+            for it in actionable:
+                if (_s(it.get("annotation_id")) or "") in wanted:
+                    selected.append(it)
+                elif _s(it.get("status")) == anno.STATUS_IN_REVIEW:
+                    _set_annotation_status(
+                        ddb,
+                        annotations_table=annotations_table,
+                        pk=_s(it.get("pk")),
+                        sk=_s(it.get("sk")),
+                        status=anno.STATUS_OPEN,
+                        now_iso=now,
+                    )
+            actionable = selected
 
         # Cache each concept doc's body so N annotations on one page cost one GET.
         body_cache: dict[str, str | None] = {}
@@ -3306,6 +3550,7 @@ def trigger_annotation_harvest(
                 "dataset": dataset,
                 "annotations": 0,
                 "orphaned": orphaned,
+                **({"scope": scope} if scope else {}),
             }
 
         # Bound the payload: the whole survivor set is JSON-encoded into ONE invoke
@@ -3383,11 +3628,44 @@ def trigger_annotation_harvest(
             payload["dataset_guidance"] = guidance["guidance"]
             payload["dataset_guidance_version"] = guidance["guidance_updated_at"]
 
-        # Recursive improvement rides the annotation re-harvest too (all modes).
-        _apply_ri_settings(
-            payload, ddb, registry_table=registry_table,
-            data_domain=data_domain, dataset=dataset,
-        )
+        # Notes on external/ docs make cross-dataset claims — the agent can only
+        # CONFIRM or REFUTE them with qualified SQL against the counterpart's
+        # database, which the run's scoped session policy must be widened to
+        # (else every check is AccessDenied and the note gets a confident but
+        # false rejection). Derive the counterpart set from the surviving notes'
+        # concept ids and thread the glue databases through.
+        extra_dbs: list[str] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        # The UI's per-target scope names the pair outright — include it even if
+        # no surviving note's concept id references it (general-note-only runs).
+        if cross_target and "/" in cross_target:
+            td, tds = cross_target.split("/", 1)
+            if td and tds:
+                seen_pairs.add((td, tds))
+        for it in survivors:
+            cid = _s(it.get("concept_id")) or ""
+            parts = cid.split("/")
+            if len(parts) >= 4 and parts[0] == "external":
+                seen_pairs.add((parts[1], parts[2]))
+        for td, tds in sorted(seen_pairs):
+            t_source = get_dataset_source(
+                ddb, registry_table=registry_table, data_domain=td, dataset=tds
+            )
+            t_db = source_glue_database(t_source) if t_source else None
+            if t_db and t_db not in extra_dbs:
+                extra_dbs.append(t_db)
+        if extra_dbs:
+            payload["extra_glue_databases"] = extra_dbs
+
+        # Recursive improvement rides the annotation re-harvest — EXCEPT a
+        # cross-scoped run: the RI loop measures (and edits) the dataset's OWN
+        # wiki, which the operator explicitly scoped away from (same exclusion
+        # as mode="cross" in trigger_harvest).
+        if scope != "cross":
+            _apply_ri_settings(
+                payload, ddb, registry_table=registry_table,
+                data_domain=data_domain, dataset=dataset,
+            )
 
         agentcore.invoke_agent_runtime(
             agentRuntimeArn=runtime_arn,
@@ -3429,6 +3707,7 @@ def trigger_annotation_harvest(
         # Whether this run was carrying a pending guidance change (so the UI can
         # say "applying updated guidance" even on a zero-annotation run).
         "guidance_applied": guidance_dirty,
+        **({"scope": scope} if scope else {}),
     }
 
 

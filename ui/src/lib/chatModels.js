@@ -1,4 +1,4 @@
-// The chat model is FIXED to Claude Opus 4.8 — no model choice in the UI.
+// The chat model is FIXED to Claude Opus 5 — no model choice in the UI.
 // (GPT-5.6 on Bedrock Mantle doesn't return reasoning summaries and behaved
 // inconsistently, so the wiki chat pins Opus.) Only the reasoning EFFORT is
 // user-selectable. This module keeps the small surface the rest of the chat UI
@@ -7,8 +7,8 @@
 export const DEFAULT_EFFORT = "high"
 
 // The one and only chat model.
-export const CHAT_MODEL = "global.anthropic.claude-opus-4-8"
-export const CHAT_MODEL_LABEL = "Claude Opus 4.8"
+export const CHAT_MODEL = "global.anthropic.claude-opus-5"
+export const CHAT_MODEL_LABEL = "Claude Opus 5"
 export const CHAT_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
 export function effortsFor(_model) {

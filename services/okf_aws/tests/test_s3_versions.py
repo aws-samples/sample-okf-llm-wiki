@@ -339,3 +339,27 @@ def test_restore_snapshot_refuses_oversized_bundles(aws):
             aws, bucket="unused", data_domain=DOMAIN, dataset=DATASET,
             snapshot=snap, live={},
         )
+
+
+def test_interrupted_harvest_leaves_no_current_version(aws):
+    # A cancelled/crashed harvest writes in_progress and never restores the
+    # complete marker: the working files are an UNCOMMITTED state, so the
+    # newest complete version must NOT be labeled current — that label would
+    # both lie in the UI and block the documented rollback (repromote refuses
+    # a "current" version as a no-op).
+    bucket = "test-bundles-cancelled"
+    _make_bucket(aws, bucket)
+    v1, v2 = _write_history(aws, bucket)
+    _tick()
+    # Harvest 3 starts (marker -> in_progress, some docs churn) then is
+    # cancelled — no fresh complete marker is ever written.
+    _mark(aws, bucket, "in_progress", started_at="2026-01-03T00:00:00+00:00")
+    _put(aws, bucket, "tables/a.md", _doc("A", "alpha v3 half-written"))
+
+    markers = sv.list_complete_markers(
+        aws, bucket=bucket, data_domain=DOMAIN, dataset=DATASET
+    )
+    # Both published versions still enumerate, newest first — but none is
+    # current: the live marker version is the in_progress write.
+    assert [m.version_id for m in markers] == [v2, v1]
+    assert not any(m.is_current for m in markers)

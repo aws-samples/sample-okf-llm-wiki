@@ -1,7 +1,7 @@
 // Shared chat control state, lifted OUT of ChatPanel so the sidebar (rendered by
 // the app shell, above ChatPanel) and the chat page drive the same conversation:
 // new-chat, resume-from-history, the history drawer toggle, and the reasoning
-// EFFORT. The model is FIXED to Opus 4.8 (no model choice), so there's no model
+// EFFORT. The model is FIXED to Opus 5 (no model choice), so there's no model
 // state and effort can change freely on any conversation.
 
 import { useCallback, useEffect, useState } from "react"

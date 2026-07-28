@@ -12,11 +12,14 @@ Payload (from the Control API's InvokeAgentRuntime call):
     "dataset": "orders",              # the dataset id (Glue: the database name)
     "source": {"type": "glue", "glue_database": "orders"},  # source descriptor;
                                       # absent -> default glue source named by dataset
-    "mode": "full" | "incremental" | "annotated",
+    "mode": "full" | "incremental" | "annotated" | "cross",
     "changed_table": "customers",     # incremental only
     "diff": {...}                      # incremental only, optional
     "user_sub": "<cognito sub>",      # annotated only (whose annotations)
     "annotations": [{...}],            # annotated only (the live feedback)
+    "target": {"data_domain": "crm",  # cross only: the resolved counterpart
+               "dataset": "customers",#   (validated by the Control API; carries
+               "source": {...}},      #   its source + domain description/context)
     "model": "openai.gpt-5.6-sol",    # optional per-harvest override; falls
     "effort": "xhigh",                # back to OKF_HARVEST_* env when omitted
     "subagent_model": "...",          # optional SUB-AGENT override (authors/
@@ -40,6 +43,7 @@ import threading
 from harvest.clients import build_source, dataset_root
 from harvest.runner import (
     run_annotation_harvest,
+    run_cross_harvest,
     run_full_harvest,
     run_incremental_harvest,
 )
@@ -78,7 +82,27 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
     # into the payload; build_source dispatches on its type. Absent (an older
     # payload) -> build_source defaults to a glue source named by the dataset, the
     # historical convention, so nothing that predates the descriptor breaks.
-    source = build_source(dataset, source=payload.get("source"))
+    # A CROSS run widens this dataset's scoped session policy to the target's
+    # Glue database too, so qualified run_sql can verify joins across the pair
+    # (the Control API validated both sides are glue-backed). An ANNOTATED run
+    # carrying notes on external/ docs needs the same widening — the Control
+    # API derives the counterpart databases from the surviving notes and sends
+    # them as `extra_glue_databases` (without it, every qualified query against
+    # the counterpart is AccessDenied and the agent would "refute" cross notes
+    # it simply couldn't check).
+    target = payload.get("target") or {}
+    extra_dbs: list[str] = [
+        db for db in (payload.get("extra_glue_databases") or []) if db
+    ]
+    if mode == "cross":
+        target_db = (target.get("source") or {}).get("glue_database") or target.get(
+            "dataset"
+        )
+        if target_db and target_db not in extra_dbs:
+            extra_dbs.append(target_db)
+    source = build_source(
+        dataset, source=payload.get("source"), extra_glue_databases=extra_dbs or None
+    )
 
     # Domain description/context (enriched by control_api from DOMAIN#/META).
     domain_description = payload.get("domain_description")
@@ -134,6 +158,32 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             dataset_guidance=dataset_guidance,
             dataset_guidance_version=dataset_guidance_version,
             recursive_improvement=recursive_improvement,
+            session_id=session_id,
+        )
+    elif mode == "cross":
+        # Cross-dataset references (Roadmap §5, OSS flat-trust mode). The target
+        # block was resolved + validated by the Control API: {data_domain,
+        # dataset, source, domain_description?, domain_context?}. No dataset
+        # guidance and no RI in this mode by design (see run_cross_harvest).
+        target_source = build_source(target["dataset"], source=target.get("source"))
+        run_cross_harvest(
+            source=source,
+            dataset_root=root,
+            data_domain=data_domain,
+            dataset=dataset,
+            target_source=target_source,
+            target_root=dataset_root(
+                MOUNT_PATH, target["data_domain"], target["dataset"]
+            ),
+            target_data_domain=target["data_domain"],
+            target_dataset=target["dataset"],
+            model_config=model_config,
+            subagent_model_config=subagent_model_config,
+            reviewer_model_config=reviewer_model_config,
+            domain_description=domain_description,
+            domain_context=domain_context,
+            target_domain_description=target.get("domain_description"),
+            target_domain_context=target.get("domain_context"),
             session_id=session_id,
         )
     elif mode == "annotated":
@@ -218,6 +268,9 @@ def _safe(payload: dict) -> dict:
     # Never log annotation bodies (reader feedback text); just how many there were.
     if payload.get("annotations") is not None:
         safe["annotations"] = f"<{len(payload.get('annotations') or [])} items>"
+    target = payload.get("target")
+    if isinstance(target, dict):
+        safe["target"] = f"{target.get('data_domain')}/{target.get('dataset')}"
     return safe
 
 
@@ -235,6 +288,28 @@ def _validate(payload: dict) -> str | None:
             return f"missing required field: {key}"
     if mode == "incremental" and not payload.get("changed_table"):
         return "incremental mode requires 'changed_table'"
+    if mode == "cross":
+        target = payload.get("target")
+        if not isinstance(target, dict) or not (
+            target.get("data_domain") and target.get("dataset")
+        ):
+            return "cross mode requires 'target' with data_domain and dataset"
+        if (
+            target.get("data_domain") == payload.get("data_domain")
+            and target.get("dataset") == payload.get("dataset")
+        ):
+            return "cross mode target must differ from the dataset itself"
+        # The target components become destructive paths (remove_tree, the
+        # guard's writable_prefix, the .metadata snapshot dir) and the
+        # '#'-delimited XREF signal key — validate them as path segments here,
+        # at the payload boundary (external_pair_prefix rejects "/", "..",
+        # "#", and anything else outside the segment charset).
+        from okf_core.paths import external_pair_prefix
+
+        try:
+            external_pair_prefix(target["data_domain"], target["dataset"])
+        except ValueError as e:
+            return f"cross mode target has an invalid component: {e}"
     if mode == "annotated":
         if not payload.get("user_sub"):
             return "annotated mode requires 'user_sub'"

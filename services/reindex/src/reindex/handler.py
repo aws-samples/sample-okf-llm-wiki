@@ -57,6 +57,7 @@ from okf_core.embedding import (
     build_non_filterable_metadata,
     vector_key,
 )
+from okf_core.paths import EXTERNAL_DIR, external_pair_prefix
 
 # EventBridge detail-type values for S3 events (see docs/API_REFERENCE.md §4).
 _CREATED = "Object Created"
@@ -184,6 +185,123 @@ def _advance_sequencer(ddb, *, freshness_table: str, vkey: str, sequencer: str) 
         raise
 
 
+# --- cross-dataset reference signal (XREF rows) -------------------------------
+#
+# Cross-dataset pair docs live ONLY in the initiating bundle (one home — see
+# CONVENTIONS.md "Cross-dataset references"). The referenced dataset still needs
+# to be discoverable as "cross-referenced by X", so this worker DERIVES that
+# signal from the same object events that drive the vector index: a concept doc
+# under okf/<sd>/<sds>/external/<td>/<tds>/ upserts a registry row
+# pk="DOMAIN#<td>", sk="XREF#<tds>#<sd>#<sds>"; when the pair subtree's last
+# concept doc is deleted, the row is removed. Being event-derived, the signal
+# survives full-harvest wipes and repromotes (both emit object events) and is
+# rebuildable by replay, exactly like the vectors — it can never silently drift
+# from the S3 truth.
+
+
+def _xref_pair(location: ConceptLocation) -> tuple[str, str] | None:
+    """The (target_domain, target_dataset) a concept doc cross-references, or None.
+
+    A cross doc's concept id is ``external/<td>/<tds>/<...>`` — at least four
+    segments (something must exist below the pair dir for it to be a doc). The
+    two components are validated as OKF path segments (external_pair_prefix):
+    the XREF sort key joins them with ``#``, so a name carrying a ``#`` would
+    make two different pairs collide on one row — such keys produce NO signal
+    rather than a corrupt one.
+    """
+    parts = location.concept_id.split("/")
+    if len(parts) >= 4 and parts[0] == EXTERNAL_DIR and parts[1] and parts[2]:
+        try:
+            external_pair_prefix(parts[1], parts[2])
+        except ValueError:
+            return None
+        return parts[1], parts[2]
+    return None
+
+
+def _xref_key(location: ConceptLocation, pair: tuple[str, str]) -> dict[str, str]:
+    td, tds = pair
+    return {
+        "pk": f"DOMAIN#{td}",
+        "sk": f"XREF#{tds}#{location.data_domain}#{location.dataset}",
+    }
+
+
+def _upsert_xref(ddb, *, registry_table: str, location: ConceptLocation) -> None:
+    """Record that ``location``'s bundle cross-references the doc's target pair.
+
+    Idempotent unconditional put (re-embeds and re-runs just refresh
+    ``updated_at``). No-op for non-cross docs.
+    """
+    pair = _xref_pair(location)
+    if pair is None:
+        return
+    table = ddb.Table(registry_table)
+    table.put_item(
+        Item={
+            **_xref_key(location, pair),
+            "target_data_domain": pair[0],
+            "target_dataset": pair[1],
+            "source_data_domain": location.data_domain,
+            "source_dataset": location.dataset,
+            "updated_at": _now_iso(),
+        }
+    )
+
+
+def _clear_xref_if_pair_empty(
+    s3, ddb, *, bundle_bucket: str, registry_table: str, location: ConceptLocation
+) -> None:
+    """Remove the pair's XREF row when its subtree holds no concept docs anymore.
+
+    Decided from CURRENT S3 truth (a live listing of the pair prefix), not from
+    the event payload, so out-of-order deletes and re-authoring races
+    self-correct: whichever event is processed last sees the real final state.
+    Generated ``index.md`` files under the pair dir don't count as docs
+    (``parse_bundle_key`` rejects them), so a subtree holding only a leftover
+    index is treated as empty.
+
+    The delete is CONDITIONAL on the row not having been (re-)upserted since
+    this check began: LIST-then-DELETE is not atomic, and with concurrent SQS
+    workers a stalled delete-path worker could otherwise erase the row a
+    create-path worker just wrote for newly authored docs (the per-key
+    sequencer can't catch it — the create advanced a different key's marker).
+    ``updated_at >= cutoff`` ⇒ someone re-upserted after our listing started ⇒
+    the pair is live again and losing the condition is the CORRECT outcome.
+    """
+    pair = _xref_pair(location)
+    if pair is None:
+        return
+    cutoff = _now_iso()  # BEFORE the listing: bounds the race window
+    prefix = (
+        f"okf/{location.data_domain}/{location.dataset}/"
+        f"{EXTERNAL_DIR}/{pair[0]}/{pair[1]}/"
+    )
+    kwargs: dict[str, Any] = {"Bucket": bundle_bucket, "Prefix": prefix}
+    while True:
+        resp = s3.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []):
+            if parse_bundle_key(obj["Key"]) is not None:
+                return  # a concept doc remains — the pair is still documented
+        token = resp.get("NextContinuationToken")
+        if not token:
+            break
+        kwargs["ContinuationToken"] = token
+    from boto3.dynamodb.conditions import Attr
+
+    try:
+        ddb.Table(registry_table).delete_item(
+            Key=_xref_key(location, pair),
+            ConditionExpression=(
+                Attr("updated_at").not_exists() | Attr("updated_at").lt(cutoff)
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 - a lost condition is the safe path
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code != "ConditionalCheckFailedException":
+            raise
+
+
 def _get_object_text(s3, *, bucket: str, key: str) -> str:
     obj = s3.get_object(Bucket=bucket, Key=key)
     raw = obj["Body"].read()
@@ -248,6 +366,7 @@ def process_record(
     vector_bucket: str,
     vector_index: str,
     freshness_table: str,
+    registry_table: str = "okf-registry",
 ) -> str:
     """Process one SQS record. Pure w.r.t. AWS — all clients are injected.
 
@@ -289,6 +408,15 @@ def process_record(
         delete_vector(
             s3vectors, vector_bucket=vector_bucket, index_name=vector_index, key=vkey
         )
+        # Cross-dataset signal: if this was the pair's last doc, drop its XREF
+        # row (decided from a live listing — see _clear_xref_if_pair_empty).
+        _clear_xref_if_pair_empty(
+            s3,
+            ddb,
+            bundle_bucket=bundle_bucket,
+            registry_table=registry_table,
+            location=location,
+        )
         _advance_sequencer(
             ddb, freshness_table=freshness_table, vkey=vkey, sequencer=event.sequencer
         )
@@ -304,6 +432,9 @@ def process_record(
         vector_bucket=vector_bucket,
         vector_index=vector_index,
     )
+    # Cross-dataset signal: a doc under external/<td>/<tds>/ marks its target
+    # as cross-referenced by this bundle (idempotent upsert; no-op otherwise).
+    _upsert_xref(ddb, registry_table=registry_table, location=location)
     _advance_sequencer(
         ddb, freshness_table=freshness_table, vkey=vkey, sequencer=event.sequencer
     )
@@ -332,6 +463,7 @@ def _build_clients() -> dict[str, Any]:
         "vector_bucket": os.environ["OKF_VECTOR_BUCKET"],
         "vector_index": os.environ["OKF_VECTOR_INDEX"],
         "freshness_table": os.environ.get("OKF_FRESHNESS_TABLE", "okf-freshness"),
+        "registry_table": os.environ.get("OKF_REGISTRY_TABLE", "okf-registry"),
     }
 
 

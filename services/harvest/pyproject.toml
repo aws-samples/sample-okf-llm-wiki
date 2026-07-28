@@ -18,7 +18,7 @@ dependencies = [
     # ChatBedrockConverse lives in the standalone langchain-aws partner package,
     # which we import directly (agent.py) — depend on it explicitly rather than
     # relying on the langchain[aws] extra to pull a compatible version.
-    "langchain-aws>=1.6",
+    "langchain-aws>=1.6.4",
     # GPT on Bedrock Mantle: ChatOpenAI (agent.py) drives the Mantle OpenAI-
     # compatible endpoint, and aws-bedrock-token-generator mints the SigV4-derived
     # bearer key it authenticates with. Both are imported lazily inside
