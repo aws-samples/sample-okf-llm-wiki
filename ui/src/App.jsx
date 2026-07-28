@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { toast } from "sonner"
 import { useAuth } from "react-oidc-context"
 import {
   BoxesIcon,
@@ -522,7 +523,7 @@ function TopbarHeader({
 // The Chat nav entry + its sub-controls. The Chat button behaves like any nav
 // item; when chat is the ACTIVE section its controls (new chat, history) reveal
 // as sub-items beneath it — driven by the shared chat controller so they operate
-// the same conversation the chat page renders. The model is fixed (Opus 4.8);
+// the same conversation the chat page renders. The model is fixed (Opus 5);
 // effort lives in the composer, so no model/effort controls here.
 function ChatNav({ item, active, onNavigate, ctrl, tooltip = item.label }) {
   const { historyOpen, setHistoryOpen } = ctrl
@@ -644,6 +645,20 @@ function Console({ auth, api }) {
     [push, selectionKey]
   )
 
+  // Follow a cross-bundle address (a bundle-escaping link in a cross-dataset
+  // reference doc) into ANOTHER dataset's Browse view: switch the selection and
+  // open the target concept in one hash push (back returns to the source doc).
+  // The address may dangle — Browse then shows its normal missing-doc state.
+  const openCrossConcept = useCallback(
+    (dataDomain, dataset, conceptId) =>
+      push({
+        section: "browse",
+        selectionKey: `${dataDomain}/${dataset}`,
+        concept: conceptId,
+      }),
+    [push]
+  )
+
   // Browse reports the concept it opened so the URL stays in sync (and Back
   // returns to the previously-open concept).
   const onBrowseConcept = useCallback(
@@ -686,6 +701,16 @@ function Console({ auth, api }) {
       (d) => `${d.data_domain}/${d.dataset}` === selectionKey
     )
     if (!SECTION_KEYS.has(route.section) || !known) {
+      // The URL NAMED a dataset that isn't registered (a stale deep link, or a
+      // cross-bundle address whose counterpart was deregistered) — say so
+      // before falling back, or the user lands in an unrelated dataset with
+      // only a misleading "concept not found" to explain it.
+      if (selectionKey && !known) {
+        toast.error(
+          `Dataset ${selectionKey} is not registered — it may have been ` +
+            "removed. Showing the first available dataset instead."
+        )
+      }
       replace({
         section,
         selectionKey: known
@@ -899,6 +924,7 @@ function Console({ auth, api }) {
                     }
                     concept={routeConcept}
                     onConceptChange={onBrowseConcept}
+                    onOpenCross={openCrossConcept}
                   />
                 </div>
               ) : section === "graph" ? (
@@ -924,7 +950,11 @@ function Console({ auth, api }) {
                     <ContextView api={api} selection={selection} />
                   )}
                   {section === "harvest" && (
-                    <HarvestView api={api} selection={selection} />
+                    <HarvestView
+                      api={api}
+                      selection={selection}
+                      datasets={datasets}
+                    />
                   )}
                   {section === "benchmark" && (
                     <BenchmarkView api={api} selection={selection} />

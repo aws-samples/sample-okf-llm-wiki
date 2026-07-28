@@ -19,6 +19,43 @@ def test_list_domains_returns_only_domain_items(tools):
     assert pairs == [("ops", "logs"), ("sales", "f1")]
     # The HARVEST#... status item must not leak in.
     assert all(d["data_domain"] for d in domains)
+    # No cross-dataset pairs seeded -> the signal fields are simply absent.
+    assert all("cross_references" not in d for d in domains)
+    assert all("cross_referenced_by" not in d for d in domains)
+
+
+def test_list_domains_surfaces_cross_reference_signal(tools, aws):
+    # A reindex-derived XREF row: sales/f1's bundle holds pair docs about
+    # ops/logs. Both sides must learn about it — the initiating side so it can
+    # find its own external/ folder, the referenced side because NOTHING in its
+    # own bundle reveals the relationship (the docs live in the other bundle).
+    aws["table"].put_item(
+        Item={
+            "pk": "DOMAIN#ops",
+            "sk": "XREF#logs#sales#f1",
+            "target_data_domain": "ops",
+            "target_dataset": "logs",
+            "source_data_domain": "sales",
+            "source_dataset": "f1",
+            "updated_at": "t",
+        }
+    )
+    by_id = {(d["data_domain"], d["dataset"]): d for d in tools.list_domains()}
+    assert by_id[("sales", "f1")]["cross_references"] == ["ops/logs"]
+    assert "cross_referenced_by" not in by_id[("sales", "f1")]
+    assert by_id[("ops", "logs")]["cross_referenced_by"] == ["sales/f1"]
+    assert "cross_references" not in by_id[("ops", "logs")]
+
+
+def test_list_domains_ignores_malformed_xref_rows(tools, aws):
+    aws["table"].put_item(
+        Item={"pk": "DOMAIN#ops", "sk": "XREF#logs#sales#f1", "updated_at": "t"}
+    )
+    domains = tools.list_domains()
+    assert all("cross_referenced_by" not in d for d in domains)
+    # And the XREF row itself is never mistaken for a dataset mapping.
+    pairs = sorted((d["data_domain"], d["dataset"]) for d in domains)
+    assert pairs == [("ops", "logs"), ("sales", "f1")]
 
 
 # -- list_directory ---------------------------------------------------------

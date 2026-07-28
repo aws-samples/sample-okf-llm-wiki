@@ -20,6 +20,10 @@ def test_skill_is_vendored():
         pkg_skills / "okf-authoring" / "references" / "sources" / "athena-glue.md"
     ).is_file()
     assert (pkg_skills / "okf-authoring" / "references" / "templates.md").is_file()
+    # The cross-dataset methodology (mode="cross" runs read it first) ships too.
+    assert (
+        pkg_skills / "okf-authoring" / "references" / "cross-dataset.md"
+    ).is_file()
 
 
 def test_skill_md_has_deepagents_frontmatter():

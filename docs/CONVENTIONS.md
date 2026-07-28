@@ -17,8 +17,15 @@ okf/<data_domain>/
     │                                 #   folders: joins/ metrics/ enums/
     │                                 #   named_sets/ glossary/ known_issues/
     │                                 #   (one doc per item; see okf-authoring skill)
+    ├── external/<d>/<ds>/…           # type: Cross-Dataset Reference — one subtree
+    │                                 #   per counterpart dataset, written ONLY by a
+    │                                 #   cross-mode harvest (see "Cross-dataset
+    │                                 #   references" below); overview.md + the same
+    │                                 #   fact-typed folders (joins/ metrics/ …)
     ├── .context/                     # user-uploaded source docs (persisted)
     ├── .metadata/                    # read-only Glue metadata snapshot (per run)
+    │                                 #   (+ .metadata/external/<d>/<ds>/ on a cross
+    │                                 #   run: the target's snapshot + published docs)
     └── .harvest/state.json           # commit marker (status: complete | in_progress)
 ```
 
@@ -52,6 +59,54 @@ the dataset listing by `is_domain_dataset()`. Vector key:
   sheet.
 - A bundle is consumable only once `.harvest/state.json` exists with
   `status == "complete"`.
+
+### Cross-dataset references (`external/`)
+
+`external/<counterpart_domain>/<counterpart_dataset>/…` holds docs representing
+knowledge that SPANS this dataset and one counterpart (verified cross-dataset
+joins, cross-dataset metrics, the pair overview) — Roadmap §5's OSS flat-trust
+mode. Rules:
+
+- **The pair docs have exactly ONE home: the bundle of the dataset whose cross
+  harvest authored them.** Nothing is ever written into the counterpart's
+  bundle. This is the load-bearing decision: a mirrored copy would make the
+  pair a distributed fact across two independently versioned, independently
+  restorable bundles, so a full harvest OR a **repromote** of the counterpart
+  (restoring a version from before/after a sync) would silently desynchronize
+  it, with no transaction able to span the two. One home means a dataset's
+  version history is self-contained and pair state cannot drift.
+- Written ONLY by a `mode="cross"` harvest; the write guard confines a cross run
+  to exactly its pair subtree, and every other mode never touches `external/`.
+- The counterpart's discoverability is a DERIVED signal, not a copy — see
+  "Cross-dataset reference signal" below.
+- Every doc carries `type: Cross-Dataset Reference` and a `cross_dataset:
+  {source: {data_domain, dataset}, target: {…}}` frontmatter block (`source` =
+  the initiating side, i.e. where the docs live). Prose is symmetric (read by
+  consumers of BOTH datasets) and tables are named as qualified SQL
+  identifiers.
+- **Links go to BOTH sides — a link is an address, and addresses may go
+  stale.** Home-side docs are linked file-relative as usual (from a `joins/`
+  doc: `../../../../tables/<t>.md`) — these resolve in the per-bundle link
+  graph and stitch the pair subtree into it (backlinks from a table surface its
+  cross-dataset joins). Counterpart docs are linked with the bundle-ESCAPING
+  relative form (`../../../../../../<td>/<tds>/tables/<t>.md`): all bundles
+  share one `okf/` tree, so the address resolves when the tree is browsed as
+  files, and the UI's Browse view follows it into the other dataset. The link
+  resolver (`okf_core/links.py`) deliberately DROPS bundle-escaping links from
+  the graph (OKF tolerates dangling cross-bundle links), and a re-harvest of
+  the counterpart may dangle the address — accepted; the qualified SQL
+  identifier in the prose is the durable reference.
+- The docs are ordinary published concepts: listed, served, embedded, and
+  searchable exactly like the rest of the bundle (concept id
+  `external/<d>/<ds>/joins/<slug>` etc.). Nothing downstream special-cases them
+  beyond the annotation scope filter below.
+- **A full harvest deletes `external/` along with everything else**
+  (`clean_authored_output`'s delete-every-non-dot-entry rule — there is
+  deliberately no keep-list). Re-run the cross harvest to restore the pair docs;
+  vectors and the XREF signal are pruned/rebuilt through the normal reindex
+  event path.
+- A cross re-run of the same pair replaces that pair's subtree wholesale; other
+  pairs' subtrees are untouched.
 
 ## Bundle versions & repromote
 
@@ -205,7 +260,13 @@ provisioned cluster's `DBName` hint from `/redshift/clusters` — defaulting to
 
 **Harvest status.** `pk = "HARVEST#<data_domain>#<dataset>"`, `sk = "STATUS"`,
 attrs `{status: queued | running | complete | failed | cancelled, mode,
-started_at, updated_at, detail, runtime_session_id, model, effort}`. `model` and
+started_at, updated_at, detail, runtime_session_id, model, effort}`. A
+`mode = "cross"` row additionally carries `cross_target`
+(`"<domain>/<dataset>"`, stamped at lease time — the counterpart the discovery
+run is against, surfaced by the status GET so the UI shows WHO, not just the
+mode; mirrors the repromote rows' `repromote_target`). Mode strings are wire
+values — the UI maps them to display labels (e.g. `cross` renders as
+"Cross-dataset discovery", `annotated` as "Apply annotations"). `model` and
 `effort` record the RESOLVED LLM config the run actually used (override or
 deploy-time default); the runtime stamps them on the `running` transition
 (`harvest.status.report_status`), so they're empty on a still-`queued` row.
@@ -244,6 +305,13 @@ feedback — never orphaned while the dataset exists. `submitted_via` records
 provenance: `"ui"` (default) or `"agent"` — the chat agent's per-run
 `submit_annotation` tool files on the user's behalf (the run's verified sub
 keys the partition; chat role has PutItem-only on the annotations table).
+
+A **cross-dataset run** (`mode = "cross"`) takes only ITS OWN dataset's lease —
+the target is read via a start-time snapshot and never written, so no lease is
+ever taken on it and no cross-bundle write window exists. Concurrent X→Y and
+Y→X cross runs are therefore independent by construction (each harvests its own
+dataset). The initiating bundle's fresh `complete` marker carries
+`cross_target: "<d>/<ds>"` provenance.
 
 A **repromote** (bundle version restore, below) takes this SAME lease with
 `mode = "repromote"` and rides the existing `queued → complete | failed`
@@ -350,6 +418,39 @@ collide with it (distinct `sk` prefix) and carry no lease semantics. Emitted liv
 in parallel as an `OKF_STEP` `kind:"benchmark"` event so the UI shows KPIs mid-run
 (the CloudWatch feed is the live view; this row is the durable/queryable record).
 
+**Cross-dataset reference signal (derived).** `pk = "DOMAIN#<target_domain>"`,
+`sk = "XREF#<target_dataset>#<source_domain>#<source_dataset>"`, attrs
+`{target_data_domain, target_dataset, source_data_domain, source_dataset,
+updated_at}`. One row per documented PAIR, recording that
+`<source>`'s bundle holds `external/<target_domain>/<target_dataset>/…` docs.
+
+**Derived, never authored.** The reindex worker maintains these rows from the
+bundle's S3 object events — the same events that drive the vector index (see
+`reindex.handler._upsert_xref` / `_clear_xref_if_pair_empty`): a concept doc
+under `okf/<sd>/<sds>/external/<td>/<tds>/` upserts the row; a delete whose
+pair prefix no longer holds ANY concept doc (checked with a live listing, so
+out-of-order events self-correct) removes it — with a CONDITIONAL delete
+(`updated_at` older than the listing's start), so a concurrent worker's fresh
+upsert for newly authored docs can never be erased by a stalled delete-path
+worker. Pair components that fail OKF segment validation (e.g. a `#`, which
+would collide two pairs onto one sort key) produce no row at all. Because it is event-derived it
+survives full-harvest wipes and repromotes with no writer having to remember it,
+and it is rebuildable by replay — the same "S3 markdown is truth, everything
+else is derived" rule as the vectors. Whether the pair prefix is empty is judged
+by `parse_bundle_key`, so a leftover generated `index.md` does not keep a row
+alive.
+
+**Why it exists.** Pair docs live only in the initiating bundle, so a consumer
+scoped to the referenced dataset would otherwise never learn the relationship
+exists. `list_domains` (both the Control API's `GET /domains` and the
+consumption MCP tool) reads these rows in the SAME scan it already does over
+`DOMAIN#` partitions and adds two optional fields per dataset:
+`cross_references` (datasets this one holds pair docs FOR) and
+`cross_referenced_by` (datasets whose bundle holds pair docs about this one —
+read them under `<that dataset>/external/<this_domain>/<this_dataset>/`). Both
+are omitted when empty. The reindex role therefore holds `PutItem` +
+`DeleteItem` on the registry table (and `ListBucket` on the bundle bucket).
+
 **MCP credential.** `pk = "CRED#<client_id>"`, `sk = "META"`, attrs
 `{name, client_id, created_by?, created_at}`. Metadata only — the client secret
 is returned once at creation and never stored. This backs the credentials UI
@@ -360,9 +461,11 @@ is returned once at creation and never stored. This backs the credentials UI
 arbitrary app client, such as the public SPA login client, can't be deleted — and
 when a caller identity is present it must equal `created_by`.
 
-Listing: `list_domains` queries `pk begins_with "DOMAIN#"` AND
-`sk begins_with "DATASET#"` (tightened so `META` rows are excluded);
-`list_declared_domains` scans with `sk = "META"`;
+Listing: `list_domains` scans `pk begins_with "DOMAIN#"` with `sk begins_with
+"DATASET#"` (the mappings — so declared-domain `META` rows are excluded) OR
+`sk begins_with "XREF#"` (the derived cross-reference signal, folded into the
+same pass and returned as the `cross_references` / `cross_referenced_by`
+fields, never as mappings); `list_declared_domains` scans with `sk = "META"`;
 `list_credentials` scans `pk begins_with "CRED#"`.
 
 ### `okf-freshness` — reindex and incremental dedup state
@@ -427,6 +530,42 @@ CRUD: `GET|POST /annotations/{domain}/{dataset}` and
 `DELETE /annotations/{domain}/{dataset}/{annotation_id}?concept=<id>` (the concept
 id has slashes, so it rides in the query string, not a path segment).
 
+**Annotation scope (cross-dataset docs).** The run endpoint accepts an optional
+body `{"scope": "dataset" | "cross"}`: `cross` applies only notes whose
+`concept_id` is under `external/` (the cross-dataset docs), `dataset` only the
+rest; absent = everything. `_dataset`-WIDE notes are general feedback and pass
+BOTH filters — whether one rides a given run is the `annotation_ids`
+selection's call (the UI offers them in every scope, preselected only in the
+dataset one). Out-of-scope OPEN
+notes stay untouched for a later run of the other scope; an out-of-scope
+`in_review` STRAGGLER (from a dead prior run) is reverted to `open` rather than
+dropped, preserving the reclaim invariant even for users who always pick one
+scope. A `cross`-scoped run also IGNORES dataset guidance AND the saved
+`recursive_improvement` settings (both operate on the dataset's own docs, which
+the scope excludes). When surviving notes reference `external/<d>/<ds>/…` docs,
+the Control API derives the counterpart datasets from the concept ids and sends
+their Glue database names as `extra_glue_databases` in the payload — the
+runtime widens the run's scoped session policy to them so the agent can
+actually verify cross claims with qualified SQL (without it, every check would
+be AccessDenied and the notes would be falsely rejected). The UI's picker modal
+offers one cross scope PER TARGET PAIR (`Cross-dataset · <domain>/<dataset>`,
+from the bundle's `external/` listing plus any pending note that targets one) —
+never a generic "all external" bucket — so a run names exactly which target it
+verifies against. The pair choice rides in `annotation_ids` plus an optional
+`cross_target: "<domain>/<dataset>"` body field (the wire `scope` stays
+`"cross"`; `cross_target` is refused with any other scope): the selected notes'
+concept ids widen the session policy, and `cross_target` guarantees the
+target's Glue database is granted even when the selection carries only
+`_dataset`-wide general notes (whose ids name no pair).
+
+**Partial selection.** The run endpoint also accepts an optional body
+`annotation_ids: [<id>, …]` (the UI's annotation picker): only the listed notes
+ride the run. Unselected OPEN notes stay open for a later run; an unselected
+`in_review` straggler reverts to `open` — the same stranding argument as the
+scope filter. An empty list is valid: with a dirty guidance the run still fires
+guidance-only, otherwise it short-circuits as "nothing to apply". Composes with
+`scope` (the id filter applies within the scope).
+
 ## Harvest invocation payload
 
 `InvokeAgentRuntime(agentRuntimeArn=<harvest arn>, runtimeSessionId=<per-dataset
@@ -460,6 +599,40 @@ Glue-only (it fires on `aws.glue` catalog events) and always sends a `glue` sour
   "domain_description": "Revenue & order pipelines",
   "domain_context": "Covers all B2C sales; refunds excluded." }
 ```
+
+or, for a cross-dataset run (Roadmap §5 — author `external/` pair docs):
+
+```json
+{ "data_domain": "sales", "dataset": "orders", "mode": "cross",
+  "source": { "type": "glue", "glue_database": "orders" },
+  "target": { "data_domain": "crm", "dataset": "customers",
+              "source": { "type": "glue", "glue_database": "customers" },
+              "domain_description": "Customer master data",
+              "domain_context": "…" },
+  "domain_description": "Revenue & order pipelines" }
+```
+
+The Control API resolves + validates `target` from the UI's flat
+`target_data_domain`/`target_dataset` body fields (`resolve_cross_target`):
+registered mapping (404), glue-backed on BOTH sides (400 — v1 verification is
+qualified Athena SQL, so cross-source pairs have no common engine), distinct
+from the dataset itself AND resolving to a DIFFERENT Glue database (400 — the
+same dataset name under two domains is the same physical data), and BOTH
+bundles published (409). A cross payload deliberately carries **no
+`dataset_guidance` and no `recursive_improvement`** — guidance is
+dataset-scoped steering and the pair docs are shared with another dataset's
+readers. The runtime validates the target components as path segments
+(`okf_core.paths.external_pair_prefix` — they become destructive paths and the
+XREF key), widens the run's scoped session policy to the pair's two Glue
+databases (never more), snapshots the target's catalog + published docs (minus
+the target's own `external/` subtree — another run's pair docs are not the
+target's own verified facts) into `.metadata/external/<d>/<ds>/`, and confines
+writes to `external/<d>/<ds>/` (guard-enforced, INCLUDING the cross-mode
+reviewer's middleware). Ordering is load-bearing: the target-readiness
+re-checks (the trigger-time check only covered trigger time) and the required
+target snapshot all run BEFORE the first destructive step, so a failure there
+leaves the bundle untouched and READY — prior pair docs intact. Uses a fresh
+session id per trigger, like `full`.
 
 or, for an annotation run (apply a user's wiki feedback in place):
 

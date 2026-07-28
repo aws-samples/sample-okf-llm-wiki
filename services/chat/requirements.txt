@@ -6,7 +6,8 @@ langgraph>=0.6
 langgraph-checkpoint-aws
 # ChatBedrockConverse (Claude) + ChatOpenAI-on-Mantle (GPT); imported lazily by
 # okf_aws.model_factory. aws-bedrock-token-generator mints the Mantle bearer.
-langchain-aws>=1.6
+# >=1.6.4: first release that streams Claude Opus 5 (the chat default model).
+langchain-aws>=1.6.4
 langchain-openai>=1.3
 aws-bedrock-token-generator>=1.0
 # Raw FastAPI app on 0.0.0.0:8080 (/invocations + /ping); we own the app so we

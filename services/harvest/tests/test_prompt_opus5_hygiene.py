@@ -17,6 +17,9 @@ ALL_PROMPTS = (
     prompts.REVIEWER_PROMPT,
     prompts.CONTEXT_EXTRACTOR_PROMPT,
     prompts.ANNOTATION_PROMPT,
+    prompts.build_cross_supervisor_prompt(),
+    prompts.build_cross_author_prompt(),
+    prompts.build_cross_reviewer_prompt(),
 )
 
 
@@ -30,23 +33,25 @@ def test_every_prompt_right_sizes_written_docs():
 
 
 def test_supervisor_prescribes_delegation_exactly():
-    # Opus 5 delegates readily; the supervisor must be told which dispatches the
-    # workflow prescribes and that nothing beyond them is warranted — including
-    # extra verification rounds (it verifies its own work without being told).
-    p = prompts.SUPERVISOR_PROMPT
-    assert "Delegation discipline" in p
-    assert "finish yourself in a couple of" in p
-    assert "NO further verification" in p
+    # Opus 5 delegates readily; every supervisor (standard AND cross-mode) must
+    # be told which dispatches the workflow prescribes and that nothing beyond
+    # them is warranted — including extra verification rounds (it verifies its
+    # own work without being told).
+    for p in (prompts.SUPERVISOR_PROMPT, prompts.build_cross_supervisor_prompt()):
+        assert "Delegation discipline" in p
+        assert "finish yourself in a couple of" in p
+        assert "NO further verification" in p
 
 
 def test_review_pass_is_bounded_to_a_single_pass():
-    p = prompts.SUPERVISOR_PROMPT
-    assert "do NOT re-review docs after" in p
-    assert "do NOT add verification passes of your own" in p
+    for p in (prompts.SUPERVISOR_PROMPT, prompts.build_cross_supervisor_prompt()):
+        assert "do NOT re-review docs after" in p
+        assert "do NOT add verification passes of your own" in p
 
 
 def test_supervisor_final_summary_is_length_calibrated():
     assert "Keep your final summary short" in prompts.SUPERVISOR_PROMPT
+    assert "Keep your final summary short" in prompts.build_cross_supervisor_prompt()
 
 
 def test_reviewer_scope_is_its_cluster_only():

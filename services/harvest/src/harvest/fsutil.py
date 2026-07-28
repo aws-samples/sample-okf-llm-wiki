@@ -87,6 +87,27 @@ def write_text(path: str | Path, text: str) -> None:
         _retry(lambda: p.write_text(text, encoding="utf-8"), what=f"rewrite {p}")
 
 
+def remove_tree(path: str | Path) -> bool:
+    """Remove a directory subtree (or file), tolerating transient NFS errors.
+
+    Returns True when something was removed, False when ``path`` didn't exist.
+    Used by the cross-dataset mode to clear a pair's prior ``external/<d>/<ds>/``
+    output before re-authoring (the scoped analogue of clean_authored_output).
+    """
+    p = Path(path)
+    if not p.exists():
+        return False
+
+    def _rm() -> None:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+
+    _retry(_rm, what=f"rm {p}")
+    return True
+
+
 def clean_authored_output(dataset_root: str | Path) -> list[str]:
     """Delete a full harvest's PRIOR authored output for a clean rebuild.
 

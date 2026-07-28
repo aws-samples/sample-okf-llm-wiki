@@ -968,7 +968,7 @@ def read_history(
     checkpointed prefix must stay in history while the buffer appends only the
     continuation.
     """
-    graph = build_agent("us.anthropic.claude-opus-4-8", "high", None, checkpointer)
+    graph = build_agent("global.anthropic.claude-opus-5", "high", None, checkpointer)
     cfg = {"configurable": {"thread_id": internal_thread_id}}
     state = graph.get_state(cfg)
     messages = (state.values or {}).get("messages", []) if state else []

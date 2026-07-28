@@ -161,6 +161,58 @@ export function resolveConceptLink(target, fromConceptId) {
   return { conceptId, anchor }
 }
 
+// Resolve a bundle-ESCAPING relative `.md` link to another dataset's concept.
+//
+// Cross-dataset reference docs (external/) link the counterpart's docs by
+// address: all bundles share one `okf/` tree, so from
+// `external/<td>/<tds>/joins/x.md` the counterpart table is
+// `../../../../../../<td>/<tds>/tables/customers.md` — a link that escapes
+// this bundle's root but resolves within the tree. resolveConceptLink (above)
+// deliberately returns null for those (matching the Python resolver, which
+// drops them from the link graph); this resolves them against the tree
+// instead, returning `{ dataDomain, dataset, conceptId, anchor }` when the
+// escape lands on a plausible concept in ANOTHER dataset — or null (link
+// doesn't escape, rises above the tree, or lands somewhere non-concept-like).
+// The target dataset may not exist anymore (the address may dangle — that is
+// accepted); callers navigate and let the bundle view report the miss.
+export function resolveCrossBundleLink(target, fromConceptId, selection) {
+  if (!target || !selection?.data_domain || !selection?.dataset) return null
+  if (target.includes("://") || target.startsWith("/")) return null
+  if (target.startsWith("#")) return null
+
+  let path = target
+  let anchor = ""
+  const hash = path.indexOf("#")
+  if (hash !== -1) {
+    anchor = path.slice(hash + 1)
+    path = path.slice(0, hash)
+  }
+  if (!path.endsWith(".md")) return null
+
+  // Only links that ESCAPE the bundle are candidates here (in-bundle links are
+  // resolveConceptLink's job).
+  if (posixResolve(dirOf(fromConceptId), path) != null) return null
+
+  // Re-resolve against the shared tree: okf/<domain>/<dataset>/<fromDir>/.
+  const treeBase = ["okf", selection.data_domain, selection.dataset, dirOf(fromConceptId)]
+    .filter(Boolean)
+    .join("/")
+  const resolved = posixResolve(treeBase, path)
+  if (resolved == null) return null // rose above the okf/ tree itself
+  const parts = resolved.split("/")
+  // okf/<domain>/<dataset>/<concept path...> — needs all three levels plus a
+  // doc, no dot-segments (reserved dirs are never concepts).
+  if (parts.length < 4 || parts[0] !== "okf") return null
+  if (parts.some((p) => p.startsWith("."))) return null
+  const [, dataDomain, dataset] = parts
+  const conceptId = parts.slice(3).join("/").replace(/\.md$/, "")
+  if (!conceptId) return null
+  // Same-bundle links never belong here (they'd have resolved in-bundle).
+  if (dataDomain === selection.data_domain && dataset === selection.dataset)
+    return null
+  return { dataDomain, dataset, conceptId, anchor }
+}
+
 // Directory part of a concept id: "tables/races" -> "tables", "index" -> "".
 function dirOf(conceptId) {
   const idx = (conceptId || "").lastIndexOf("/")

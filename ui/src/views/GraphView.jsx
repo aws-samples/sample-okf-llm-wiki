@@ -19,6 +19,7 @@ import {
   DatabaseIcon,
   ExternalLinkIcon,
   FocusIcon,
+  Link2Icon,
   NetworkIcon,
   Table2Icon,
   XIcon,
@@ -139,8 +140,17 @@ const EDGE_TYPES = { floating: FloatingEdge }
 
 // Map a concept's frontmatter `type` to an icon + accent color. Types are
 // free-form, so we match on keywords and fall back to a generic concept style.
-function nodeKind(type) {
+// Cross-dataset reference docs (the external/ subtree) are matched FIRST — by
+// the concept id's location, not just the type string, so every doc under
+// external/ is distinguishable even if its type drifted — and additionally get
+// a tinted card background (`external: true`) so they read as a different
+// class of knowledge at a glance.
+function nodeKind(type, conceptId) {
   const t = (type || "").toLowerCase()
+  if ((conceptId || "").startsWith("external/") || t.includes("cross-dataset"))
+    // chart-4 (deep cyan) for the bar/icon so they hold contrast on the tinted
+    // card wash in both themes (chart-5, pale cyan, washes out on it).
+    return { icon: Link2Icon, accent: "var(--chart-4)", external: true }
   if (t.includes("table")) return { icon: Table2Icon, accent: "var(--chart-1)" }
   if (t.includes("dataset") || t.includes("database"))
     return { icon: DatabaseIcon, accent: "var(--chart-2)" }
@@ -229,8 +239,12 @@ function collapseEdges(rawEdges) {
 }
 
 // A modern concept node: accent bar + type icon, title, and the concept id.
+// Cross-dataset reference cards get a distinct background (--xref-node-bg, an
+// explicit per-theme token in index.css — a faint brand-cyan wash in light AND
+// dark) — they represent knowledge about ANOTHER dataset's relationship to
+// this one, worth telling apart at a glance.
 const ConceptNode = memo(function ConceptNode({ data, selected }) {
-  const { icon: Icon, accent } = nodeKind(data.type)
+  const { icon: Icon, accent, external } = nodeKind(data.type, data.conceptId)
   return (
     <div
       className={cn(
@@ -238,7 +252,11 @@ const ConceptNode = memo(function ConceptNode({ data, selected }) {
         "hover:shadow-md",
         selected && "ring-2 ring-primary"
       )}
-      style={{ borderLeftColor: accent, borderLeftWidth: 3 }}
+      style={{
+        borderLeftColor: accent,
+        borderLeftWidth: 3,
+        ...(external ? { backgroundColor: "var(--xref-node-bg)" } : {}),
+      }}
     >
       <Handle
         type="target"

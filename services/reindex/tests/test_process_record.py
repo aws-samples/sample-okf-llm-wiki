@@ -11,6 +11,7 @@ from reindex.handler import process_record
 from fakes import (
     BUNDLE_BUCKET,
     FRESHNESS_TABLE,
+    REGISTRY_TABLE,
     VECTOR_BUCKET,
     VECTOR_INDEX,
     FakeBedrock,
@@ -31,6 +32,7 @@ def _process(record, aws, s3vectors, bedrock):
         vector_bucket=VECTOR_BUCKET,
         vector_index=VECTOR_INDEX,
         freshness_table=FRESHNESS_TABLE,
+        registry_table=REGISTRY_TABLE,
     )
 
 

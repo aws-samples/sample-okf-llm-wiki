@@ -416,12 +416,21 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                     }
                   />
                 </SelectTrigger>
-                <SelectContent>
+                {/* popper + max-w pins the list to the trigger's width, and the
+                    truncating span (cloned into the trigger's value too) gives
+                    a long "name — description" a real ellipsis instead of
+                    cramming under the chevron. */}
+                <SelectContent
+                  position="popper"
+                  className="max-w-(--radix-select-trigger-width)"
+                >
                   <SelectGroup>
                     {declaredDomains.map((d) => (
                       <SelectItem key={d.data_domain} value={d.data_domain}>
-                        {d.data_domain}
-                        {d.description ? ` — ${d.description}` : ""}
+                        <span className="min-w-0 truncate">
+                          {d.data_domain}
+                          {d.description ? ` — ${d.description}` : ""}
+                        </span>
                       </SelectItem>
                     ))}
                   </SelectGroup>
@@ -445,12 +454,17 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                       }
                     />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent
+                    position="popper"
+                    className="max-w-(--radix-select-trigger-width)"
+                  >
                     <SelectGroup>
                       {databases.map((db) => (
                         <SelectItem key={db.name} value={db.name}>
-                          {db.name}
-                          {db.description ? ` — ${db.description}` : ""}
+                          <span className="min-w-0 truncate">
+                            {db.name}
+                            {db.description ? ` — ${db.description}` : ""}
+                          </span>
                         </SelectItem>
                       ))}
                     </SelectGroup>
@@ -486,14 +500,19 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                         }
                       />
                     </SelectTrigger>
-                    <SelectContent>
+                    <SelectContent
+                      position="popper"
+                      className="max-w-(--radix-select-trigger-width)"
+                    >
                       <SelectGroup>
                         {rsTargets.map((t) => (
                           <SelectItem
                             key={`${t.kind}:${t.id}`}
                             value={`${t.kind}:${t.id}`}
                           >
-                            {t.id} ({t.kind})
+                            <span className="min-w-0 truncate">
+                              {t.id} ({t.kind})
+                            </span>
                           </SelectItem>
                         ))}
                       </SelectGroup>

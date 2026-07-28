@@ -112,3 +112,20 @@ def test_compose_system_prompt_appends_blocks_in_order():
     assert both.index(WEB_SEARCH_BLOCK) < both.index(SQL_BLOCK)
     # Empty/absent blocks are skipped, not rendered as gaps.
     assert compose_system_prompt("", SQL_BLOCK) == SYSTEM_PROMPT_WITH_SQL
+
+
+def test_prompt_teaches_cross_dataset_references():
+    # The agent must know the cross-dataset capability: the one-home layout,
+    # BOTH list_domains signal fields, prefer-verified-pair-docs over derived
+    # joins, hypothesis discipline for unverified candidates, and how to direct
+    # the user to run a cross harvest (it cannot trigger one itself).
+    assert "<cross_dataset_references>" in SYSTEM_PROMPT
+    assert "external/<domain>/<dataset>/" in SYSTEM_PROMPT
+    assert "cross_references" in SYSTEM_PROMPT
+    assert "cross_referenced_by" in SYSTEM_PROMPT
+    low = SYSTEM_PROMPT.lower()
+    assert "one bundle only" in low
+    assert "unverified hypothesis" in low
+    assert "cannot run harvests" in low
+    assert "Cross-dataset discovery…" in SYSTEM_PROMPT
+    assert "zero docs" in low  # no-convergence is a valid outcome to explain

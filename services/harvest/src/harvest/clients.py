@@ -43,8 +43,15 @@ def _session_policy(
     workgroup: str,
     results_bucket_arn: str | None,
     enable_lakeformation: bool = False,
+    extra_databases: list[str] | None = None,
 ) -> dict:
     """Inline STS session policy pinning access to ONE dataset's resources.
+
+    ``extra_databases`` is the CROSS-DATASET widening (Roadmap §5 /
+    RELATIONSHIP_DISCOVERY §8): a cross-mode run must verify joins spanning this
+    dataset and its chosen target with qualified Athena SQL, so the policy pins
+    the exact database SET involved — never ``*``, never catalog-wide. Empty on
+    every other mode, which keeps the single-dataset containment unchanged.
 
     Intersected with the data role's (broad) identity policy at assume time, so
     the resulting credential can touch only:
@@ -68,6 +75,12 @@ def _session_policy(
     Stays well under the 2,048-char inline session-policy limit.
     """
     glue_arn = f"arn:aws:glue:{region}:{account_id}"
+    # The run's database SET: this dataset's, plus (cross mode only) the target's.
+    databases = [database, *(extra_databases or [])]
+    db_resources = [f"{glue_arn}:catalog"]
+    for db in databases:
+        db_resources.append(f"{glue_arn}:database/{db}")
+        db_resources.append(f"{glue_arn}:table/{db}/*")
     statements: list[dict] = [
         {
             "Sid": "GlueThisDb",
@@ -79,11 +92,7 @@ def _session_policy(
                 "glue:GetPartitions",
                 "glue:GetTableVersions",
             ],
-            "Resource": [
-                f"{glue_arn}:catalog",
-                f"{glue_arn}:database/{database}",
-                f"{glue_arn}:table/{database}/*",
-            ],
+            "Resource": db_resources,
         },
         {
             # List is catalog-level only (no per-db ARN); metadata listing only.
@@ -259,6 +268,7 @@ def build_source(
     source: dict[str, Any] | None = None,
     region: str | None = None,
     account_id: str | None = None,
+    extra_glue_databases: list[str] | None = None,
 ) -> Source:
     """Build the :class:`~harvest.source_base.Source` for a dataset, dispatching on
     the source descriptor's ``type``.
@@ -274,6 +284,10 @@ def build_source(
     the data role with an inline policy pinned to THIS dataset's resources and build
     the source's clients from those scoped creds; unset (local dev / tests) falls
     back to ambient creds. Scoping is a production hardening, not a correctness dep.
+
+    ``extra_glue_databases`` (glue sources only) widens the scoped session policy
+    to the named additional databases — the cross-dataset mode passes the target's
+    database so qualified ``run_sql`` can verify joins spanning the pair.
     """
     from okf_core.sources import normalize_source
 
@@ -285,7 +299,12 @@ def build_source(
     source_type = resolved.get("type")
 
     if source_type == GlueAthenaSource.name:
-        return _build_glue_source(resolved, region=region, account_id=account_id)
+        return _build_glue_source(
+            resolved,
+            region=region,
+            account_id=account_id,
+            extra_databases=extra_glue_databases,
+        )
     if source_type == RedshiftSource.name:
         return _build_redshift_source(resolved, region=region, account_id=account_id)
     # normalize_source already rejects unsupported types, so this is defensive.
@@ -293,7 +312,11 @@ def build_source(
 
 
 def _build_glue_source(
-    source: dict[str, Any], *, region: str, account_id: str
+    source: dict[str, Any],
+    *,
+    region: str,
+    account_id: str,
+    extra_databases: list[str] | None = None,
 ) -> GlueAthenaSource:
     """A GlueAthenaSource with per-invocation scoped Glue/Athena clients."""
     import boto3
@@ -313,6 +336,7 @@ def _build_glue_source(
             workgroup=workgroup,
             results_bucket_arn=_results_bucket_arn(output_location),
             enable_lakeformation=enable_lf,
+            extra_databases=extra_databases,
         )
         try:
             session = build_scoped_session(

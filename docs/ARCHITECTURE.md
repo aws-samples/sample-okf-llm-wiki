@@ -9,7 +9,7 @@ aren't obvious from the code. Section numbers (§) refer to `OKF_DESIGN.md`.
 |---|---|---|---|
 | UI (§1) | React SPA, shadcn/ui, Cognito OIDC | `ui/` | JavaScript, not TypeScript. Vite multi-entry (`index.html` + `callback.html`), `react-oidc-context`. Views: Domains, Context, Harvest, Browse (with link graph). |
 | Control API (§2) | API GW HTTP API + Lambda | `services/control_api`, `infra/compute/control_api.tf` | Cognito JWT authorizer (audience = client id). One Lambda with an internal router behind a `$default` route. Endpoints: list Glue databases, domain mapping, context presign/list/delete, start harvest, harvest status, bundle list/read/graph, credential vending. |
-| Induction (§3) | deepagents agent on AgentCore | `services/harvest` | `create_deep_agent` + `FilesystemBackend(virtual_mode=True)` for containment, plus `OKFGuardMiddleware` and the `LinkGraph` tools. Authoring methodology comes from the vendored `okf-authoring` skill in `services/harvest/skills/`, loaded via `skills=["/skills/"]`. Fans out one `table-author` subagent per table, then a `reviewer` subagent per link-cluster of documents (≤5 related docs, grouped by the `cluster_concepts` tool) that checks each doc's load-bearing claims (grain, joins, gotchas, SQL) and the docs' mutual consistency against live data with `run_sql`; the supervisor only fixes findings it can reproduce. A `run_code` tool (AgentCore Code Interpreter, `harvest/code_interpreter.py`) lets the agent extract text from binary `.context/` docs (PDF/DOCX/PPTX/XLSX). The entrypoint offloads the crawl to a thread and reports `HealthyBusy`. |
+| Induction (§3) | deepagents agent on AgentCore | `services/harvest` | `create_deep_agent` + `FilesystemBackend(virtual_mode=True)` for containment, plus `OKFGuardMiddleware` and the `LinkGraph` tools. Authoring methodology comes from the vendored `okf-authoring` skill in `services/harvest/skills/`, loaded via `skills=["/skills/"]`. Fans out one `table-author` subagent per table, then a `reviewer` subagent per link-cluster of documents (≤5 related docs, grouped by the `cluster_concepts` tool) that checks each doc's load-bearing claims (grain, joins, gotchas, SQL) and the docs' mutual consistency against live data with `run_sql`; the supervisor only fixes findings it can reproduce. A `run_code` tool (AgentCore Code Interpreter, `harvest/code_interpreter.py`) lets the agent extract text from binary `.context/` docs (PDF/DOCX/PPTX/XLSX). A `mode="cross"` run instead documents relationships against one target dataset into `external/<domain>/<dataset>/` in its OWN bundle only — the target gets a derived cross-reference signal, never a copy (see "Cross-dataset references" below). The entrypoint offloads the crawl to a thread and reports `HealthyBusy`. |
 | Incremental (§4) | Glue event → SQS → orchestrator | `services/incremental`, `infra/compute/incremental.tf` | Confirms a real change via `UpdateTime` / `GetTableVersions`, stages `.harvest/pending.json`, and invokes a harvest scoped to the changed table. A nightly reconcile catches missed events. |
 | Freshness (§5) | S3 events → SQS → reindex | `services/reindex`, `infra/compute/reindex.tf` | Titan V2 (512-dim) embed → `PutVectors` / `DeleteVectors` keyed by concept path. Dedups on the S3 `sequencer` in DynamoDB. SQS in front absorbs Bedrock throttling. |
 | Link graph (§6) | `networkx` graph, rebuilt on write | `okf_core/link_graph.py`, `harvest/graph_tools.py` | Link/backlink graph over the dataset subtree; `get_backlinks` / `get_links` return id, title, and heading, and `cluster_concepts` partitions the bundle into link-related groups of ≤5 docs for the review fan-out. Rebuilt lazily when the guard marks it dirty. Used by the harvest agent only. |
@@ -76,6 +76,44 @@ frontmatter or shrinking schema/citations (the augmentation guard), fills in the
 timestamp, canonicalizes key order, and marks the link graph dirty. The guard is
 attached to every subagent's middleware list as well, because subagent
 middleware replaces rather than inherits.
+
+**Cross-dataset references: one home for the docs, a derived signal for the
+other side.** `mode="cross"` (Roadmap §5, OSS flat-trust) documents the
+relationship between the run's dataset and ONE operator-chosen target into
+`external/<d>/<ds>/` in the RUN'S OWN bundle. Design follows three rules.
+(1) *Snapshot, don't share*: the target's catalog + published wiki are copied
+read-only into `.metadata/external/<d>/<ds>/` at run start
+(`export_target_metadata`), so discovery is "grep two `columns.tsv` files" with
+zero new tool surface and no lease ever taken on the target; verification is
+qualified Athena SQL (`"db"."table"`), for which the run's scoped session policy
+is widened to exactly the pair's two Glue databases
+(`clients._session_policy(extra_databases=…)`) — never catalog-wide.
+(2) *Confined authoring*: the guard's `writable_prefix` restricts every
+write/edit to the pair subtree; the supervisor runs a cross-specific prompt and
+fans out `cross-author` subagents (plus the usual reviewer). The authoring
+METHODOLOGY — understand both wikis FIRST and gate on a genuine business
+convergence (unrelated datasets author nothing), then the column-evidence
+lenses, then SQL that tests named hypotheses — lives in the vendored skill
+(`skills/okf-authoring/references/cross-dataset.md`), with the prompts carrying
+only the runtime facts (snapshot paths, guard scope, the fixed `type:
+Cross-Dataset Reference` string + `cross_dataset` endpoints block), the same
+split as every other mode.
+(3) *One home + a derived signal, NOT a mirror*: the pair docs are never copied
+into the target's bundle. A mirror would make the pair a distributed fact over
+two independently versioned, independently restorable bundles — a full harvest
+or a **repromote** of the target would silently desynchronize it, and no
+transaction spans two bundles. Instead the reindex worker derives `XREF#`
+registry rows from the pair docs' own S3 object events, and `list_domains`
+(Control API + MCP) surfaces `cross_references` / `cross_referenced_by` so a
+consumer scoped to the target is routed one hop to the docs. Being
+event-derived, the signal survives wipes and repromotes with no writer
+maintaining it and is rebuildable by replay — the same "S3 is truth, the rest is
+derived" rule as the vector index. Deliberately NOT threaded through: dataset
+guidance (one side's operator steering must not shape docs both sides read) and
+the RI benchmark loop. `external/` is ordinary published content — embedded,
+served, annotatable (the annotation run gains a `scope` filter on the
+`external/` prefix) — and a full harvest wipes it like everything else;
+re-running the cross harvest restores it.
 
 **Binary `.context/` docs are decoded in a network-isolated sandbox, not
 hardcoded.** deepagents' built-in `read_file` base64-encodes any non-text file,

@@ -121,9 +121,15 @@ def list_complete_markers(
     """Enumerate the bundle's versions: ``complete`` marker versions, newest first.
 
     ``in_progress`` marker writes (harvest start / repromote in-flux) and
-    unparseable versions are filtered out — they delimit nothing. The first
-    surviving entry is the *current* version by definition (both finalize and
-    repromote end by writing a fresh complete marker).
+    unparseable versions are filtered out — they delimit nothing.
+
+    ``is_current`` is true only for a complete marker that is ALSO the marker
+    key's LIVE object version (S3's ``IsLatest``). The newest complete version
+    is NOT automatically current: after an interrupted (cancelled/crashed)
+    harvest the live marker is an ``in_progress`` write, the working files are
+    an uncommitted state, and NO version is current — which is what lets that
+    last good version be repromoted (a "current" version is refused as a
+    no-op), i.e. the documented rollback path for interrupted harvests.
     """
     key = state_marker_key(data_domain, dataset)
     out: list[MarkerVersion] = []
@@ -147,11 +153,9 @@ def list_complete_markers(
                 table_versions=dict(state.get("table_versions") or {}),
                 repromoted_from=str(state.get("repromoted_from") or ""),
                 repromoted_by=str(state.get("repromoted_by") or ""),
-                is_current=False,
+                is_current=bool(entry.get("IsLatest")),
             )
         )
-    if out:
-        out[0].is_current = True
     return out
 
 

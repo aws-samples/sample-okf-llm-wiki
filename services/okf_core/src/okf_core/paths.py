@@ -13,6 +13,35 @@ from pathlib import Path
 # A path segment: starts alnum/underscore, then alnum/underscore/dot/dash.
 _SEGMENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*")
 
+# Top-level bundle dir holding CROSS-DATASET reference docs, one subtree per
+# counterpart dataset: ``external/<data_domain>/<dataset>/...``. Written ONLY by
+# a cross-mode harvest, and ONLY in the initiating bundle (the pair docs have
+# one home — the counterpart gets a derived XREF discovery signal, never a
+# copy); wiped by a full harvest like any other authored output (it is NOT
+# dot-prefixed — the docs are published concepts, indexed and embedded like the
+# rest of the bundle).
+EXTERNAL_DIR = "external"
+
+
+def external_pair_prefix(data_domain: str, dataset: str) -> str:
+    """The concept-id prefix of the cross-dataset subtree for one counterpart.
+
+    ``external_pair_prefix("sales", "orders") == "external/sales/orders/"`` —
+    every doc a cross harvest against ``sales/orders`` authors lives under this
+    prefix in the initiating bundle. Both segments are VALIDATED (ValueError on
+    ``/``, ``..``, ``#``, …), which is why the harvest runtime, the write
+    guard, and the reindex XREF keying all build the pair path through this
+    helper rather than f-strings.
+    """
+    for seg in (data_domain, dataset):
+        _validate_segment(seg)
+    return f"{EXTERNAL_DIR}/{data_domain}/{dataset}/"
+
+
+def is_external_concept_id(concept_id: str) -> bool:
+    """True iff ``concept_id`` names a cross-dataset doc (under ``external/``)."""
+    return concept_id.startswith(f"{EXTERNAL_DIR}/")
+
 
 def _validate_segment(seg: str) -> None:
     if not _SEGMENT_RE.fullmatch(seg):

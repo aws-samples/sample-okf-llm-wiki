@@ -19,6 +19,12 @@ _BUILDERS = (
     prompts.build_reference_author_prompt,
     prompts.build_reviewer_prompt,
     prompts.build_context_extractor_prompt,
+    # Cross-dataset mode's trio: keyed to the same per-scope flags in agent.py
+    # (supervisor_gpt for the supervisor, subagent_gpt for cross-author,
+    # reviewer_gpt for the cross reviewer).
+    prompts.build_cross_supervisor_prompt,
+    prompts.build_cross_author_prompt,
+    prompts.build_cross_reviewer_prompt,
 )
 
 _BLOCKS = ("<persistence>", "<context_gathering>", "<output_discipline>")

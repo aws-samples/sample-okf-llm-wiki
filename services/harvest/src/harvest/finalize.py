@@ -28,8 +28,15 @@ def finalize_bundle(
     timestamp: str,
     table_versions: dict[str, str] | None = None,
     synthesize=None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Regenerate indexes, then write the commit marker. Returns the state doc."""
+    """Regenerate indexes, then write the commit marker. Returns the state doc.
+
+    ``extra`` merges additional provenance keys into the marker — a cross-
+    dataset run writes ``cross_target`` (the counterpart pair it documented)
+    so the fresh ``complete`` marker records what its ``external/`` docs are
+    about (see CONVENTIONS.md).
+    """
     root = Path(dataset_root)
 
     # 1) Regenerate index.md files (progressive disclosure).
@@ -45,6 +52,7 @@ def finalize_bundle(
         # per-table Glue VersionId / UpdateTime seen at harvest time, used by the
         # incremental path to detect real changes.
         "table_versions": table_versions or {},
+        **(extra or {}),
     }
     state_dir = root / _STATE_DIR
     mkdirs(state_dir)

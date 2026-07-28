@@ -49,3 +49,36 @@ def test_custom_synthesizer_used_for_multi_entry_dirs(tmp_path):
     root_index = (tmp_path / "index.md").read_text()
     assert "SYNTH SUMMARY" in root_index
     assert calls  # synthesizer invoked for the multi-entry tables/ dir
+
+
+def test_stale_index_chain_is_deleted_when_concepts_are_removed(tmp_path):
+    # A cross-dataset pair re-run that authors nothing removes the pair's docs
+    # but not the previously GENERATED index files above them — regenerate must
+    # delete those, or consumers walk a phantom chain (external/index.md ->
+    # crm/ -> ...) into a subtree that no longer exists.
+    doc = "---\ntype: Reference\ntitle: T\ndescription: d\n---\nbody\n"
+    root = tmp_path
+    pair = root / "external" / "crm" / "customers"
+    pair.mkdir(parents=True)
+    (pair / "overview.md").write_text(doc, encoding="utf-8")
+    (root / "tables").mkdir()
+    (root / "tables" / "orders.md").write_text(doc, encoding="utf-8")
+
+    from okf_core.index_gen import regenerate_indexes
+
+    regenerate_indexes(root)
+    assert (root / "external" / "index.md").is_file()
+    assert (root / "external" / "crm" / "index.md").is_file()
+
+    # The pair is removed (remove_tree analogue); empty parents linger on disk.
+    (pair / "overview.md").unlink()
+    (pair / "index.md").unlink()
+    regenerate_indexes(root)
+
+    # The whole generated chain above the removed pair is gone...
+    assert not (root / "external" / "index.md").exists()
+    assert not (root / "external" / "crm" / "index.md").exists()
+    # ...and the root index no longer lists the phantom external/ subtree.
+    root_index = (root / "index.md").read_text(encoding="utf-8")
+    assert "external" not in root_index
+    assert "tables" in root_index

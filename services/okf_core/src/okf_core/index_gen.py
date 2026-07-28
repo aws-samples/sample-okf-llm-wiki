@@ -114,18 +114,29 @@ def regenerate_indexes(
                 entries.append((typ, title, child.name, desc))
             elif child.is_dir():
                 # Skip reserved (.harvest/.context) and internal scratch dirs so
-                # they never appear as bundle entries.
+                # they never appear as bundle entries — and skip dirs holding no
+                # concept docs at all (e.g. an external/<domain>/ chain whose
+                # pair subtree was removed): an entry would link a phantom index.
                 if _is_ignored_rel(bundle_root, child):
+                    continue
+                if not any(child.rglob("*.md")):
                     continue
                 desc = dir_descriptions.get(child, "")
                 entries.append(
                     ("Subdirectories", child.name, f"{child.name}/{_INDEX_FILE}", desc)
                 )
 
+        index_path = directory / _INDEX_FILE
         if not entries:
+            # A directory whose concepts were all removed (a cross-dataset pair
+            # re-run that authored nothing, a scoped cleanup) must not keep
+            # serving a stale generated index — consumers would walk a chain of
+            # phantom subdirectory links into a subtree that no longer exists.
+            # Deepest-first ordering means a child's stale index is deleted
+            # before its parent decides whether the child still counts.
+            index_path.unlink(missing_ok=True)
             continue
 
-        index_path = directory / _INDEX_FILE
         index_path.write_text(_build_index_text(entries), encoding="utf-8")
         written.append(index_path)
 

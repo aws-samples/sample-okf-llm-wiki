@@ -518,6 +518,26 @@ def _r_trigger_harvest(cfg, params, body, query, caller):
         # dataset name today, but the runtime reads the descriptor — keep the
         # probe pointed at what will actually be harvested).
         handlers.assert_glue_database_exists(cfg.glue, glue_database)
+    mode = body.get("mode") or "full"
+    # Cross-dataset mode (Roadmap §5): resolve + validate the chosen target at
+    # this trust boundary — registered, glue-backed (v1), distinct from the
+    # dataset, and BOTH bundles published — into the payload's `target` block.
+    cross_target = None
+    if mode == "cross":
+        target_data_domain = handlers._require(body, "target_data_domain")
+        target_dataset = handlers._require(body, "target_dataset")
+        cross_target = handlers.resolve_cross_target(
+            cfg.ddb,
+            cfg.s3,
+            cfg.glue,
+            registry_table=cfg.registry_table,
+            bucket=cfg.bucket,
+            data_domain=data_domain,
+            dataset=dataset,
+            source=source,
+            target_data_domain=target_data_domain,
+            target_dataset=target_dataset,
+        )
     return 200, handlers.trigger_harvest(
         cfg.agentcore,
         cfg.ddb,
@@ -525,8 +545,9 @@ def _r_trigger_harvest(cfg, params, body, query, caller):
         runtime_arn=cfg.harvest_runtime_arn,
         data_domain=data_domain,
         dataset=dataset,
-        mode=body.get("mode") or "full",
+        mode=mode,
         changed_table=body.get("changed_table"),
+        cross_target=cross_target,
         model=model,
         effort=effort,
         subagent_model=subagent_model,
@@ -539,6 +560,31 @@ def _r_trigger_harvest(cfg, params, body, query, caller):
 def _r_trigger_annotation_harvest(cfg, params, body, query, caller):
     if not cfg.harvest_runtime_arn:
         raise ApiError(500, "OKF_HARVEST_RUNTIME_ARN not configured")
+    # Optional scope (body {"scope": "dataset"|"cross"}): narrows the run to the
+    # dataset's own docs vs its external/ cross-dataset docs. The UI sends it
+    # when the bundle has an external/ subtree; absent = apply everything.
+    scope = (body or {}).get("scope")
+    if scope not in (None, "dataset", "cross"):
+        raise ApiError(400, "scope must be 'dataset' or 'cross'")
+    # Optional explicit selection (the UI's annotation picker): only the listed
+    # annotation ids are applied. Absent = every in-scope note, as before.
+    annotation_ids = (body or {}).get("annotation_ids")
+    if annotation_ids is not None and (
+        not isinstance(annotation_ids, list)
+        or not all(isinstance(a, str) and a for a in annotation_ids)
+    ):
+        raise ApiError(400, "annotation_ids must be a list of annotation id strings")
+    # Optional cross target ("<domain>/<dataset>", the UI's per-pair scope):
+    # merged into the run's extra Glue databases so a pair-scoped run keeps SQL
+    # access to THAT target even when only general (_dataset-wide) notes are
+    # selected. Only meaningful — so only accepted — with scope="cross".
+    cross_target = (body or {}).get("cross_target")
+    if cross_target is not None:
+        if scope != "cross":
+            raise ApiError(400, "cross_target requires scope 'cross'")
+        parts = cross_target.split("/") if isinstance(cross_target, str) else []
+        if len(parts) != 2 or not all(parts):
+            raise ApiError(400, "cross_target must be '<data_domain>/<dataset>'")
     # Enrich with the declared domain's description/context (same as a full
     # harvest) so the agent applies annotations domain-aware.
     domain_meta = handlers.get_domain(
@@ -556,6 +602,9 @@ def _r_trigger_annotation_harvest(cfg, params, body, query, caller):
         dataset=params["dataset"],
         user_sub=caller.sub,
         domain_meta=domain_meta,
+        scope=scope,
+        annotation_ids=annotation_ids,
+        cross_target=cross_target,
     )
 
 

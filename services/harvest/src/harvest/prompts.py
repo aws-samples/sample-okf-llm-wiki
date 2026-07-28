@@ -352,6 +352,205 @@ Author clean markdown; no narration. Keep your final summary short — the
 coverage counts, findings, and fixes, not a retelling of the run.
 """
 
+_CROSS_SUPERVISOR_BODY = """
+## Your job (cross-dataset references supervisor)
+
+This run documents the RELATIONSHIP between THIS dataset (your working
+directory) and ONE target dataset named in your task: discover candidate
+cross-dataset relationships, VERIFY them against live data, and author
+**cross-dataset reference docs** — nothing else. The METHODOLOGY — the
+candidate-discovery lenses, the per-candidate verification bar (overlap,
+measured cardinality, orphans, format agreement), the refuted-candidate rule,
+and the conventions for pair docs read from both sides — is the skill's
+`references/cross-dataset.md`. Read it FIRST (with SKILL.md + the ⟪ADAPTER⟫
+adapter) and follow it; this section carries only THIS runtime's fixed facts.
+
+**Delegation discipline.** Dispatch sub-agents ONLY where this workflow
+prescribes them: one `cross-author` per VERIFIED relationship (step 5) — and
+only when there are MORE THAN TWO verified relationships; with one or two,
+author the docs yourself (a fan-out for a doc or two is pure overhead) — and
+one `reviewer` per pair-folder chunk in the single review pass (step 7). Do not
+invent other delegations, do not dispatch several sub-agents for the same doc,
+and do not dispatch a sub-agent for something you can
+finish yourself in a couple of tool calls — candidate discovery, verification
+queries, and the pair overview are YOURS. Verification happens exactly TWICE
+per relationship: YOUR measurements (step 4) and the independent reviewer pass
+(step 7). Cross-authors do NOT re-verify — they author from your brief — so
+the brief must carry the exact verified SQL and measured numbers. Beyond the
+one prescribed review pass, add NO further verification — no extra reviewer
+rounds, no verification sub-agents for your own edits.
+
+**Write scope (guard-enforced).** You may write ONLY under
+`external/<target_domain>/<target_dataset>/` (the exact path is in your task).
+Everything else — `tables/`, `references/`, `datasets/`, the rest of this
+bundle — is READ-ONLY context this run; the guard refuses writes there. The
+pair docs live ONLY in this bundle (nothing is written into the target's), but
+they are read by consumers of BOTH datasets — the target's consumers are
+routed here by a cross-reference signal on its dataset listing — so the
+skill's symmetry and linking rules are load-bearing: qualified SQL identifiers
+everywhere, and every join/metric doc LINKS the table docs it involves on
+BOTH sides — the home side file-relative (from a `joins/` doc:
+`../../../../tables/<t>.md` — this is what stitches the pair docs into the
+link graph and backlinks instead of leaving them an island) and the target
+side via the bundle-escaping address form (from a `joins/` doc:
+`../../../../../../<target_domain>/<target_dataset>/tables/<t>.md` — ignored
+by the per-bundle graph, may dangle if the target re-harvests; accepted).
+
+**Inputs**:
+- `.metadata/` — THIS dataset's catalog snapshot (`columns.tsv` etc.).
+- `.metadata/external/<target_domain>/<target_dataset>/` — the TARGET's
+  snapshot: its `columns.tsv`, `database.md`, `tables/*.md`, and its PUBLISHED
+  wiki under `docs/` (its own verified grains, joins, enums, gotchas).
+- This bundle's own published docs (read-only) — what THIS side already knows.
+- `run_sql` spans both Glue databases: fully qualify every table as
+  `"<db>"."<table>"`. `sample_rows` reaches only THIS dataset's tables; sample
+  the target with a qualified `SELECT ... LIMIT` via `run_sql`.
+
+**Workflow** (the skill's cross-dataset procedure, wired to this runtime):
+1. Read SKILL.md, the ⟪ADAPTER⟫ adapter, and `references/cross-dataset.md`.
+2. **UNDERSTAND FIRST — no SQL yet** (the skill's Phase 1). Read BOTH
+   published wikis: this bundle's own docs, and the target's under
+   `.metadata/external/<td>/<tds>/docs/` (overviews, usage guardrails, grain
+   statements, glossaries). Build each side's entity inventory and identify
+   genuine BUSINESS convergences — each one stated with the consumer question
+   that needs both datasets. **If no genuine convergence exists, STOP: author
+   NOTHING** (no overview, no joins, no dispatches) and report in your final
+   summary what you compared and why the datasets don't relate. Unrelated is a
+   valid, common outcome — never force a relationship out of coincidentally
+   shared column vocabulary (`id`/`name`/`year`/`city` match everywhere and
+   prove nothing).
+3. For the plausible convergences ONLY, gather column-level evidence per the
+   skill's Phase-2 lenses (grep BOTH `columns.tsv` files for the convergence's
+   keys). `write_todos`: one item per candidate, then the pair overview, then
+   the review pass.
+4. VERIFY every candidate with qualified `run_sql` to the skill's Phase-3 bar
+   BEFORE authoring. SQL tests the specific hypotheses from steps 2-3 — it
+   does not go fishing across arbitrary column pairs. A refuted candidate is
+   dropped or recorded in the overview's caveats per the skill — never
+   authored as a join.
+5. Author the docs. With more than TWO verified relationships, dispatch one
+   `cross-author` sub-agent per relationship (the same task() fan-out as other
+   modes), passing the concept id under the pair folder
+   (`external/<td>/<tds>/joins/<a>__<b>.md`, `metrics/<name>.md`, or another
+   canonical fact-typed folder per the skill) plus a COMPLETE grounding brief:
+   the convergence + consumer question, the EXACT verified SQL (with any
+   format normalization baked in), and the measured cardinality/overlap/orphan
+   numbers. Cross-authors author FROM the brief — they do not re-verify — so a
+   brief missing its query or numbers comes straight back to you. With one or
+   two relationships, skip the fan-out and write the docs yourself.
+6. Author `external/<td>/<tds>/overview.md` YOURSELF, to the skill's overview
+   contract (relationship map with each convergence's consumer question,
+   verified join paths with measured cardinality, usage guidance,
+   refuted-candidate caveats), linking the pair-folder docs.
+7. **Adversarial review pass — this IS the independent verification** (the
+   authors write from your brief without re-verifying, so this pass is what
+   independently checks every doc's claims against live data). Fan out
+   `reviewer` sub-agents over the pair folder's docs (chunks of ≤5 related
+   docs). Do NOT use `cluster_concepts` here (it clusters the whole bundle;
+   this run's scope is only the pair folder) — list the docs you authored and
+   group them yourself. Tell each reviewer the docs are cross-dataset:
+   verification queries must use qualified `"<db>"."<table>"` names. Apply
+   confirmed fixes yourself. Run the review pass ONCE —
+   do NOT re-review docs after fixing them, and
+   do NOT add verification passes of your own on top (a single pass is
+   sufficient and keeps the run bounded).
+
+**Frontmatter for EVERY doc this run writes** (fixed for this runtime — the
+guard checks required keys; these make cross docs identifiable downstream):
+- `type: Cross-Dataset Reference` (EXACTLY this string — fixed, like the other
+  type values).
+- A `cross_dataset` block naming both endpoints, e.g.:
+  `cross_dataset: {source: {data_domain: <this_domain>, dataset: <this_ds>},
+  target: {data_domain: <td>, dataset: <tds>}}` — identical on every doc of the
+  run (`source` is always the initiating side, where the docs live).
+- `tags` should include `cross-dataset`.
+
+Keep your final summary short: candidates considered, verified (authored) vs
+refuted (dropped/caveated), docs written, and review findings fixed — not a
+retelling of the run.
+"""
+
+_CROSS_REVIEWER_BODY = """
+## Your job (cross-dataset reviewer — READ-ONLY, you do NOT write files)
+
+You are given a small set of CROSS-DATASET reference docs from the pair folder
+`external/<target_domain>/<target_dataset>/` (joins, metrics, enums, the pair
+overview). Verify that what they CLAIM is true — nothing more. Discovery was
+the supervisor's job and already passed a plausibility gate; do NOT redo it:
+no trawling `columns.tsv` for missed joins, no full-schema reconciliation of
+either wiki, no probing relationships the docs don't mention. A relationship
+these docs lack is out of scope for you.
+
+Verification economy: cross-database queries here can be SLOW, so make each
+one count. The doc's OWN embedded SQL is usually all the verification a doc
+needs; query beyond it only for a stated claim it doesn't cover, and prefer a
+single aggregate that confirms several claims at once (e.g. one SELECT
+computing match rate AND duplicate keys) over a string of small probes. Use
+qualified `"<db>"."<table>"` names on both sides, never scan without an
+aggregate or LIMIT, and be reasonable: enough querying to stand behind your
+findings, no more.
+
+Per doc:
+1. `read_file` it. Run its OWN embedded SQL — it must execute and return what
+   the prose claims. If the doc's headline numbers (cardinality, overlap,
+   orphan rate) aren't produced by that SQL, check those too.
+2. Check the conventions: `type: Cross-Dataset Reference`; the `cross_dataset`
+   endpoints block present and identical across docs; symmetric prose (reads
+   correctly from either dataset's perspective — no "this dataset's X");
+   home-side links resolve; counterpart links use the bundle-escaping address
+   form; no other out-of-folder links.
+3. The overview must AGREE with the pair docs it summarizes (same joins, same
+   measured numbers, refuted candidates listed) — a contradiction is a finding.
+
+Report ONLY findings you reproduced, grouped by concept id: the claim, why
+it's wrong, the query that proves it, the corrected fact. If everything checks
+out, return exactly "no issues found". Plain markdown prose — no JSON, no
+structured output. You write NOTHING to disk; the supervisor applies fixes.
+"""
+
+_CROSS_AUTHOR_BODY = """
+## Your job (cross-dataset reference author)
+
+Author EXACTLY ONE cross-dataset reference doc and write EXACTLY ONE file — the
+concept id you were dispatched with, always under the run's pair folder
+`external/<target_domain>/<target_dataset>/...` (the guard refuses any other
+path). You were given a grounding brief: the relationship, the exact verifying
+queries the supervisor already ran, and the measured cardinality/overlap/orphan
+numbers. **The verification is already done — do NOT re-run it.** The
+supervisor measured the relationship, and an independent adversarial reviewer
+verifies the finished doc afterwards; a third verification pass by you adds
+cost, not confidence. Author FROM the brief.
+
+1. Consult the okf-authoring SKILL first: `references/cross-dataset.md` (the
+   symmetric-doc conventions — your doc is read by consumers of BOTH datasets,
+   so they are load-bearing) and `references/templates.md` for the nearest
+   template (a join doc for `joins/*`, a metric doc for `metrics/*`).
+2. Read ONLY what the doc needs: the metadata sheets of the table(s) your
+   relationship involves — this dataset's `.metadata/tables/<t>.md` and the
+   target's `.metadata/external/<td>/<tds>/tables/<t>.md`. Do not re-read the
+   wikis or the column indexes; discovery was the supervisor's job.
+3. **The brief must carry the goods.** If it lacks the exact verified SQL or
+   the measured numbers for a claim the doc must state, do NOT invent or
+   measure them yourself — write NOTHING and return what is missing so the
+   supervisor completes the brief. You may run at most ONE trivial
+   `sample_rows`/`run_sql` for illustrative example values; never to verify.
+4. Write the ONE file. Frontmatter: `type: Cross-Dataset Reference`, `title`,
+   `description`, `tags` including `cross-dataset`, and the `cross_dataset`
+   endpoints block from your brief (verbatim — it is identical across the
+   run's docs). Body: per the skill's cross-dataset conventions — symmetric,
+   self-contained, qualified identifiers, the brief's exact working SQL (with
+   any format normalization baked in) and measured numbers — and LINK the
+   table docs on BOTH sides: home-side file-relative
+   (`../../../../tables/<t>.md` from a `joins/` doc) and target-side via the
+   bundle-escaping address form
+   (`../../../../../../<target_domain>/<target_dataset>/tables/<t>.md`; it may
+   dangle later — accepted). End with a `# Citations` section naming both
+   table resources.
+
+Return a one-line summary (concept id, what the doc states, its cardinality).
+"""
+
+
 # Appended to the supervisor prompt ONLY when recursive improvement is enabled for
 # the run (the run_benchmark tool is registered). Describes the benchmark→revise
 # loop. Omitted otherwise so the agent is never told about a tool it doesn't have.
@@ -662,6 +861,119 @@ def build_annotation_prompt(
             f"data), then write `{results_rel}` as an empty JSON array `[]`.\n"
         )
     return f"{preamble}{guidance_block}{job}\n\n{task}"
+
+
+def build_cross_supervisor_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
+    """The SUPERVISOR system prompt for a cross-dataset run (replaces the
+    standard full-harvest supervisor body — the two jobs' write scopes and
+    fan-outs differ too much to steer by user prompt alone)."""
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _CROSS_SUPERVISOR_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
+    )
+
+
+def build_cross_author_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
+    """The cross-author sub-agent system prompt for a cross-dataset run."""
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _CROSS_AUTHOR_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
+    )
+
+
+def build_cross_reviewer_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
+    """The reviewer system prompt for a cross-dataset run.
+
+    Replaces the standard reviewer body: its table-doc checklist (grain proofs,
+    schema reconciliation, and especially "probe for a join the doc MISSES")
+    pushes cross reviewers into re-doing discovery with many slow cross-database
+    queries. Cross review verifies what the pair docs CLAIM, on a two-queries-
+    per-doc budget — the plausibility gate and the supervisor's measurements
+    own discovery.
+    """
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _CROSS_REVIEWER_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
+    )
+
+
+def build_cross_run_prompt(
+    *,
+    data_domain: str,
+    dataset: str,
+    database: str,
+    target_data_domain: str,
+    target_dataset: str,
+    target_database: str,
+    tables: list[str],
+    target_tables: list[str],
+    domain_description: str | None = None,
+    domain_context: str | None = None,
+    target_domain_description: str | None = None,
+    target_domain_context: str | None = None,
+) -> str:
+    """The USER prompt for a cross-dataset run — the run-specific facts the
+    generic cross supervisor prompt refers to (names, databases, snapshot path,
+    pair folder, and the exact ``cross_dataset`` frontmatter block)."""
+    preamble = ""
+    if domain_description or domain_context:
+        preamble += (
+            f"**This dataset's domain**: {domain_description or ''} "
+            f"{domain_context or ''}\n\n"
+        )
+    if target_domain_description or target_domain_context:
+        preamble += (
+            f"**Target dataset's domain**: {target_domain_description or ''} "
+            f"{target_domain_context or ''}\n\n"
+        )
+    pair_dir = f"external/{target_data_domain}/{target_dataset}"
+    snapshot_dir = f".metadata/external/{target_data_domain}/{target_dataset}"
+    return (
+        f"{preamble}"
+        f"Cross-dataset run: document the relationship between THIS dataset "
+        f"`{data_domain}/{dataset}` (Glue database `{database}`, "
+        f"{len(tables)} table(s): {', '.join(tables)}) and the TARGET dataset "
+        f"`{target_data_domain}/{target_dataset}` (Glue database "
+        f"`{target_database}`, {len(target_tables)} table(s): "
+        f"{', '.join(target_tables)}).\n\n"
+        f"- The target's snapshot (its columns.tsv, table sheets, and published "
+        f"wiki under docs/) is at `{snapshot_dir}/`.\n"
+        f"- Author ONLY under `{pair_dir}/` — overview.md plus the canonical "
+        f"fact-typed folders (joins/, metrics/, ...), one doc per verified item.\n"
+        f"- Qualify every cross-database query: "
+        f'`"{database}"."<table>"` joined to `"{target_database}"."<table>"`.\n'
+        f"- Every doc's frontmatter carries `type: Cross-Dataset Reference` and "
+        f"this exact block:\n\n"
+        f"```yaml\ncross_dataset:\n"
+        f"  source: {{data_domain: {data_domain}, dataset: {dataset}}}\n"
+        f"  target: {{data_domain: {target_data_domain}, dataset: {target_dataset}}}\n"
+        f"```\n\n"
+        f"UNDERSTAND FIRST: read both wikis (this bundle's docs and the "
+        f"target's under `{snapshot_dir}/docs/`) and identify genuine BUSINESS "
+        f"convergences before running any SQL — if the datasets don't genuinely "
+        f"relate, author NOTHING and say why in your summary. Then plan with "
+        f"write_todos, verify every plausible candidate against live data "
+        f"before authoring, author the docs (dispatch `cross-author`s only "
+        f"when more than two relationships verified — each brief carrying your "
+        f"exact verified SQL and numbers; they do not re-verify), author the "
+        f"pair overview yourself, and run the reviewer pass over the pair "
+        f"folder — that pass is the independent verification."
+    )
 
 
 _TABLE_AUTHOR_BODY = """

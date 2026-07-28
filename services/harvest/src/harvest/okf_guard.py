@@ -63,6 +63,19 @@ def _is_readonly_path(file_path: str | None) -> bool:
     return _READONLY_DIR in parts
 
 
+def _normalized_rel(file_path: str) -> str:
+    """Normalize a tool ``file_path`` to a root-relative POSIX path.
+
+    Strips the optional leading slash the virtual backend accepts and resolves
+    ``.``/``..`` segments textually, so a ``external/../tables/x.md`` can't slip
+    past a prefix check. (Escapes beyond the root are the backend's job — this
+    just canonicalizes for comparison.)
+    """
+    import posixpath
+
+    return posixpath.normpath(str(file_path).replace("\\", "/").lstrip("/"))
+
+
 class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
     """Enforce OKF correctness on filesystem writes.
 
@@ -79,6 +92,7 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         *,
         read_current: Callable[[str], str | None],
         benchmark_budget: int | None = None,
+        writable_prefix: str | None = None,
     ):
         super().__init__()
         self.engine = engine
@@ -88,6 +102,10 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         # (a normal harvest) means the tool isn't registered, so this is inert.
         self._benchmark_budget = benchmark_budget
         self._benchmark_calls = 0
+        # Cross-dataset mode: confine EVERY write/edit to this root-relative
+        # subtree (e.g. "external/<domain>/<dataset>/"). The rest of the bundle
+        # is read-only context for the run. None (all other modes) = inert.
+        self._writable_prefix = writable_prefix.strip("/") + "/" if writable_prefix else None
 
     def wrap_tool_call(self, request, handler):  # type: ignore[override]
         """Sync path (invoke/stream)."""
@@ -151,6 +169,19 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
                 "grep / glob), never to write. Author bundle docs under "
                 "datasets/, tables/, references/ instead.",
             )
+
+        # Cross-dataset confinement: this run may write ONLY under its pair
+        # subtree; everything else in the bundle is read-only context.
+        if self._writable_prefix and file_path:
+            rel = _normalized_rel(file_path)
+            if not rel.startswith(self._writable_prefix):
+                return self._refuse(
+                    request,
+                    f"Refused: `{file_path}` is outside this run's writable "
+                    f"subtree `{self._writable_prefix}`. A cross-dataset run "
+                    "authors ONLY the cross-dataset reference docs under that "
+                    "folder; the rest of the bundle is read-only context here.",
+                )
 
         if not _is_markdown(file_path):
             return None

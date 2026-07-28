@@ -6,12 +6,14 @@ import remarkGfm from "remark-gfm"
 import rehypeHighlight from "rehype-highlight"
 import {
   CheckCircle2Icon,
+  CheckIcon,
   ChevronDownIcon,
   CircleDashedIcon,
   CoinsIcon,
   DatabaseIcon,
   FileTextIcon,
   GaugeIcon,
+  Link2Icon,
   ListTreeIcon,
   MessageSquareTextIcon,
   PlayIcon,
@@ -29,6 +31,14 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -115,6 +125,17 @@ const TERMINAL_STATUSES = new Set(["complete", "failed", "cancelled"])
 // and frees the lease). Mirrors the backend's cancellable predicate.
 const CANCELLABLE_STATUSES = new Set(["queued", "running"])
 
+// Human-facing labels for the backend's mode strings (the wire values are
+// frozen in CONVENTIONS.md; presentation is the UI's job). Unknown modes fall
+// back to the raw string so a new backend mode is never hidden.
+const MODE_LABEL = {
+  full: "Full harvest",
+  incremental: "Incremental update",
+  annotated: "Apply annotations",
+  cross: "Cross-dataset discovery",
+  repromote: "Version repromote",
+}
+
 // Map harvest status -> Badge variant. queued/running are in-flight, complete
 // is success, failed/cancelled are terminal (cancelled is operator-initiated, so
 // outline rather than destructive).
@@ -135,13 +156,38 @@ function statusVariant(status) {
 }
 
 // Start a harvest for the selected dataset and poll its status every ~4s.
-export default function HarvestView({ api, selection }) {
+// `datasets` is the registered-mapping list (threaded from App) — the candidate
+// pool for the cross-dataset target picker.
+export default function HarvestView({ api, selection, datasets = [] }) {
   const [status, setStatus] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [starting, setStarting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [startingAnnotations, setStartingAnnotations] = useState(false)
+  // Cross-dataset harvest: the target-picker dialog + the chosen counterpart
+  // (encoded "<domain>/<dataset>" — segments can't contain a slash).
+  const [crossOpen, setCrossOpen] = useState(false)
+  const [crossTarget, setCrossTarget] = useState("")
+  const [startingCross, setStartingCross] = useState(false)
+  // Whether the published bundle carries an external/ subtree (cross-dataset
+  // docs). Probed from the bundle listing on selection change; refreshed at
+  // click time before the annotation run so the scope question is never stale.
+  const [hasExternal, setHasExternal] = useState(false)
+  // "Apply annotations" picker modal: a scope dropdown (dataset docs vs
+  // external/ cross-dataset docs) over the caller's pending notes, each
+  // individually selectable so a run can apply a PARTIAL selection. Always
+  // shown (even with no external/ docs) — picking notes is the point.
+  const [annoOpen, setAnnoOpen] = useState(false)
+  const [annoLoading, setAnnoLoading] = useState(false)
+  const [annoNotes, setAnnoNotes] = useState([])
+  // "dataset" or "cross:<domain>/<dataset>" — cross scopes are PER TARGET PAIR,
+  // never a generic bucket: the selected notes drive the run's session-policy
+  // widening (extra_glue_databases), so one run = one visible target.
+  const [annoScope, setAnnoScope] = useState("dataset")
+  const [annoSelected, setAnnoSelected] = useState(() => new Set())
+  // The distinct external/<domain>/<dataset> pairs present in the bundle.
+  const [externalPairs, setExternalPairs] = useState([])
   // Dataset guidance (shared authoring instructions). `guidance` is the saved
   // server value + dirty flag; `guidanceDraft` is the editable buffer; `dirty`
   // means the draft differs from what's saved (unsaved edits).
@@ -420,6 +466,33 @@ export default function HarvestView({ api, selection }) {
     }
   }, [api, domain, dataset, hasSelection])
 
+  // Probe the bundle listing for an external/ subtree (cross-dataset docs).
+  // Cheap (one listing call); returns the fresh answer AND caches it in state so
+  // the dialogs' copy can reference it without re-probing.
+  const probeExternal = useCallback(async () => {
+    if (!api || !hasSelection) return false
+    try {
+      const files = await api.listBundle(domain, dataset)
+      // Collect the distinct target pairs (external/<domain>/<dataset>/…) so
+      // the annotation picker can offer one scope PER TARGET.
+      const pairs = new Set()
+      for (const f of files || []) {
+        const cid = f.concept_id || ""
+        if (!cid.startsWith("external/")) continue
+        const parts = cid.split("/")
+        if (parts.length >= 4) pairs.add(`${parts[1]}/${parts[2]}`)
+      }
+      setHasExternal(pairs.size > 0)
+      setExternalPairs([...pairs].sort())
+      return pairs.size > 0
+    } catch {
+      // No bundle yet (or a transient read error) — treat as no external docs.
+      setHasExternal(false)
+      setExternalPairs([])
+      return false
+    }
+  }, [api, domain, dataset, hasSelection])
+
   // Persist the draft. Bumps the server version → guidance goes DIRTY until the
   // next re-harvest applies it.
   const saveGuidance = useCallback(async () => {
@@ -444,6 +517,8 @@ export default function HarvestView({ api, selection }) {
   useEffect(() => {
     setStatus(null)
     setError(null)
+    setHasExternal(false)
+    setCrossTarget("")
     // Reset the feed whenever the selection changes so a prior dataset's steps
     // don't bleed into the new one (also invalidates any in-flight poll).
     resetFeed()
@@ -453,6 +528,7 @@ export default function HarvestView({ api, selection }) {
     pollEvents()
     startFeed()
     loadGuidance()
+    probeExternal()
     return () => {
       stopPolling()
       stopFeed()
@@ -466,6 +542,7 @@ export default function HarvestView({ api, selection }) {
     stopFeed,
     resetFeed,
     loadGuidance,
+    probeExternal,
     hasSelection,
   ])
 
@@ -503,11 +580,20 @@ export default function HarvestView({ api, selection }) {
   // Re-harvest driven by the caller's wiki annotations. The backend takes the
   // same per-dataset lease, sweeps orphaned notes, and only invokes the agent if
   // some live annotations remain (else returns {status:"complete", skipped}).
-  const startAnnotationHarvest = async () => {
+  // `scope` ("dataset" | "cross") + `annotationIds` (the picker's selection)
+  // narrow the run; `crossTarget` ("<domain>/<dataset>") names the pair a
+  // cross-scoped run verifies against — all chosen in the picker modal below.
+  const startAnnotationHarvest = async (scope, annotationIds, crossTarget) => {
     if (!hasSelection) return
     setStartingAnnotations(true)
     try {
-      const res = await api.runAnnotationHarvest(domain, dataset)
+      const res = await api.runAnnotationHarvest(
+        domain,
+        dataset,
+        scope,
+        annotationIds,
+        crossTarget
+      )
       if (res?.skipped) {
         toast.info(
           res.orphaned
@@ -540,6 +626,140 @@ export default function HarvestView({ api, selection }) {
       )
     } finally {
       setStartingAnnotations(false)
+    }
+  }
+
+  // The "Apply annotations" picker. Always opens (even with no external/ docs):
+  // the modal is where the user picks WHICH notes ride the run. It loads the
+  // caller's pending notes (open + in_review stragglers from a dead run — the
+  // same set the backend would reclaim) and probes for external/ docs FRESH at
+  // click time (a cross harvest may have added them since the view loaded) to
+  // build the per-target cross scopes. Notes on external/ docs verify against
+  // THAT target's data — the run's SQL permissions are widened to exactly the
+  // targets the selected notes reference — so each pair is its own scope.
+  const externalPairOf = (n) => {
+    const cid = n.concept_id || ""
+    if (!cid.startsWith("external/")) return null
+    const parts = cid.split("/")
+    return parts.length >= 4 ? `${parts[1]}/${parts[2]}` : null
+  }
+  // The notes belonging to a scope: "dataset" = the dataset's own docs,
+  // "cross:<pair>" = that pair's docs. GENERAL (`_dataset`-wide) notes are
+  // valid steering for either, so they appear in EVERY scope — the backend
+  // scope filter agrees (it never filters them; the selection decides).
+  const isGeneralNote = (n) => (n.concept_id || "") === "_dataset"
+  const notesInScope = (notes, scope) =>
+    scope === "dataset"
+      ? notes.filter((n) => !(n.concept_id || "").startsWith("external/"))
+      : notes.filter(
+          (n) =>
+            isGeneralNote(n) ||
+            externalPairOf(n) === scope.slice("cross:".length)
+        )
+  // Preselect everything in scope, EXCEPT general notes in a cross scope —
+  // there they're offered (tickable) but opt-in, so switching to a pair never
+  // silently consumes general feedback meant for the dataset run.
+  const seedAnnoSelection = (notes, scope) =>
+    new Set(
+      notesInScope(notes, scope)
+        .filter((n) => scope === "dataset" || !isGeneralNote(n))
+        .map((n) => n.annotation_id)
+    )
+  const openAnnotationPicker = async () => {
+    if (!hasSelection) return
+    setAnnoOpen(true)
+    setAnnoLoading(true)
+    try {
+      const [notes] = await Promise.all([
+        api.listAnnotations(domain, dataset),
+        probeExternal(),
+      ])
+      const pending = (notes || []).filter(
+        (n) => n.status === "open" || n.status === "in_review"
+      )
+      // Default to the dataset scope unless ONLY cross notes are pending — then
+      // land on the first pair that has one.
+      let scope = "dataset"
+      if (!notesInScope(pending, "dataset").length) {
+        const firstPair = pending.map(externalPairOf).find(Boolean)
+        if (firstPair) scope = `cross:${firstPair}`
+      }
+      setAnnoNotes(pending)
+      setAnnoScope(scope)
+      setAnnoSelected(seedAnnoSelection(pending, scope))
+    } catch (err) {
+      setAnnoOpen(false)
+      toast.error(`Could not load annotations: ${err.message || err}`)
+    } finally {
+      setAnnoLoading(false)
+    }
+  }
+  // Switching scope re-seeds the selection to "all in that scope" — the common
+  // case; unticking is the exception.
+  const changeAnnoScope = (scope) => {
+    setAnnoScope(scope)
+    setAnnoSelected(seedAnnoSelection(annoNotes, scope))
+  }
+  const toggleAnnoNote = (id) => {
+    setAnnoSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+  const applyPickedAnnotations = async () => {
+    const ids = notesInScope(annoNotes, annoScope)
+      .filter((n) => annoSelected.has(n.annotation_id))
+      .map((n) => n.annotation_id)
+    // The wire scope stays "dataset" | "cross" (CONVENTIONS); the pair rides as
+    // cross_target so the run's SQL permissions cover the target even when the
+    // selection is only general notes (whose ids name no pair).
+    const pair =
+      annoScope === "dataset" ? null : annoScope.slice("cross:".length)
+    await startAnnotationHarvest(pair ? "cross" : "dataset", ids, pair)
+    setAnnoOpen(false)
+  }
+
+  // Cross-dataset harvest (mode="cross"): documents the relationship between
+  // this dataset and the picked target into THIS bundle's external/ folder
+  // (one home — the target gets a derived cross-reference signal, never a
+  // copy). The server validates the target (registered, glue-backed, a
+  // different Glue database, bundle ready).
+  const startCrossHarvest = async () => {
+    if (!hasSelection || !crossTarget) return
+    const [targetDomain, targetDataset] = crossTarget.split("/")
+    setStartingCross(true)
+    try {
+      await api.startHarvest(
+        domain,
+        dataset,
+        "cross",
+        model,
+        effort,
+        subModel,
+        subModel ? subEffort : "",
+        revModel,
+        revModel ? revEffort : "",
+        { target: { dataDomain: targetDomain, dataset: targetDataset } }
+      )
+      toast.success(
+        `Cross-dataset discovery queued: ${domain}/${dataset} × ${crossTarget}`
+      )
+      setCrossOpen(false)
+      resetFeed()
+      await poll()
+      startPolling()
+      startFeed()
+    } catch (err) {
+      const msg = err.message || String(err)
+      toast.error(
+        /-> 409/.test(msg)
+          ? `Could not start: ${msg.split(": ").slice(1).join(": ") || "a harvest is already running."}`
+          : `Could not start cross-dataset discovery: ${msg}`
+      )
+    } finally {
+      setStartingCross(false)
     }
   }
 
@@ -614,6 +834,56 @@ export default function HarvestView({ api, selection }) {
     startHarvest()
   }
 
+  // Cross-target candidates: every registered dataset except this one. v1 is
+  // Glue↔Glue only (verification is qualified Athena SQL), so non-glue mappings
+  // are filtered out; a legacy row with no source descriptor is glue by
+  // convention. Readiness is validated server-side (the picker can't know it).
+  const crossCandidates = datasets.filter(
+    (d) =>
+      !(d.data_domain === domain && d.dataset === dataset) &&
+      (d.source?.type ?? "glue") === "glue"
+  )
+
+  // Annotation picker derivations: the notes in the ACTIVE scope + selection
+  // stats. One cross scope PER TARGET PAIR — from the bundle's external/ docs
+  // and from pending notes (belt and braces — a note can outlive its docs).
+  const visibleAnno = notesInScope(annoNotes, annoScope)
+  const annoSelectedCount = visibleAnno.filter((n) =>
+    annoSelected.has(n.annotation_id)
+  ).length
+  const allAnnoSelected =
+    visibleAnno.length > 0 && annoSelectedCount === visibleAnno.length
+  const crossScopePairs = [
+    ...new Set([
+      ...externalPairs,
+      ...annoNotes.map(externalPairOf).filter(Boolean),
+    ]),
+  ].sort()
+  const showCrossScope = crossScopePairs.length > 0
+  // A dataset-scoped run with nothing ticked still fires when the guidance is
+  // dirty — applying the updated instructions is its own reason to run.
+  const guidanceOnlyRun =
+    annoScope === "dataset" &&
+    !!guidance?.guidance_dirty &&
+    annoSelectedCount === 0
+  const toggleAllAnno = () => {
+    setAnnoSelected((prev) => {
+      const next = new Set(prev)
+      if (allAnnoSelected) visibleAnno.forEach((n) => next.delete(n.annotation_id))
+      else visibleAnno.forEach((n) => next.add(n.annotation_id))
+      return next
+    })
+  }
+  // The reindex-derived cross-reference signal for THIS dataset (see
+  // CONVENTIONS.md): pairs we hold docs for, and datasets whose own bundle
+  // documents a relationship to us (their docs, one hop away — the pair docs
+  // live only in the initiating bundle).
+  const selfMapping = datasets.find(
+    (d) => d.data_domain === domain && d.dataset === dataset
+  )
+  const crossReferences = selfMapping?.cross_references || []
+  const crossReferencedBy = selfMapping?.cross_referenced_by || []
+
   return (
     // h-full: fill the content region (which is bounded by the viewport / the
     // floating sidebar's bottom gap), so the card — and its live feed — grow to
@@ -682,19 +952,32 @@ export default function HarvestView({ api, selection }) {
                   <DropdownMenuContent align="start" className="w-64">
                     <DropdownMenuLabel>Re-harvest</DropdownMenuLabel>
                     <DropdownMenuItem
-                      onSelect={startAnnotationHarvest}
+                      onSelect={openAnnotationPicker}
                       disabled={startingAnnotations}
                       className="flex-col items-start gap-0.5"
                     >
                       <span className="flex items-center gap-2">
                         <MessageSquareTextIcon />
-                        Apply annotations
+                        Apply annotations…
                         {guidance?.guidance_dirty ? " + guidance" : ""}
                       </span>
                       <span className="pl-6 text-[11px] text-muted-foreground">
                         {guidance?.guidance_dirty
-                          ? "In-place: your notes + the updated guidance."
-                          : "In-place: applies your open annotations."}
+                          ? "In-place: pick which notes to apply, plus the updated guidance."
+                          : "In-place: pick which of your open notes to apply."}
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() => setCrossOpen(true)}
+                      disabled={startingCross}
+                      className="flex-col items-start gap-0.5"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Link2Icon />
+                        Cross-dataset discovery…
+                      </span>
+                      <span className="pl-6 text-[11px] text-muted-foreground">
+                        Discover + verify relationships with another dataset.
                       </span>
                     </DropdownMenuItem>
                   </DropdownMenuContent>
@@ -750,7 +1033,12 @@ export default function HarvestView({ api, selection }) {
                   already has a knowledge bundle. A full harvest rebuilds it
                   from scratch — every existing doc is discarded and
                   re-authored, including any applied annotations and manual
-                  edits. This can't be undone. To apply new feedback without a
+                  edits
+                  {hasExternal
+                    ? ", and its cross-dataset references (external/) — re-run" +
+                      " a cross-dataset discovery afterwards to restore them"
+                    : ""}
+                  . This can't be undone. To apply new feedback without a
                   rebuild, use{" "}
                   <span className="font-medium">Apply my annotations</span>{" "}
                   instead.
@@ -763,6 +1051,249 @@ export default function HarvestView({ api, selection }) {
                 <Button variant="destructive" onClick={confirmStartHarvest}>
                   <PlayIcon data-icon="inline-start" />
                   Rebuild bundle
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          {/* Cross-dataset target picker. Rendered at CardHeader level (a
+              sibling of the trigger, like the confirm dialog above) — nesting
+              a Dialog inside the DropdownMenuItem would bubble its close click
+              back into the menu. */}
+          <Dialog open={crossOpen} onOpenChange={setCrossOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Cross-dataset discovery</DialogTitle>
+                <DialogDescription>
+                  Explore one other dataset for relationships with{" "}
+                  <span className="font-medium text-foreground">
+                    {domain}/{dataset}
+                  </span>
+                  , verify them against live data, and write the resulting
+                  join/metric docs into{" "}
+                  <span className="font-medium">this dataset's external/</span>{" "}
+                  folder. The target's listing gains a "referenced by" signal
+                  pointing here — nothing is written into its bundle. Both
+                  datasets need a published bundle; a full harvest of{" "}
+                  <span className="font-medium">this</span> dataset removes
+                  its external/ docs (re-run the cross harvest to restore
+                  them).
+                </DialogDescription>
+              </DialogHeader>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="cross-target">Target dataset</Label>
+                {/* A searchable list, not a plain dropdown: real catalogs run
+                    to thousands of datasets. cmdk filters as you type. */}
+                <Command className="rounded-2xl border">
+                  <CommandInput
+                    id="cross-target"
+                    placeholder="Search datasets…"
+                  />
+                  <CommandList className="max-h-52">
+                    <CommandEmpty>No datasets match.</CommandEmpty>
+                    <CommandGroup>
+                      {crossCandidates.map((d) => {
+                        const id = `${d.data_domain}/${d.dataset}`
+                        // Already documented (either direction) — re-running
+                        // replaces that pair's docs.
+                        const done =
+                          crossReferences.includes(id) ||
+                          crossReferencedBy.includes(id)
+                        return (
+                          <CommandItem
+                            key={id}
+                            value={id}
+                            onSelect={() =>
+                              setCrossTarget(crossTarget === id ? "" : id)
+                            }
+                          >
+                            <CheckIcon
+                              className={cn(
+                                "size-4",
+                                crossTarget === id
+                                  ? "opacity-100"
+                                  : "opacity-0"
+                              )}
+                            />
+                            <span className="min-w-0 truncate">{id}</span>
+                            {done ? (
+                              <span className="ml-auto text-xs text-muted-foreground">
+                                documented
+                              </span>
+                            ) : null}
+                          </CommandItem>
+                        )
+                      })}
+                    </CommandGroup>
+                  </CommandList>
+                </Command>
+                {crossCandidates.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No other Glue-backed datasets are registered yet — map one
+                    first (cross-references are Glue↔Glue for now).
+                  </p>
+                ) : null}
+              </div>
+              <DialogFooter>
+                <DialogClose asChild>
+                  <Button variant="outline">Cancel</Button>
+                </DialogClose>
+                <Button
+                  onClick={startCrossHarvest}
+                  disabled={!crossTarget || startingCross}
+                >
+                  {startingCross ? (
+                    <Spinner />
+                  ) : (
+                    <PlayIcon data-icon="inline-start" />
+                  )}
+                  Start discovery
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          {/* Annotation picker — scope dropdown + per-note checkboxes so a run
+              can apply a PARTIAL selection. Always shown; the cross scope is
+              offered only when external/ docs (or notes on them) exist. */}
+          <Dialog open={annoOpen} onOpenChange={setAnnoOpen}>
+            <DialogContent className="sm:max-w-lg">
+              <DialogHeader>
+                <DialogTitle>Apply annotations</DialogTitle>
+                <DialogDescription>
+                  Pick which of your pending notes on{" "}
+                  <span className="font-medium text-foreground">
+                    {domain}/{dataset}
+                  </span>{" "}
+                  this run should apply.
+                  {showCrossScope
+                    ? " Notes on cross-dataset docs are verified against the" +
+                      " target dataset's data — each target is its own scope," +
+                      " and the run's SQL access is widened to that target" +
+                      " only."
+                    : ""}
+                </DialogDescription>
+              </DialogHeader>
+              {annoLoading ? (
+                <div className="flex flex-col gap-2">
+                  <Skeleton className="h-8 w-44" />
+                  <Skeleton className="h-14 w-full" />
+                  <Skeleton className="h-14 w-full" />
+                </div>
+              ) : (
+                // min-w-0: DialogContent is a grid, and a grid item's default
+                // min-width:auto lets a nowrap child (the truncating quote
+                // line) blow the column past the dialog's max-w — the same
+                // overflow as the mapping select. Shrinkable item = real
+                // truncation.
+                <div className="flex min-h-0 min-w-0 flex-col gap-3">
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="anno-scope">Scope</Label>
+                    <Select value={annoScope} onValueChange={changeAnnoScope}>
+                      <SelectTrigger id="anno-scope" className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent
+                        position="popper"
+                        className="max-w-(--radix-select-trigger-width)"
+                      >
+                        <SelectGroup>
+                          <SelectItem value="dataset">
+                            <DatabaseIcon className="size-4" />
+                            Dataset docs
+                          </SelectItem>
+                          {/* One scope per cross-dataset TARGET: the pair names
+                              exactly which dataset the run verifies against. */}
+                          {crossScopePairs.map((pair) => (
+                            <SelectItem key={pair} value={`cross:${pair}`}>
+                              <Link2Icon className="size-4" />
+                              <span className="min-w-0 truncate">
+                                Cross-dataset · {pair}
+                              </span>
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-muted-foreground">
+                      {annoSelectedCount} of {visibleAnno.length} selected
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={toggleAllAnno}
+                      disabled={!visibleAnno.length}
+                    >
+                      {allAnnoSelected ? "Unselect all" : "Select all"}
+                    </Button>
+                  </div>
+                  {visibleAnno.length ? (
+                    <div className="flex max-h-64 flex-col gap-1.5 overflow-y-auto pr-1">
+                      {visibleAnno.map((n) => (
+                        <label
+                          key={n.annotation_id}
+                          className="flex min-w-0 cursor-pointer items-start gap-2.5 overflow-hidden rounded-xl border px-3 py-2 transition-colors hover:bg-muted/50"
+                        >
+                          <input
+                            type="checkbox"
+                            className="mt-0.5 size-3.5 shrink-0 accent-primary"
+                            checked={annoSelected.has(n.annotation_id)}
+                            onChange={() => toggleAnnoNote(n.annotation_id)}
+                          />
+                          <span className="flex min-w-0 flex-col gap-0.5">
+                            <span className="text-sm leading-snug break-words">
+                              {n.note}
+                            </span>
+                            <span className="truncate font-mono text-[11px] text-muted-foreground">
+                              {n.concept_id === "_dataset"
+                                ? "general note"
+                                : n.concept_id}
+                              {n.quote ? ` · “${n.quote}”` : ""}
+                            </span>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      {annoScope !== "dataset"
+                        ? `No pending notes on the ${annoScope.slice("cross:".length)} cross-dataset docs.`
+                        : guidance?.guidance_dirty
+                          ? "No pending notes on this dataset's docs — the run applies the updated guidance only."
+                          : "No pending notes on this dataset's docs."}
+                    </p>
+                  )}
+                  {annoScope === "dataset" &&
+                  guidance?.guidance_dirty &&
+                  visibleAnno.length ? (
+                    <p className="text-xs text-muted-foreground">
+                      The updated dataset guidance rides this run too.
+                    </p>
+                  ) : null}
+                </div>
+              )}
+              <DialogFooter>
+                <DialogClose asChild>
+                  <Button variant="outline">Cancel</Button>
+                </DialogClose>
+                <Button
+                  onClick={applyPickedAnnotations}
+                  disabled={
+                    annoLoading ||
+                    startingAnnotations ||
+                    (annoSelectedCount === 0 && !guidanceOnlyRun)
+                  }
+                >
+                  {startingAnnotations ? (
+                    <Spinner />
+                  ) : (
+                    <PlayIcon data-icon="inline-start" />
+                  )}
+                  {annoSelectedCount
+                    ? `Apply ${annoSelectedCount} note${annoSelectedCount === 1 ? "" : "s"}`
+                    : guidanceOnlyRun
+                      ? "Apply guidance"
+                      : "Apply"}
                 </Button>
               </DialogFooter>
             </DialogContent>
@@ -805,6 +1336,38 @@ export default function HarvestView({ api, selection }) {
                 )}
               </div>
 
+              {crossReferences.length || crossReferencedBy.length ? (
+                // The reindex-derived cross-reference signal. Pair docs live in
+                // the bundle that authored them, so "referenced by" points at
+                // ANOTHER dataset's external/ folder — worth showing here, since
+                // nothing in this bundle reveals it.
+                <div className="flex flex-col gap-1 text-xs text-muted-foreground">
+                  {crossReferences.length ? (
+                    <span className="flex flex-wrap items-center gap-1.5">
+                      <Link2Icon className="size-3.5" />
+                      Cross-references
+                      {crossReferences.map((id) => (
+                        <Badge key={id} variant="secondary">
+                          {id}
+                        </Badge>
+                      ))}
+                    </span>
+                  ) : null}
+                  {crossReferencedBy.length ? (
+                    <span className="flex flex-wrap items-center gap-1.5">
+                      <Link2Icon className="size-3.5" />
+                      Referenced by
+                      {crossReferencedBy.map((id) => (
+                        <Badge key={id} variant="outline">
+                          {id}
+                        </Badge>
+                      ))}
+                      <span>(their bundle holds the pair docs)</span>
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
+
               {(inner.mode ||
                 inner.started_at ||
                 showUpdated ||
@@ -817,7 +1380,17 @@ export default function HarvestView({ api, selection }) {
                   {inner.mode && (
                     <div className="min-w-0">
                       <dt className="text-xs text-muted-foreground">Mode</dt>
-                      <dd className="break-words">{inner.mode}</dd>
+                      <dd className="break-words">
+                        {MODE_LABEL[inner.mode] || inner.mode}
+                      </dd>
+                    </div>
+                  )}
+                  {inner.cross_target && (
+                    // Cross-dataset discovery: WHO the run is against (stamped
+                    // on the status row at trigger time).
+                    <div className="min-w-0">
+                      <dt className="text-xs text-muted-foreground">Target</dt>
+                      <dd className="break-words">{inner.cross_target}</dd>
                     </div>
                   )}
                   {(inner.model || inner.effort) && (

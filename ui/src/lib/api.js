@@ -103,6 +103,10 @@ export function makeApi(token) {
     // omitted model → the backend's deploy-time default; omitted subagent pair →
     // the sub-agents run on the harvester's config. The Control API validates
     // each pair against the model catalog and 400s an unknown model/effort.
+    // The trailing options object carries mode-specific extras: `target`
+    // ({ dataDomain, dataset }) is REQUIRED for mode "cross" — the counterpart
+    // dataset the run documents relationships against (validated server-side:
+    // registered, glue-backed, bundle ready).
     startHarvest: (
       dataDomain,
       dataset,
@@ -112,7 +116,8 @@ export function makeApi(token) {
       subagentModel,
       subagentEffort,
       reviewerModel,
-      reviewerEffort
+      reviewerEffort,
+      { target } = {}
     ) =>
       request(token, "POST", "/harvest", {
         data_domain: dataDomain,
@@ -124,6 +129,12 @@ export function makeApi(token) {
         ...(subagentEffort ? { subagent_effort: subagentEffort } : {}),
         ...(reviewerModel ? { reviewer_model: reviewerModel } : {}),
         ...(reviewerEffort ? { reviewer_effort: reviewerEffort } : {}),
+        ...(target
+          ? {
+              target_data_domain: target.dataDomain,
+              target_dataset: target.dataset,
+            }
+          : {}),
       }),
     harvestStatus: (domain, dataset) =>
       request(token, "GET", `/harvest/${domain}/${dataset}`),
@@ -231,12 +242,25 @@ export function makeApi(token) {
     // Run the caller's open annotations through an annotation-mode re-harvest.
     // The server takes the lease, sweeps orphans, and invokes if some live
     // annotations remain OR the dataset guidance is dirty (else returns
-    // {status:"complete", skipped:true}).
-    runAnnotationHarvest: (domain, dataset) =>
+    // {status:"complete", skipped:true}). `scope` (optional, "dataset"|"cross")
+    // narrows the run to the dataset's own docs vs its external/ cross-dataset
+    // docs; a cross-scoped run also ignores dataset guidance. `annotationIds`
+    // (optional list) narrows further to an explicit selection — the picker
+    // modal's partial apply. Omitted = every in-scope note. `crossTarget`
+    // ("<domain>/<dataset>", cross scope only) names the pair the run verifies
+    // against, so its Glue DB is granted even on a general-notes-only run.
+    runAnnotationHarvest: (domain, dataset, scope, annotationIds, crossTarget) =>
       request(
         token,
         "POST",
-        `/harvest/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/annotations/run`
+        `/harvest/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/annotations/run`,
+        scope || annotationIds
+          ? {
+              ...(scope ? { scope } : {}),
+              ...(annotationIds ? { annotation_ids: annotationIds } : {}),
+              ...(crossTarget ? { cross_target: crossTarget } : {}),
+            }
+          : undefined
       ),
 
     // Dataset guidance: shared, persistent authoring instructions that steer every

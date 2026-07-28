@@ -7,6 +7,12 @@ data "aws_iam_policy_document" "reindex" {
     actions   = ["s3:GetObject"]
     resources = ["${local.d.bundle_bucket_arn}/*"]
   }
+  # ListBucket: deciding whether a cross-dataset pair still has any doc left
+  # (the XREF signal's delete path) reads CURRENT S3 truth for the pair prefix.
+  statement {
+    actions   = ["s3:ListBucket"]
+    resources = [local.d.bundle_bucket_arn]
+  }
   statement {
     actions   = ["bedrock:InvokeModel"]
     resources = ["*"]
@@ -21,6 +27,13 @@ data "aws_iam_policy_document" "reindex" {
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
     resources = [local.d.freshness_table_arn]
+  }
+  # Registry: the derived cross-dataset reference signal (XREF# rows on the
+  # target domain's partition — see reindex.handler._upsert_xref). PutItem +
+  # DeleteItem only; the worker never reads or touches other registry rows.
+  statement {
+    actions   = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
+    resources = [local.d.registry_table_arn]
   }
   statement {
     actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
