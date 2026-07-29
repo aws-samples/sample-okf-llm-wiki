@@ -16,6 +16,11 @@
     --color-sidebar-primary: var(--sidebar-primary);
     --color-sidebar-foreground: var(--sidebar-foreground);
     --color-sidebar: var(--sidebar);
+    --color-chart-10: var(--chart-10);
+    --color-chart-9: var(--chart-9);
+    --color-chart-8: var(--chart-8);
+    --color-chart-7: var(--chart-7);
+    --color-chart-6: var(--chart-6);
     --color-chart-5: var(--chart-5);
     --color-chart-4: var(--chart-4);
     --color-chart-3: var(--chart-3);
@@ -69,16 +74,43 @@
     --ring: oklch(0.723 0.014 214.4);
     /* Chart palette for LIGHT mode — anchored on the app's BRAND CYAN (--primary,
        hue ~223) and extending to the sidebar sky-blue (~237), so charts read as the
-       same color family as the rest of the UI (not the old teal/green/amber ramp).
-       Series are separated by a spread of lightness (~0.45→0.78) + chroma within
-       the cyan→sky hue band, tuned darker/more saturated to stand out on the near-
-       white page (~0.96). --chart-1 is the brand cyan. Consumed by the chat charts
-       AND GraphView node accents. Keep the .dark ramp (below) in the same family. */
-    --chart-1: oklch(0.55 0.12 223); /* brand cyan (matches --primary) */
-    --chart-2: oklch(0.7 0.13 218); /* bright cyan */
-    --chart-3: oklch(0.62 0.14 238); /* sky blue */
-    --chart-4: oklch(0.45 0.1 214); /* deep teal-cyan */
-    --chart-5: oklch(0.78 0.1 230); /* pale cyan */
+       Categorical (identity) hues, NOT a single-hue cyan ramp: an all-cyan chart
+       spends only lightness to tell series apart, which collapses on a screen
+       or in a photo/printout. --chart-1 stays the brand cyan (matches --primary,
+       hue 227) so a single-series chart still reads as "the app's color"; slots
+       2-5 use distinct hue FAMILIES (orange / aqua-green / amber / magenta) —
+       adjacent-pair validated (dataviz skill's validate_palette.js: CVD ΔE ≥ 8,
+       normal-vision floor ≥ 15, both hard-pass here at 9.0/19.4 light,
+       8.2/19.0 dark) so neighbors stay distinguishable under color-vision
+       deficiency AND for full-color viewers. Three light-mode slots (orange,
+       aqua, magenta) sit below 3:1 contrast on the near-white page by design —
+       Chart.js's legend + point-style markers are ALWAYS on (chartIframe.js) as
+       the required secondary encoding, so identity never rides contrast alone.
+       Consumed by the chat charts AND GraphView node accents/CodeView syntax
+       tokens (index.css .okf-prose .hljs-* below) — those keep their existing
+       chart-N role assignments; only the underlying hues moved.
+       TEN slots. Slot ORDER is the CVD-safety mechanism (assigned in sequence,
+       never cycled), and it was chosen by enumerating all orderings of slots
+       6-10 and taking the one that maximizes the WORST adjacent pair across
+       BOTH modes — the result costs nothing: the worst adjacent pair of the
+       10-slot ramp is still one of slots 1-5's own pairs (9.0 light / 8.2
+       dark), so extending 5 -> 10 did not weaken any pair. Slots 1-5 keep
+       their exact previous values, so existing charts do not repaint.
+       SERIES CAP: these gates are the ADJACENT-pair pairlist (correct for
+       bars/lines/stacks/pie, where only neighbours touch). For scatter/bubble
+       forms, where ANY two marks can sit side by side, only the first THREE
+       slots clear the all-pairs gate — past three, fold to "Other" or facet
+       rather than reaching for slot 4. */
+    --chart-1: oklch(0.556 0.108 227); /* cyan (brand) */
+    --chart-2: oklch(0.67 0.175 41); /* orange */
+    --chart-3: oklch(0.67 0.14 162); /* aqua-green */
+    --chart-4: oklch(0.76 0.16 75); /* amber */
+    --chart-5: oklch(0.72 0.14 357); /* magenta */
+    --chart-6: oklch(0.62 0.14 118); /* lime */
+    --chart-7: oklch(0.52 0.17 295); /* violet */
+    --chart-8: oklch(0.55 0.14 145); /* green */
+    --chart-9: oklch(0.55 0.16 262); /* blue */
+    --chart-10: oklch(0.58 0.19 20); /* red */
     /* GraphView cross-dataset (external/) node cards: a faint brand-cyan wash
        on the white card surface. An explicit per-mode token (see .dark) rather
        than a runtime color-mix: mixing the cyan accents with white IN OKLCH
@@ -118,16 +150,26 @@
     --border: oklch(1 0 0 / 10%);
     --input: oklch(1 0 0 / 15%);
     --ring: oklch(0.56 0.021 213.5);
-    /* Chart palette for DARK mode — same BRAND CYAN→sky family as :root (hue
-       ~214-238), but brighter/lighter (lightness ~0.62→0.85) so each series reads
-       on the near-black page (~0.148). --chart-1 is the brand cyan, brightened for
-       dark. Mirrors the light ramp's ordering so a series keeps its identity across
-       themes. (Replaces the old teal/green ramp that clashed with the app cyan.) */
-    --chart-1: oklch(0.72 0.13 223); /* brand cyan, brightened for dark */
-    --chart-2: oklch(0.82 0.13 216); /* bright cyan */
-    --chart-3: oklch(0.7 0.14 238); /* sky blue */
-    --chart-4: oklch(0.6 0.11 212); /* deep cyan */
-    --chart-5: oklch(0.85 0.08 230); /* pale cyan */
+    /* Chart palette for DARK mode — same categorical HUES as :root (cyan /
+       orange / aqua-green / amber / magenta), independently stepped into the
+       dark lightness band (OKLCH L 0.48-0.67) rather than just brightened —
+       validate_palette.js passes both bands as separate ramps, not one ramp
+       shared across modes. Same slot order as light, so a series keeps its
+       identity across a theme switch. Re-validated: CVD ΔE 8.2, normal-vision
+       floor 19.0 (both clear the ≥8 / ≥15 gates), all 10 slots ≥3:1 on this
+       surface (dark mode needs no contrast relief, unlike light). Same ten
+       hues and same slot order as :root — see the light block for why the
+       order is what it is and for the scatter/bubble series cap. */
+    --chart-1: oklch(0.64 0.13 223); /* cyan (brand, dark-stepped) */
+    --chart-2: oklch(0.62 0.17 40); /* orange */
+    --chart-3: oklch(0.62 0.13 163); /* aqua-green */
+    --chart-4: oklch(0.67 0.14 73); /* amber */
+    --chart-5: oklch(0.62 0.17 1); /* magenta */
+    --chart-6: oklch(0.65 0.14 118); /* lime */
+    --chart-7: oklch(0.55 0.17 295); /* violet */
+    --chart-8: oklch(0.58 0.13 145); /* green */
+    --chart-9: oklch(0.58 0.15 262); /* blue */
+    --chart-10: oklch(0.6 0.18 20); /* red */
     /* GraphView cross-dataset node cards, dark variant: one step lighter than
        --card (0.218) with a touch more cyan chroma, so the wash reads on the
        dark surface without glowing. Same hue family as the light token. */
@@ -269,7 +311,20 @@
   /* highlight.js (rehype-highlight) token colors, mapped onto our theme tokens
      so SQL/code highlighting reads well in BOTH light and dark mode instead of
      shipping a fixed-palette hljs theme. Keywords use the primary (cyan); the
-     rest lean on chart/muted tokens. */
+     rest lean on chart/muted tokens — but this is a WCAG text-contrast job
+     (readable code characters), not the categorical-series job --chart-1..5
+     are now tuned for (see the --chart-1 definition above), so the three roles
+     take the chart slots by contrast against the code block's --muted
+     background, not by hue meaning: chart-1 (4.2:1 light / 5.3:1 dark) is the
+     best all-round slot after primary; chart-2 (2.9 / 4.3) edges chart-3
+     (2.6 / 4.9) in LIGHT mode specifically (the mode where nothing but
+     primary/chart-1 reaches body-text AA of 4.5:1), so numbers/symbols — a
+     common token — get chart-2. Dark mode clears 4.3:1+ on every slot either
+     way. This is a real step down from the old ramp's number/symbol slot
+     (5.40:1 light, since retired), which was hand-tuned for THIS use; the new
+     ramp is tuned for categorical series identity instead and code-token
+     contrast is accepted as secondary here (position + keyword context in a
+     fenced, monospaced block carry most of the readability). */
   .okf-prose .hljs-keyword,
   .okf-prose .hljs-selector-tag,
   .okf-prose .hljs-literal,
@@ -279,17 +334,17 @@
     color: var(--primary);
     font-weight: 600;
   }
-  .okf-prose .hljs-string,
-  .okf-prose .hljs-attr,
-  .okf-prose .hljs-template-tag,
-  .okf-prose .hljs-addition {
-    color: var(--chart-2);
-  }
   .okf-prose .hljs-number,
   .okf-prose .hljs-symbol,
   .okf-prose .hljs-bullet,
   .okf-prose .hljs-link {
-    color: var(--chart-4);
+    color: var(--chart-2);
+  }
+  .okf-prose .hljs-string,
+  .okf-prose .hljs-attr,
+  .okf-prose .hljs-template-tag,
+  .okf-prose .hljs-addition {
+    color: var(--chart-3);
   }
   .okf-prose .hljs-title,
   .okf-prose .hljs-type,

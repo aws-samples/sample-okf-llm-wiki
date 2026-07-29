@@ -608,7 +608,9 @@ function ConceptBreadcrumb({ conceptId }) {
 // resolved against the shared okf/ tree and navigate into THAT dataset's
 // Browse view via `onNavigateCross`; the address may dangle, in which case the
 // target view reports the missing doc.
-function ConceptDoc({
+// Exported: the chat's doc-peek panel (components/chat/DocPeek) renders cited
+// docs with THIS component so a citation opens Browse-grade markdown.
+export function ConceptDoc({
   conceptId,
   text,
   onNavigate,

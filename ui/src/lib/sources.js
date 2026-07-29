@@ -107,6 +107,69 @@ export function collectWebSources(events) {
   return index
 }
 
+// Build a concept-id → {data_domain, dataset} index from the conversation's
+// wiki tool traffic, so a cited doc can be OPENED (the chat's doc-peek panel)
+// even in an unscoped conversation, where the concept id alone doesn't name its
+// bundle. Two feeds:
+//   - tool CALL args carrying {data_domain, dataset, concept_id} (read_page /
+//     get_backlinks — for scoped conversations the server folds the scope into
+//     the args, so the event always shows the resolved location);
+//   - semantic_search RESULTS, whose `concept_id` is the full vector key
+//     `<domain>/<dataset>/<concept path>`.
+// First writer wins, so a doc read twice keeps its first (authoritative)
+// location. Includes external/ pair docs (citable, but not in CONCEPT_ID_RE).
+const WIKI_TOP_RE = /^(datasets|tables|references|external)\//
+
+export function collectWikiSources(events) {
+  const index = new Map()
+  for (const ev of events || []) {
+    if (ev.type !== "tool") continue
+    const content = coerce(ev.content)
+    if (ev.tool_start) {
+      if (!content || typeof content !== "object") continue
+      const dd = content.data_domain
+      const ds = content.dataset
+      const cid = content.concept_id
+      if (
+        dd &&
+        ds &&
+        typeof cid === "string" &&
+        WIKI_TOP_RE.test(cid) &&
+        !index.has(cid)
+      ) {
+        index.set(cid, { data_domain: String(dd), dataset: String(ds) })
+      }
+      continue
+    }
+    if (ev.tool_name !== "semantic_search") continue
+    const results = Array.isArray(content)
+      ? content
+      : Array.isArray(content?.results)
+        ? content.results
+        : []
+    for (const r of results) {
+      const key = typeof r?.concept_id === "string" ? r.concept_id : ""
+      const m = /^([^/]+)\/([^/]+)\/(.+)$/.exec(key)
+      if (m && WIKI_TOP_RE.test(m[3]) && !index.has(m[3])) {
+        index.set(m[3], { data_domain: m[1], dataset: m[2] })
+      }
+    }
+  }
+  return index
+}
+
+// A stable signature over ALL tool events (calls and results), so the wiki
+// source index can be memoized without re-running on every streamed token.
+export function wikiSourcesSignature(events) {
+  let sig = ""
+  for (const ev of events || []) {
+    if (ev.type !== "tool") continue
+    const len = typeof ev.content === "string" ? ev.content.length : ev.content ? 1 : 0
+    sig += `${ev.id || ""}${ev.tool_start ? "s" : "r"}${len}|`
+  }
+  return sig
+}
+
 // A stable signature over the web_search results in a turn's events, so the
 // index can be memoized without re-running on every streamed token (the events
 // array identity changes on every flush).

@@ -167,10 +167,10 @@ function textOf(children) {
   return String(children)
 }
 
-// Components depend on datasetScope + the turn's web-source index (both feed the
-// citation cards), so build them per turn. Memoized in Markdown so the object is
-// stable across streaming re-renders.
-function makeComponents(datasetScope, webSources) {
+// Components depend on datasetScope + the turn's web/wiki source indexes (all
+// feed the citation cards) + the doc-peek opener, so build them per turn.
+// Memoized in Markdown so the object is stable across streaming re-renders.
+function makeComponents(datasetScope, webSources, wikiSources, onOpenDoc) {
   return {
   a({ href, children, ...props }) {
     // Citation badge — an `okf-cite:<encoded source list>` link (from
@@ -182,6 +182,8 @@ function makeComponents(datasetScope, webSources) {
           sources={parseCiteList(list)}
           datasetScope={datasetScope}
           webSources={webSources}
+          wikiSources={wikiSources}
+          onOpenDoc={onOpenDoc}
         />
       )
     }
@@ -246,14 +248,16 @@ export function Markdown({
   datasetScope = null,
   streaming = false,
   webSources = null,
+  wikiSources = null,
+  onOpenDoc = null,
 }) {
   const scopeKey = datasetScope
     ? `${datasetScope.data_domain}/${datasetScope.dataset}`
     : ""
   const components = useMemo(
-    () => makeComponents(datasetScope, webSources),
+    () => makeComponents(datasetScope, webSources, wikiSources, onOpenDoc),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [scopeKey, webSources]
+    [scopeKey, webSources, wikiSources, onOpenDoc]
   )
   const source = preprocessCitations(
     streaming ? stripStreamTail(children) : children

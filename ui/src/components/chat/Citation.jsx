@@ -12,10 +12,17 @@
 //     from the turn's web_search results (lib/sources.collectWebSources); a URL we
 //     have no result for still renders — host + link, just without title/snippet.
 //   - WIKI DOC (a concept id): kind glyph + "Table"/"Reference"/"Dataset", the full
-//     concept-id path, and the conversation's dataset when it's scoped. Not a link
-//     (the chat isn't a doc browser).
+//     concept-id path, and the doc's dataset. When the doc's bundle is known
+//     (conversation scope, or the conversation's own tool traffic —
+//     lib/sources.collectWikiSources), the card is CLICKABLE and opens the doc in
+//     the chat's doc-peek panel (`onOpenDoc`); an unresolvable id stays a plain
+//     summary rather than a dead link.
 
-import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react"
+import {
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  PanelRightOpenIcon,
+} from "lucide-react"
 import { useState } from "react"
 
 import { DocIcon, SourceIcon } from "@/components/chat/SourceIcon"
@@ -70,31 +77,68 @@ function WebCard({ url, meta }) {
   )
 }
 
-function DocCard({ id, datasetScope }) {
+function DocCard({ id, datasetScope, wikiSources, onOpenDoc }) {
   const kind = CITE_KIND[String(id).split("/")[0]] || "Doc"
-  const dataset = datasetScope
-    ? `${datasetScope.data_domain}/${datasetScope.dataset}`
-    : null
-  return (
-    <div className="flex flex-col gap-1.5">
+  // Where this doc lives: the conversation's tool traffic first (exact — it
+  // names the bundle the doc was actually read from), then the conversation
+  // scope. Unresolvable → the card stays a plain, non-clickable summary.
+  const loc = wikiSources?.get(String(id)) || datasetScope || null
+  const dataset = loc ? `${loc.data_domain}/${loc.dataset}` : null
+  const body = (
+    <>
       <span className="flex items-center gap-1.5">
         <DocIcon conceptId={id} size={14} />
         <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
           {kind} · wiki
         </span>
+        {loc && onOpenDoc ? (
+          <span className="ml-auto flex items-center gap-1 text-[10px] text-muted-foreground group-hover:text-foreground">
+            <PanelRightOpenIcon className="size-3" />
+            Open page
+          </span>
+        ) : null}
       </span>
-      <span className="font-mono text-xs break-all text-foreground">{id}</span>
+      <span className="font-mono text-xs break-all text-foreground group-hover:underline">
+        {id}
+      </span>
       {dataset ? (
         <span className="text-xs text-muted-foreground">
           in <span className="font-mono">{dataset}</span>
         </span>
       ) : null}
-    </div>
+    </>
   )
+  if (loc && onOpenDoc) {
+    return (
+      <button
+        type="button"
+        onClick={() =>
+          onOpenDoc({
+            dataDomain: loc.data_domain,
+            dataset: loc.dataset,
+            conceptId: String(id),
+          })
+        }
+        className="group flex w-full cursor-pointer flex-col gap-1.5 text-left"
+      >
+        {body}
+      </button>
+    )
+  }
+  return <div className="flex flex-col gap-1.5">{body}</div>
 }
 
-export function CitationGroup({ sources, datasetScope = null, webSources = null }) {
+export function CitationGroup({
+  sources,
+  datasetScope = null,
+  webSources = null,
+  wikiSources = null,
+  onOpenDoc = null,
+}) {
   const [page, setPage] = useState(0)
+  // Controlled so opening a doc in the peek panel also closes the card —
+  // otherwise the popover would sit on top of the panel it just opened.
+  const [open, setOpen] = useState(false)
   if (!sources || sources.length === 0) return null
 
   const total = sources.length
@@ -112,7 +156,7 @@ export function CitationGroup({ sources, datasetScope = null, webSources = null 
   }
 
   return (
-    <Popover>
+    <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <span className="okf-cite" tabIndex={0} role="button">
           {isWebSource(first) ? (
@@ -164,7 +208,19 @@ export function CitationGroup({ sources, datasetScope = null, webSources = null 
           {isWebSource(current) ? (
             <WebCard url={current} meta={webSources?.get(current)} />
           ) : (
-            <DocCard id={current} datasetScope={datasetScope} />
+            <DocCard
+              id={current}
+              datasetScope={datasetScope}
+              wikiSources={wikiSources}
+              onOpenDoc={
+                onOpenDoc
+                  ? (target) => {
+                      setOpen(false)
+                      onOpenDoc(target)
+                    }
+                  : null
+              }
+            />
           )}
         </div>
       </PopoverContent>
