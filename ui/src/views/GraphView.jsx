@@ -148,15 +148,18 @@ const EDGE_TYPES = { floating: FloatingEdge }
 function nodeKind(type, conceptId) {
   const t = (type || "").toLowerCase()
   if ((conceptId || "").startsWith("external/") || t.includes("cross-dataset"))
-    // chart-4 (deep cyan) for the bar/icon so they hold contrast on the tinted
-    // card wash in both themes (chart-5, pale cyan, washes out on it).
-    return { icon: Link2Icon, accent: "var(--chart-4)", external: true }
-  if (t.includes("table")) return { icon: Table2Icon, accent: "var(--chart-1)" }
+    // chart-1 (cyan) for the bar/icon: --xref-node-bg is a cyan-family tint, and
+    // chart-1 is the only slot that still clears 3:1 against it in LIGHT mode
+    // (the other four are hue-separated for chart series identity, not stepped
+    // for contrast on this specific wash — orange/aqua/magenta land at
+    // 2.4-2.9:1, amber at 2.0:1). All five clear it in dark mode.
+    return { icon: Link2Icon, accent: "var(--chart-1)", external: true }
+  if (t.includes("table")) return { icon: Table2Icon, accent: "var(--chart-2)" }
   if (t.includes("dataset") || t.includes("database"))
-    return { icon: DatabaseIcon, accent: "var(--chart-2)" }
+    return { icon: DatabaseIcon, accent: "var(--chart-3)" }
   if (t.includes("reference") || t.includes("join") || t.includes("metric"))
-    return { icon: BookMarkedIcon, accent: "var(--chart-3)" }
-  return { icon: BoxIcon, accent: "var(--chart-4)" }
+    return { icon: BookMarkedIcon, accent: "var(--chart-4)" }
+  return { icon: BoxIcon, accent: "var(--chart-5)" }
 }
 
 function toRfNode(node) {

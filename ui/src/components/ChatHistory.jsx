@@ -6,9 +6,10 @@
 // (get_session_history over the DynamoDB checkpoint), so a resumed thread fills
 // in immediately.
 //
-// It renders at a FIXED width (w-72) and is clipped by an animated wrapper in
-// ChatPanel, so opening/closing is a smooth width slide without the content
-// reflowing mid-transition.
+// It fills its parent: ChatPanel mounts it inside the shared PanelShell (the
+// same floating-card chrome as the doc-peek reader — narrower, not resizable)
+// within a fixed-width, width-animated clip, so opening/closing is a smooth
+// slide without the content reflowing mid-transition.
 
 import {
   HistoryIcon,
@@ -183,7 +184,7 @@ export function ChatHistory({
   const noMatches = !loading && !error && hasThreads && filtered.length === 0
 
   return (
-    <div className="flex h-full w-72 shrink-0 flex-col border-l bg-card/40">
+    <div className="flex h-full min-h-0 flex-col">
       {/* Header — mirrors the sidebar's own headers (icon + label), with the
           count as a subtle pill and a close affordance on the right. */}
       <div className="flex h-11 shrink-0 items-center gap-2 border-b px-3">

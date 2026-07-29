@@ -28,9 +28,22 @@ import CHART_SANKEY_SRC from "@/vendor/chartjs-chart-sankey.min.js?raw"
 import CHART_TREEMAP_SRC from "@/vendor/chartjs-chart-treemap.min.js?raw"
 
 // The palette + UI tokens we resolve from the app theme and hand to the frame.
-// --chart-1..5 are the series palette; the rest style axes/legend/tooltip so the
-// chart reads as part of the UI. Names map to CSS custom properties on :root.
-const PALETTE_VARS = ["--chart-1", "--chart-2", "--chart-3", "--chart-4", "--chart-5"]
+// --chart-1..10 are the series palette; the rest style axes/legend/tooltip so
+// the chart reads as part of the UI. Names map to CSS custom properties on
+// :root. ORDER MATTERS: series take these in sequence (seriesColor), and that
+// order is the CVD-safety mechanism — see the --chart-1 comment in index.css.
+const PALETTE_VARS = [
+  "--chart-1",
+  "--chart-2",
+  "--chart-3",
+  "--chart-4",
+  "--chart-5",
+  "--chart-6",
+  "--chart-7",
+  "--chart-8",
+  "--chart-9",
+  "--chart-10",
+]
 const UI_VARS = {
   foreground: "--foreground",
   mutedForeground: "--muted-foreground",
@@ -75,7 +88,21 @@ function resolveVar(ctx, rootStyle, cssVar) {
 // changes the tokens produces a rebuilt frame with the new colors.
 export function resolveChartPalette() {
   const fallback = {
-    chart: ["59, 130, 246", "16, 185, 129", "245, 158, 11", "139, 92, 246", "236, 72, 153"],
+    // The LIGHT-mode palette as literals — used only when the theme tokens
+    // can't be resolved (no document / no 2d context), so a chart still draws
+    // in the right colors instead of Chart.js defaults.
+    chart: [
+      "0, 127, 164",
+      "235, 104, 51",
+      "31, 175, 122",
+      "235, 160, 2",
+      "233, 125, 166",
+      "127, 145, 16",
+      "115, 77, 190",
+      "48, 134, 57",
+      "58, 108, 206",
+      "211, 57, 73",
+    ],
     foreground: "23, 23, 23",
     mutedForeground: "115, 115, 115",
     border: "229, 229, 229",
@@ -119,6 +146,20 @@ function helperSource() {
     return a == null ? "rgb(" + triple + ")" : "rgba(" + triple + ", " + a + ")";
   }
   function seriesColor(i) { return SERIES[i % SERIES.length]; }
+
+  // WCAG relative luminance of an "r,g,b" triple — picks readable label ink for
+  // text drawn ON a solid series fill (treemap tiles). Threshold 0.19 is where
+  // white-on-fill and dark-on-fill contrast cross over.
+  function relLumOf(triple) {
+    var lin = triple.split(",").map(function (n) {
+      var c = Number(n) / 255;
+      return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+  }
+  function inkOn(triple) {
+    return relLumOf(triple) < 0.19 ? "rgba(255,255,255,0.95)" : "rgba(0,0,0,0.78)";
+  }
 
   // Gridline / axis color. We DON'T use --border here: in light mode that token is
   // near-white (~oklch 0.925), so gridlines on the near-white page were invisible
@@ -257,7 +298,10 @@ function helperSource() {
         if (f && f.to != null && nodes.indexOf(f.to) === -1) nodes.push(f.to);
       });
       var nodeColor = function (name) {
-        return rgb(seriesColor(Math.max(0, nodes.indexOf(name))), 0.85);
+        // FULL opacity: an alpha fill here blends with the page behind the
+        // frame, so the same series color rendered lighter in light mode and
+        // darker in dark mode — the color must be the theme token itself.
+        return rgb(seriesColor(Math.max(0, nodes.indexOf(name))));
       };
       return {
         type: "sankey",
@@ -316,17 +360,25 @@ function helperSource() {
           backgroundColor: function (c) {
             if (c.type !== "data") return "transparent";
             var o = (c.raw && c.raw._data) || {};
-            // Only the LEAVES carry color (a solid group-hue tint). The group
-            // header rect is left TRANSPARENT — its saturated fill otherwise
-            // competes with the leaves it contains; the caption + the shared
-            // leaf hue already convey the grouping. Leaves still read as one
-            // color family per group via nodeIdx.
+            // Only the LEAVES carry color. The group header rect is left
+            // TRANSPARENT — its saturated fill otherwise competes with the
+            // leaves it contains; the caption + the shared leaf hue already
+            // convey the grouping. Leaves still read as one color family per
+            // group via nodeIdx. FULL opacity on the fill: the old 0.75 alpha
+            // blended the tile with the page behind the frame, so the same
+            // palette slot rendered as a light tint in light mode and a dark
+            // shade in dark mode — the tile must BE the theme's series color.
             var isHeader = hasGroups && o.group === "group";
-            return isHeader ? "transparent" : rgb(seriesColor(nodeIdx(c)), 0.75);
+            return isHeader ? "transparent" : rgb(seriesColor(nodeIdx(c)));
           },
           labels: {
             display: true,
-            color: "rgba(255,255,255,0.95)",
+            // Per-tile ink: solid fills from the categorical palette span
+            // light (amber) to dark (cyan) — fixed white text would wash out
+            // on the light ones, so pick by the FILL's luminance.
+            color: function (c) {
+              return c.type === "data" ? inkOn(seriesColor(nodeIdx(c))) : "transparent";
+            },
             formatter: function (c) {
               var o = (c.raw && c.raw._data) || {};
               if (o.label == null) return "";

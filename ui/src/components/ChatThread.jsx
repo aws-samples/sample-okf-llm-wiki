@@ -11,13 +11,21 @@
 //     at the bottom.
 
 import { AlertCircleIcon, ArrowDownIcon } from "lucide-react"
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { WikiCubeIcon } from "@/components/WikiCubeIcon"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import { collectWikiSources, wikiSourcesSignature } from "@/lib/sources"
 
 // Loading placeholder for a resumed conversation — a couple of turn-shaped
 // skeletons (a right-aligned question pill + a left-aligned answer block).
@@ -64,6 +72,7 @@ export function ChatThread({
   datasets,
   datasetScope,
   onScopeChange,
+  onOpenDoc,
   composerLeftSlot,
   disabled,
 }) {
@@ -81,6 +90,19 @@ export function ChatThread({
 
   const isEmpty = chatTurns.length === 0
   const showWelcome = isEmpty && !loadingHistory
+
+  // Concept id → {data_domain, dataset} from ALL turns' wiki tool traffic —
+  // a later turn may cite a doc it read in an earlier turn without re-reading
+  // it, so the index spans the whole conversation. Memoized on a result
+  // signature (the turns/events arrays get fresh identities every stream
+  // flush) so the map reference stays stable for ChatMessage/Block memos.
+  const allEvents = chatTurns.flatMap((t) => t.aiMessage || [])
+  const wikiSig = wikiSourcesSignature(allEvents)
+  const wikiSources = useMemo(
+    () => collectWikiSources(allEvents),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [wikiSig]
+  )
 
   // CALLBACK REF: measure the viewport whenever the node attaches — not just on
   // first mount. The transcript mounts LATER than the component (a fresh chat
@@ -256,6 +278,8 @@ export function ChatThread({
                     turn={turn}
                     streaming={isStreaming && isLast}
                     datasetScope={datasetScope}
+                    wikiSources={wikiSources}
+                    onOpenDoc={onOpenDoc}
                   />
                 </div>
               )

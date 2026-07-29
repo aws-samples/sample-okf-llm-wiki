@@ -49,7 +49,15 @@ function blockSig(block) {
 // its own content changes — not when a sibling block streams. During a stream
 // only the last (growing) block re-parses; earlier blocks are skipped.
 const Block = memo(
-  function Block({ block, complete, live, datasetScope, webSources }) {
+  function Block({
+    block,
+    complete,
+    live,
+    datasetScope,
+    webSources,
+    wikiSources,
+    onOpenDoc,
+  }) {
     if (block.type === "think") {
       return (
         <UnifiedThinkingBlock
@@ -80,6 +88,8 @@ const Block = memo(
         datasetScope={datasetScope}
         streaming={!complete}
         webSources={webSources}
+        wikiSources={wikiSources}
+        onOpenDoc={onOpenDoc}
       >
         {block.content}
       </Markdown>
@@ -89,14 +99,16 @@ const Block = memo(
     prev.complete === next.complete &&
     prev.live === next.live &&
     prev.datasetScope === next.datasetScope &&
-    // Reference-compared: the index is memoized on a result signature in
-    // ChatMessageImpl, so it only changes when a search actually returned
-    // something new — not on every streamed token.
+    // Reference-compared: each index is memoized on a result signature (web in
+    // ChatMessageImpl, wiki in ChatThread), so it only changes when tool traffic
+    // actually returned something new — not on every streamed token.
     prev.webSources === next.webSources &&
+    prev.wikiSources === next.wikiSources &&
+    prev.onOpenDoc === next.onOpenDoc &&
     blockSig(prev.block) === blockSig(next.block)
 )
 
-function ChatMessageImpl({ turn, streaming, datasetScope }) {
+function ChatMessageImpl({ turn, streaming, datasetScope, wikiSources, onOpenDoc }) {
   const aiEvents = turn.aiMessage || []
   const isEnd = aiEvents.length > 0 && aiEvents[aiEvents.length - 1]?.end === true
   const blocks = useMemo(
@@ -177,6 +189,8 @@ function ChatMessageImpl({ turn, streaming, datasetScope }) {
                 live={streaming}
                 datasetScope={datasetScope}
                 webSources={webSources}
+                wikiSources={wikiSources}
+                onOpenDoc={onOpenDoc}
               />
             )
           })}
