@@ -7,6 +7,17 @@ error ToolMessage (no disk write — the model self-corrects) or lets the write
 proceed (optionally with normalized frontmatter). Path containment is handled
 by the ``FilesystemBackend``'s ``virtual_mode``, not here.
 
+Two blanket refusals sit in front of the engine checks:
+
+* ``delete`` (the recursive filesystem tool deepagents ≥0.7 hands every agent
+  whose backend supports it) is ALWAYS refused — nothing in a bundle is ever
+  deleted by an agent; stale or wrong docs are corrected or annotated, and
+  deletions are a human decision outside the run.
+* ``read_only=True`` builds a guard variant for the verify-and-report
+  sub-agents (reviewer, context-extractor): every write/edit is refused, so
+  "read-only" is enforced at the tool boundary rather than promised by the
+  prompt (deepagents hands every sub-agent the backend's write tools).
+
 ``ToolErrorMiddleware`` converts any exception a tool RAISES into a
 ``ToolMessage(status="error")`` so a single failing call (a ``PermissionError``
 from the S3 Files mount mid-write, a transient ``OSError``) surfaces to the
@@ -37,13 +48,7 @@ except Exception:  # pragma: no cover - exercised only when langchain is absent
     ToolMessage = None  # type: ignore[assignment]
     _HAVE_LANGCHAIN = False
 
-_GUARDED_TOOLS = {"write_file", "edit_file"}
-
-# The recursive-improvement benchmark tool. When RI is enabled the guard counts
-# calls to it and refuses once the per-run iteration budget is spent — a backstop
-# against a runaway loop, independent of the supervisor prompt's own budget. When
-# RI is disabled this tool isn't even registered, so the counter never moves.
-_BENCHMARK_TOOL = "run_benchmark"
+_GUARDED_TOOLS = {"write_file", "edit_file", "delete"}
 
 # The read-only Glue metadata snapshot (see metadata_export.py). Any write/edit
 # whose path lands in this dir is refused: the snapshot is an INPUT the agent
@@ -91,21 +96,18 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         engine: OKFGuardEngine,
         *,
         read_current: Callable[[str], str | None],
-        benchmark_budget: int | None = None,
         writable_prefix: str | None = None,
+        read_only: bool = False,
     ):
         super().__init__()
         self.engine = engine
         self._read_current = read_current
-        # Recursive-improvement backstop. When set (RI enabled), the guard allows
-        # at most this many run_benchmark calls per run and refuses the rest. None
-        # (a normal harvest) means the tool isn't registered, so this is inert.
-        self._benchmark_budget = benchmark_budget
-        self._benchmark_calls = 0
         # Cross-dataset mode: confine EVERY write/edit to this root-relative
         # subtree (e.g. "external/<domain>/<dataset>/"). The rest of the bundle
         # is read-only context for the run. None (all other modes) = inert.
         self._writable_prefix = writable_prefix.strip("/") + "/" if writable_prefix else None
+        # Verify-and-report sub-agents: refuse every write/edit outright.
+        self._read_only = read_only
 
     def wrap_tool_call(self, request, handler):  # type: ignore[override]
         """Sync path (invoke/stream)."""
@@ -140,24 +142,32 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         args = request.tool_call["args"]
         file_path = args.get("file_path")
 
-        # Recursive-improvement iteration backstop: count run_benchmark calls and
-        # refuse once the budget is spent. Checked before the write-tool gate
-        # because run_benchmark is not a write tool. Inert when budget is None.
-        if name == _BENCHMARK_TOOL and self._benchmark_budget is not None:
-            if self._benchmark_calls >= self._benchmark_budget:
-                return self._refuse(
-                    request,
-                    f"Refused: the recursive-improvement benchmark budget of "
-                    f"{self._benchmark_budget} iteration(s) is spent. Stop looping "
-                    f"and let the run finalize — the wiki ships exactly as you have "
-                    f"left it (there is no rollback), so make sure it's in your best "
-                    f"state before you finish.",
-                )
-            self._benchmark_calls += 1
-            return None
-
         if name not in _GUARDED_TOOLS:
             return None
+
+        # The delete tool (deepagents ≥0.7 exposes it whenever the backend
+        # supports it, and it is RECURSIVE) is never part of authoring: stale
+        # or wrong docs are corrected in place or annotated — removing bundle
+        # content is a human decision outside the run. Refused unconditionally,
+        # before any path/extension logic.
+        if name == "delete":
+            return self._refuse(
+                request,
+                f"Refused: `delete` is not available in this run. Nothing in "
+                f"the bundle is ever deleted by an agent — correct the doc in "
+                f"place with `edit_file` (or supersede it) instead; `{file_path}` "
+                "was not touched.",
+            )
+
+        # Read-only agents (reviewer / context-extractor): they verify and
+        # REPORT — findings go in the reply, never on disk.
+        if self._read_only:
+            return self._refuse(
+                request,
+                f"Refused: this agent is READ-ONLY — it verifies and reports, "
+                f"it never writes. `{file_path}` was not touched; put the "
+                "finding in your reply instead (the supervisor applies fixes).",
+            )
 
         # The .metadata/ snapshot is read-only: refuse any write into it,
         # regardless of extension, before the .md-only OKF checks below.

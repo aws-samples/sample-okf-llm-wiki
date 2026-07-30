@@ -117,7 +117,12 @@ data "aws_iam_policy_document" "harvest_data" {
     actions = [
       "glue:GetDatabase", "glue:GetDatabases",
       "glue:GetTable", "glue:GetTables",
-      "glue:GetPartitions", "glue:GetTableVersions",
+      # GetPartitions (bulk list) is NOT enough for a partitioned table: Athena
+      # also calls the SINGULAR GetPartition and BatchGetPartition while pruning
+      # partitions for a query, and their absence is an AccessDenied at query
+      # time, not at plan time.
+      "glue:GetPartitions", "glue:GetPartition", "glue:BatchGetPartition",
+      "glue:GetTableVersions",
     ]
     resources = ["*"]
   }
@@ -310,6 +315,11 @@ data "aws_iam_policy_document" "harvest" {
     sid = "BundleBucketReadWrite"
     actions = [
       "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
+      # A version-pinned benchmark run reconstructs the wiki snapshot from the
+      # bucket's version history (okf_aws.s3_versions: ListObjectVersions +
+      # per-VersionId GETs) — same grants the Control API's version endpoints
+      # carry in lambda_policies.tf.
+      "s3:GetObjectVersion", "s3:ListBucketVersions",
     ]
     resources = [
       local.d.bundle_bucket_arn,
@@ -579,7 +589,10 @@ data "aws_iam_policy_document" "chat" {
       actions = [
         "glue:GetDatabase", "glue:GetDatabases",
         "glue:GetTable", "glue:GetTables",
-        "glue:GetPartitions", "glue:GetTableVersions",
+        # Singular + batch partition reads: Athena calls these when pruning a
+        # partitioned table (see the harvest_data GlueReadOnly note).
+        "glue:GetPartitions", "glue:GetPartition", "glue:BatchGetPartition",
+        "glue:GetTableVersions",
       ]
       resources = ["*"]
     }

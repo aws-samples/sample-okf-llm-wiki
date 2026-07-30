@@ -3,7 +3,12 @@
 Ports the BIRD-EX comparator (``~/.claude/skills/okf-sql-benchmark/scripts/
 ex_compare.py``) from SQLite to Athena: execute the gold SQL and the predicted
 SQL, compare their result sets as **unordered sets of rows**
-(``set(pred) == set(gold)``). No LLM, no agent tool layer — the gold SQL lives in
+(``set(pred) == set(gold)``, rows positional within themselves — BIRD ignores
+row ORDER, never column order). Athena returns every cell as a string, so
+numeric-looking cells are normalized to ``Decimal`` before comparing — that
+recovers BIRD's native-value semantics where ``3 == 3.0`` (a ``COUNT(*)`` gold
+vs a ``SUM(...)`` prediction would otherwise be a false FAIL on formatting).
+No LLM, no agent tool layer — the gold SQL lives in
 the tool-process memory here and never touches the agent-visible mount, which is
 what makes gold-blindness physical (see ``docs/CONVENTIONS.md``).
 
@@ -28,16 +33,19 @@ Two caches make the loop affordable across rounds:
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Callable
 
-# Rows come back from the source as list[dict] (header-keyed). We compare on a
-# canonical, order-insensitive form: a multiset of value-tuples per row, with the
-# COLUMNS also order-insensitive within a row (BIRD compares row value-sets, and
-# a text-to-SQL answer that selects the right values in a different column order
-# is correct). Cells are stringified for stable hashing (Athena returns strings).
+# Rows come back from the source as list[dict] (header-keyed, insertion order =
+# column order). We compare BIRD-style: each row is a POSITIONAL tuple of its
+# cells (sorting within a row would let transposed values — gold ('Hamilton',
+# 'Mercedes') vs predicted ('Mercedes','Hamilton') — pass falsely), and the set
+# of those tuples ignores row order. Numeric-looking cells normalize to Decimal
+# (Athena stringifies everything; BIRD compares native values where 3 == 3.0).
 Row = dict[str, Any]
 Execute = Callable[[str], list[Row]]
 
@@ -64,25 +72,52 @@ class QuestionResult:
     gold_rowcount: int | None = None
     pred_sample: list[list[str]] = field(default_factory=list)
     discard_reason: str = ""
+    # The solver's trace (harvest.benchmark.trace.SolverTrace), attached by the round
+    # AFTER grading — the grader neither produces nor reads it. Typed loosely so the
+    # deterministic grader keeps its zero-import core. None on an untraced solve.
+    trace: Any = None
 
 
 _SAMPLE_ROWS = 5
 
+# A cell that is unambiguously a number AS ATHENA RENDERS ONE (plain or
+# scientific, no leading zeros beyond a bare '0'). Deliberately excludes
+# 'NaN'/'Infinity' (Decimal accepts 'NaN', and NaN != NaN would make identical
+# result sets compare unequal forever) and identifier lookalikes like '007'
+# (a varchar code, not the number 7 — Athena never renders a numeric cell
+# with leading zeros).
+_NUMERIC_RE = re.compile(r"^[+-]?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$")
 
-def _canonical(rows: list[Row]) -> set[tuple[str, ...]]:
-    """Order-insensitive multiset key for a result set.
 
-    Each row → a *sorted* tuple of its stringified cell values (column order
-    doesn't matter), and the set of those tuples ignores row order. ``None``
-    (SQL NULL) is distinguished from the empty string so a genuine NULL mismatch
-    still fails. Note: as a set this drops true duplicate rows — matching BIRD's
-    ``set(pred) == set(gold)`` exactly.
+def _cell(value: Any) -> Any:
+    """One cell's canonical comparison value.
+
+    ``None`` (SQL NULL) maps to a sentinel distinct from the empty string so a
+    genuine NULL mismatch still fails. Numeric-looking strings become
+    ``Decimal`` — Athena returns every cell as text, and BIRD compares native
+    values where ``3 == 3.0`` and ``2.50 == 2.5`` (equal Decimals hash equal,
+    so set comparison stays sound). Everything else compares as its string.
     """
-    canon: set[tuple[str, ...]] = set()
-    for row in rows:
-        cells = tuple(sorted("\x00NULL" if v is None else str(v) for v in row.values()))
-        canon.add(cells)
-    return canon
+    if value is None:
+        return "\x00NULL"
+    s = str(value)
+    if _NUMERIC_RE.match(s.strip()):
+        try:
+            return Decimal(s.strip())
+        except InvalidOperation:  # pragma: no cover - regex should preclude this
+            return s
+    return s
+
+
+def _canonical(rows: list[Row]) -> set[tuple[Any, ...]]:
+    """Row-order-insensitive key for a result set (BIRD semantics).
+
+    Each row → the POSITIONAL tuple of its canonical cell values (column order
+    is meaningful — see :func:`_cell` and the module docstring), and the set of
+    those tuples ignores row order. Note: as a set this drops true duplicate
+    rows — matching BIRD's ``set(pred) == set(gold)`` exactly.
+    """
+    return {tuple(_cell(v) for v in row.values()) for row in rows}
 
 
 def _sample(rows: list[Row]) -> list[list[str]]:

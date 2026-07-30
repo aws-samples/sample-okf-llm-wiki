@@ -138,6 +138,18 @@ variable "harvest_model_catalog" {
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "xhigh"
     },
+    {
+      model          = "global.anthropic.claude-fable-5"
+      label          = "Claude Fable 5"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "xhigh"
+    },
+    {
+      model          = "openai.gpt-5.6-luna"
+      label          = "GPT-5.6 Luna"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "xhigh"
+    },
   ]
 }
 

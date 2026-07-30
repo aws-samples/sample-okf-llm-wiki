@@ -103,6 +103,18 @@ DEFAULT_CATALOG: list[dict[str, Any]] = [
         EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
         DEFAULT_EFFORT_KEY: "xhigh",
     },
+    {
+        MODEL_KEY: "global.anthropic.claude-fable-5",
+        LABEL_KEY: "Claude Fable 5",
+        EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
+        DEFAULT_EFFORT_KEY: "xhigh",
+    },
+    {
+        MODEL_KEY: "openai.gpt-5.6-luna",
+        LABEL_KEY: "GPT-5.6 Luna",
+        EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
+        DEFAULT_EFFORT_KEY: "xhigh",
+    },
 ]
 
 

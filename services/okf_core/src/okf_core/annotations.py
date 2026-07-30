@@ -51,9 +51,12 @@ STATUS_RESOLVED = "resolved"
 
 # Provenance: how the annotation was filed. The chat agent files on the USER'S
 # behalf (their sub is still the partition key — this field is display
-# provenance, never authorization).
+# provenance, never authorization). "benchmark" marks annotations a human
+# selected off a Benchmark Studio report's aggregated set — judged wiki gaps,
+# reviewed by the user before they exist.
 SUBMITTED_VIA_UI = "ui"
 SUBMITTED_VIA_AGENT = "agent"
+SUBMITTED_VIA_BENCHMARK = "benchmark"
 
 # Sentinel concept id for DATASET-LEVEL feedback (a general note with no single
 # page to anchor to). Underscore-prefixed like the `_domain` pseudo-dataset, so

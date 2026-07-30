@@ -225,11 +225,11 @@ function ChartGenerating({ active }) {
 // so without this beat the skeleton would just flash.
 const MIN_GENERATING_MS = 900
 
-function ChartFrameInner({ code, title, live }) {
+function ChartFrameInner({ code, title, live, boxHeight = 340 }) {
   const iframeRef = useRef(null)
-  // Default matches what the frame will report (#chartbox 340px + 8px wrap
+  // Default matches what the frame will report (#chartbox boxHeight + 8px wrap
   // padding, see chartIframe.js) so the placeholder footprint == the reveal.
-  const [height, setHeight] = useState(348)
+  const [height, setHeight] = useState(boxHeight + 8)
   const [status, setStatus] = useState("loading") // loading | ok | error
   const [errorMsg, setErrorMsg] = useState(null)
 
@@ -287,10 +287,10 @@ function ChartFrameInner({ code, title, live }) {
       typeof document !== "undefined"
         ? getComputedStyle(document.body).fontFamily
         : "system-ui, sans-serif"
-    return buildChartSrcdoc({ code, palette, fontFamily })
+    return buildChartSrcdoc({ code, palette, fontFamily, height: boxHeight })
     // themeSig is a dep on purpose: a theme flip must rebuild with new colors.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [code, themeSig])
+  }, [code, themeSig, boxHeight])
 
   // Reset transient status when we (re)build the frame.
   useEffect(() => {
@@ -423,7 +423,13 @@ function ChartFrameInner({ code, title, live }) {
 // from the render_chart tool call's args (see buildMessageBlocks chart block).
 // `live` = the block appeared mid-stream (drives the generating-animation hold);
 // history-loaded charts pass false and plot immediately.
-export function ChartFrame({ code, title, live = false, pending = false }) {
+export function ChartFrame({
+  code,
+  title,
+  live = false,
+  pending = false,
+  height = 340,
+}) {
   const codeStr = typeof code === "string" ? code : ""
   if (!codeStr && !pending) {
     return <ChartError title={title} message="chart had no code to run" />
@@ -437,7 +443,12 @@ export function ChartFrame({ code, title, live = false, pending = false }) {
   // code exists.
   return (
     <ChartBoundary title={title}>
-      <ChartFrameInner code={codeStr} title={title} live={live} />
+      <ChartFrameInner
+        code={codeStr}
+        title={title}
+        live={live}
+        boxHeight={height}
+      />
     </ChartBoundary>
   )
 }

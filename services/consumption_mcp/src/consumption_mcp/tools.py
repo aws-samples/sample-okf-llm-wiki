@@ -36,6 +36,7 @@ from okf_core.document import OKFDocument, OKFDocumentError
 from okf_core.domain import DOMAIN_DOC_TYPE, is_domain_dataset
 from okf_core.links import extract_links_with_headings
 from okf_core.paths import parse_concept_id
+from okf_core.wiki_primer import MCP_PRIMER
 
 _BUNDLE_PREFIX = "okf/"
 _RESERVED_FILES = {"index.md", "log.md"}
@@ -205,6 +206,17 @@ class ConsumptionTools:
         self.bedrock_runtime = bedrock_runtime
         self.ddb = ddb  # a DynamoDB resource Table object (boto3 resource style)
         self.config = config
+
+    # -- read_me ---------------------------------------------------------
+
+    def read_me(self) -> str:
+        """The wiki-usage primer (static; ``okf_core.wiki_primer.MCP_PRIMER``).
+
+        Structure, trap locations, and the navigation moves that work — served
+        as a tool so an agent's FIRST call orients it instead of it re-deriving
+        the layout by trial and error (and never touching ``get_backlinks``).
+        """
+        return MCP_PRIMER
 
     # -- list_domains ----------------------------------------------------
 

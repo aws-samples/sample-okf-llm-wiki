@@ -12,7 +12,8 @@ Payload (from the Control API's InvokeAgentRuntime call):
     "dataset": "orders",              # the dataset id (Glue: the database name)
     "source": {"type": "glue", "glue_database": "orders"},  # source descriptor;
                                       # absent -> default glue source named by dataset
-    "mode": "full" | "incremental" | "annotated" | "cross",
+    "mode": "full" | "incremental" | "annotated" | "cross"
+            | "benchmark" | "aggregate_annotations",
     "changed_table": "customers",     # incremental only
     "diff": {...}                      # incremental only, optional
     "user_sub": "<cognito sub>",      # annotated only (whose annotations)
@@ -20,10 +21,14 @@ Payload (from the Control API's InvokeAgentRuntime call):
     "target": {"data_domain": "crm",  # cross only: the resolved counterpart
                "dataset": "customers",#   (validated by the Control API; carries
                "source": {...}},      #   its source + domain description/context)
+    "report_id": "r...-...",          # benchmark/aggregate only (the REPORT# id)
+    "checks": ["sql","behavior"],     # benchmark only, + runs/version_id/
+                                      #   questions_key/solver_*/judge_* — see
+                                      #   harvest/benchmark/studio.py
     "model": "openai.gpt-5.6-sol",    # optional per-harvest override; falls
     "effort": "xhigh",                # back to OKF_HARVEST_* env when omitted
     "subagent_model": "...",          # optional SUB-AGENT override (authors/
-    "subagent_effort": "high",        # extractors/benchmark); absent -> the
+    "subagent_effort": "high",        # extractors); absent -> the
                                       # supervisor's config
     "reviewer_model": "...",          # optional REVIEWER-only override (cross-
     "reviewer_effort": "high"         # model review); absent -> the sub-agents'
@@ -77,6 +82,20 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
         run_write_domain_doc(payload)
         return
 
+    # Benchmark Studio modes. Hosted here (the container owns the model factory,
+    # the Athena source, and harvest/benchmark/) but NOT harvests: no lease, no
+    # mount, nothing written to the bundle — see harvest/benchmark/studio.py.
+    if mode == "benchmark":
+        from harvest.benchmark.studio import run_benchmark_report
+
+        run_benchmark_report(payload, session_id=session_id)
+        return
+    if mode == "aggregate_annotations":
+        from harvest.benchmark.studio import run_aggregate_annotations
+
+        run_aggregate_annotations(payload, session_id=session_id)
+        return
+
     root = dataset_root(MOUNT_PATH, data_domain, dataset)
     # The Control API threads the resolved source descriptor ({type, ...config})
     # into the payload; build_source dispatches on its type. Absent (an older
@@ -115,11 +134,6 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
     dataset_guidance = payload.get("dataset_guidance")
     dataset_guidance_version = payload.get("dataset_guidance_version")
 
-    # Recursive-improvement config (optional). Presence of the validated block is
-    # the enable signal; the Control API already validated/clamped it. Absent ⇒ a
-    # normal harvest. Threaded into full/incremental/annotated identically.
-    recursive_improvement = payload.get("recursive_improvement")
-
     # Per-harvest model/effort override (chosen in the UI, validated by the
     # Control API against the TF catalog). When absent, resolve_model_config
     # falls back to the deploy-time OKF_HARVEST_* env vars — so this is fully
@@ -157,7 +171,6 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
             dataset_guidance_version=dataset_guidance_version,
-            recursive_improvement=recursive_improvement,
             session_id=session_id,
         )
     elif mode == "cross":
@@ -201,7 +214,6 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
             dataset_guidance_version=dataset_guidance_version,
-            recursive_improvement=recursive_improvement,
             session_id=session_id,
         )
     else:
@@ -217,7 +229,6 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
             dataset_guidance_version=dataset_guidance_version,
-            recursive_improvement=recursive_improvement,
             session_id=session_id,
         )
 
@@ -254,6 +265,15 @@ def _safe(payload: dict) -> dict:
             "dataset",
             "mode",
             "changed_table",
+            "report_id",
+            "checks",
+            "runs",
+            "version_id",
+            "solver_model",
+            "solver_effort",
+            "judge_model",
+            "judge_effort",
+            "behavior_live_sql",
             "model",
             "effort",
             "subagent_model",
@@ -283,6 +303,14 @@ def _validate(payload: dict) -> str | None:
         if not payload.get("data_domain"):
             return "missing required field: data_domain"
         return None
+    if mode == "benchmark":
+        from harvest.benchmark.studio import validate_benchmark_payload
+
+        return validate_benchmark_payload(payload)
+    if mode == "aggregate_annotations":
+        from harvest.benchmark.studio import validate_aggregate_payload
+
+        return validate_aggregate_payload(payload)
     for key in ("data_domain", "dataset"):
         if not payload.get(key):
             return f"missing required field: {key}"

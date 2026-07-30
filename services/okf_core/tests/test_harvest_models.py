@@ -19,6 +19,11 @@ def test_default_catalog_offers_the_full_model_set():
     assert "global.anthropic.claude-opus-5" in models
     assert "global.anthropic.claude-sonnet-5" in models
     assert "openai.gpt-5.6-terra" in models
+    # The Claude 5 flagship tier + the fast GPT-5.6 variant, added on request:
+    # available to the harvest picker (supervisor/sub-agents/reviewer) AND the
+    # benchmark solver/judge — one catalog validates them all.
+    assert "global.anthropic.claude-fable-5" in models
+    assert "openai.gpt-5.6-luna" in models
     # Opus 4.8 stays FIRST — the first entry is the UI picker's default; the
     # others are additional offerings, not a new default.
     assert models[0] == "global.anthropic.claude-opus-4-8"

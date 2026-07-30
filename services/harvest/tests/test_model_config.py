@@ -347,3 +347,53 @@ def test_build_model_dispatches_gpt_to_mantle(monkeypatch):
     ag._build_model("openai.gpt-5.6-sol", "high", 32000, callbacks=None)
 
     assert captured["model"] == "openai.gpt-5.6-sol"  # went through the OpenAI stub
+
+
+def test_build_model_surfaces_reasoning_when_asked_converse(monkeypatch):
+    # The benchmark SOLVER builds its model with surface_reasoning=True so its
+    # thinking comes back in the messages (the solver trace's `thinking` steps).
+    import sys
+    import types
+
+    captured: dict = {}
+
+    class _FakeConverse:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    law = types.ModuleType("langchain_aws")
+    law.ChatBedrockConverse = _FakeConverse
+    monkeypatch.setitem(sys.modules, "langchain_aws", law)
+
+    ag._build_model("us.anthropic.claude-opus-4-8", "high", 32000)
+    assert captured["additional_model_request_fields"]["thinking"] == {
+        "type": "adaptive"
+    }
+
+    ag._build_model(
+        "us.anthropic.claude-opus-4-8", "high", 32000, surface_reasoning=True
+    )
+    assert captured["additional_model_request_fields"]["thinking"] == {
+        "type": "adaptive",
+        "display": "summarized",
+    }
+
+
+def test_build_model_surfaces_reasoning_when_asked_gpt(monkeypatch):
+    for k in ("OKF_HARVEST_MANTLE_REGION", "OKF_HARVEST_MANTLE_BASE_URL",
+              "OKF_HARVEST_MANTLE_USE_RESPONSES_API"):
+        monkeypatch.delenv(k, raising=False)
+    captured, _state = _install_openai_stubs(monkeypatch)
+
+    ag._build_model("openai.gpt-5.6-sol", "high", 32000)
+    # Default: plain effort, no summary requested, no reasoning in the content.
+    assert captured["reasoning_effort"] == "high"
+    assert "reasoning" not in captured
+
+    captured.clear()
+    ag._build_model("openai.gpt-5.6-sol", "high", 32000, surface_reasoning=True)
+    # The `reasoning` object replaces reasoning_effort, and output_version puts
+    # the summary into message CONTENT where the trace capture reads it.
+    assert captured["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert captured["output_version"] == "responses/v1"
+    assert "reasoning_effort" not in captured

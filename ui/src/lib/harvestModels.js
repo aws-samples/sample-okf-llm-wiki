@@ -39,6 +39,18 @@ const FALLBACK_CATALOG = [
     efforts: ["low", "medium", "high", "xhigh", "max"],
     default_effort: "xhigh",
   },
+  {
+    model: "global.anthropic.claude-fable-5",
+    label: "Claude Fable 5",
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+    default_effort: "xhigh",
+  },
+  {
+    model: "openai.gpt-5.6-luna",
+    label: "GPT-5.6 Luna",
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+    default_effort: "xhigh",
+  },
 ]
 
 function decodeCatalog(raw) {
@@ -73,11 +85,20 @@ export function defaultEffortFor(model) {
 
 // -- picker grouping ---------------------------------------------------------
 // The pickers render the catalog grouped by provider family, most capable
-// first within each family: tier (Opus > Sonnet > Haiku; Sol > Terra > Luna),
-// then newer version. Ranking is a heuristic over the model id — an id with an
-// unknown tier or version sorts last in its family instead of breaking.
+// first within each family: tier (Fable > Opus > Sonnet > Haiku; Sol > Terra
+// > Luna), then newer version. Ranking is a heuristic over the model id — an
+// id with an unknown tier or version sorts last in its family instead of
+// breaking. Fable is Anthropic's Mythos-class tier ABOVE Opus, hence rank -1.
 const FAMILY_ORDER = ["Anthropic", "OpenAI", "Other"]
-const TIER_RANK = { opus: 0, sol: 0, sonnet: 1, terra: 1, haiku: 2, luna: 2 }
+const TIER_RANK = {
+  fable: -1,
+  opus: 0,
+  sol: 0,
+  sonnet: 1,
+  terra: 1,
+  haiku: 2,
+  luna: 2,
+}
 
 function familyOf(model) {
   if (model.startsWith("openai.") || model.startsWith("gpt-")) return "OpenAI"
@@ -92,9 +113,9 @@ function tierRankOf(model) {
   return 9
 }
 
-// "claude-opus-4-8" -> 4.8, "claude-sonnet-5" -> 5, "gpt-5.6-terra" -> 5.6.
+// "claude-opus-4-8" -> 4.8, "claude-fable-5" -> 5, "gpt-5.6-terra" -> 5.6.
 function versionOf(model) {
-  const m = model.match(/(?:opus|sonnet|haiku|gpt)[-.]?(\d+)(?:[.-](\d+))?/)
+  const m = model.match(/(?:fable|opus|sonnet|haiku|gpt)[-.]?(\d+)(?:[.-](\d+))?/)
   if (!m) return 0
   return parseInt(m[1], 10) + (m[2] ? parseInt(m[2], 10) / 10 : 0)
 }

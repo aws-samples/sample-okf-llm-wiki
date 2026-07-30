@@ -129,3 +129,21 @@ def test_prompt_teaches_cross_dataset_references():
     assert "cannot run harvests" in low
     assert "Cross-dataset discovery…" in SYSTEM_PROMPT
     assert "zero docs" in low  # no-convergence is a valid outcome to explain
+
+
+def test_prompt_teaches_the_wiki_structure_leanly():
+    # The primer content (bundle shape, trap locations, the backlinks habit)
+    # rides the STATIC prompt — chat has one shared prompt for Opus and GPT,
+    # so both families get it, and it sits in the cached prefix. Budget-pinned
+    # so it stays lean: the agent should get the map, not a manual.
+    assert "<wiki_structure>" in SYSTEM_PROMPT
+    for token in (
+        "index.md",
+        "usage_guardrails",
+        "known_issues",
+        "get_backlinks",
+        "grain",
+    ):
+        assert token in SYSTEM_PROMPT
+    block = SYSTEM_PROMPT.split("<wiki_structure>")[1].split("</wiki_structure>")[0]
+    assert len(block) < 1500, f"wiki_structure block grew to {len(block)} chars"

@@ -119,67 +119,15 @@ def test_metadata_dir_is_read_only(monkeypatch):
         called["n"] += 1
         return "SHOULD NOT RUN"
 
-    for path in (
-        ".metadata/tables/races.md",
-        "/.metadata/columns.tsv",
-        ".metadata/index.md",
-    ):
-        req = _request(name="write_file", file_path=path, content="x")
-        result = mw.wrap_tool_call(req, handler)
-        assert isinstance(result, dict), f"{path} should be refused"
-        assert "read-only" in result["content"]
-    assert called["n"] == 0  # handler never ran for any metadata path
-
-
-def test_benchmark_budget_none_is_inert():
-    # A normal harvest (no RI): run_benchmark isn't even registered, but if some
-    # call arrived the guard must pass it through (budget None → no counting).
-    mw = _mw(_AllowEngine())  # default benchmark_budget=None
-    req = types.SimpleNamespace(
-        tool_call={"name": "run_benchmark", "args": {}, "id": "b-1"}
+    req = _request(
+        name="write_file",
+        file_path=".metadata/tables/races.md",
+        content="---\ntype: Glue Table\n---\n",
     )
-    assert mw.wrap_tool_call(req, lambda r: "RAN") == "RAN"
-
-
-def test_benchmark_budget_allows_up_to_limit_then_refuses(monkeypatch):
-    monkeypatch.setattr(
-        okf_guard,
-        "ToolMessage",
-        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
-    )
-    mw = OKFGuardMiddleware(
-        _AllowEngine(), read_current=lambda _p: None, benchmark_budget=3
-    )
-    ran = {"n": 0}
-
-    def handler(r):
-        ran["n"] += 1
-        return "RAN"
-
-    def _bench():
-        req = types.SimpleNamespace(
-            tool_call={"name": "run_benchmark", "args": {}, "id": "b"}
-        )
-        return mw.wrap_tool_call(req, handler)
-
-    # First 3 calls run; the 4th is refused with a budget message.
-    assert _bench() == "RAN"
-    assert _bench() == "RAN"
-    assert _bench() == "RAN"
-    result = _bench()
-    assert isinstance(result, dict)
-    assert "budget" in result["content"]
-    assert ran["n"] == 3  # handler ran exactly the budgeted number of times
-
-
-def test_benchmark_budget_does_not_affect_write_guarding(monkeypatch):
-    # A benchmark budget must not change how ordinary .md writes are guarded.
-    mw = OKFGuardMiddleware(
-        _AllowEngine(), read_current=lambda _p: None, benchmark_budget=5
-    )
-    req = _request(content="body")
-    assert mw.wrap_tool_call(req, lambda r: "ok") == "ok"
-    assert req.tool_call["args"]["content"].endswith("<normalized>")
+    result = mw.wrap_tool_call(req, handler)
+    assert called["n"] == 0  # short-circuited before the handler
+    assert isinstance(result, dict) and result["status"] == "error"
+    assert "read-only" in result["content"]
 
 
 def test_edit_into_metadata_dir_also_refused(monkeypatch):
@@ -198,6 +146,50 @@ def test_edit_into_metadata_dir_also_refused(monkeypatch):
     result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
     assert isinstance(result, dict)
     assert "read-only" in result["content"]
+
+
+def test_delete_tool_always_refused(monkeypatch):
+    # deepagents ≥0.7 exposes a recursive `delete` fs tool to every agent whose
+    # backend supports it. Nothing in a bundle is ever deleted by an agent —
+    # the guard refuses it unconditionally, for ANY path or extension, before
+    # the engine is even consulted.
+    monkeypatch.setattr(
+        okf_guard,
+        "ToolMessage",
+        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
+    )
+    mw = _mw(_AllowEngine())  # engine would allow writes; delete never reaches it
+    for path in ("tables/races.md", "notes.txt", "external/crm/customers"):
+        req = _request(name="delete", file_path=path)
+        result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+        assert isinstance(result, dict) and result["status"] == "error"
+        assert "delete" in result["content"]
+
+
+def test_read_only_guard_refuses_all_writes(monkeypatch):
+    # The reviewer/context-extractor variant: verify-and-report agents get a
+    # guard that refuses EVERY write/edit at the tool boundary (deepagents
+    # hands every sub-agent the backend's write tools, so read-only can't be
+    # left to the prompt). Reads/other tools pass through untouched.
+    monkeypatch.setattr(
+        okf_guard,
+        "ToolMessage",
+        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
+    )
+    mw = OKFGuardMiddleware(
+        _AllowEngine(), read_current=lambda _p: None, read_only=True
+    )
+    for name, args in (
+        ("write_file", {"content": "x"}),
+        ("edit_file", {"old_string": "a", "new_string": "b"}),
+        ("delete", {}),
+    ):
+        req = _request(name=name, **args)
+        result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+        assert isinstance(result, dict) and result["status"] == "error"
+    # Non-guarded tools (reads) are untouched.
+    req = _request(name="read_file")
+    assert mw.wrap_tool_call(req, lambda r: "READ") == "READ"
 
 
 # --------------------------------------------------------------------------- #

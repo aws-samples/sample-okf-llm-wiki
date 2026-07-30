@@ -1,6 +1,10 @@
 # Runtime deps for the harvest AgentCore container.
 # okf-core is installed from the local wheel/source in the Docker build.
-deepagents>=0.6.12,<0.8
+# 0.7.0 breaking changes are accounted for in agent.py/okf_guard.py/solver.py:
+# TodoListMiddleware is attached explicitly (no longer a default), the new
+# `delete` fs tool is refused by the OKF guard, and backend.read() returns a
+# ReadResult (rendered in the benchmark solver's read tool).
+deepagents>=0.7.0,<0.8
 langchain>=1.3
 # ChatBedrockConverse (agent.py) — standalone partner package, declared explicitly.
 # >=1.6.4 adds Claude Opus 5 streaming (kept in lockstep with the chat container).

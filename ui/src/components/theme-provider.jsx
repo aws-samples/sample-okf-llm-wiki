@@ -34,6 +34,14 @@ export function ThemeProvider({
     const resolved = theme === "system" ? getSystemTheme() : theme
     root.classList.remove("light", "dark")
     root.classList.add(resolved)
+    // The pre-paint script in index.html/callback.html put an inline HEX
+    // background + color-scheme on <html> (so the first frame paints in-theme
+    // before the stylesheet exists). Once React owns the theme, swap the hex
+    // for the live token so runtime toggles recolor it (a stale inline hex
+    // shows in overscroll/rubber-band areas), and keep color-scheme in sync
+    // for native scrollbars/controls.
+    root.style.colorScheme = resolved
+    root.style.backgroundColor = "var(--background)"
   }, [theme])
 
   const value = React.useMemo(() => ({ theme, setTheme }), [theme, setTheme])

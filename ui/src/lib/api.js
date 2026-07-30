@@ -28,6 +28,18 @@ async function request(token, method, path, body) {
   return ct.includes("application/json") ? res.json() : res.text()
 }
 
+// Fetch a large benchmark artifact from its presigned S3 URL. The auth lives
+// in the URL's signature (vended inside a Cognito-authed response, minutes of
+// validity) — no bearer header, and an explicitly anonymous request so no
+// stray credentials ride along.
+async function fetchPresignedJson(url, what) {
+  const res = await fetch(url, { credentials: "omit" })
+  if (!res.ok) {
+    throw new Error(`could not fetch the ${what} document (${res.status})`)
+  }
+  return res.json()
+}
+
 // Build an API bound to one token. Components call useApi(token) once.
 export function makeApi(token) {
   return {
@@ -249,18 +261,38 @@ export function makeApi(token) {
     // modal's partial apply. Omitted = every in-scope note. `crossTarget`
     // ("<domain>/<dataset>", cross scope only) names the pair the run verifies
     // against, so its Glue DB is granted even on a general-notes-only run.
-    runAnnotationHarvest: (domain, dataset, scope, annotationIds, crossTarget) =>
+    // The model/effort triple mirrors startHarvest's — applying annotations is
+    // a harvest like any other, so it honors the SAME picker selection a full
+    // harvest would (was previously dropped, always running on the runtime's
+    // deploy-time default regardless of what the user had picked).
+    runAnnotationHarvest: (
+      domain,
+      dataset,
+      scope,
+      annotationIds,
+      crossTarget,
+      model,
+      effort,
+      subagentModel,
+      subagentEffort,
+      reviewerModel,
+      reviewerEffort
+    ) =>
       request(
         token,
         "POST",
         `/harvest/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/annotations/run`,
-        scope || annotationIds
-          ? {
-              ...(scope ? { scope } : {}),
-              ...(annotationIds ? { annotation_ids: annotationIds } : {}),
-              ...(crossTarget ? { cross_target: crossTarget } : {}),
-            }
-          : undefined
+        {
+          ...(scope ? { scope } : {}),
+          ...(annotationIds ? { annotation_ids: annotationIds } : {}),
+          ...(crossTarget ? { cross_target: crossTarget } : {}),
+          ...(model ? { model } : {}),
+          ...(effort ? { effort } : {}),
+          ...(subagentModel ? { subagent_model: subagentModel } : {}),
+          ...(subagentEffort ? { subagent_effort: subagentEffort } : {}),
+          ...(reviewerModel ? { reviewer_model: reviewerModel } : {}),
+          ...(reviewerEffort ? { reviewer_effort: reviewerEffort } : {}),
+        }
       ),
 
     // Dataset guidance: shared, persistent authoring instructions that steer every
@@ -281,26 +313,11 @@ export function makeApi(token) {
         { guidance }
       ),
 
-    // Recursive-improvement benchmark. GET/PUT the dataset's saved settings
-    // ({enabled, questions_key, max_iterations}); the PUT is validated + clamped
-    // server-side (400 on a bad value). The stop target is FIXED (judge accuracy
-    // >= 90%), so it is not a setting. The CSV (question,gold_sql) uploads via a
-    // SEPARATE presign that pins an OFF-MOUNT key (benchmark/<d>/<ds>/questions.csv,
-    // NOT under okf/) so the gold is unreadable by the harvest agent — see
+    // Benchmark Studio. The question CSV (one gold column per check) uploads via
+    // a presign that pins an OFF-MOUNT key (benchmark/<d>/<ds>/questions.csv, NOT
+    // under okf/) so the gold is unreadable by every LLM role; a RUN is a
+    // standalone evaluation (no harvest, no lease) that persists a REPORT — see
     // docs/CONVENTIONS.md and docs/BENCHMARK_GUIDE.md.
-    getBenchmarkSettings: (domain, dataset) =>
-      request(
-        token,
-        "GET",
-        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}`
-      ),
-    setBenchmarkSettings: (domain, dataset, settings) =>
-      request(
-        token,
-        "PUT",
-        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}`,
-        settings
-      ),
     presignBenchmarkUpload: (domain, dataset, contentType) =>
       request(
         token,
@@ -308,26 +325,90 @@ export function makeApi(token) {
         `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/presign`,
         { content_type: contentType }
       ),
-    // Parse the uploaded CSV with the SAME parser the harvest runtime uses and
-    // report {uploaded, valid, count, total_in_csv, dropped, capped, error} — so
-    // the UI shows the exact question count a harvest would benchmark, and flags a
-    // bad format before the user relies on it.
+    // Parse the uploaded CSV with the SAME parser the benchmark runtime uses and
+    // report {uploaded, valid, count, check_counts, dropped, capped, error} — so
+    // the UI shows exactly what each check would grade, and flags a bad format
+    // at upload.
     inspectBenchmarkQuestions: (domain, dataset) =>
       request(
         token,
         "GET",
         `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/questions`
       ),
-    // One benchmark round's per-question review (all buckets, with gold + predicted
-    // SQL). Off-mount S3 read behind the Cognito-authed API — this gold-carrying
-    // detail is NEVER exposed to the harvest agent, only to the human here. 404 if
-    // the round hasn't persisted a review. session = runtime_session_id from the
-    // harvest feed; iteration = 0-based round index.
-    getBenchmarkReview: (domain, dataset, session, iteration) =>
+    // Start a run: {checks, runs, solver_model?, solver_effort?, judge_model?,
+    // judge_effort?, version_id?}. Validated server-side (models against the
+    // harvest catalog; the CSV must carry participants for an enabled check).
+    // Returns {report_id, status:"queued", ...} — the list poller takes it from
+    // there.
+    startBenchmarkRun: (domain, dataset, config) =>
+      request(
+        token,
+        "POST",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/runs`,
+        config
+      ),
+    // Every report row for the dataset, newest first — flat index rows: status,
+    // config summary, live progress stamps (phase/check/run/current/total), and
+    // headline KPIs once complete. The full document is a separate fetch.
+    listBenchmarkReports: (domain, dataset) =>
       request(
         token,
         "GET",
-        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/reviews/${encodeURIComponent(session)}/${encodeURIComponent(iteration)}`
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/runs`
+      ),
+    // One report: {row, report} — report is null until the run completes. A
+    // document too large to ride the Lambda response arrives as report_url (a
+    // short-lived presigned S3 GET); follow it here so callers always see the
+    // same {row, report} shape.
+    getBenchmarkReport: async (domain, dataset, reportId) => {
+      const res = await request(
+        token,
+        "GET",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/runs/${encodeURIComponent(reportId)}`
+      )
+      if (res && !res.report && res.report_url) {
+        res.report = await fetchPresignedJson(res.report_url, "report")
+      }
+      return res
+    },
+    // The report's solver traces (per failed question/check/run: reasoning, tool
+    // calls, files read). Large — fetched lazily when a human opens a row's
+    // steps, and routinely past the Lambda response cap, in which case the
+    // handler answers {traces_url} and the document is fetched from S3 here.
+    getBenchmarkReportTraces: async (domain, dataset, reportId) => {
+      const res = await request(
+        token,
+        "GET",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/runs/${encodeURIComponent(reportId)}/traces`
+      )
+      if (res && !res.traces && res.traces_url) {
+        return fetchPresignedJson(res.traces_url, "solver traces")
+      }
+      return res
+    },
+    deleteBenchmarkReport: (domain, dataset, reportId) =>
+      request(
+        token,
+        "DELETE",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/runs/${encodeURIComponent(reportId)}`
+      ),
+    // Kick the annotation aggregator for a complete report (409 while one runs).
+    // Progress lands on the row's agg_status; the final set in the report JSON.
+    aggregateReportAnnotations: (domain, dataset, reportId) =>
+      request(
+        token,
+        "POST",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/runs/${encodeURIComponent(reportId)}/aggregate`
+      ),
+    // Batch-create the user's SELECTED final annotations ([{note, concept_id?}])
+    // with submitted_via="benchmark"; a normal annotation harvest then applies
+    // them (runAnnotationHarvest with the returned ids).
+    applyReportAnnotations: (domain, dataset, reportId, annotations) =>
+      request(
+        token,
+        "POST",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/runs/${encodeURIComponent(reportId)}/annotations`,
+        { annotations }
       ),
 
     // Chat conversations (the per-user sidebar list). The chat RUNTIME writes the

@@ -410,9 +410,10 @@ def test_scope_filter_reverts_out_of_scope_in_review_stragglers(cfg):
     assert items[_EXTERNAL_CONCEPT]["status"] == "open"
 
 
-def test_cross_scope_omits_ri_settings(cfg):
-    # The RI loop measures (and edits) the dataset's OWN wiki — exactly what a
-    # cross-scoped run excludes. Same exclusion as mode="cross".
+def test_no_run_carries_recursive_improvement(cfg):
+    # The RI loop is RETIRED: even a dataset with a legacy saved
+    # recursive_improvement map gets a plain harvest payload — the harvester can
+    # no longer benchmark (Benchmark Studio is a separate run mode).
     _seed_scoped_annotations(cfg)
     cfg.ddb.update_item(
         TableName=REGISTRY,
@@ -428,25 +429,19 @@ def test_cross_scope_omits_ri_settings(cfg):
             }
         },
     )
-    r = _run_annotations(cfg, scope="cross")
-    assert _json(r)["annotations"] == 1
-    payload = _harvest_calls(cfg)[0]
-    assert "recursive_improvement" not in payload
-
-    # Release the first run's lease (the fake runtime never reports terminal)
-    # so the second run isn't refused with a 409.
-    cfg.ddb.update_item(
-        TableName=REGISTRY,
-        Key={"pk": {"S": "HARVEST#sales#orders"}, "sk": {"S": "STATUS"}},
-        UpdateExpression="SET #s = :s",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": {"S": "complete"}},
-    )
-
-    # A dataset-scoped run keeps the existing behavior: RI rides along.
-    r = _run_annotations(cfg, scope="dataset")
-    assert _json(r)["annotations"] == 1
-    assert "recursive_improvement" in _harvest_calls(cfg)[-1]
+    for scope in ("cross", "dataset"):
+        r = _run_annotations(cfg, scope=scope)
+        assert _json(r)["annotations"] == 1
+        assert "recursive_improvement" not in _harvest_calls(cfg)[-1]
+        # Release the lease so the next scope's run isn't refused with a 409
+        # (the fake runtime never reports terminal).
+        cfg.ddb.update_item(
+            TableName=REGISTRY,
+            Key={"pk": {"S": "HARVEST#sales#orders"}, "sk": {"S": "STATUS"}},
+            UpdateExpression="SET #s = :s",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": {"S": "complete"}},
+        )
 
 
 def test_annotation_run_rejects_unknown_scope(cfg):

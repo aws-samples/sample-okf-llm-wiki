@@ -230,6 +230,75 @@ def test_run_invokes_with_only_live_annotations(cfg):
     assert items["status 9 means refunds"]["status"] == "in_review"
 
 
+def test_run_omits_model_effort_by_default(cfg):
+    # No model/effort in the body -> not in the payload (runtime uses env
+    # default) — same contract as POST /harvest.
+    _seed_doc(cfg)
+    app.route(
+        _event(
+            "POST",
+            "/annotations/sales/orders",
+            body={"concept_id": "tables/races", "quote": "status 9 means refunds",
+                  "note": "wrong"},
+        ),
+        cfg,
+    )
+    _run(cfg)
+    payload = json.loads(cfg.agentcore.calls[-1]["payload"].decode())
+    assert "model" not in payload and "effort" not in payload
+    assert "subagent_model" not in payload and "reviewer_model" not in payload
+
+
+def test_run_forwards_valid_model_effort_triple(cfg):
+    # Applying annotations is a harvest like any other — it must honor the SAME
+    # per-harvest model/effort override triple (supervisor / sub-agents /
+    # reviewer) that a full harvest accepts, not silently fall back to the
+    # runtime's deploy-time default regardless of what the operator picked.
+    _seed_doc(cfg)
+    app.route(
+        _event(
+            "POST",
+            "/annotations/sales/orders",
+            body={"concept_id": "tables/races", "quote": "status 9 means refunds",
+                  "note": "wrong"},
+        ),
+        cfg,
+    )
+    resp = _run(
+        cfg,
+        body={
+            "model": "openai.gpt-5.6-sol",
+            "effort": "high",
+            "subagent_model": "global.anthropic.claude-sonnet-5",
+            "reviewer_model": "openai.gpt-5.6-terra",
+            "reviewer_effort": "max",
+        },
+    )
+    assert resp["statusCode"] == 200
+    payload = json.loads(cfg.agentcore.calls[-1]["payload"].decode())
+    assert payload["model"] == "openai.gpt-5.6-sol"
+    assert payload["effort"] == "high"
+    assert payload["subagent_model"] == "global.anthropic.claude-sonnet-5"
+    assert payload["reviewer_model"] == "openai.gpt-5.6-terra"
+    assert payload["reviewer_effort"] == "max"
+
+
+def test_run_unknown_model_400(cfg):
+    _seed_doc(cfg)
+    app.route(
+        _event(
+            "POST",
+            "/annotations/sales/orders",
+            body={"concept_id": "tables/races", "quote": "status 9 means refunds",
+                  "note": "wrong"},
+        ),
+        cfg,
+    )
+    resp = _run(cfg, body={"model": "anthropic.made-up"})
+    assert resp["statusCode"] == 400
+    assert cfg.agentcore.calls == []  # never invoked; nothing flipped in_review
+
+
 def test_run_all_orphaned_skips_invoke_and_completes(cfg):
     _seed_doc(cfg, body="nothing relevant")
     app.route(

@@ -46,6 +46,47 @@ def message_text(message: Any) -> str:
     return str(content or "")
 
 
+def reasoning_text(message: Any) -> str:
+    """Extract the THINKING text of a model message (the inverse of ``message_text``).
+
+    Adaptive thinking returns reasoning as its own content blocks, which
+    ``message_text`` deliberately skips. The solver TRACE wants them (the reasoning
+    is the most useful part of "what did this solver actually do"), so this pulls
+    them out, tolerating the provider shapes ``chat/server.py`` already handles:
+    Converse ``{"type":"reasoning_content","reasoning_content":{"text":…}}`` (or a
+    bare string), GPT Responses ``{"type":"reasoning","summary":[{"text":…}]}``, and
+    a plain ``{"type":"thinking","thinking":…}``. Returns "" when there is none.
+    """
+    content = getattr(message, "content", message)
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") not in ("reasoning_content", "reasoning", "thinking"):
+            continue
+        parts.append(_reasoning_block_text(block))
+    return "".join(p for p in parts if p)
+
+
+def _reasoning_block_text(block: dict) -> str:
+    """The text inside one reasoning block, across provider shapes."""
+    for key in ("reasoning_content", "thinking", "summary"):
+        value = block.get(key)
+        if isinstance(value, dict):
+            return str(value.get("text") or "")
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(
+                str(item.get("text") or "")
+                for item in value
+                if isinstance(item, dict)
+            )
+    return str(block.get("text") or "")
+
+
 def extract_sql(text: Any) -> str:
     """Pull the SQL query out of a reply — the last fenced block, else the text.
 
@@ -60,6 +101,16 @@ def extract_sql(text: Any) -> str:
     if blocks:
         return blocks[-1].strip()
     return s.strip()
+
+
+def extract_text(text: Any) -> str:
+    """The reply's plain text, stripped — for checks whose prediction IS prose.
+
+    The Behavior check's solver answers in free-form text (no fence protocol);
+    its whole final message is the prediction the judge grades. Thinking blocks
+    are already skipped by ``message_text``.
+    """
+    return message_text(text).strip()
 
 
 def extract_json(text: Any, default: Any = None) -> Any:

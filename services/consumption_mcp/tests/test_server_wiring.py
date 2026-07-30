@@ -17,10 +17,12 @@ class FakeMCP:
 
     def __init__(self):
         self.registered: dict[str, object] = {}
+        self.descriptions: dict[str, str | None] = {}
 
-    def tool(self):
+    def tool(self, description: str | None = None):
         def deco(fn):
             self.registered[fn.__name__] = fn
+            self.descriptions[fn.__name__] = description
             return fn
 
         return deco
@@ -30,6 +32,7 @@ def test_register_tools_registers_all(tools):
     mcp = FakeMCP()
     server.register_tools(mcp, tools)
     assert set(mcp.registered) == {
+        "read_me",
         "list_domains",
         "list_declared_domains",
         "search_domains",
@@ -40,6 +43,19 @@ def test_register_tools_registers_all(tools):
         "glob",
         "grep",
     }
+
+
+def test_read_me_leads_with_the_use_first_instruction(tools):
+    # The description is the contract: an agent must be told to call this
+    # BEFORE exploring, and the body must teach the moves this surface has.
+    mcp = FakeMCP()
+    server.register_tools(mcp, tools)
+    desc = mcp.descriptions["read_me"]
+    assert desc is not None
+    assert desc.startswith("Use this tool FIRST, before exploring the wiki")
+    primer = mcp.registered["read_me"]()
+    assert "get_backlinks" in primer
+    assert "index.md" in primer
 
 
 def test_registered_wrappers_delegate(tools):

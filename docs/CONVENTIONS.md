@@ -200,17 +200,10 @@ dataset-guidance attrs `{guidance, guidance_updated_at, guidance_applied_version
 pre-existing `META` row for the same `pk` (enforced by `assert_domain_declared`
 in the upsert adapter).
 
-Optionally also carries **recursive-improvement settings** under a single nested
-`recursive_improvement` map: `{enabled, questions_key, max_iterations}` (see
-`docs/BENCHMARK_GUIDE.md` and the harvest payload's `recursive_improvement`
-block below). The stop target is **fixed** (judge accuracy ≥ 90%), so it is NOT a
-setting — legacy `ex_threshold`/`judge_threshold`/`gate_kpis` keys are ignored by
-the validator. These are the
-dataset's saved benchmark config: when `enabled` is true the Control API copies
-this map (validated) into the harvest invocation payload on **every** trigger for
-the dataset — `full`, `incremental`, and `annotated` alike — so a dataset once
-configured keeps benchmarking on each re-harvest without re-uploading the CSV.
-Absent or `enabled=false` ⇒ the feature is entirely inert for the dataset.
+A legacy `recursive_improvement` map may still sit on old `DATASET#` rows; it is
+**dead** — the in-harvest recursive-improvement loop is retired (harvests never
+benchmark; see the Benchmark Studio sections below) and nothing reads or writes
+the attribute anymore.
 
 `source` is the first-class, future-extensible **source descriptor** — a nested
 map `{type, ...type-specific config}` naming WHERE the dataset's data lives and
@@ -396,27 +389,30 @@ poll scans only a recent window instead of the whole run. On first load
 page mid-run backfills the whole current run. `OKF_STEP` is a frozen marker
 shared by `harvest.steps` and `control_api.handlers`.
 
-**Benchmark KPI (recursive improvement).** `pk = "HARVEST#<data_domain>#<dataset>"`,
-`sk = "BENCH#<runtime_session_id>#<iteration>"`, attrs `{iteration,
-runtime_session_id, ex_score, judge_accuracy, passed, failed, discarded, graded,
-genuine_error_count, target_met, created_at}`. One row per benchmark round of a
-recursive-improvement run (see `docs/BENCHMARK_GUIDE.md`); `graded = passed
-+ failed`, `ex_score = passed / graded` (DISCARDED questions — gold that can't
-bind to the schema — are excluded from both). `target_met` is true once judge
-accuracy ≥ 0.9 (the fixed target) with EX > 0. A terminal
-`sk = "BENCH#<runtime_session_id>#final"` row carries the shipped iteration's
-numbers. (No checkpoint/restore — the agent owns the final bundle; whatever it
-authored is what ships.) Written
-**append-only** (`PutItem`, never read-modify-write) best-effort by the harvest
-runtime — a KPI write must never crash a harvest, same discipline as
-`report_status`. The `runtime_session_id` in the `sk` scopes rows to one run: a
-reader gets *this* job's KPIs by reading the STATUS row's `runtime_session_id`
-(same correlation the events feed uses) then `Query begins_with(sk,
-"BENCH#<session>")`, so prior runs' rows can't be confused for the current one.
-These rows sit on the same partition as the dataset's `STATUS` lease but never
-collide with it (distinct `sk` prefix) and carry no lease semantics. Emitted live
-in parallel as an `OKF_STEP` `kind:"benchmark"` event so the UI shows KPIs mid-run
-(the CloudWatch feed is the live view; this row is the durable/queryable record).
+**Benchmark report index (Benchmark Studio).** `pk =
+"HARVEST#<data_domain>#<dataset>"`, `sk = "REPORT#<report_id>"` — one row per
+standalone benchmark run (`okf_core.benchmark_report` owns the shapes; the
+retired RI loop's `BENCH#` rows have no successor and old ones are ignorable).
+Report ids are time-prefixed (`r<UTC compact>-<hex>`, charset-locked by
+`is_valid_report_id`) so the sk RANGE ordering is chronological — the report
+list is one `Query begins_with(sk, "REPORT#")`, `ScanIndexForward=False`, no
+GSI. **Flat scalars only** (structure lives in the S3 report JSON): `status`
+(`queued → running → complete | failed`), `created_at`/`started_at`/
+`completed_at`/`updated_at`, `detail` (failure reason), config summary
+(`checks` as a CSV string, `runs`, `solver_model`/`solver_effort`,
+`judge_model`/`judge_effort`, `version_id`, `question_count`, `count_<check>`),
+`runtime_session_id`, `requested_by`, live progress stamps (`phase`,
+`progress_check`, `progress_run`, `total_runs`, `progress_current`,
+`progress_total` — throttled UpdateItems from the runtime; the Benchmark list
+POLLS rows for live progress, there is no benchmark CloudWatch feed), headline
+KPIs once complete (`<check>_raw`, `<check>_adjusted`, `<check>_graded`,
+`total_tokens`, `annotation_candidates`), and the annotation-aggregation
+sub-lifecycle (`agg_status`: `idle | running | complete | failed`,
+`annotation_final_count`). The Control API writes the QUEUED row (conditional
+PutItem) and invokes the runtime; the runtime owns everything after via
+UpdateItem. **No lease semantics**: benchmark runs never touch the `STATUS`
+row — they write nothing to the bundle, so they run concurrently with harvests
+and with each other. Rows persist until the user deletes the report (no TTL).
 
 **Cross-dataset reference signal (derived).** `pk = "DOMAIN#<target_domain>"`,
 `sk = "XREF#<target_dataset>#<source_domain>#<source_dataset>"`, attrs
@@ -644,11 +640,24 @@ or, for an annotation run (apply a user's wiki feedback in place):
       "quote": "one row per order", "prefix": "", "suffix": "",
       "block_line": 12, "note": "grain is per line-item, not per order" }
   ],
+  "model": "openai.gpt-5.6-sol", "effort": "high",
+  "subagent_model": "…", "subagent_effort": "…",
+  "reviewer_model": "…", "reviewer_effort": "…",
   "domain_description": "Revenue & order pipelines",
   "domain_context": "Covers all B2C sales; refunds excluded.",
   "dataset_guidance": "Ignore the staging_* tables; status is decoded in the dictionary.",
   "dataset_guidance_version": "2026-07-17T09:00:00+00:00" }
 ```
+
+Applying annotations is a harvest like any other, so `model`/`effort` (+ the
+`subagent_*`/`reviewer_*` pairs) are the SAME optional per-harvest override
+triple `mode: "full"` accepts — same three scopes (supervisor / sub-agents /
+reviewer), same catalog validation at the Control API trust boundary, same
+fallback when omitted (the runtime's deploy-time `OKF_HARVEST_MODEL`/
+`OKF_HARVEST_EFFORT`). The UI's harvest picker sends its current selection on
+an annotation run, so applying annotations honors whatever model an operator
+had chosen for full harvests of this dataset, rather than silently reverting
+to the deploy-time default.
 
 `dataset_guidance` (optional, on every mode) is the dataset's shared authoring
 guidance — persistent, editable operator instructions (registry
@@ -660,51 +669,109 @@ there are live annotations **or** the guidance is dirty — so editing guidance 
 re-running applies it even with zero annotations (a guidance-only re-harvest,
 `annotations: []`).
 
-`recursive_improvement` (optional, on `full`/`incremental`/`annotated`) enables
-the benchmark-driven improvement loop for the run (see
-`docs/BENCHMARK_GUIDE.md`). Its **presence is the enable signal** — absent
-⇒ the feature is entirely inert and the harvest is unchanged. The block:
+**Benchmark Studio invocation (`mode: "benchmark"`).** A standalone,
+human-triggered evaluation on the harvest runtime — NOT a harvest: it takes no
+lease, doesn't use the S3-Files mount (the wiki snapshot is GET straight from
+S3, live or pinned to a bundle version), and writes nothing to the bundle. The
+harvester itself can no longer benchmark — the in-run recursive-improvement
+loop, its `run_benchmark` tool, and the `recursive_improvement` payload block
+are retired end to end. The payload (`okf_core.benchmark_report` field names):
 
 ```json
-{ "data_domain": "sales", "dataset": "orders", "mode": "full",
-  "recursive_improvement": {
-    "questions_key": "benchmark/sales/orders/questions.csv",
-    "max_iterations": 5 } }
+{ "data_domain": "sales", "dataset": "orders", "mode": "benchmark",
+  "report_id": "r20260729t101500-1a2b3c4d",
+  "checks": ["sql", "behavior"],
+  "runs": 3,
+  "version_id": "",
+  "questions_key": "benchmark/sales/orders/questions.csv",
+  "solver_model": "global.anthropic.claude-sonnet-5", "solver_effort": "high",
+  "judge_model": "global.anthropic.claude-opus-5", "judge_effort": "xhigh",
+  "behavior_live_sql": false,
+  "source": {"type": "glue", "glue_database": "orders"} }
 ```
 
-`questions_key` is the S3 key of the uploaded `question,gold_sql` CSV. It lives
-under the **off-mount** `benchmark/<domain>/<dataset>/` prefix — deliberately NOT
-under `okf/` (which the harvest S3 Files mount is rooted at), so the gold SQL is
-invisible to every LLM role's file tools (supervisor + authoring subagents
-included, not just the solver). The runner fetches it via boto3 `GetObject` into
-the benchmark tool's process memory; it is never written to the mount. This
-requires `s3:GetObject` on `<bundle-bucket>/benchmark/*` for the harvest runtime
-role. `max_iterations` is the
-benchmark→revise round budget (2–5, **clamped to 5** by the Control API). The stop
-**target is fixed** — judge (adjudicated) accuracy ≥ 90% with EX > 0 — and is not
-configurable (the point is to improve the wiki, not to tune a benchmark score).
-The Control API validates this block at the trust boundary — clamps
-`max_iterations`, requires `questions_key` when enabled — and ignores any legacy
-`ex_threshold`/`judge_threshold`/`gate_kpis` keys. It sources the block
-from the dataset's saved `recursive_improvement` settings on the `DATASET#` row
-(so it rides along on every trigger for a configured dataset). Question count is
-inferred from the CSV and **hard-capped at 100** (first 100 in CSV order) inside
-the harvest tool. Questions the reviewer classifies as noisy/ambiguous gold are
-**pruned** from later rounds (they're not wiki defects). All benchmark LLM roles
-reuse the run's single `chat_model` instance (no separate model/effort), so
-benchmark token usage folds into the run's cumulative total automatically.
+`behavior_live_sql` (optional, default false; also a `BOOL` on the REPORT#
+row's config summary when true) hands the BEHAVIOR solver read-only `run_sql`
+against the live dataset — a truer consumer simulation (real agents can
+query); its prompt flips from "you CANNOT query" to wiki-leads-SQL-verifies
+(`harvest/benchmark/checks.py solver_protocol`). It never applies to the SQL
+EX check, whose solver stays data-blind by design. Reports carry the flag —
+scores are not comparable across different settings of it.
 
-**Per-round review artifact (off-mount, human-facing).** Each round the harvest
-runtime writes one JSON to `benchmark/<domain>/<dataset>/reviews/<runtime_session_id>/<iteration>.json`
-(same off-mount prefix as the CSV — it carries gold SQL, so no LLM role may read
-it). Shape: `{iteration, counts: {<bucket>: n}, questions: [{q_id, bucket,
-question, gold_sql, predicted_sql, note, reason}]}`, where `bucket` ∈ `passed`,
-`genuine_error`, `noisy_gold`, `ambiguous`, `unknown`, `discarded`. It is served
-ONLY to the UI via the Cognito-authed Control API route `GET
-/benchmark/{domain}/{dataset}/reviews/{session}/{iteration}` (the round-done
-`kind:"benchmark"` feed event sets `has_review` + `runtime_session_id` so the UI
-knows to offer it). It is NEVER part of the `run_benchmark` tool return — the agent
-still sees only aggregate KPIs + anonymous `improvements`.
+`questions_key` is the uploaded CSV — one gold column per check
+(`question,gold_sql,expected_behavior`; a question participates in a check iff
+its gold cell is non-blank; unrecognized columns are ignored — the retired
+`gold_answer` no longer resolves). It lives under the
+**off-mount** `benchmark/<domain>/<dataset>/` prefix — deliberately NOT under
+`okf/` — so the gold is invisible to every LLM role; the runtime GETs it into
+process memory (needs `s3:GetObject` on `<bundle-bucket>/benchmark/*`).
+`checks` ⊆ `{sql, behavior}` (≥ 1); `runs` is clamped to 1–5; models are
+validated against the harvest catalog by the Control API; `version_id`
+(optional) pins the wiki to a published bundle version — **the WIKI, not the
+DATA**: grading always executes against live Athena. Question count is
+hard-capped at 100. `sql` (shown as "Accuracy") grades deterministically —
+BIRD-style result-set equality: rows compared as POSITIONAL tuples (column
+order matters, row order doesn't), with numeric-looking cells normalized to
+`Decimal` so Athena's stringified `3` vs `3.0` compare equal; `behavior` is
+**judge-graded**: `expected_behavior` is
+free-form prose (refusals, policy adherence, "should say it isn't tracked"),
+the solver answers in free-form text, and the judge rules on EVERY
+(question, run) attempt independently — so `behavior` has NO judge-adjusted
+score and its failed pairs never enter the overturn review (the grader already
+was the judge; its score block carries `adjusted: null`, and the REPORT# row
+omits `behavior_adjusted`). Each failed behavior pair instead gets ONE
+question-level SYNTHESIS review (all graded runs together): it supplies the
+pair's `judge` block — comment + one consolidated annotation (the annotation
+candidate) — and never changes outcomes.
+Failures are LOUD: a run that can't fetch/parse its questions or materialize
+its snapshot fails the REPORT# row with the error (no silent degradation). The
+judge phase is always on; there is no stop target and no loop. Every benchmark
+ReAct role (solver, the judge's hats, the annotation aggregator) is built via
+``harvest/benchmark/react.py`` — LangChain ``create_agent`` with the chat
+agent's ``BedrockPromptCachingMiddleware`` — so on a Converse Claude model the
+per-turn re-sent conversation bills as cache READS (a Mantle GPT caches
+implicitly server-side, where the middleware no-ops). The judge hats DELIVER
+their ruling through a tool call (``submit_verdict`` / the reviewer's
+``submit_review`` — args are the output, structured by construction, no fence
+parsing), and a ``SubmitToolNudgeMiddleware`` steers a hat that tries to
+finish without submitting — at most twice, then the unparseable-output path
+rules the case a fail with ``judge_error`` set.
+
+**Report artifacts (off-mount, human-facing).** The run persists
+`benchmark/<d>/<ds>/reports/<report_id>/report.json` — config recap, per-check
+scores (raw + judge-adjusted, per-run + mean ± spread), per-question stability,
+per-question detail (gold, every attempt's outcome/reason/prediction, the
+judge's `{verdict: pass|fail, comment, annotation}`), telemetry (per-tool call
+distribution, tokens by role, wall time), and the judge's annotation
+`candidates` (+ the aggregator's `final` set once generated) — and a companion
+`traces.json` (EVERY attempt's bounded solver trace, passing and failing, keyed
+`{q_id, check, run}`; shape per `harvest/benchmark/trace.py`). Both carry gold,
+so they are served ONLY via the Cognito-authed Control API: `POST/GET
+/benchmark/{d}/{ds}/runs`, `GET/DELETE .../runs/{report_id}`,
+`GET .../runs/{report_id}/traces`, `POST .../runs/{report_id}/aggregate`.
+An artifact past the 4 MiB inline cap (a Lambda response tops out at 6 MB;
+multi-run `traces.json` routinely exceeds it) is answered as a short-lived
+presigned S3 GET instead of the document — `report_url` on the report
+response, `{report_id, traces_url}` on traces — which the UI api client
+follows transparently. `DELETE .../runs/{report_id}` is refused (409) while
+the run or an aggregation is genuinely active, but a row whose `updated_at`
+heartbeat predates the harvest-lease stale cutoff (8 h) is deletable — a
+killed runtime must not leave an immortal zombie — and the runtime's row
+writes are conditional on the row existing, so a late finish can't resurrect
+a deleted report. Deleting the DATASET purges the whole
+`benchmark/<d>/<ds>/` prefix (questions.csv + all report artifacts) and every
+`REPORT#` row along with the bundle. `POST .../runs/{report_id}/aggregate`
+kicks `mode: "aggregate_annotations"` — the ReAct aggregator dedupes the
+candidates into the final set on the report — and `POST
+.../runs/{report_id}/annotations` batch-creates the human-selected set as
+normal annotations with `submitted_via: "benchmark"` (validated whole-batch
+before anything is written — no partial commits); an unscoped annotation
+harvest then applies them. The judge reads each solver's trace — what it
+searched, which docs it opened — which is what separates "the wiki never
+says this" from "the wiki says it and the solver never found it"; beyond the
+per-case inline summaries, ALL traces are laid into the judge's file tree as
+`.traces/<check>/q<id>-run<n>.md` so it can `grep` across solvers for
+systemic patterns.
 
 or, for writing/refreshing a domain's concept doc through the mount:
 
@@ -734,8 +801,8 @@ the UI's harvest-settings picker; `full`/`incremental` only). When present the
 runtime uses them; when absent it falls back to the deploy-time `OKF_HARVEST_MODEL`
 / `OKF_HARVEST_EFFORT` env. `subagent_model` and `subagent_effort` are the same
 kind of override for the run's SUB-AGENTS — the table/reference authors,
-reviewers, context-extractors, and the recursive-improvement benchmark
-solver/adjudicator; when absent the sub-agents run on the supervisor's config.
+reviewers, and context-extractors; when absent the sub-agents run on the
+supervisor's config.
 The Control API **validates each pair against the model catalog**
 (`OKF_HARVEST_MODEL_CATALOG`, from `var.harvest_model_catalog`) before
 invoking — an unknown model or an effort not offered for that model is a `400`,
@@ -752,7 +819,7 @@ family doesn't share the authoring model's blind spots). Absent ⇒ the reviewer
 runs on the sub-agents' config (which itself falls back to the supervisor's).
 
 The runtime always builds **three model instances** — the supervisor's, the
-sub-agents' (authors/extractors + the benchmark solver/adjudicator), and the
+sub-agents' (authors/extractors), and the
 reviewer's (identical configs when no overrides were sent) — each carrying its
 own scope-tagged usage callback. That is what makes the step feed's `usage`
 snapshot splittable: it carries the cumulative run totals plus a `by` object
@@ -812,9 +879,8 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_HARVEST_BEDROCK_READ_TIMEOUT` | botocore read timeout in seconds for the harvest bedrock-runtime client (default `600`). Botocore's 60s default is too low: one xhigh Opus 4.8 turn can generate for minutes, and a slow Converse response would otherwise raise `ReadTimeoutError` and fail the harvest. |
 | `OKF_HARVEST_BEDROCK_CONNECT_TIMEOUT` | botocore connect timeout in seconds (default `10`) |
 | `OKF_HARVEST_BEDROCK_MAX_ATTEMPTS` | botocore `retries.max_attempts` in adaptive mode (default `5`); retries transient throttles and timeouts instead of failing the run |
-| `OKF_BENCHMARK_MAX_CONCURRENCY` | how many benchmark solver ReAct loops run at once inside the `run_benchmark` tool (default `10`). Its own `asyncio.Semaphore`, independent of the `task()` subagent cap — each solver is one in-flight model request at a time, so this is the peak concurrent Bedrock requests from the benchmark. All hit the same account model quota (the shared client's adaptive retry absorbs throttles); raise on generous quota, lower on `ThrottlingException`. Recursive-improvement runs only. |
-| `OKF_BENCHMARK_ATHENA_CONCURRENCY` | how many benchmark grader queries (predicted/gold SQL) run against Athena at once (default `15`); size under the Athena workgroup's concurrent-DML limit. Recursive-improvement runs only |
-| `OKF_BENCHMARK_RECURSION_LIMIT` | LangGraph `recursion_limit` for a recursive-improvement supervisor run (default higher than the standard `full` limit, since the in-run loop consumes extra steps). Unset → the standard harvest recursion limit |
+| `OKF_BENCHMARK_MAX_CONCURRENCY` | how many benchmark solver ReAct loops (and judge reviews) run at once in a Benchmark Studio run (default `10`). Its own `asyncio.Semaphore` — each solver is one in-flight model request at a time, so this is the peak concurrent Bedrock requests from the benchmark. Raise on generous quota, lower on `ThrottlingException`. `mode: "benchmark"` runs only. |
+| `OKF_BENCHMARK_ATHENA_CONCURRENCY` | how many benchmark grading queries (gold/predicted SQL EX executions) run against Athena at once (default `15`); size under the Athena workgroup's concurrent-DML limit. `mode: "benchmark"` runs only |
 | `OKF_USER_POOL_ID` | Cognito user pool id (the Control API vends and revokes M2M app clients in this pool) |
 | `OKF_MCP_SCOPE` | the custom scope (`okf-mcp/invoke`) granted to vended M2M clients; must match the consumption authorizer's `allowed_scopes` |
 | `OKF_HARVEST_LOG_GROUP` | the harvest runtime's CloudWatch log group the Control API reads to serve the live step feed (`GET /harvest/{domain}/{dataset}/events`). Derived by Terraform as `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT` (overridable via `var.harvest_log_group`). Unset/incorrect → the feed returns an empty batch; status polling is unaffected |
