@@ -16,6 +16,7 @@ import { DocPeek } from "@/components/chat/DocPeek"
 import { PanelShell } from "@/components/chat/PanelShell"
 import { CHAT_CONFIGURED } from "@/lib/chatApi"
 import { useChatSession } from "@/hooks/useChatSession"
+import { usePanelWidth } from "@/hooks/usePanelWidth"
 import { cn } from "@/lib/utils"
 
 // The inner surface: mounts the session store. Keyed by conversation upstream.
@@ -115,19 +116,10 @@ function Conversation({
 
 // Doc-peek width bounds (px). Default 36rem; min keeps the doc readable, max is
 // re-clamped to the viewport at drag time so the chat column always survives.
+// The drag mechanics live in usePanelWidth (shared with the benchmark panels).
 const PEEK_WIDTH_KEY = "okf.chat.docPeekWidth"
 const PEEK_MIN = 320
 const PEEK_DEFAULT = 576
-
-function loadPeekWidth() {
-  try {
-    const saved = Number(localStorage.getItem(PEEK_WIDTH_KEY))
-    if (saved >= PEEK_MIN && saved <= 1200) return saved
-  } catch {
-    // private mode / storage disabled — fall through to the default
-  }
-  return PEEK_DEFAULT
-}
 
 export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
   const {
@@ -166,44 +158,15 @@ export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
   // Resizable width: dragged from the panel's left-edge handle, persisted as a
   // preference. While a drag is live the clip's width TRANSITION is disabled —
   // otherwise every pointermove eases over 300ms and the panel rubber-bands.
-  const [peekWidth, setPeekWidth] = useState(loadPeekWidth)
-  const [peekDragging, setPeekDragging] = useState(false)
-  const peekWidthRef = useRef(peekWidth)
-  useEffect(() => {
-    peekWidthRef.current = peekWidth
-  }, [peekWidth])
-  const startPeekResize = useCallback((e) => {
-    e.preventDefault()
-    const startX = e.clientX
-    const startW = peekWidthRef.current
-    // Clamp against the CURRENT viewport so the chat column keeps ~half the
-    // screen even on small windows.
-    const max = Math.max(
-      PEEK_MIN,
-      Math.min(880, Math.round(window.innerWidth * 0.55))
-    )
-    setPeekDragging(true)
-    const prevSelect = document.body.style.userSelect
-    document.body.style.userSelect = "none" // no text selection mid-drag
-    const move = (ev) => {
-      const next = Math.min(max, Math.max(PEEK_MIN, startW + (startX - ev.clientX)))
-      peekWidthRef.current = next
-      setPeekWidth(next)
-    }
-    const up = () => {
-      document.body.style.userSelect = prevSelect
-      setPeekDragging(false)
-      try {
-        localStorage.setItem(PEEK_WIDTH_KEY, String(peekWidthRef.current))
-      } catch {
-        // private mode / storage full — the in-memory width still applies
-      }
-      window.removeEventListener("pointermove", move)
-      window.removeEventListener("pointerup", up)
-    }
-    window.addEventListener("pointermove", move)
-    window.addEventListener("pointerup", up)
-  }, [])
+  const {
+    width: peekWidth,
+    dragging: peekDragging,
+    startResize: startPeekResize,
+  } = usePanelWidth({
+    storageKey: PEEK_WIDTH_KEY,
+    min: PEEK_MIN,
+    defaultWidth: PEEK_DEFAULT,
+  })
 
   if (!CHAT_CONFIGURED) {
     return (

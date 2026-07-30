@@ -85,6 +85,7 @@ import ContextView from "@/views/ContextView.jsx"
 import CredentialsView from "@/views/CredentialsView.jsx"
 import HarvestView from "@/views/HarvestView.jsx"
 import BenchmarkView from "@/views/BenchmarkView.jsx"
+import BenchmarkReportView from "@/views/BenchmarkReportView.jsx"
 import BrowseView from "@/views/BrowseView.jsx"
 import GraphView from "@/views/GraphView.jsx"
 
@@ -608,6 +609,10 @@ function Console({ auth, api }) {
   const selectionKey = route.selectionKey
   // Browse's currently-open concept comes from the URL (Browse pushes updates).
   const routeConcept = section === "browse" ? route.concept : null
+  // The Benchmark section reuses the trailing URL segment as a REPORT id
+  // (#/benchmark/<d>/<ds>/<report_id> opens the report detail page). Report ids
+  // are single segments, so the generic parse carries them in route.concept.
+  const routeReportId = section === "benchmark" ? route.concept : null
 
   const setSelectionKey = useCallback(
     (key) => push({ section, selectionKey: key, concept: null }),
@@ -718,7 +723,8 @@ function Console({ auth, api }) {
           : `${datasets[0].data_domain}/${datasets[0].dataset}`,
         // Preserve any deep-linked concept even when correcting the dataset —
         // Browse shows a graceful "not found" if it isn't in the new dataset.
-        concept: routeConcept,
+        // (For the benchmark section the trailing segment is a report id.)
+        concept: routeConcept ?? routeReportId,
       })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -777,7 +783,13 @@ function Console({ auth, api }) {
   // Whether the top strip (dataset picker) renders: dataset-scoped sections,
   // except Browse, which hosts the picker inside its tree-pane header. Drives
   // both TopbarHeader and the content region's top padding below.
-  const hasTopStrip = activeNav.needsSelection && section !== "browse"
+  // The benchmark REPORT page is also strip-less (chat-like): it owns the full
+  // inset height so its solver-steps side panel stands truly full height, and
+  // switching datasets mid-report would only orphan the report id — Back
+  // returns to the picker-bearing benchmark console.
+  const isBenchmarkReport = section === "benchmark" && Boolean(routeReportId)
+  const hasTopStrip =
+    activeNav.needsSelection && section !== "browse" && !isBenchmarkReport
 
   return (
     // Pin the shell to exactly the viewport height (the wrapper is min-h-svh by
@@ -935,6 +947,23 @@ function Console({ auth, api }) {
                     onOpenConcept={openConceptInBrowse}
                   />
                 </div>
+              ) : section === "benchmark" && routeReportId ? (
+                // The report page renders OUTSIDE the shared centered scroll
+                // block: it owns its own scroll column so the solver-steps
+                // side panel (the chat doc-peek pattern) can stand full-height
+                // beside it on the main layout.
+                <BenchmarkReportView
+                  api={api}
+                  selection={selection}
+                  reportId={routeReportId}
+                  onBack={() =>
+                    push({
+                      section: "benchmark",
+                      selectionKey,
+                      concept: null,
+                    })
+                  }
+                />
               ) : (
                 // p-1 gives the cards' ring/shadow room so the vertical scroll
                 // container doesn't clip them — including the first card's top edge,
@@ -957,7 +986,17 @@ function Console({ auth, api }) {
                     />
                   )}
                   {section === "benchmark" && (
-                    <BenchmarkView api={api} selection={selection} />
+                    <BenchmarkView
+                      api={api}
+                      selection={selection}
+                      onOpenReport={(id) =>
+                        push({
+                          section: "benchmark",
+                          selectionKey,
+                          concept: id,
+                        })
+                      }
+                    />
                   )}
                   {section === "credentials" && (
                     <CredentialsView api={api} email={email} />
@@ -975,11 +1014,14 @@ function Console({ auth, api }) {
 export function App() {
   const auth = useAuth()
 
-  // One API client bound to the current ID token.
+  // One API client bound to the current ID token. Keyed on the TOKEN string,
+  // not the user object: react-oidc-context dispatches a brand-new User
+  // instance on every silent renew (~hourly), and an api identity change
+  // cascades into every view keyed on it — the benchmark report page, for
+  // one, fully reset (skeleton, tab snap, traces refetch) mid-read.
   const api = useMemo(
     () => makeApi(auth.user?.id_token),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [auth.user]
+    [auth.user?.id_token]
   )
 
   let body

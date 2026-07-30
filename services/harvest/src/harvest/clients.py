@@ -57,10 +57,11 @@ def _session_policy(
     the resulting credential can touch only:
 
     * Glue metadata for ``database`` and its tables (``glue:GetDatabase/GetTable
-      /GetTables/GetPartitions/GetTableVersions`` on ``database/<db>`` +
-      ``table/<db>/*``). ``glue:GetDatabases`` (the plural LIST call) is
-      catalog-level only — it cannot be pinned to one db — so it targets
-      ``catalog`` and remains a metadata-listing capability, not a data read.
+      /GetTables/GetPartitions/GetPartition/BatchGetPartition/GetTableVersions``
+      on ``database/<db>`` + ``table/<db>/*``). ``glue:GetDatabases`` (the plural
+      LIST call) is catalog-level only — it cannot be pinned to one db — so it
+      targets ``catalog`` and remains a metadata-listing capability, not a data
+      read.
     * Athena on ``workgroup/<wg>`` only. The four Athena actions are ARN-scopable
       ONLY to a workgroup (never to a db/table), so cross-database containment is
       carried entirely by the pinned Glue ``GetTable`` ARNs above — Athena
@@ -89,7 +90,14 @@ def _session_policy(
                 "glue:GetDatabase",
                 "glue:GetTable",
                 "glue:GetTables",
+                # GetPartitions (bulk) is not enough for a PARTITIONED table:
+                # Athena also calls the singular GetPartition and
+                # BatchGetPartition while pruning partitions, and a session
+                # policy that omits them denies the query even though the data
+                # role allows it (the intersection is the effective grant).
                 "glue:GetPartitions",
+                "glue:GetPartition",
+                "glue:BatchGetPartition",
                 "glue:GetTableVersions",
             ],
             "Resource": db_resources,

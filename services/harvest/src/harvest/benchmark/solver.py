@@ -21,80 +21,164 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable
 
 from harvest.benchmark.extract import extract_sql, message_text
+from harvest.benchmark.trace import SolveResult, build_trace
 
 # Recursion budget for a single solver's explore loop — generous enough to read a
 # few pages + follow links, bounded so a confused solver can't spin.
 _SOLVER_RECURSION_LIMIT = 40
 
-SOLVER_SYSTEM_PROMPT = """\
-You are answering ONE analytics question by writing a single SQL query, using \
-ONLY the knowledge in this data wiki. The wiki is a set of markdown docs about \
-the dataset's tables, columns, joins, metrics, and gotchas.
-
-Your only knowledge source is the wiki — you have read-only tools (`read_file`, \
-`glob`, `grep`, `ls`) over it and nothing else. You CANNOT query the database, \
-see its raw schema, or sample data; if the wiki doesn't say something, you must \
-infer it from what the wiki does say. This mirrors a real agent that has only \
-the wiki to go on — so a good wiki should let you succeed.
-
-Method:
-1. Find the relevant table/reference docs (`glob`/`grep` for table names, \
-columns, metrics named in the question).
-2. Read them. Note the exact table + column names, the join keys, any coded \
-values / units / filters the docs call out (e.g. "status is an int code, \
-1=active", "revenue excludes refunds").
-3. Write ONE Athena/Trino SQL query that answers the question, using the exact \
-names and semantics the docs specify.
-
-When you have the answer, output the final query as a single fenced SQL block:
-```sql
-SELECT ...
-```
-Output nothing after the block."""
+# The canonical per-check solver prompts live in harvest.benchmark.checks; this
+# alias keeps the historical name (and the SQL EX default) for existing callers.
+from harvest.benchmark.checks import SQL_SOLVER_PROMPT as SOLVER_SYSTEM_PROMPT
 
 
 def make_solver(
-    chat_model: Any, snapshot_root: str, emit: Callable[[dict], None] | None = None
-) -> Callable[[str], Awaitable[str]]:
-    """Build an async ``solve(question) -> sql`` bound to a bundle snapshot.
+    chat_model: Any,
+    snapshot_root: str,
+    emit: Callable[[dict], None] | None = None,
+    *,
+    system_prompt: str = SOLVER_SYSTEM_PROMPT,
+    parse: Callable[[Any], str] = extract_sql,
+    extra_tools: list[Any] | None = None,
+) -> Callable[[str], Awaitable[SolveResult]]:
+    """Build an async ``solve(question) -> SolveResult`` bound to a bundle snapshot.
 
-    ``chat_model`` is the shared instrumented harvest model (so solver tokens meter
-    into the run total for free). ``snapshot_root`` is the bundle-only temp dir the
-    solver's read tools are confined to. ``emit`` (best-effort) receives a compact
-    per-question observability event — a ReAct solver is an ISOLATED graph whose
-    turns don't reach the run's StepEmitter, so without this the solver is a black
-    box (exactly the gap that made "why is EX 0?" un-diagnosable from logs). We do
-    NOT log the question or the answer's meaning — just tool-call/read counts,
-    turn count, whether SQL came out, an error if any, and a short SQL preview.
-    Returns an async callable the round orchestrator fans out under its semaphore.
+    ``chat_model`` is the shared instrumented model (so solver tokens meter into
+    the run total for free). ``snapshot_root`` is the bundle-only temp dir the
+    solver's read tools are confined to. ``system_prompt``/``parse`` select the
+    CHECK's protocol (see :mod:`.checks`) — the default pair is the SQL EX
+    protocol, so existing callers are unchanged. ``emit`` (best-effort) receives
+    a compact per-question observability event — a ReAct solver is an ISOLATED
+    graph whose turns don't reach the run's StepEmitter, so without this the
+    solver is a black box (exactly the gap that made "why is EX 0?"
+    un-diagnosable from logs). We do NOT log the question or the answer's
+    meaning — just tool-call/read counts, turn count, the files it opened,
+    whether a prediction came out, an error if any, and a short preview.
+
+    The returned :class:`~harvest.benchmark.trace.SolveResult` carries the
+    prediction plus the bounded TRACE of how the solver got there (reasoning,
+    tool calls, results) — fed to the judge and persisted in the report for the
+    human review. Returns an async callable the round orchestrator fans out
+    under its semaphore.
+
+    ``extra_tools`` extends the read-only wiki toolset for protocols that hold
+    more than the wiki — today the Behavior check's opt-in live ``run_sql``
+    (``behavior_live_sql``); the prompt selection (:func:`.checks.
+    solver_protocol`) and the tool grant travel together so a solver is never
+    told about a tool it doesn't hold, or handed one its prompt disclaims.
     """
-    from langgraph.prebuilt import create_react_agent
+    from harvest.benchmark.react import is_recursion_limit, make_react_agent
 
-    agent = create_react_agent(
+    agent = make_react_agent(
         chat_model,
-        tools=make_readonly_file_tools(snapshot_root),
-        prompt=SOLVER_SYSTEM_PROMPT,
+        # read_me first: its description says to call it before exploring, and
+        # the solver prompts' method step 1 points at it — the primer is how a
+        # solver knows the layout, the trap locations (guardrails/known issues),
+        # and that grep wants ONE literal token.
+        [
+            *make_readonly_file_tools(snapshot_root),
+            make_read_me_tool(),
+            *(extra_tools or []),
+        ],
+        system_prompt,
     )
 
-    async def solve(question: str) -> str:
+    async def solve(question: str) -> SolveResult:
         # One ReAct run: the agent explores the wiki with the read tools and ends
-        # with a fenced ```sql block. We parse the SQL out of its final message —
-        # no structured-output prefill (rejected under adaptive thinking).
+        # with its check's final payload (a fenced ```sql block / JSON action).
+        # We parse it out of the final message — no structured-output prefill
+        # (rejected under adaptive thinking). Streamed as VALUES snapshots (not
+        # ainvoke) so the message history survives a mid-run exception: a
+        # budget-blown or crashed solve still carries its trace to the judge
+        # and the report — the error itself is the most diagnosable part.
+        import time
+
         error = ""
         messages: list = []
+        started = time.monotonic()
         try:
-            out = await agent.ainvoke(
+            async for state in agent.astream(
                 {"messages": [("user", question)]},
                 config={"recursion_limit": _SOLVER_RECURSION_LIMIT},
-            )
-            messages = out.get("messages", [])
+                stream_mode="values",
+            ):
+                if isinstance(state, dict) and state.get("messages"):
+                    messages = state["messages"]
         except Exception as e:  # noqa: BLE001 - a stuck solver is a miss, captured here
-            error = f"{type(e).__name__}: {e}"
-        sql = extract_sql(_last_ai_text(messages)) if messages else ""
-        _emit_solver_debug(emit, messages=messages, sql=sql, error=error)
-        return sql
+            if is_recursion_limit(e):
+                # create_agent RAISES at the step budget (no apology message);
+                # record it as a run error, never as the solver's answer.
+                error = (
+                    f"hit the solve step budget (recursion_limit="
+                    f"{_SOLVER_RECURSION_LIMIT}) before settling on an answer"
+                )
+            else:
+                error = f"{type(e).__name__}: {e}"
+        wall_ms = int((time.monotonic() - started) * 1000)
+        prediction = "" if error else parse(_last_ai_text(messages) if messages else "")
+        # Capture BEFORE emitting so a trace exists even for a run that errored (the
+        # error itself is the most useful thing to show). Never let it break a solve.
+        try:
+            trace = build_trace(messages, sql=prediction, error=error)
+        except Exception:  # noqa: BLE001 - a trace is observability, not the answer
+            trace = None
+        _emit_solver_debug(
+            emit, messages=messages, sql=prediction, error=error, trace=trace
+        )
+        return SolveResult(
+            sql=prediction,
+            trace=trace,
+            usage=fold_usage(messages),
+            wall_ms=wall_ms,
+        )
 
     return solve
+
+
+def fold_usage(messages: list) -> dict:
+    """Sum ``usage_metadata`` over a solve's AI messages → token telemetry.
+
+    The same per-message fold chat's history stats use. Returns ``{}`` when no
+    message carried usage (a fake model, or an errored run) so callers can
+    treat the telemetry as best-effort.
+    """
+    input_tokens = output_tokens = 0
+    seen = False
+    for m in messages or []:
+        usage = getattr(m, "usage_metadata", None)
+        if not isinstance(usage, dict):
+            continue
+        seen = True
+        input_tokens += int(usage.get("input_tokens") or 0)
+        output_tokens += int(usage.get("output_tokens") or 0)
+    if not seen:
+        return {}
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+def make_read_me_tool() -> Any:
+    """The ``read_me`` primer tool — the first call a solver should make.
+
+    Static text from ``okf_core.wiki_primer`` (the SOLVER rendering: literal
+    grep, index-first, no ``get_backlinks``/``semantic_search`` — naming tools
+    the solver doesn't have would teach it to make failing calls). Deferred
+    import keeps this module importable without langchain installed.
+    """
+    from langchain_core.tools import tool
+
+    from okf_core.wiki_primer import READ_ME_DESCRIPTION, SOLVER_PRIMER
+
+    @tool
+    def read_me() -> str:
+        """Read the wiki-usage primer (structure, gotchas, navigation)."""
+        return SOLVER_PRIMER
+
+    read_me.description = READ_ME_DESCRIPTION
+    return read_me
 
 
 def make_readonly_file_tools(root: str, *, scope: str = "wiki") -> list[Any]:
@@ -110,12 +194,30 @@ def make_readonly_file_tools(root: str, *, scope: str = "wiki") -> list[Any]:
     separately for the roles that get them.
 
     IMPORTANT: deepagents' backend returns dataclass *containers* (GlobResult
-    ``.matches`` / LsResult ``.entries`` / GrepResult ``.matches``) whose ITEMS are
-    TypedDicts (FileInfo ``{"path",...}``, GrepMatch ``{"path","line","text"}``),
-    and read is ``read(file_path) -> str`` (cat -n text), NOT
-    ``read_file().content``. Getting this wrong crashed every solver on turn 0 with
-    "'dict' object has no attribute 'path'" (EX 0). :func:`_field` is dict-or-attr
+    ``.matches`` / LsResult ``.entries`` / GrepResult ``.matches``, each with
+    ``error``/``truncated`` fields) whose ITEMS are TypedDicts (FileInfo
+    ``{"path",...}``, GrepMatch ``{"path","line","text"}``), and ``read()``
+    returns a ``ReadResult`` (``error`` or ``file_data{"content","encoding"}``
+    plus ``total_lines``/``end_line``/``next_offset``) since deepagents 0.7 —
+    rendered to numbered text by :func:`_read_text` (a pre-0.7 str passes
+    through). Getting shapes wrong crashed every solver on turn 0 with "'dict'
+    object has no attribute 'path'" (EX 0). :func:`_field` is dict-or-attr
     tolerant so a backend shape change degrades gracefully instead of crashing.
+
+    Two contract points these wrappers must uphold (both burned us):
+
+    * **A raising tool must not abort the solve.** These tools sit inside plain
+      ReAct agent graphs with NO ToolErrorMiddleware, and the
+      backend RAISES ``ValueError`` on any '..' in a path/pattern — while wiki
+      docs legitimately contain ``../`` relative links the solver will follow.
+      Every wrapper catches and returns the error as text, so a bad call costs
+      the solver one turn, not the whole (graded!) run.
+    * **Partial evidence must say it is partial.** Reads page at 2000 lines
+      (offset/limit exposed, precise continuation notice), binary (base64)
+      content is refused instead of dumped into the context, and grep/glob
+      surface the backend's ``error``/``truncated`` fields — a silently
+      truncated search otherwise reads as "the wiki never documents this",
+      the exact evidence judge verdicts turn on.
     """
     from deepagents.backends import FilesystemBackend
     from langchain_core.tools import tool
@@ -127,39 +229,128 @@ def make_readonly_file_tools(root: str, *, scope: str = "wiki") -> list[Any]:
     # ("Function must have a docstring if description not provided") without one.
     # We then refine the wording per-scope by overriding `.description` below.
     @tool
-    def read_file(file_path: str) -> str:
-        """Read a file by its path (e.g. 'tables/races.md')."""
-        return backend.read(_vpath(file_path))
+    def read_file(file_path: str, offset: int = 0, limit: int = 2000) -> str:
+        """Read a file by its path (e.g. 'tables/races.md'). Long files are
+        paged: a truncated read says so and gives the offset to continue from."""
+        try:
+            return _read_text(backend, _vpath(file_path), offset=offset, limit=limit)
+        except Exception as e:  # noqa: BLE001 - a bad call is one lost turn, not a lost run
+            return f"Error: {e}"
 
     @tool
     def glob(pattern: str) -> list[str]:
         """Find files matching a glob (e.g. '**/*.md', 'tables/*')."""
-        return [_field(m, "path") for m in (backend.glob(pattern).matches or [])]
+        try:
+            res = backend.glob(pattern)
+        except Exception as e:  # noqa: BLE001
+            return [f"Error: {e}"]
+        if getattr(res, "error", None):
+            return [f"Error: {res.error}"]
+        out = [_field(m, "path") for m in (res.matches or [])]
+        if getattr(res, "truncated", False):
+            out.append("… (result truncated — narrow the pattern)")
+        return out
 
     @tool
     def grep(pattern: str) -> list[str]:
         """Search file contents for a literal string; returns matching locations."""
-        res = backend.grep(pattern)
-        return [
+        try:
+            res = backend.grep(pattern)
+        except Exception as e:  # noqa: BLE001
+            return [f"Error: {e}"]
+        if getattr(res, "error", None):
+            return [f"Error: {res.error}"]
+        out = [
             f"{_field(m, 'path')}:{_field(m, 'line')}: {_field(m, 'text')}"
             for m in (res.matches or [])
         ]
+        if getattr(res, "truncated", False):
+            out.append(
+                "… (result truncated — matches beyond this point were dropped; "
+                "narrow the pattern before concluding something isn't documented)"
+            )
+        return out
 
     @tool
     def ls(path: str = "/") -> list[str]:
         """List entries in a directory."""
-        return [_field(e, "path") for e in (backend.ls(_vpath(path)).entries or [])]
+        try:
+            res = backend.ls(_vpath(path))
+        except Exception as e:  # noqa: BLE001
+            return [f"Error: {e}"]
+        if getattr(res, "error", None):
+            return [f"Error: {res.error}"]
+        return [_field(e, "path") for e in (res.entries or [])]
 
     # Refine the description per-scope so the same mechanics read correctly for the
     # wiki-only solver and the whole-dataset adjudicator (the docstrings above are
     # the scope-neutral fallback that satisfies the @tool decorator).
-    read_file.description = f"Read a {noun} file by its path (e.g. 'tables/races.md')."
+    read_file.description = (
+        f"Read a {noun} file by its path (e.g. 'tables/races.md'). Long files "
+        "are paged; a truncated read gives the offset to continue from."
+    )
     glob.description = f"Find {noun} files matching a glob (e.g. '**/*.md', 'tables/*')."
     grep.description = (
         f"Search {noun} file contents for a literal string; returns matching locations."
     )
     ls.description = f"List entries in a {noun} directory."
     return [read_file, glob, grep, ls]
+
+
+def _read_text(backend: Any, vpath: str, *, offset: int = 0, limit: int = 2000) -> str:
+    """Render ``backend.read()`` for the model, across deepagents versions.
+
+    deepagents ≥0.7 returns a ``ReadResult`` (``error`` set, or
+    ``file_data{"content", "encoding"}`` plus ``total_lines``/``end_line``/
+    ``next_offset``); older versions returned the rendered ``cat -n``-style
+    string directly. Errors come back as plain text — these tools sit behind
+    ``ToolErrorMiddleware``-free ReAct agents, so a raising read would
+    otherwise end the whole solve. Base64 (binary) content is refused rather
+    than dumped — a single uploaded PDF under ``.context/`` would otherwise
+    inject megabytes of noise into one ToolMessage — and a read that stopped
+    at the line limit says so precisely, so the model pages instead of
+    mistaking the visible prefix for the whole file.
+    """
+    result = backend.read(vpath, offset=offset, limit=limit)
+    if isinstance(result, str):
+        return result
+    error = getattr(result, "error", None)
+    if error:
+        return f"Error: {error}"
+    file_data = getattr(result, "file_data", None) or {}
+    content = file_data.get("content", "") if isinstance(file_data, dict) else ""
+    encoding = str(file_data.get("encoding", "") if isinstance(file_data, dict) else "")
+    if encoding and encoding.lower() not in ("utf-8", "utf8", "text"):
+        return (
+            f"Error: {vpath.lstrip('/')} is a binary file ({encoding}-encoded) — "
+            "these tools read text files only."
+        )
+    if not isinstance(content, str):
+        return str(content)
+    try:
+        # The numbered-gutter rendering the built-in read_file tool shows, so
+        # grep's path:line hits line up with what the model reads (the gutter
+        # starts at the read's real first line, not 1, on paged reads).
+        from deepagents.backends.utils import format_content_with_line_numbers
+
+        start_line = int(getattr(result, "start_line", None) or offset + 1)
+        rendered = format_content_with_line_numbers(content, start_line=start_line)
+    except Exception:  # noqa: BLE001 - rendering sugar, never worth a crash
+        rendered = content
+    total = getattr(result, "total_lines", None)
+    end = getattr(result, "end_line", None)
+    next_offset = getattr(result, "next_offset", None)
+    if (
+        isinstance(total, int)
+        and isinstance(end, int)
+        and end < total
+        and next_offset is not None
+    ):
+        rendered += (
+            f"\n… truncated: showing lines through {end} of {total}. "
+            f"Call read_file again with offset={next_offset} to continue."
+        )
+    return rendered
 
 
 def _field(item: Any, key: str) -> str:
@@ -188,8 +379,15 @@ def _emit_solver_debug(
     messages: list,
     sql: str,
     error: str,
+    trace: Any = None,
 ) -> None:
-    """Emit a compact benchmark_solver observability event (best-effort)."""
+    """Emit a compact benchmark_solver observability event (best-effort).
+
+    Stays COUNTS-ONLY plus the files opened — the full step-by-step trace goes to
+    the off-mount review artifact, not into the CloudWatch feed. ``files_read`` is
+    the cheap signal that answers the first diagnostic question ("did this solver
+    even open the right doc?") straight from the logs.
+    """
     if emit is None:
         return
     tool_calls = 0
@@ -203,6 +401,7 @@ def _emit_solver_debug(
                 "kind": "benchmark_solver",
                 "turns": len(messages),
                 "tool_calls": tool_calls,
+                "files_read": list(getattr(trace, "files_read", None) or []),
                 "sql_len": len(sql),
                 "sql_preview": (sql[:200] if sql else ""),
                 "error": error,

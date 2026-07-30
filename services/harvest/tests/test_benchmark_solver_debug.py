@@ -224,3 +224,23 @@ def test_readonly_file_tools_factory_reads_wiki_and_dotdirs(tmp_path):
     assert any("results.md" in p for p in all_md)
     status_hits = grep.invoke({"pattern": "status"})
     assert any(".context/spec.md" in h for h in status_hits)
+
+
+@pytest.mark.skipif(
+    not _HAVE_LANGCHAIN_TOOLS,
+    reason="langchain_core.tools not installed here",
+)
+def test_read_me_tool_serves_the_solver_primer():
+    # The primer tool: named read_me, description LEADS with the call-before-
+    # exploring instruction, body is the SOLVER rendering (literal grep,
+    # index-first — and none of the MCP-only tools it doesn't have).
+    from okf_core.wiki_primer import SOLVER_PRIMER
+
+    from harvest.benchmark.solver import make_read_me_tool
+
+    tool = make_read_me_tool()
+    assert tool.name == "read_me"
+    assert tool.description.startswith(
+        "Use this tool FIRST, before exploring the wiki"
+    )
+    assert tool.invoke({}) == SOLVER_PRIMER

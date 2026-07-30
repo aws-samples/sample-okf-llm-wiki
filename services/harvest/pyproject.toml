@@ -13,7 +13,7 @@ dependencies = [
     # (okf_aws.model_factory); harvest's agent.py delegates model construction to
     # it so the chat agent builds identical clients.
     "okf-aws",
-    "deepagents>=0.6.12,<0.8",
+    "deepagents>=0.7.0,<0.8",
     "langchain>=1.3",
     # ChatBedrockConverse lives in the standalone langchain-aws partner package,
     # which we import directly (agent.py) — depend on it explicitly rather than

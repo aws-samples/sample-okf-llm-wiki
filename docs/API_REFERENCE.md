@@ -9,8 +9,34 @@ don't drift. Sources are at the end of each section.
 
 ## 1. deepagents (LangChain Deep Agents)
 
-- Install `deepagents` (stable 0.6.x), Python ≥ 3.11. Extras: `deepagents[aws]`
-  for Bedrock, `deepagents[quickjs]` for dynamic subagents.
+- Install `deepagents` (stable 0.7.x — the repo pins `>=0.7.0,<0.8`),
+  Python ≥ 3.11. Extras: `deepagents[aws]` for Bedrock, `deepagents[quickjs]`
+  for dynamic subagents.
+- **0.7.0 breaking changes this repo codes against:**
+  - `TodoListMiddleware` is NO LONGER a default — without it there is no
+    `write_todos` tool, `todos` state, or planning prompt. The harvest attaches
+    it explicitly to the MAIN agent (`from langchain.agents.middleware import
+    TodoListMiddleware`); sub-agents stay lean (their prompts don't plan with
+    todos).
+  - Default prompts are lean: the authored base prompt is empty and the
+    tool-usage prose constants (`TASK_SYSTEM_PROMPT`,
+    `FILESYSTEM_SYSTEM_PROMPT`, …) are gone. Fine here — every role's prompt
+    is fully authored in `prompts.py`.
+  - A recursive **`delete`** filesystem tool is exposed to the model whenever
+    the backend supports it (FilesystemBackend does). The OKF guard refuses it
+    unconditionally — nothing in a bundle is agent-deletable.
+  - `write_file` now OVERWRITES an existing file instead of returning a
+    file-exists error (no create-only mode). The guard engine already
+    validates overwrites against the existing doc (augmentation rules), so
+    this is covered.
+  - `BackendProtocol.read()` returns a `ReadResult` (`error` /
+    `file_data{"content"}` / line-range fields), not the rendered string — the
+    benchmark solver's custom `read_file` renders it via
+    `format_content_with_line_numbers` (see `solver._read_text`).
+  - `FilesystemBackend`/`LocalShellBackend` default `virtual_mode=True` now
+    (we always passed it explicitly). `read_file` output uses dynamic-width
+    line numbers + two-space separator (no fixed `cat -n` gutter);
+    agent-facing empty `ls`/`glob` render as `No files found`.
 - `from deepagents import create_deep_agent, CompiledSubAgent`
 - Signature (everything after `tools` is keyword-only):
   ```python
@@ -41,10 +67,13 @@ don't drift. Sources are at the end of each section.
   FilesystemBackend(root_dir=..., virtual_mode=True)})`, so the agent's internal
   files (`/large_tool_results/`, `/conversation_history/`) stay ephemeral and
   only `/workspace/` hits disk.
-- **Built-in tools:** `ls`, `read_file`, `write_file`, `edit_file`, `glob`,
-  `grep`, `task`, `write_todos`. `write_file(file_path, content)`;
-  `edit_file(file_path, old_string, new_string)` is an exact-string replace
-  (Claude Code semantics); `read_file` supports pagination.
+- **Built-in tools:** `ls`, `read_file`, `write_file`, `edit_file`, `delete`,
+  `glob`, `grep`, `task` — plus `write_todos` when `TodoListMiddleware` is
+  attached (no longer a default in 0.7). `write_file(file_path, content)`
+  creates OR fully replaces; `edit_file(file_path, old_string, new_string)` is
+  an exact-string replace (Claude Code semantics); `delete(file_path)` is
+  recursive (refused by the OKF guard in this repo); `read_file` supports
+  pagination.
 - **Subagent dict** (`SubAgent`): `name` (required), `description` (required),
   `system_prompt` (required — never inherited), `tools` (optional — when set it
   *replaces* the inherited tools), `model` (optional — inherits the parent),

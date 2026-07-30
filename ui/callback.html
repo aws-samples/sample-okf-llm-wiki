@@ -8,6 +8,27 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=3" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=3" />
     <title>Signing in… · Data wiki</title>
+    <!-- Pre-paint theme apply — same script as index.html (see the note there):
+         without it the OAuth callback page flashes white in dark mode. -->
+    <script>
+      ;(function () {
+        var theme = null
+        try {
+          theme = localStorage.getItem("theme")
+        } catch (e) {
+          /* storage blocked: fall through to the system preference */
+        }
+        if (theme !== "light" && theme !== "dark") {
+          theme = window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light"
+        }
+        var root = document.documentElement
+        root.classList.add(theme)
+        root.style.colorScheme = theme
+        root.style.backgroundColor = theme === "dark" ? "#090B0C" : "#F1F3F3"
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

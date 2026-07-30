@@ -13,7 +13,7 @@ aren't obvious from the code. Section numbers (§) refer to `OKF_DESIGN.md`.
 | Incremental (§4) | Glue event → SQS → orchestrator | `services/incremental`, `infra/compute/incremental.tf` | Confirms a real change via `UpdateTime` / `GetTableVersions`, stages `.harvest/pending.json`, and invokes a harvest scoped to the changed table. A nightly reconcile catches missed events. |
 | Freshness (§5) | S3 events → SQS → reindex | `services/reindex`, `infra/compute/reindex.tf` | Titan V2 (512-dim) embed → `PutVectors` / `DeleteVectors` keyed by concept path. Dedups on the S3 `sequencer` in DynamoDB. SQS in front absorbs Bedrock throttling. |
 | Link graph (§6) | `networkx` graph, rebuilt on write | `okf_core/link_graph.py`, `harvest/graph_tools.py` | Link/backlink graph over the dataset subtree; `get_backlinks` / `get_links` return id, title, and heading, and `cluster_concepts` partitions the bundle into link-related groups of ≤5 docs for the review fan-out. Rebuilt lazily when the guard marks it dirty. Used by the harvest agent only. |
-| Consumption (§7) | streamable-HTTP MCP on AgentCore | `services/consumption_mcp` | FastMCP, stateless, Cognito JWT. Tools: `list_domains`, `list_directory`, `read_page`, `glob` (path pattern), `grep` (content regex), `get_backlinks`, `semantic_search` (S3 Vectors, hierarchy-filtered). |
+| Consumption (§7) | streamable-HTTP MCP on AgentCore | `services/consumption_mcp` | FastMCP, stateless, Cognito JWT. Tools: `read_me` (usage primer, described as the first call), `list_domains`, `list_directory`, `read_page`, `glob` (path pattern), `grep` (content regex), `get_backlinks`, `semantic_search` (S3 Vectors, hierarchy-filtered). |
 | Infrastructure (§8) | Terraform, split by lifecycle | `infra/durable`, `infra/compute` | Durable state (buckets, index, Cognito, DynamoDB) is a separate stack from compute (Lambdas, API, runtimes, CloudFront), wired via `terraform_remote_state`. |
 
 ## Key decisions
@@ -109,8 +109,8 @@ consumer scoped to the target is routed one hop to the docs. Being
 event-derived, the signal survives wipes and repromotes with no writer
 maintaining it and is rebuildable by replay — the same "S3 is truth, the rest is
 derived" rule as the vector index. Deliberately NOT threaded through: dataset
-guidance (one side's operator steering must not shape docs both sides read) and
-the RI benchmark loop. `external/` is ordinary published content — embedded,
+guidance (one side's operator steering must not shape docs both sides read).
+`external/` is ordinary published content — embedded,
 served, annotatable (the annotation run gains a `scope` filter on the
 `external/` prefix) — and a full harvest wipes it like everything else;
 re-running the cross harvest restores it.
@@ -132,6 +132,28 @@ is serialized (subagents share one
 session). It is a **separate tool, not the default backend** — the bundle stays
 on the `FilesystemBackend` mount that `finalize`/`reindex` read. Optional: with
 `OKF_CODE_INTERPRETER_ID` unset the harvest degrades to text-only `.context`.
+
+**Benchmarking is a standalone run mode, not part of a harvest.** Benchmark
+Studio (`mode: "benchmark"` on the harvest runtime — the container already owns
+the model factory, the Athena source, and `harvest/benchmark/`) evaluates a
+wiki against a user-supplied question set: per independent run, per enabled
+check (Accuracy/SQL EX / Behavior), bundle-blind solvers answer from the
+wiki alone; the judge grades every Behavior attempt independently against the
+row's free-form expectation (hallucination/policy tests — no deterministic
+grade exists), then reviews every failed Accuracy question once — with live
+data, the schema snapshot, and each solver's own solve trace — and rules it
+confirmed or overturned (Behavior skips that review: its grader already was
+the judge). The old in-harvest recursive-improvement loop is
+retired: a harvest only authors, and the improvement path is human-led (the
+judge's suggestions → an aggregator agent → user-reviewed annotations → a
+normal annotation harvest). Three boundaries carry over unchanged: gold lives
+off-mount (`benchmark/` prefix, never under `okf/`) where no LLM role's file
+tools reach; the report artifacts (gold-carrying) are served only via the
+Cognito-authed Control API; and a benchmark run takes **no harvest lease** — it
+writes nothing to the bundle (its wiki snapshot is materialized straight from
+S3, live or version-pinned), so it runs concurrently with harvests. Lifecycle
+and live progress ride the `REPORT#` registry row (flat scalars, polled by the
+UI); the report JSON in S3 is the durable truth.
 
 **Auth is Cognito OIDC.** One user pool; the same discovery URL feeds the UI, the
 API Gateway JWT authorizer, and the AgentCore JWT authorizer for consumption.

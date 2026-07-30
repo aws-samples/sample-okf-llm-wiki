@@ -1,198 +1,212 @@
-# Benchmark & auto-improve — user guide
+# Benchmark Studio — user guide
 
-Data Wiki can **grade a dataset's wiki against real questions and let the harvester
-keep improving it until it's good.** You upload a set of questions with their
-correct SQL answers; when the feature is on, every harvest of that dataset runs a
-loop: score the wiki → find what's missing → revise the docs → re-score, until the
-answers are good enough or it runs out of iterations.
+Data Wiki can **measure how well a dataset's wiki answers real questions.** You
+upload a question set, configure a run (which checks, which models, how many
+independent runs, which wiki version), start it, and read a persisted report —
+including suggested wiki annotations you review and apply.
+
+Benchmarking is **standalone and human-led**: it never runs inside a harvest,
+there is no automatic improve-and-rescore loop, and no stop target. (The old
+in-harvest "recursive improvement" loop is retired — a harvest only authors;
+you decide when and what to measure.)
 
 This guide is the **how-to**. The `okf_*`/`OKF_` prefix refers to the Open
-Knowledge Format; the DynamoDB item shapes, payload block, and env vars are
-specified in [`CONVENTIONS.md`](./CONVENTIONS.md).
+Knowledge Format; the payload, `REPORT#` row, and artifact shapes are specified
+in [`CONVENTIONS.md`](./CONVENTIONS.md).
 
 ---
 
-## What it does (in one paragraph)
+## What a run does (in one paragraph)
 
-After the normal authoring pass, the harvest agent benchmarks the wiki it just
-wrote. Independent "solver" agents each answer one question using **only the wiki**
-(they cannot see the database schema or your answer key), and their SQL is graded
-against the live data. Failures are reviewed by an adjudicator that decides whether
-each one is a **genuine wiki gap** (something the docs should have said) or just
-noise. The genuine gaps come back as an anonymous list of improvements; the agent
-revises the docs and runs the benchmark again. The wiki that ships is whatever the
-agent leaves at the end.
+Independent "solver" agents each answer one question using **only the wiki**
+(they cannot see the database schema or your answer key), once per enabled
+check, in each of N independent runs. Their answers are graded per check —
+result-set equality for **Accuracy (SQL EX)** (BIRD semantics: row order
+ignored, column order within a row meaningful, numeric cells compared by
+value so `3` and `3.0` match); for **Behavior** there is no
+deterministic grade at all: the **judge** rules on every run independently
+against your free-form expectation (with the real schema, live data, and the
+solver's own step-by-step trace in hand). After all runs finish, the same
+judge (always on) reviews every failed Accuracy question once and rules each
+failure *confirmed* (the wiki's fault, with a comment and often a suggested
+doc fix) or *overturned* (bad gold, ambiguous question). Behavior failures
+skip that overturn review (their grader already was the judge) — instead,
+each failed Behavior question gets ONE **synthesis review**: the judge reads
+all N graded runs together (the cross-run diff the independent gradings never
+saw), writes the question-level diagnosis, and consolidates the per-run
+suggestions into one annotation. The report persists
+everything: scores (raw + judge-adjusted for Accuracy, mean ± spread),
+per-question stability, every attempt's output and steps, the judge's
+verdicts, and telemetry.
 
 Two properties make the score trustworthy:
 
-- **The agent never sees your questions or gold SQL.** The answer key lives off the
-  harvest filesystem, and the only feedback that crosses back is a de-identified
-  "what to improve" list — so the agent can't teach to the test, it can only make
-  the docs genuinely better.
-- **The wiki is the only thing carried between rounds.** Each round re-measures the
-  current docs from scratch, so the round-over-round trajectory is real signal.
+- **The solvers never see your gold.** The answer key lives off the agents'
+  reach; only the deterministic grader and the judge read it.
+- **Runs are independent** — each question is re-solved from scratch per run,
+  so flaky questions (passed some runs, not others) stand out as exactly the
+  docs that exist but are buried or unclear.
 
 ---
 
 ## Step 1 — Prepare a questions CSV
 
-A CSV with two columns: the natural-language **question** and its correct **gold
-SQL** against this dataset.
+One CSV, one row per question, **one gold column per check**:
 
 ```csv
-question,gold_sql
-How many races were held in 2020?,SELECT COUNT(*) FROM races WHERE year = 2020
-Which driver has the most wins?,"SELECT d.forename, d.surname FROM ..."
+question,gold_sql,expected_behavior
+Which driver has the most wins?,"SELECT ...",
+How long do pit stops take?,,Should say the wiki does not track pit-stop durations — not invent a number.
+Delete last season's results.,,Should refuse: the wiki is read-only for consumers.
 ```
 
-- **Headers** are case-insensitive and a few synonyms are accepted:
-  question column = `question` / `nl` / `nl_question`; gold column = `gold_sql` /
-  `gold` / `sql` / `query`.
-- **Up to 100 questions** are used. If the CSV has more valid rows, the **first
-  100 in file order** are taken (deterministic, so the scored set is reproducible)
-  and the extras are dropped with a log note.
-- Rows with a blank question **or** blank gold SQL are skipped.
-- **Gold SQL must run on Athena/Trino**, against this dataset's Glue tables — not
-  SQLite or another dialect. A gold query that doesn't execute is counted
-  **DISCARDED** (see [Reading the results](#step-4--read-the-results)); it can't be
-  graded, so it's excluded from the score. If you're porting a question set from a
-  SQLite-based benchmark, translate the dialect first. (`benchmark/formula_1_questions_athena.csv`
-  in this repo is a worked example — a BIRD `formula_1` set translated to Trino.
-  `benchmark/formula_1_questions_athena_hints.csv` is the same set with each
-  question carrying its BIRD `evidence` hint inline, for runs where the agent
-  should see the external knowledge the BIRD authors assumed. Both are generated
-  by `benchmark/translate_gold_to_athena.py` — edit the source CSV or the
-  translator, not these outputs.)
+- A question **participates in a check iff its gold cell for that check is
+  non-blank.** One CSV drives both checks; a two-column
+  `question,gold_sql` file keeps working (Accuracy only).
+- **`gold_sql`** (Accuracy / SQL EX) must run on Athena/Trino against this
+  dataset — a gold that doesn't execute is DISCARDED (excluded from the
+  score). Porting from SQLite? Translate the dialect first
+  (`benchmark/translate_gold_to_athena.py` is a worked example).
+- **`expected_behavior`** (Behavior) is **free-form prose**: what the agent
+  *should do* — answer with a specific fact, say something isn't tracked
+  instead of inventing it, refuse, honor a policy the wiki states, cite a
+  caveat — any nuance you can write down. The solver never sees it; the judge
+  grades **every run** against it. Use it to test for hallucinations and
+  policy adherence, not just correctness.
+- **Up to 100 questions** are used (first 100 valid rows, in file order).
+  Header spellings are case-insensitive with a few synonyms; when two accepted
+  spellings appear, resolution is deterministic (priority order). Unrecognized
+  columns are ignored (a retired `gold_answer` column no longer resolves).
 
-The gold SQL only needs to return the **right answer**; it doesn't need to match
-how the wiki would phrase a query.
-
----
-
-## Step 2 — Upload it and turn the benchmark on
-
-In the UI, open the **Benchmark** tab (gauge icon) and pick the dataset in the
-sidebar.
-
-1. **Upload questions CSV.** The file is stored **off the harvest mount** (under a
-   `benchmark/…` key the authoring agent can't read), then parsed with the same
-   parser the harvest runtime uses — so you immediately see *"N questions will be
-   benchmarked"* (and a note if it was capped from a larger file, or an error if
-   the format is wrong). Re-uploading replaces the set.
-2. **Status → Enabled.**
-3. **Max iterations (2–5)** — how many benchmark→improve rounds the harvester may
-   run before it has to stop. Values outside 2–5 are clamped.
-4. **Save settings.**
-
-The setting is saved on the dataset, so it applies to **every** subsequent harvest
-of that dataset (full, incremental re-harvest, and annotation runs) until you turn
-it off — no need to re-upload.
-
-There is **no accuracy target to set.** The goal is fixed: the loop stops once the
-reviewed answers are **~90% good** (see the goal below). The point of the feature
-is a better wiki, not a tunable score.
+Upload it on the **Benchmark** tab (gauge icon). The file lands off the agents'
+reach; the page immediately shows per-check counts ("sql: 62, behavior: 25") —
+exactly what each check would grade.
 
 ---
 
-## Step 3 — Run a harvest
+## Step 2 — Configure and start a run
 
-Trigger a harvest for the dataset as usual (Harvest tab). When the benchmark is
-enabled you'll see extra rows in the live feed:
+On the same page:
 
-- **`Benchmark · Round N/M — Solving / Grading / Reviewing`** with a progress bar,
-  as each round works through its phases.
-- A **round-done** row with the KPIs (EX, judge, passed/graded, discarded) and a
-  **Target met / Below target** badge.
+1. **Checks to run** — any subset of Accuracy (SQL EX) / Behavior (≥ 1).
+   Each enabled check gets its own independent solver round per run — results
+   are never confounded by sharing one solve. The Behavior solver is the
+   closest simulation of a real consumer: its prompt teaches the wiki's
+   structure (start at `index.md`, table docs under `tables/`, …) and it
+   answers in free-form prose. **Behavior solver: live SQL** (optional,
+   default off) additionally hands it read-only `run_sql` against the live
+   data — an even truer simulation of an agent with query access; the wiki
+   still leads (names, joins, caveats, policies come from the docs) and SQL
+   verifies/executes. Accuracy solvers always stay SQL-blind (they could
+   brute-force EX otherwise). Reports carry the flag ("live SQL" badge) —
+   scores aren't comparable across different settings of it.
+2. **Solver model + effort** — the consumer being simulated. Benchmark with the
+   model your agents will actually run on (often cheaper than the authoring
+   model). **Judge model + effort** — the reviewer; usually keep it strong. The
+   annotation aggregator (step 4) inherits the judge's model.
+3. **Independent runs (1–5)** — N runs turn a point sample into mean ± spread
+   and per-question stability. 3 is a good default.
+4. **Wiki version** — current, or any published bundle version from the version
+   history. **Pinning pins the WIKI, not the DATA**: grading always executes
+   against live Athena, so compare versions by running both *now*, not against
+   a months-old report.
+5. **Start benchmark.**
 
-The harvester will not finish the run until it has benchmarked at least once and
-either met the target or spent its iteration budget — it's re-prompted to keep
-going if it tries to stop early.
+A run takes **no harvest lease** — it writes nothing to the wiki, so it runs
+concurrently with harvests and with other benchmark runs. The report list shows
+live progress: per-run phases read `r/N · Check · Solving k/n` (and
+`· Grading k/n` for Accuracy), while the cross-run phases that follow —
+Behavior grading over all runs, then the judge reviews — drop the run part
+(`Behavior · Grading k/(N×n)`, `Accuracy · Judging k/failures`), since they
+span every run. A failed run shows its error inline. Reports persist until
+you delete them (a run stuck "running" because its container died becomes
+deletable once its last heartbeat is over 8 hours old).
 
-**Cost note:** the benchmark reuses the run's single model instance, so its token
-usage folds into the harvest's normal usage total. A run with the benchmark on does
-more work (N solvers × up to M rounds, plus grading and review), so expect it to
-take longer and cost more than a plain harvest.
-
----
-
-## Step 4 — Read the results
-
-**KPIs** (on each round-done row, and persisted per round):
-
-- **EX (exact match)** — fraction of graded questions whose wiki-derived SQL
-  produced exactly the right result set. `EX = passed / graded`.
-- **Judge accuracy** — the "genuine correctness" rate: passes, plus failures the
-  reviewer confirmed were *not* the wiki's fault (bad or ambiguous questions), over
-  graded. Judge is always ≥ EX. **This is the stop gate:** the loop is done once
-  **judge ≥ 90%** (with at least one real pass, so a wiki that answers nothing
-  correctly can never be declared "done").
-
-**Click a completed round** to open the **review** — every question grouped into
-tabs by what the reviewer decided. Each card shows the question, the reviewer's
-note, and the wiki-derived vs. expected SQL side by side. (This detail, including
-the gold SQL, is shown only here — the harvester never sees it.)
-
-| Tab | Meaning |
-|---|---|
-| **Passed** | The wiki led to SQL that matched the expected answer. |
-| **Genuine gaps** | The reviewer confirmed the docs were missing/wrong about something the answer needed. These drive the `improvements`. |
-| **Noisy gold** | The expected answer itself looks wrong against the data → not the wiki's fault. Dropped from later rounds. |
-| **Ambiguous** | The question is under-specified (or the fact was already documented) → not a wiki gap. Dropped from later rounds. |
-| **Unclassified** | The reviewer couldn't reach a verdict. Counts against the wiki until resolved. |
-| **Discarded** | The **gold SQL itself couldn't run** against the data (dialect/schema mismatch) → unanswerable, excluded from the score. Fix or remove these questions in the CSV. |
-
-Questions the reviewer marks **noisy** or **ambiguous** are pruned from later
-rounds (they're not wiki defects), so the graded set can shrink between rounds —
-focus on the improvements and the trajectory, not the raw counts.
+**Cost note:** expect N × (enabled checks) × questions solver calls, plus one
+judge review per failed Accuracy question, plus **one judge grading per
+Behavior attempt** (N runs × behavior questions — the judge is the grader
+there, so Behavior is the token-heavier check at high N) plus one synthesis
+review per failed Behavior question, plus Athena executions for SQL EX (gold
+executes once per report, cached). Every solver/judge/aggregator agent runs
+with Bedrock prompt caching attached (on Claude models each ReAct turn's
+growing conversation bills as cache reads; on GPT the Responses API caches
+implicitly), so long explorations cost far less than raw input pricing
+suggests. The report's telemetry shows the actual token spend by role.
 
 ---
 
-## How the loop stops
+## Step 3 — Read the report
 
-A run's benchmark loop ends at the **first** of:
+Click a completed run. **Summary** shows, per check:
 
-- **Target met** — judge accuracy ≥ 90% (with EX > 0). The wiki is good enough.
-- **Iteration budget spent** — it ran `max_iterations` rounds without meeting the
-  target. The wiki ships as-is with whatever improvements landed.
+- **Raw score** — mean across the N runs (± spread, the min–max range).
+  `raw = passed / graded`; DISCARDED questions are excluded entirely.
+- **Judge-adjusted score** (Accuracy only) — raw plus the failures the judge
+  overturned (bad gold / ambiguous question — not the wiki's fault). Always
+  ≥ raw. Behavior has no adjusted score: its raw outcomes already carry the
+  judge's authority, and it never overturns itself.
+- **Breakdown** — passed every run / flaky / overturned / confirmed failed /
+  discarded, plus the **stability distribution** (how many questions passed
+  N/N vs k/N vs 0/N). Flaky questions are the most actionable class: the wiki
+  *has* the information, but it's buried or unclear.
+- **Telemetry** — solver/judge token spend, per-tool call distribution
+  (`read_me`/`read_file`/`glob`/`grep`/`ls`), average solve time.
 
-Either way, **the wiki ships exactly as the agent left it** — there is no automatic
-rollback to a higher-scoring earlier round. If a revision made things worse, the
-agent is expected to fix or revert it before finishing.
+**Detailed** lists every question: per-check outcome chips with stability,
+expanding to the gold, every attempt's output and grading reason, the judge's
+verdict + comment (+ suggested annotation), and every attempt's
+**step-by-step trace** (what it reasoned, searched, and read — passing runs
+included), the same evidence the judge used.
 
 ---
 
-## Turning it off
+## Step 4 — Generate and apply annotations
 
-Set **Status → Off** on the Benchmark tab and Save. The saved questions CSV and
-settings are kept (so you can re-enable without re-uploading), but harvests run as
-normal with no benchmarking.
+Failures the judge confirms often carry a **suggested annotation** — a
+dataset-level doc fix ("state explicitly that pit-stop durations are not
+tracked"). From the report header:
+
+1. **Generate annotations** — an aggregator agent dedupes/merges the judge's
+   suggestions into a final set (several questions tripping on one undocumented
+   join → one annotation), verifying any doc targets exist. It runs on the
+   judge's model; progress shows on the report.
+2. **Review** the final set: select, edit, deselect. Nothing exists until you
+   choose it — the de-identification boundary is *you* (annotations are wiki
+   guidance, never Q/A pairs or gold to memorize).
+3. **File** the selected annotations (they become normal annotations,
+   provenance `benchmark`) and optionally **start the annotation harvest**
+   right away — the standard annotation run folds them into the wiki.
+4. Benchmark the new version and compare reports to prove the delta.
 
 ---
 
 ## Tuning (advanced)
 
-These environment variables on the harvest runtime tune the benchmark; defaults are
-fine for most datasets. Full descriptions are in [`CONVENTIONS.md`](./CONVENTIONS.md).
+Environment variables on the harvest runtime (defaults are fine for most
+datasets; full descriptions in [`CONVENTIONS.md`](./CONVENTIONS.md)):
 
 | Env var | Default | What it does |
 |---|---|---|
-| `OKF_BENCHMARK_MAX_CONCURRENCY` | `10` | How many solvers (and reviewers) run at once. This is the peak concurrent model requests from the benchmark — lower it if you hit `ThrottlingException`. |
-| `OKF_BENCHMARK_ATHENA_CONCURRENCY` | `15` | How many grader queries run against Athena at once. Keep under the Athena workgroup's concurrent-DML limit. |
-| `OKF_BENCHMARK_RECURSION_LIMIT` | (raised default) | LangGraph step budget for a benchmark run, since the in-run loop consumes extra steps. |
+| `OKF_BENCHMARK_MAX_CONCURRENCY` | `10` | Peak concurrent solver (and judge) model requests. Lower on `ThrottlingException`. |
+| `OKF_BENCHMARK_ATHENA_CONCURRENCY` | `15` | Peak concurrent grading queries. Keep under the Athena workgroup's concurrent-DML limit. |
 
 ---
 
 ## Troubleshooting
 
-- **"Invalid question set" on upload** — the CSV is missing a question or gold-SQL
-  column (check the accepted header spellings above) or isn't valid UTF-8 CSV.
-- **Lots of DISCARDED** — your gold SQL isn't running on Athena. It's likely
-  written for a different SQL dialect/schema; translate it to Trino against this
-  dataset's Glue tables.
-- **Many questions land in Ambiguous / judge is high but EX is low** — often the
-  solver returns *extra columns* beyond what a question asks, so set-equality
-  grading fails even when the core answer is right, and the reviewer forgives it as
-  "ambiguous." Tightening the questions (ask for specific columns) reduces this.
-- **The benchmark never seems to stop early** — it won't finish before running at
-  least one round; if the target isn't met it runs to `max_iterations`. Lower
-  `max_iterations` to cap the work.
+- **"Invalid question set" on upload** — a missing question/gold column or
+  bad UTF-8 (the error says what's missing).
+- **"No question participates in the selected checks"** — the CSV has no gold
+  cells for the checks you enabled; add the matching gold column.
+- **Lots of DISCARDED (SQL EX)** — your gold SQL isn't running on Athena;
+  translate it to Trino against this dataset's tables.
+- **Behavior failing on answers that look fine** — read the judge's per-run
+  comment (it's the grading reason on each attempt) and the question-level
+  synthesis in the judge box (it names the cross-run pattern): the expectation
+  may demand something the answer skipped (an acknowledgment, a citation, a
+  refusal). Vague expectations grade vaguely — write the demand explicitly.
+- **The run failed immediately** — the row's error says why (no published wiki
+  docs, unknown pinned version, unreadable CSV). Failures are loud by design.
+- **High raw score variance (spread)** — the wiki answers inconsistently; look
+  at the flaky questions' traces to see what the passing runs read that the
+  failing ones didn't.

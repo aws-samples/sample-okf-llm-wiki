@@ -551,60 +551,21 @@ Return a one-line summary (concept id, what the doc states, its cardinality).
 """
 
 
-# Appended to the supervisor prompt ONLY when recursive improvement is enabled for
-# the run (the run_benchmark tool is registered). Describes the benchmark→revise
-# loop. Omitted otherwise so the agent is never told about a tool it doesn't have.
-_RECURSIVE_IMPROVEMENT_SECTION = """
-## Recursive improvement (benchmark-driven) — REQUIRED this run
-
-This run has a `run_benchmark` tool and a benchmark question set. AFTER the review
-pass, and BEFORE you consider the bundle done, you MUST measure and improve the
-wiki against the benchmark:
-
-1. Call `run_benchmark` (no arguments). It runs the whole question set through
-   independent solvers that may read ONLY your wiki, grades their SQL against the
-   real data, and returns `{iteration, ex_score, judge_accuracy, passed, failed,
-   discarded, graded, target_met, improvements}`. You NEVER see the questions
-   or the expected answers — only the aggregated `improvements` themes. `target_met`
-   is true once adjudicated (judge) accuracy reaches the fixed 90% bar.
-2. If `target_met` is true, you are done — stop calling `run_benchmark`.
-3. Otherwise, treat each `improvements` item as a HYPOTHESIS about a wiki gap.
-   For each, VERIFY it against live data (`run_sql`/`sample_rows`, `.metadata/`)
-   the same way you author anything — then fix the relevant docs (respecting the
-   guard; `get_backlinks` to propagate). Do NOT invent content to chase a score;
-   only write what the data confirms. An improvement you can't reproduce against
-   live data, you leave alone.
-4. Call `run_benchmark` again to re-measure. Repeat until `target_met` is true
-   or the tool refuses further calls (your iteration budget is spent) — either is
-   a valid stopping point. Questions the review deems noisy or ambiguous are
-   dropped from later rounds automatically, so the graded set may shrink between
-   calls — focus on the `improvements`, not the raw pass counts.
-
-The wiki ships EXACTLY as you leave it — there is NO automatic rollback to a
-higher-scoring earlier round. So if a revision lowers the score, fix or revert it
-before you finish; never end on a version worse than one you already had. The
-`improvements` are dataset-level facts (e.g. "document that `status` is an int
-code, 1=active"); write them as durable doc content, not as answers to specific
-questions (you can't see the questions anyway).
-"""
-
 def build_supervisor_prompt(
-    recursive_improvement: bool = False,
     *,
     profile: SourcePromptProfile | None = None,
     gpt: bool = False,
 ) -> str:
-    """The supervisor prompt for ``profile``'s source, with the RI section iff enabled.
+    """The supervisor prompt for ``profile``'s source.
 
     ``profile`` defaults to the Glue profile so the no-arg call (and legacy callers)
-    still produce the Glue prompt. An RI run appends the benchmark-loop section.
-    ``gpt`` appends the GPT-family addendum (set iff the SUPERVISOR's resolved
-    model is an OpenAI GPT — see ``_GPT_ADDENDUM``).
+    still produce the Glue prompt. ``gpt`` appends the GPT-family addendum (set iff
+    the SUPERVISOR's resolved model is an OpenAI GPT — see ``_GPT_ADDENDUM``).
+    A harvest never benchmarks: the retired in-run RI loop's prompt section is
+    gone with its `run_benchmark` tool (Benchmark Studio is a separate run mode).
     """
     profile = profile or GlueAthenaSource.prompt_profile
     prompt = _fill(_RUNTIME_TMPL + _SUPERVISOR_BODY, profile)
-    if recursive_improvement:
-        prompt = prompt + _RECURSIVE_IMPROVEMENT_SECTION
     return _with_gpt(prompt, gpt)
 
 
@@ -1095,8 +1056,8 @@ Return a one-line summary (the concept id, fact type, and what you verified).
 #   <output_discipline> — GPT is trained to emit tool preambles and to NOT
 #                         format final answers as Markdown; both are inverted
 #                         here (no narration; everything is Markdown).
-# Deliberately NOT applied to the benchmark solver/adjudicator prompts: their
-# fenced SQL/JSON output contracts are explicit and must not be contradicted.
+# Deliberately NOT applied to the benchmark solver/judge prompts: their fenced
+# SQL/JSON output contracts are explicit and must not be contradicted.
 _GPT_ADDENDUM = """
 ## GPT-family runtime notes
 

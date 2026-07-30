@@ -83,7 +83,7 @@ KIND_SUBAGENT = "subagent"
 # `cache_creation` (Anthropic prompt-cache WRITE); `cache_read` is a cache HIT.
 # The snapshot ALSO carries `by`: the same counters split per METERING SCOPE —
 # `supervisor` (the top-level agent's own turns), `subagents` (the dispatched
-# authors/extractors AND the benchmark solver/adjudicator), and `reviewer` (the
+# authors/extractors), and `reviewer` (the
 # adversarial review fan-out, which can run on its own model for cross-model
 # coverage). Attribution is by MODEL INSTANCE: each scope runs on a separate
 # instance carrying its own scope-tagged UsageForwarder, so no per-callback
@@ -95,21 +95,6 @@ KIND_USAGE = "usage"
 SCOPE_SUPERVISOR = "supervisor"
 SCOPE_SUBAGENTS = "subagents"
 SCOPE_REVIEWER = "reviewer"
-# Recursive-improvement benchmark events. KIND_BENCHMARK_PROGRESS is a live
-# in-round update (phase + an N/M counter) the UI renders as a progress row that
-# updates in place, keyed by (iteration, phase). KIND_BENCHMARK is the per-round
-# KPI summary emitted when a round finishes. Both carry benchmark-specific fields
-# (phase/iteration/current/total + the KPI fields) that the Control API
-# _parse_step_line must whitelist to reach the UI.
-KIND_BENCHMARK = "benchmark"
-KIND_BENCHMARK_PROGRESS = "benchmark_progress"
-
-# Benchmark phases (the label the progress row shows).
-BENCH_PHASE_SOLVE = "solving"
-BENCH_PHASE_GRADE = "grading"
-BENCH_PHASE_ADJUDICATE = "reviewing"
-BENCH_PHASE_DONE = "done"
-
 # Sub-agent lifecycle phases (mirror langchain_quickjs SubagentStreamEvent).
 PHASE_START = "start"  # dispatched and running
 PHASE_COMPLETE = "complete"

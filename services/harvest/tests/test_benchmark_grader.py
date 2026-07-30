@@ -47,8 +47,10 @@ def test_fail_on_set_difference():
     assert "differ" in r.reason
 
 
-def test_column_order_within_row_ignored():
-    # Same values, different SELECT column order → still PASS (value-set compare).
+def test_transposed_values_within_row_fail():
+    # BIRD compares rows POSITIONALLY: the same values in swapped columns is a
+    # different answer (gold ('x','5') vs predicted ('5','x') must NOT pass —
+    # per-row value sorting used to admit exactly this false PASS).
     fake = FakeAthena(
         {
             "GOLD": [{"name": "x", "n": "5"}],
@@ -56,7 +58,37 @@ def test_column_order_within_row_ignored():
         }
     )
     g = Grader(fake.execute)
+    assert g.grade(0, "GOLD", "PRED").outcome is Outcome.FAIL
+
+
+def test_numeric_strings_compare_by_value():
+    # Athena stringifies every cell; BIRD compares native values where
+    # 3 == 3.0. A COUNT(*) gold vs an equivalent SUM prediction must PASS.
+    fake = FakeAthena(
+        {
+            "GOLD": [{"c": "3", "avg": "2.50"}],
+            "PRED": [{"c": "3.0", "avg": "2.5"}],
+        }
+    )
+    g = Grader(fake.execute)
     assert g.grade(0, "GOLD", "PRED").outcome is Outcome.PASS
+
+
+def test_numeric_lookalikes_stay_strings():
+    # '007' is an identifier, not the number 7 (Athena never renders a numeric
+    # cell with leading zeros); 'NaN' must not become Decimal NaN (NaN != NaN
+    # would make identical result sets compare unequal).
+    fake = FakeAthena(
+        {
+            "GOLD": [{"c": "007"}],
+            "PRED": [{"c": "7"}],
+            "NAN_G": [{"c": "NaN"}],
+            "NAN_P": [{"c": "NaN"}],
+        }
+    )
+    g = Grader(fake.execute)
+    assert g.grade(0, "GOLD", "PRED").outcome is Outcome.FAIL
+    assert g.grade(1, "NAN_G", "NAN_P").outcome is Outcome.PASS
 
 
 def test_null_distinguished_from_empty_string():

@@ -26,7 +26,6 @@ from okf_aws import s3_versions
 from okf_core import annotations as anno
 from okf_core import chat_threads as ct
 from okf_core import guidance as gd
-from okf_core import recursive_improvement as ri
 from okf_core.domain import DOMAIN_DATASET
 from okf_core.links import extract_links_with_headings
 from okf_core.paths import is_external_concept_id, parse_concept_id
@@ -717,113 +716,6 @@ def set_dataset_guidance(
     }
 
 
-def get_dataset_ri_settings(
-    ddb, *, registry_table: str, data_domain: str, dataset: str
-) -> dict[str, Any]:
-    """Return the dataset's saved recursive_improvement settings (or a disabled default).
-
-    404 if the mapping is missing. When no RI settings are stored, returns
-    ``{enabled: False}`` so the UI can render an off toggle.
-    """
-    resp = ddb.get_item(
-        TableName=registry_table,
-        Key={"pk": {"S": f"DOMAIN#{data_domain}"}, "sk": {"S": f"DATASET#{dataset}"}},
-    )
-    item = resp.get("Item")
-    if not item:
-        raise ApiError(404, f"no such dataset: {data_domain}/{dataset}")
-    return {
-        "data_domain": data_domain,
-        "dataset": dataset,
-        "recursive_improvement": _ri_settings_from_item(item),
-    }
-
-
-def set_dataset_ri_settings(
-    ddb,
-    *,
-    registry_table: str,
-    data_domain: str,
-    dataset: str,
-    settings: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Persist the dataset's recursive_improvement settings on the DATASET# row.
-
-    ``settings`` is the caller's raw config; it is VALIDATED + clamped by
-    ``okf_core.recursive_improvement.validate`` at this trust boundary (bad values
-    → 400). Disabling (``enabled`` false / omitted) stores a minimal disabled
-    marker so the feature is inert without losing the ability to re-enable. When a
-    ``questions_key`` isn't supplied, the canonical off-mount key is used.
-    """
-    # Default the questions_key to the canonical off-mount location if absent, so a
-    # UI that just uploaded the CSV + flipped "enabled" needn't restate the key.
-    settings = dict(settings or {})
-    if settings.get(ri.FIELD_ENABLED) and not settings.get(ri.FIELD_QUESTIONS_KEY):
-        settings[ri.FIELD_QUESTIONS_KEY] = benchmark_questions_key(data_domain, dataset)
-    try:
-        validated = ri.validate(settings)
-    except ri.RecursiveImprovementConfigError as e:
-        raise ApiError(400, str(e)) from e
-
-    stored = validated or {ri.FIELD_ENABLED: False}
-    try:
-        ddb.update_item(
-            TableName=registry_table,
-            Key={
-                "pk": {"S": f"DOMAIN#{data_domain}"},
-                "sk": {"S": f"DATASET#{dataset}"},
-            },
-            UpdateExpression="SET #ri = :ri",
-            ConditionExpression="attribute_exists(pk)",
-            ExpressionAttributeNames={"#ri": ri.CONFIG_KEY},
-            ExpressionAttributeValues={":ri": {"M": _ri_to_ddb(stored)}},
-        )
-    except Exception as e:  # noqa: BLE001 - map a missing mapping to 404
-        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
-        if code == "ConditionalCheckFailedException":
-            raise ApiError(404, f"no such dataset: {data_domain}/{dataset}") from e
-        raise
-    return {
-        "data_domain": data_domain,
-        "dataset": dataset,
-        "recursive_improvement": stored,
-    }
-
-
-def _ri_to_ddb(settings: dict[str, Any]) -> dict[str, Any]:
-    """Marshal a validated RI settings map to a DynamoDB ``M`` value's contents."""
-    out: dict[str, Any] = {}
-    for key, value in settings.items():
-        if isinstance(value, bool):
-            out[key] = {"BOOL": value}
-        elif isinstance(value, (int, float)):
-            out[key] = {"N": str(value)}
-        elif isinstance(value, list):
-            out[key] = {"L": [{"S": str(v)} for v in value]}
-        else:
-            out[key] = {"S": str(value)}
-    return out
-
-
-def _ri_settings_from_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Read the recursive_improvement map off a DATASET# item (disabled if absent)."""
-    m = (item.get(ri.CONFIG_KEY) or {}).get("M")
-    if not m:
-        return {ri.FIELD_ENABLED: False}
-    out: dict[str, Any] = {}
-    for key, av in m.items():
-        if "BOOL" in av:
-            out[key] = av["BOOL"]
-        elif "N" in av:
-            n = av["N"]
-            out[key] = int(n) if "." not in n else float(n)
-        elif "L" in av:
-            out[key] = [e.get("S", "") for e in av["L"]]
-        else:
-            out[key] = av.get("S", "")
-    return out
-
-
 def provision_dataset_dirs(
     agentcore,
     *,
@@ -969,12 +861,16 @@ def delete_domain_mapping(
        **S3 Vectors** entries for free: each ``Object Deleted`` event flows
        through the reindex pipeline, which ``DeleteVectors`` by key. (The Control
        API has no s3vectors permissions by design; the cascade owns that.)
+       **Benchmark objects** under ``benchmark/<domain>/<dataset>/`` go with
+       them — the gold-carrying ``questions.csv`` and every report artifact
+       must not outlive the dataset (a re-registered same-named dataset would
+       otherwise inherit the previous owner's gold and reports).
     2. **Freshness rows** in the freshness table: the per-table ``TABLE#.../VERSION``
        rows and the reindex dedup ``VEC#.../SEQ`` markers for this dataset.
-    3. **Harvest status** row (``HARVEST#.../STATUS``) and the **mapping**
-       (``DOMAIN#/DATASET#``) in the registry — deleted LAST so that if an
-       earlier step fails and the request is retried, the dataset is still
-       resolvable/visible rather than half-gone.
+    3. **Harvest status + REPORT# rows** (the whole ``HARVEST#<d>#<ds>``
+       partition) and the **mapping** (``DOMAIN#/DATASET#``) in the registry —
+       deleted LAST so that if an earlier step fails and the request is
+       retried, the dataset is still resolvable/visible rather than half-gone.
 
     ``s3``/``bundle_bucket``/``freshness_table`` are optional so existing callers
     and tests that only exercise the registry keep working; when omitted, the
@@ -983,19 +879,14 @@ def delete_domain_mapping(
     purged_objects = 0
     purged_freshness = 0
 
-    # 1. Bundle objects (+ cascade to vectors via Object-Deleted events).
+    # 1. Bundle + benchmark objects (+ cascade to vectors via Object-Deleted
+    #    events for the .md keys).
     if s3 is not None and bundle_bucket:
-        prefix = bundle_prefix(data_domain, dataset)
-        batch: list[dict[str, str]] = []
-        for key in _iter_bundle_keys(s3, bucket=bundle_bucket, prefix=prefix):
-            batch.append({"Key": key})
-            if len(batch) == 1000:  # DeleteObjects hard limit
-                s3.delete_objects(Bucket=bundle_bucket, Delete={"Objects": batch})
-                purged_objects += len(batch)
-                batch = []
-        if batch:
-            s3.delete_objects(Bucket=bundle_bucket, Delete={"Objects": batch})
-            purged_objects += len(batch)
+        for prefix in (
+            bundle_prefix(data_domain, dataset),
+            _benchmark_prefix(data_domain, dataset),
+        ):
+            purged_objects += _purge_s3_prefix(s3, bucket=bundle_bucket, prefix=prefix)
 
     # 2. Freshness rows: TABLE#<d>#<ds>#* / VERSION and VEC#<d>/<ds>/* / SEQ.
     if freshness_table:
@@ -1003,7 +894,9 @@ def delete_domain_mapping(
             ddb, freshness_table, data_domain, dataset
         )
 
-    # 3. Harvest status row, then the mapping (mapping last).
+    # 3. Benchmark REPORT# rows, the harvest status row, then the mapping
+    #    (mapping last).
+    purged_reports = _delete_report_rows(ddb, registry_table, data_domain, dataset)
     ddb.delete_item(
         TableName=registry_table,
         Key={"pk": {"S": f"HARVEST#{data_domain}#{dataset}"}, "sk": {"S": "STATUS"}},
@@ -1018,7 +911,60 @@ def delete_domain_mapping(
         "dataset": dataset,
         "purged_bundle_objects": purged_objects,
         "purged_freshness_rows": purged_freshness,
+        "purged_report_rows": purged_reports,
     }
+
+
+def _purge_s3_prefix(s3, *, bucket: str, prefix: str) -> int:
+    """Batch-delete every object under ``prefix``; returns the count deleted."""
+    deleted = 0
+    batch: list[dict[str, str]] = []
+    for key in _iter_bundle_keys(s3, bucket=bucket, prefix=prefix):
+        batch.append({"Key": key})
+        if len(batch) == 1000:  # DeleteObjects hard limit
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+            deleted += len(batch)
+            batch = []
+    if batch:
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+        deleted += len(batch)
+    return deleted
+
+
+def _delete_report_rows(
+    ddb, registry_table: str, data_domain: str, dataset: str
+) -> int:
+    """Delete every benchmark ``REPORT#`` row for a dataset; returns the count.
+
+    Same partition as the harvest status row (``HARVEST#<d>#<ds>``), so this is
+    one Query on the sk prefix + per-row deletes. Without it a deleted dataset's
+    reports (KPIs, gold-derived config) survived — and re-registering the same
+    names resurrected them in the new owner's report list.
+    """
+    from okf_core import benchmark_report as br
+
+    deleted = 0
+    kwargs: dict[str, Any] = {
+        "TableName": registry_table,
+        "KeyConditionExpression": "pk = :pk AND begins_with(sk, :skp)",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+            ":skp": {"S": br.report_sk_query_prefix()},
+        },
+    }
+    while True:
+        resp = ddb.query(**kwargs)
+        for item in resp.get("Items", []):
+            ddb.delete_item(
+                TableName=registry_table,
+                Key={"pk": item["pk"], "sk": item["sk"]},
+            )
+            deleted += 1
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+    return deleted
 
 
 def _delete_freshness_rows(
@@ -1364,10 +1310,13 @@ def delete_context_doc(
 # so a malformed multi-MB upload can't be read fully into the Lambda for nothing.
 _BENCHMARK_CSV_MAX_BYTES = CONTEXT_UPLOAD_MAX_BYTES
 
-# A per-round review JSON is bounded: <=100 questions, each with two SQL strings +
-# a short note. 8 MiB is generous headroom; the cap just stops a corrupt/huge object
-# from being read wholesale into the Lambda.
-_BENCHMARK_REVIEW_MAX_BYTES = 8 * 1024 * 1024
+# Inline cap for benchmark artifacts (report.json / traces.json) served through
+# the Lambda. A synchronous Lambda response tops out at 6 MB, and a multi-run
+# traces.json (EVERY attempt: questions × checks × runs) legitimately exceeds
+# that — so anything past this cap is served as a short-lived presigned S3 GET
+# instead of being streamed (which would die in the platform as an opaque 502).
+_BENCHMARK_INLINE_MAX_BYTES = 4 * 1024 * 1024
+_BENCHMARK_PRESIGN_EXPIRY_SECONDS = 300
 
 
 # --------------------------------------------------------------------------- #
@@ -1447,8 +1396,11 @@ def inspect_benchmark_questions(
       questions that will be benchmarked (after skipping blank rows and applying
       the 100-row cap), ``capped`` true iff rows were dropped by the cap.
     """
-    from okf_core.benchmark_questions import BenchmarkCSVError, load_questions
-    from okf_core.recursive_improvement import MAX_QUESTIONS
+    from okf_core.benchmark_questions import (
+        MAX_QUESTIONS,
+        BenchmarkCSVError,
+        load_questions,
+    )
 
     key = benchmark_questions_key(data_domain, dataset)
     try:
@@ -1488,7 +1440,10 @@ def inspect_benchmark_questions(
             "uploaded": True,
             "valid": False,
             "key": key,
-            "error": "no valid rows — every row is missing a question or gold_sql",
+            "error": (
+                "no valid rows — every row is missing a question or has no gold "
+                "cell (gold_sql / expected_behavior)"
+            ),
         }
 
     return {
@@ -1500,54 +1455,634 @@ def inspect_benchmark_questions(
         "dropped": loaded.dropped,
         "capped": loaded.dropped > 0,
         "max_questions": MAX_QUESTIONS,
+        # Per-check participation over the KEPT questions — what a run of that
+        # check would actually grade ("sql: 62, behavior: 25").
+        "check_counts": loaded.check_counts,
     }
 
 
-# --------------------------------------------------------------------------- #
-# Recursive-improvement per-round REVIEW (off-mount, gold-carrying, human-facing)
-# --------------------------------------------------------------------------- #
-#
-# The harvest runtime writes one JSON per round under this prefix (see
-# harvest/benchmark/review_store.py). It carries gold + predicted SQL, so it lives
-# OFF the okf/ mount (no LLM role can read it) and is served ONLY here, to the
-# Cognito-authed UI. The key shape MUST match review_store.review_key verbatim.
+def _read_benchmark_artifact(
+    s3, *, bucket: str, key: str, what: str, missing: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """GET + parse one off-mount benchmark JSON artifact (report or traces).
 
-
-def benchmark_review_prefix(data_domain: str, dataset: str) -> str:
-    """Off-mount S3 prefix for a dataset's benchmark review artifacts."""
-    return f"{_benchmark_prefix(data_domain, dataset)}reviews/"
-
-
-def benchmark_review_key(
-    data_domain: str, dataset: str, session_id: str, iteration: int
-) -> str:
-    """The S3 key for one round's review JSON."""
-    return f"{benchmark_review_prefix(data_domain, dataset)}{session_id}/{iteration}.json"
-
-
-def get_benchmark_review(
-    s3, *, bucket: str, data_domain: str, dataset: str, session_id: str, iteration: int
-) -> dict[str, Any]:
-    """Return one round's persisted review JSON (all buckets, per-question, w/ gold).
-
-    404 if the round's artifact doesn't exist (older run, or the round hasn't
-    persisted yet). Other S3 errors surface as 502. The session_id + iteration come
-    from the harvest feed's ``benchmark`` event (which set ``has_review`` true)."""
-    key = benchmark_review_key(data_domain, dataset, session_id, iteration)
+    Returns ``(doc, None)`` for an artifact small enough to ride the Lambda
+    response, or ``(None, presigned_url)`` for a large one — the UI follows the
+    short-lived S3 URL instead. Same trust boundary: the URL is vended only
+    inside a Cognito-authed response and expires in minutes. A completed run's
+    report must NEVER become unreadable because it grew (it used to 502 forever
+    past a hard cap — after hours of paid solving). A missing object is a clean
+    404 (an older run, or a run that never persisted); every other S3/decode
+    failure is a 502.
+    """
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
     except Exception as e:  # noqa: BLE001 - a missing object is a clean 404
         code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
         if code in ("NoSuchKey", "404", "NotFound"):
-            raise ApiError(404, "no review for that round") from e
-        raise ApiError(502, f"could not read benchmark review: {e}") from e
-    raw = obj["Body"].read(_BENCHMARK_REVIEW_MAX_BYTES + 1)
-    if len(raw) > _BENCHMARK_REVIEW_MAX_BYTES:
-        raise ApiError(502, "benchmark review artifact is unexpectedly large")
+            raise ApiError(404, missing) from e
+        raise ApiError(502, f"could not read benchmark {what}: {e}") from e
+
+    def _presign() -> tuple[None, str]:
+        try:
+            url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=_BENCHMARK_PRESIGN_EXPIRY_SECONDS,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise ApiError(502, f"could not presign benchmark {what}: {e}") from e
+        return None, url
+
+    if int(obj.get("ContentLength") or 0) > _BENCHMARK_INLINE_MAX_BYTES:
+        return _presign()
+    raw = obj["Body"].read(_BENCHMARK_INLINE_MAX_BYTES + 1)
+    if len(raw) > _BENCHMARK_INLINE_MAX_BYTES:
+        # ContentLength was absent or lied — degrade to the URL, never a 502.
+        return _presign()
     try:
-        return json.loads(raw.decode("utf-8"))
+        return json.loads(raw.decode("utf-8")), None
     except (UnicodeDecodeError, ValueError) as e:
-        raise ApiError(502, f"benchmark review is not valid JSON: {e}") from e
+        raise ApiError(502, f"benchmark {what} is not valid JSON: {e}") from e
+
+
+# --------------------------------------------------------------------------- #
+# Benchmark Studio: standalone runs + persisted reports
+# --------------------------------------------------------------------------- #
+#
+# A benchmark run is NOT a harvest: it writes nothing to the bundle, takes no
+# harvest lease (concurrent with harvests and with other runs — independent
+# reports; Athena workgroup concurrency is the only shared resource), and its
+# lifecycle lives on its own REPORT# row. The Control API mints the report id,
+# writes the QUEUED row (config summary, flat scalars), and invokes the runtime
+# with mode="benchmark"; the runtime owns everything after that (running →
+# complete/failed, progress stamps, the S3 report artifacts). See
+# okf_core.benchmark_report for the shared key/field shapes and
+# docs/BENCHMARK_GUIDE.md for the product story.
+
+_REPORT_APPLY_MAX = 50  # annotations per apply call (payload-bound guard)
+
+
+def _report_pk(data_domain: str, dataset: str) -> str:
+    return f"HARVEST#{data_domain}#{dataset}"
+
+
+def _plain_attr(av: dict[str, Any] | None) -> Any:
+    """One DynamoDB attribute value → a plain scalar (the row is flat by contract)."""
+    if not isinstance(av, dict):
+        return None
+    if "S" in av:
+        return av["S"]
+    if "BOOL" in av:
+        return bool(av["BOOL"])
+    if "N" in av:
+        raw = av["N"]
+        try:
+            return int(raw) if "." not in raw and "e" not in raw.lower() else float(raw)
+        except ValueError:
+            return float(raw)
+    return None
+
+
+def _report_row_to_dict(item: dict[str, Any]) -> dict[str, Any]:
+    """A REPORT# row → the wire dict (every non-key attribute, plainly typed)."""
+    out: dict[str, Any] = {}
+    for key, av in item.items():
+        if key in ("pk", "sk"):
+            continue
+        out[key] = _plain_attr(av)
+    return out
+
+
+def start_benchmark_run(
+    agentcore,
+    ddb,
+    s3,
+    *,
+    registry_table: str,
+    runtime_arn: str,
+    bucket: str,
+    data_domain: str,
+    dataset: str,
+    checks: Any,
+    runs: Any,
+    solver_model: str | None,
+    solver_effort: str | None,
+    judge_model: str | None,
+    judge_effort: str | None,
+    version_id: str = "",
+    requested_by: str = "",
+    behavior_live_sql: bool = False,
+) -> dict[str, Any]:
+    """Validate the run config, write the QUEUED report row, invoke the runtime.
+
+    Validation is the trust boundary (models were already catalog-validated in
+    the route adapter): checks/runs normalize via ``okf_core.benchmark_report``;
+    the question CSV must exist, parse, and carry at least one participant for
+    an enabled check (fail HERE with a 400 the user can act on, not minutes
+    later on the row); a pinned ``version_id`` must name a known complete
+    marker. On invoke failure the row flips to ``failed`` so the list never
+    shows a phantom queued run.
+    """
+    from okf_core import benchmark_report as br
+    from okf_core.benchmark_questions import BenchmarkCSVError, load_questions
+
+    try:
+        checks = br.validate_checks(checks)
+        runs = br.coerce_runs(runs)
+    except br.BenchmarkRunConfigError as e:
+        raise ApiError(400, str(e)) from e
+
+    # The question set: present, parseable, and USABLE for the enabled checks.
+    questions_key = benchmark_questions_key(data_domain, dataset)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=questions_key)
+        text = obj["Body"].read(_BENCHMARK_CSV_MAX_BYTES).decode("utf-8")
+    except Exception as e:  # noqa: BLE001 - a missing CSV is a user-fixable 400
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            raise ApiError(
+                400, "no question set uploaded — upload the CSV first"
+            ) from e
+        raise ApiError(502, f"could not read the question set: {e}") from e
+    try:
+        loaded = load_questions(text)
+    except (BenchmarkCSVError, UnicodeDecodeError) as e:
+        raise ApiError(400, f"invalid question set: {e}") from e
+    enabled_counts = {c: loaded.check_counts.get(c, 0) for c in checks}
+    if not any(enabled_counts.values()):
+        raise ApiError(
+            400,
+            "no question participates in any enabled check "
+            f"(per-check counts: {loaded.check_counts})",
+        )
+
+    version_id = (version_id or "").strip()
+    if version_id:
+        markers = s3_versions.list_complete_markers(
+            s3, bucket=bucket, data_domain=data_domain, dataset=dataset
+        )
+        if not any(m.version_id == version_id for m in markers):
+            raise ApiError(400, f"unknown bundle version: {version_id}")
+
+    now = _now_iso()
+    report_id = br.new_report_id(
+        now_compact=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"),
+        token=uuid.uuid4().hex[:8],
+    )
+    session_id = runtime_session_id(data_domain, dataset, unique_token=report_id)
+
+    # The QUEUED index row — flat scalars only (structure lives in the S3 JSON).
+    item: dict[str, Any] = {
+        "pk": {"S": _report_pk(data_domain, dataset)},
+        "sk": {"S": br.report_sk(report_id)},
+        "report_id": {"S": report_id},
+        "status": {"S": br.STATUS_QUEUED},
+        "created_at": {"S": now},
+        "updated_at": {"S": now},
+        "checks": {"S": ",".join(checks)},
+        "runs": {"N": str(runs)},
+        "version_id": {"S": version_id},
+        "question_count": {"N": str(len(loaded.questions))},
+        "runtime_session_id": {"S": session_id},
+        "agg_status": {"S": br.AGG_IDLE},
+    }
+    for check, count in enabled_counts.items():
+        item[f"count_{check}"] = {"N": str(count)}
+    if solver_model:
+        item["solver_model"] = {"S": solver_model}
+    if solver_effort:
+        item["solver_effort"] = {"S": solver_effort}
+    if judge_model:
+        item["judge_model"] = {"S": judge_model}
+    if judge_effort:
+        item["judge_effort"] = {"S": judge_effort}
+    if behavior_live_sql:
+        # Config summary the list renders as a badge; also a comparability
+        # marker — scores taken with and without live SQL measure different
+        # things. Written only when ON (absent == the classic wiki-only solver).
+        item["behavior_live_sql"] = {"BOOL": True}
+    if requested_by:
+        item["requested_by"] = {"S": requested_by}
+    ddb.put_item(
+        TableName=registry_table,
+        Item=item,
+        ConditionExpression="attribute_not_exists(sk)",
+    )
+
+    payload: dict[str, Any] = {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "mode": "benchmark",
+        "report_id": report_id,
+        br.FIELD_CHECKS: checks,
+        br.FIELD_RUNS: runs,
+        br.FIELD_VERSION_ID: version_id,
+        br.FIELD_QUESTIONS_KEY: questions_key,
+    }
+    if solver_model:
+        payload[br.FIELD_SOLVER_MODEL] = solver_model
+    if solver_effort:
+        payload[br.FIELD_SOLVER_EFFORT] = solver_effort
+    if judge_model:
+        payload[br.FIELD_JUDGE_MODEL] = judge_model
+    if judge_effort:
+        payload[br.FIELD_JUDGE_EFFORT] = judge_effort
+    if behavior_live_sql:
+        payload[br.FIELD_BEHAVIOR_LIVE_SQL] = True
+    source = get_dataset_source(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
+    if source:
+        payload["source"] = source
+
+    try:
+        agentcore.invoke_agent_runtime(
+            agentRuntimeArn=runtime_arn,
+            runtimeSessionId=session_id,
+            payload=json.dumps(payload).encode(),
+            qualifier="DEFAULT",
+        )
+    except Exception as e:  # noqa: BLE001 - flip the row so no phantom queued run
+        try:
+            ddb.update_item(
+                TableName=registry_table,
+                Key={
+                    "pk": {"S": _report_pk(data_domain, dataset)},
+                    "sk": {"S": br.report_sk(report_id)},
+                },
+                UpdateExpression="SET #s = :s, detail = :d, updated_at = :u",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":s": {"S": br.STATUS_FAILED},
+                    ":d": {"S": f"invoke failed: {e}"[:1024]},
+                    ":u": {"S": _now_iso()},
+                },
+            )
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+        raise ApiError(502, f"could not start the benchmark run: {e}") from e
+
+    return {
+        "report_id": report_id,
+        "status": br.STATUS_QUEUED,
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "checks": checks,
+        "runs": runs,
+        "question_count": len(loaded.questions),
+        "check_counts": enabled_counts,
+    }
+
+
+def list_benchmark_reports(
+    ddb, *, registry_table: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """Every report row for the dataset, newest first.
+
+    Report ids are time-prefixed, so the sk RANGE ordering IS chronological —
+    one Query, ``ScanIndexForward=False``, no GSI needed.
+    """
+    from okf_core import benchmark_report as br
+
+    kwargs: dict[str, Any] = {
+        "TableName": registry_table,
+        "KeyConditionExpression": "pk = :pk AND begins_with(sk, :skp)",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": _report_pk(data_domain, dataset)},
+            ":skp": {"S": br.report_sk_query_prefix()},
+        },
+        "ScanIndexForward": False,
+    }
+    reports: list[dict[str, Any]] = []
+    while True:
+        resp = ddb.query(**kwargs)
+        reports.extend(_report_row_to_dict(item) for item in resp.get("Items", []))
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+    return {"data_domain": data_domain, "dataset": dataset, "reports": reports}
+
+
+def _get_report_row(
+    ddb, *, registry_table: str, data_domain: str, dataset: str, report_id: str
+) -> dict[str, Any]:
+    from okf_core import benchmark_report as br
+
+    if not br.is_valid_report_id(report_id):
+        raise ApiError(400, f"invalid report id: {report_id!r}")
+    resp = ddb.get_item(
+        TableName=registry_table,
+        Key={
+            "pk": {"S": _report_pk(data_domain, dataset)},
+            "sk": {"S": br.report_sk(report_id)},
+        },
+    )
+    item = resp.get("Item")
+    if not item:
+        raise ApiError(404, "no such benchmark report")
+    return item
+
+
+def _report_row_is_stale(item: dict[str, Any]) -> bool:
+    """True when the row's last heartbeat predates the lease-stale cutoff.
+
+    ``updated_at`` is stamped by every runtime progress tick (and on start),
+    so it is the liveness signal; ``started_at``/``created_at`` are fallbacks
+    for a row that died before its first tick. Mirrors the harvest lease's
+    staleness escape — an AgentCore session can't outlive 8h, so an "active"
+    row untouched for longer is a dead job, not one worth waiting for.
+    """
+    ts = (
+        _s(item.get("updated_at"))
+        or _s(item.get("started_at"))
+        or _s(item.get("created_at"))
+    )
+    if not ts:
+        return True  # no heartbeat at all — nothing to wait for
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=HARVEST_LEASE_STALE_SECONDS)
+    ).isoformat()
+    return ts < cutoff
+
+
+def get_benchmark_report(
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    report_id: str,
+) -> dict[str, Any]:
+    """One report: the index row + (when persisted) the full S3 document.
+
+    ``report`` is None while the run is still queued/running or after a failure
+    — the row's ``status``/``detail`` tell that story; the JSON appears with
+    ``complete``. A report too large to ride the Lambda response comes back as
+    ``report_url`` (a short-lived presigned GET) instead — the api client
+    follows it transparently.
+    """
+    from okf_core import benchmark_report as br
+
+    item = _get_report_row(
+        ddb, registry_table=registry_table, data_domain=data_domain,
+        dataset=dataset, report_id=report_id,
+    )
+    report_doc = None
+    report_url = None
+    try:
+        report_doc, report_url = _read_benchmark_artifact(
+            s3,
+            bucket=bucket,
+            key=br.report_key(data_domain, dataset, report_id),
+            what="report",
+            missing="no report document",
+        )
+    except ApiError as e:
+        if e.status != 404:
+            raise
+    return {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "row": _report_row_to_dict(item),
+        "report": report_doc,
+        "report_url": report_url,
+    }
+
+
+def get_benchmark_report_traces(
+    s3, *, bucket: str, data_domain: str, dataset: str, report_id: str
+) -> dict[str, Any]:
+    """The report's solver-traces document (large; the UI fetches it lazily).
+
+    Past the inline cap the response is ``{report_id, traces_url}`` (presigned
+    GET) instead of the document — traces are the artifact that most routinely
+    outgrows the Lambda response (every attempt, questions × checks × runs).
+    """
+    from okf_core import benchmark_report as br
+
+    if not br.is_valid_report_id(report_id):
+        raise ApiError(400, f"invalid report id: {report_id!r}")
+    doc, url = _read_benchmark_artifact(
+        s3,
+        bucket=bucket,
+        key=br.traces_key(data_domain, dataset, report_id),
+        what="solver traces",
+        missing="no solver traces for that report",
+    )
+    if url:
+        return {"report_id": report_id, "traces_url": url}
+    return doc
+
+
+def delete_benchmark_report(
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    report_id: str,
+) -> dict[str, Any]:
+    """Delete one report: every S3 object under its prefix + the index row.
+
+    Refused (409) while the run (or an annotation aggregation) is genuinely
+    active — the runtime would recreate row attrs and orphan artifacts
+    mid-write; cancel is "let it finish, then delete". A row stuck in an
+    active state whose last heartbeat is older than the lease-stale cutoff is
+    treated as DEAD and deletable (mirrors the harvest lease escape: an
+    AgentCore session can't outlive 8h, so such a row is a killed job whose
+    terminal write was lost — without this escape it would be an undeletable
+    zombie polled forever). The runtime side can't resurrect it either:
+    ``update_report_row`` is conditional on the row existing. History is
+    otherwise unbounded by decision (no TTL), so this is the only way a report
+    leaves the list.
+    """
+    from okf_core import benchmark_report as br
+
+    item = _get_report_row(
+        ddb, registry_table=registry_table, data_domain=data_domain,
+        dataset=dataset, report_id=report_id,
+    )
+    status = _s(item.get("status"))
+    stale = _report_row_is_stale(item)
+    if status in (br.STATUS_QUEUED, br.STATUS_RUNNING) and not stale:
+        raise ApiError(409, f"report is {status}; wait for it to finish")
+    if _s(item.get("agg_status")) == br.AGG_RUNNING and not stale:
+        raise ApiError(
+            409, "an annotation aggregation is running; wait for it to finish"
+        )
+
+    prefix = br.report_prefix(data_domain, dataset, report_id)
+    deleted = 0
+    token = None
+    while True:
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []):
+            s3.delete_object(Bucket=bucket, Key=obj["Key"])
+            deleted += 1
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+        if not token:
+            break
+    ddb.delete_item(
+        TableName=registry_table,
+        Key={
+            "pk": {"S": _report_pk(data_domain, dataset)},
+            "sk": {"S": br.report_sk(report_id)},
+        },
+    )
+    return {"deleted": True, "report_id": report_id, "objects_deleted": deleted}
+
+
+def start_annotation_aggregation(
+    agentcore,
+    ddb,
+    *,
+    registry_table: str,
+    runtime_arn: str,
+    data_domain: str,
+    dataset: str,
+    report_id: str,
+) -> dict[str, Any]:
+    """Kick the aggregator (mode=aggregate_annotations) for a COMPLETE report.
+
+    409 unless the report is complete and no aggregation is currently running.
+    The aggregator inherits the report's judge model (stored in the report's
+    config) — deliberately no model choice here.
+    """
+    from okf_core import benchmark_report as br
+
+    item = _get_report_row(
+        ddb, registry_table=registry_table, data_domain=data_domain,
+        dataset=dataset, report_id=report_id,
+    )
+    if _s(item.get("status")) != br.STATUS_COMPLETE:
+        raise ApiError(409, "the report is not complete yet")
+    if _s(item.get("agg_status")) == br.AGG_RUNNING:
+        raise ApiError(409, "an aggregation is already running for this report")
+
+    ddb.update_item(
+        TableName=registry_table,
+        Key={
+            "pk": {"S": _report_pk(data_domain, dataset)},
+            "sk": {"S": br.report_sk(report_id)},
+        },
+        UpdateExpression="SET agg_status = :s, updated_at = :u",
+        ExpressionAttributeValues={
+            ":s": {"S": br.AGG_RUNNING},
+            ":u": {"S": _now_iso()},
+        },
+    )
+    session_id = runtime_session_id(
+        data_domain, dataset, unique_token=f"agg-{report_id}-{uuid.uuid4().hex[:8]}"
+    )
+    payload = {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "mode": "aggregate_annotations",
+        "report_id": report_id,
+    }
+    try:
+        agentcore.invoke_agent_runtime(
+            agentRuntimeArn=runtime_arn,
+            runtimeSessionId=session_id,
+            payload=json.dumps(payload).encode(),
+            qualifier="DEFAULT",
+        )
+    except Exception as e:  # noqa: BLE001 - revert so the button isn't wedged
+        try:
+            ddb.update_item(
+                TableName=registry_table,
+                Key={
+                    "pk": {"S": _report_pk(data_domain, dataset)},
+                    "sk": {"S": br.report_sk(report_id)},
+                },
+                UpdateExpression="SET agg_status = :s, updated_at = :u",
+                ExpressionAttributeValues={
+                    ":s": {"S": br.AGG_FAILED},
+                    ":u": {"S": _now_iso()},
+                },
+            )
+        except Exception:  # noqa: BLE001 - best-effort revert
+            pass
+        raise ApiError(502, f"could not start the aggregation: {e}") from e
+    return {"report_id": report_id, "agg_status": br.AGG_RUNNING}
+
+
+def apply_report_annotations(
+    ddb,
+    *,
+    annotations_table: str,
+    data_domain: str,
+    dataset: str,
+    user_sub: str,
+    author: str,
+    annotations: Any,
+) -> dict[str, Any]:
+    """Batch-create the user's SELECTED final annotations from a report.
+
+    ``annotations`` is ``[{note, concept_id?}, ...]`` — the human-reviewed
+    subset of the aggregated set (possibly edited). Items are created under the
+    ACTING user's sub with ``submitted_via="benchmark"``; a normal
+    annotation-harvest then folds them into the wiki (zero new harvest
+    machinery). The de-identification boundary moved from machine to human: the
+    user saw every note before it exists.
+    """
+    user_sub = _require_user_sub(user_sub)
+    if not isinstance(annotations, list) or not annotations:
+        raise ApiError(400, "annotations must be a non-empty list of {note, concept_id}")
+    if len(annotations) > _REPORT_APPLY_MAX:
+        raise ApiError(
+            400, f"too many annotations in one apply (max {_REPORT_APPLY_MAX})"
+        )
+
+    # Validate EVERYTHING before writing ANYTHING (mirroring create_annotation's
+    # own checks, including parse_concept_id). create_annotation 400s on a bad
+    # entry, and a mid-batch 400 used to leave the earlier annotations silently
+    # committed with their ids never returned — the natural retry then filed
+    # duplicates the follow-on annotation harvest would apply twice.
+    normalized: list[tuple[str, str]] = []
+    for entry in annotations:
+        if not isinstance(entry, dict):
+            raise ApiError(400, "each annotation must be an object with a note")
+        note = str(entry.get("note") or "").strip()
+        if not note:
+            raise ApiError(400, "each annotation needs a non-empty note")
+        concept_id = str(entry.get("concept_id") or "").strip().strip("/")
+        if not concept_id:
+            concept_id = anno.DATASET_WIDE_CONCEPT
+        else:
+            try:
+                parse_concept_id(concept_id)
+            except ValueError as e:
+                raise ApiError(400, f"invalid concept_id: {concept_id!r}") from e
+        normalized.append((note, concept_id))
+
+    created: list[dict[str, Any]] = []
+    for note, concept_id in normalized:
+        created.append(
+            create_annotation(
+                ddb,
+                annotations_table=annotations_table,
+                data_domain=data_domain,
+                dataset=dataset,
+                user_sub=user_sub,
+                author=author,
+                concept_id=concept_id,
+                note=note,
+                submitted_via=anno.SUBMITTED_VIA_BENCHMARK,
+            )
+        )
+    return {"created": created, "count": len(created)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1624,43 +2159,6 @@ def acquire_harvest_lease(
         if code == "ConditionalCheckFailedException":
             return False
         raise
-
-
-def _apply_ri_settings(
-    payload: dict[str, Any],
-    ddb,
-    *,
-    registry_table: str,
-    data_domain: str,
-    dataset: str,
-) -> None:
-    """Populate ``payload['recursive_improvement']`` from saved dataset settings.
-
-    Best-effort + re-validated at this trust boundary. When RI is disabled (or no
-    settings / missing mapping / invalid stored value), the block is simply omitted
-    so the run is a normal harvest. Shared by the full/incremental and annotation
-    trigger paths so the behavior is identical on every mode.
-    """
-    try:
-        saved = get_dataset_ri_settings(
-            ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
-        )
-    except ApiError:
-        return  # no mapping row — nothing to apply
-    settings = saved.get(ri.CONFIG_KEY)
-    if not ri.is_enabled(settings):
-        return
-    try:
-        validated = ri.validate(settings)
-    except ri.RecursiveImprovementConfigError:
-        logging.getLogger("control_api").warning(
-            "Saved recursive_improvement for %s/%s is invalid; skipping.",
-            data_domain,
-            dataset,
-        )
-        return
-    if validated:
-        payload[ri.CONFIG_KEY] = validated
 
 
 def resolve_cross_target(
@@ -1872,16 +2370,6 @@ def trigger_harvest(
         except ApiError:
             pass  # no mapping row yet (shouldn't happen at harvest time) — omit
 
-        # Recursive-improvement settings (saved per dataset). When enabled, the
-        # block's PRESENCE is the runtime enable signal — it rides on every
-        # bundle-authoring mode (full/incremental/annotated), but NOT on a cross
-        # run (its benchmark loop measures the dataset's own wiki, not pair docs).
-        # Re-validated here (the trust boundary) so a hand-edited row can't push
-        # an out-of-range value to the runtime.
-        _apply_ri_settings(
-            payload, ddb, registry_table=registry_table,
-            data_domain=data_domain, dataset=dataset,
-        )
 
     if mode == "incremental":
         if not changed_table:
@@ -2226,7 +2714,6 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
         out["call_id"] = rec.get("call_id")
     # Sub-agent fleet fields (KIND_SUBAGENT): phase = start|complete|error,
     # batch groups a fan-out (the eval id), sub_id is the per-square id.
-    # `phase` is ALSO reused by benchmark events (solving/grading/reviewing/done).
     for k in ("phase", "batch", "sub_id", "subagent_type"):
         if rec.get(k):
             out[k] = rec.get(k)
@@ -2234,35 +2721,6 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
     # run. Passed through verbatim as a dict so the UI can show a running total.
     if isinstance(rec.get("usage"), dict):
         out["usage"] = rec["usage"]
-    # Recursive-improvement benchmark fields (kind="benchmark_progress" live
-    # updates + kind="benchmark" per-round KPI summary). Copied through so the UI
-    # can render a progress row (current/total) and a KPI line. `improvements` is a
-    # list of anonymous theme strings; the numeric KPIs are 0..1 / counts.
-    for k in (
-        "iteration",
-        "max_iterations",
-        "current",
-        "total",
-        "ex_score",
-        "judge_accuracy",
-        "passed",
-        "failed",
-        "discarded",
-        "graded",
-        "target_met",
-        "has_review",
-        "runtime_session_id",
-        # benchmark_solver observability (per-question): what each solver did.
-        "turns",
-        "tool_calls",
-        "sql_len",
-        "sql_preview",
-        "error",
-    ):
-        if k in rec:
-            out[k] = rec.get(k)
-    if isinstance(rec.get("improvements"), list):
-        out["improvements"] = rec["improvements"]
     return out
 
 
@@ -3057,7 +3515,12 @@ def create_annotation(
     note = (note or "").strip()
     if not note:
         raise ApiError(400, "missing required field: note")
-    if submitted_via not in ("", anno.SUBMITTED_VIA_UI, anno.SUBMITTED_VIA_AGENT):
+    if submitted_via not in (
+        "",
+        anno.SUBMITTED_VIA_UI,
+        anno.SUBMITTED_VIA_AGENT,
+        anno.SUBMITTED_VIA_BENCHMARK,
+    ):
         raise ApiError(400, f"invalid submitted_via: {submitted_via!r}")
 
     annotation_id = uuid.uuid4().hex
@@ -3315,8 +3778,23 @@ def trigger_annotation_harvest(
     scope: str | None = None,
     annotation_ids: list[str] | None = None,
     cross_target: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    subagent_model: str | None = None,
+    subagent_effort: str | None = None,
+    reviewer_model: str | None = None,
+    reviewer_effort: str | None = None,
 ) -> dict[str, Any]:
     """Run the caller's open annotations through an annotation-mode re-harvest.
+
+    ``model``/``effort`` (+ the ``subagent_*``/``reviewer_*`` pairs) mirror
+    ``trigger_harvest``'s per-harvest override knobs — same three scopes
+    (supervisor / sub-agents / reviewer), same fallback when omitted (the
+    runtime's deploy-time default). Applying annotations is a harvest like any
+    other (``mode="annotated"``); giving it no way to carry an override meant
+    every apply silently ran on ``OKF_HARVEST_MODEL``/``OKF_HARVEST_EFFORT``
+    regardless of what the operator had picked for full harvests of this
+    dataset — a bug, not a deliberate restriction.
 
     ``scope`` narrows WHICH annotations the run applies when the bundle carries
     cross-dataset docs (an ``external/`` subtree): ``"dataset"`` = only notes on
@@ -3610,6 +4088,22 @@ def trigger_annotation_harvest(
             "user_sub": user_sub,
             "annotations": payload_annotations,
         }
+        # Per-harvest model/effort overrides — same three scopes as a full
+        # harvest (supervisor, sub-agents, reviewer). Omitted -> the runtime
+        # falls back to its deploy-time env default (supervisor) / the
+        # supervisor's config (sub-agents) / the sub-agents' config (reviewer).
+        if model:
+            payload["model"] = model
+        if effort:
+            payload["effort"] = effort
+        if subagent_model:
+            payload["subagent_model"] = subagent_model
+        if subagent_effort:
+            payload["subagent_effort"] = subagent_effort
+        if reviewer_model:
+            payload["reviewer_model"] = reviewer_model
+        if reviewer_effort:
+            payload["reviewer_effort"] = reviewer_effort
         # Source descriptor so the annotation re-harvest reads the right backend.
         source = get_dataset_source(
             ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
@@ -3656,16 +4150,6 @@ def trigger_annotation_harvest(
                 extra_dbs.append(t_db)
         if extra_dbs:
             payload["extra_glue_databases"] = extra_dbs
-
-        # Recursive improvement rides the annotation re-harvest — EXCEPT a
-        # cross-scoped run: the RI loop measures (and edits) the dataset's OWN
-        # wiki, which the operator explicitly scoped away from (same exclusion
-        # as mode="cross" in trigger_harvest).
-        if scope != "cross":
-            _apply_ri_settings(
-                payload, ddb, registry_table=registry_table,
-                data_domain=data_domain, dataset=dataset,
-            )
 
         agentcore.invoke_agent_runtime(
             agentRuntimeArn=runtime_arn,

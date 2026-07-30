@@ -28,8 +28,7 @@ _BUILDERS = [
 
 
 def _redshift(builder):
-    # build_supervisor_prompt takes recursive_improvement first; the rest take the
-    # profile positionally. Call each with the Redshift profile as a kwarg.
+    # Every builder accepts the profile as a kwarg; call them uniformly.
     return builder(profile=REDSHIFT)
 
 

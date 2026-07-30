@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import os
 
+from okf_core.wiki_primer import READ_ME_DESCRIPTION
+
 from consumption_mcp.tools import ConsumptionConfig, ConsumptionTools
 
 
@@ -57,6 +59,13 @@ def register_tools(mcp, tools: ConsumptionTools) -> None:
     behaviour lives in the injected :class:`ConsumptionTools` so it stays
     unit-tested without FastMCP.
     """
+
+    # Registered FIRST so it leads the tool listing; the description (shared
+    # with the benchmark solver via okf_core.wiki_primer) opens with the
+    # call-this-before-exploring instruction.
+    @mcp.tool(description=READ_ME_DESCRIPTION)
+    def read_me() -> str:
+        return tools.read_me()
 
     @mcp.tool()
     def list_domains() -> list[dict]:

@@ -267,7 +267,14 @@ def _gpt_effort(effort: str) -> str:
     return gpt_effort(effort)
 
 
-def _build_model(model: str, effort: str, max_tokens: int, callbacks=None):
+def _build_model(
+    model: str,
+    effort: str,
+    max_tokens: int,
+    callbacks=None,
+    *,
+    surface_reasoning: bool = False,
+):
     """Build the harvest chat model, dispatching on the model id's provider.
 
     ``openai.``/``gpt-`` ids build a ChatOpenAI against the Bedrock Mantle
@@ -282,13 +289,40 @@ def _build_model(model: str, effort: str, max_tokens: int, callbacks=None):
     run's callbacks. This is how token usage is metered completely (see
     ``UsageForwarder``); sub-agents inherit this same model, so they inherit the
     callback too.
+
+    ``surface_reasoning`` makes the model RETURN its reasoning to the client
+    (Converse: ``thinking.display="summarized"`` → ``reasoning_content`` blocks;
+    Mantle GPT: ``reasoning={effort, summary:"auto"}`` → ``reasoning`` blocks).
+    Both models think regardless — this only controls whether the thinking comes
+    back. Harvests leave it off (nothing renders it; the summary tokens are pure
+    cost); the benchmark SOLVER turns it on, because its reasoning is the heart
+    of the solver trace the judge and the report UI read.
     """
     if _is_openai_model(model):
-        return _build_mantle_openai(model, effort, max_tokens, callbacks=callbacks)
-    return _build_bedrock_converse(model, effort, max_tokens, callbacks=callbacks)
+        return _build_mantle_openai(
+            model,
+            effort,
+            max_tokens,
+            callbacks=callbacks,
+            reasoning_summary="auto" if surface_reasoning else None,
+        )
+    return _build_bedrock_converse(
+        model,
+        effort,
+        max_tokens,
+        callbacks=callbacks,
+        summarize_reasoning=surface_reasoning,
+    )
 
 
-def _build_bedrock_converse(model: str, effort: str, max_tokens: int, callbacks=None):
+def _build_bedrock_converse(
+    model: str,
+    effort: str,
+    max_tokens: int,
+    callbacks=None,
+    *,
+    summarize_reasoning: bool = False,
+):
     """Construct a ChatBedrockConverse with adaptive thinking configured.
 
     Reads harvest's deploy-time knobs (AWS_REGION, the OKF_HARVEST_BEDROCK_*
@@ -307,6 +341,7 @@ def _build_bedrock_converse(model: str, effort: str, max_tokens: int, callbacks=
         region=os.environ.get("AWS_REGION", "us-east-1"),
         botocore_config=_bedrock_config(),
         callbacks=callbacks,
+        summarize_reasoning=summarize_reasoning,
     )
 
 
@@ -332,7 +367,14 @@ def _mantle_token_provider(region: str):
     return mantle_token_provider(region, ttl_seconds=_MANTLE_TOKEN_TTL_SECONDS)
 
 
-def _build_mantle_openai(model: str, effort: str, max_tokens: int, callbacks=None):
+def _build_mantle_openai(
+    model: str,
+    effort: str,
+    max_tokens: int,
+    callbacks=None,
+    *,
+    reasoning_summary: str | None = None,
+):
     """Construct a ChatOpenAI pointed at the Bedrock Mantle OpenAI endpoint.
 
     Reads harvest's Mantle knobs (OKF_HARVEST_MANTLE_*) and delegates
@@ -369,6 +411,7 @@ def _build_mantle_openai(model: str, effort: str, max_tokens: int, callbacks=Non
             "OKF_HARVEST_MANTLE_MAX_ATTEMPTS", DEFAULT_BEDROCK_MAX_ATTEMPTS
         ),
         token_ttl_seconds=_MANTLE_TOKEN_TTL_SECONDS,
+        reasoning_summary=reasoning_summary,
         callbacks=callbacks,
     )
 
@@ -381,11 +424,6 @@ class HarvestAgent:
     source: Source
     link_graph: LinkGraph
     dataset_root: Path
-    # Present only on a recursive-improvement run: the per-run benchmark session,
-    # so the runner can confirm at least one round ran (compel check). The
-    # benchmark never mutates the bundle — the agent owns its shape. None on a
-    # normal harvest.
-    benchmark_session: Any = None
 
 
 def _make_read_current(dataset_root: Path):
@@ -415,91 +453,6 @@ def _make_read_current(dataset_root: Path):
     return read_current
 
 
-def _build_benchmark_session(
-    *,
-    ri_config: dict[str, Any],
-    run: dict[str, Any],
-    questions: Any,
-    chat_model: Any,
-    source: Source,
-    source_tools: list[Any],
-    dataset_root: Path,
-    step_emitter: Any,
-    persist_kpi: Any,
-    persist_review: Any = None,
-    run_code_tool: Any = None,
-) -> Any:
-    """Construct the per-run BenchmarkSession behind the run_benchmark tool.
-
-    The solver reuses ``chat_model``, bundle-blind (rooted per-round at a wiki-only
-    snapshot the session builds). The adjudicator reuses ``chat_model`` and gets the
-    FULL read-only diagnostician toolset over the REAL dataset mount: read-only file
-    tools (``read_file``/``glob``/``grep``/``ls`` — reaching the authored wiki plus
-    the ``.metadata/`` schema snapshot and ``.context/`` source docs), the source
-    tools (``run_sql``/``sample_rows``), and ``run_code`` (binary ``.context/``
-    extraction) when the sandbox is available. It gets NO Glue catalog tool and no
-    write tools. This lets it CONFIRM a wiki gap by reading the docs the solver had,
-    not merely infer one from the solver's SQL. Both ride the shared instrumented
-    model, so benchmark tokens meter into the run total automatically.
-    ``persist_kpi(iteration, attrs)`` and the step emitter are wired so each round
-    writes a BENCH# row and a live ``kind:"benchmark"`` event.
-    """
-    from harvest.benchmark.adjudicator import make_adjudicator
-    from harvest.benchmark.grader import Grader
-    from harvest.benchmark.runner import BenchmarkSession
-    from harvest.benchmark.solver import make_readonly_file_tools, make_solver
-
-    grader = Grader(source.run_query)
-
-    # The adjudicator reads the REAL mount (not the solver's wiki-only snapshot), so
-    # its file tools reach the wiki AND .metadata/ AND .context/. Plus live-data
-    # tools, plus run_code for binary .context/ when the sandbox exists. Passed as a
-    # FACTORY so make_readonly_file_tools' deepagents import is deferred to first
-    # adjudication — keeps session construction importable in the offline test venv.
-    def _adjudicator_tools() -> list[Any]:
-        tools = [
-            *make_readonly_file_tools(str(dataset_root), scope="dataset"),
-            *source_tools,
-        ]
-        if run_code_tool is not None:
-            tools.append(run_code_tool)
-        return tools
-
-    adjudicate = make_adjudicator(chat_model, _adjudicator_tools)
-
-    def emit_event(event: dict) -> None:
-        if step_emitter is not None:
-            # StepEmitter._emit is internal but stable; benchmark events reuse the
-            # same OKF_STEP sink the feed already ships to CloudWatch.
-            step_emitter._emit(event)
-
-    # Per-question solver observability (a ReAct solver's turns don't reach the
-    # StepEmitter, so this is the only window into what each solver actually did).
-    solver_emit = emit_event if step_emitter is not None else None
-
-    return BenchmarkSession(
-        data_domain=run.get("data_domain", ""),
-        dataset=run.get("dataset", ""),
-        dataset_root=str(dataset_root),
-        runtime_session_id=run.get("runtime_session_id", ""),
-        config=ri_config,
-        questions=list(questions),
-        make_solver=lambda snap_dir: make_solver(chat_model, snap_dir, solver_emit),
-        grader=grader,
-        adjudicate=adjudicate,
-        persist_kpi=persist_kpi,
-        persist_review=persist_review,
-        emit_event=emit_event if step_emitter is not None else None,
-    )
-
-
-def _make_benchmark_tool(session: Any) -> Any:
-    """The run_benchmark LangChain tool bound to ``session`` (one round per call)."""
-    from harvest.benchmark.runner import make_run_benchmark_tool
-
-    return make_run_benchmark_tool(session)
-
-
 def build_harvest_agent(
     source: Source,
     dataset_root: str | Path,
@@ -512,11 +465,6 @@ def build_harvest_agent(
     reviewer_config: dict[str, Any] | None = None,
     sandbox: Any = None,
     step_emitter: Any = None,
-    ri_config: dict[str, Any] | None = None,
-    benchmark_questions: Any = None,
-    benchmark_run: dict[str, Any] | None = None,
-    persist_kpi: Any = None,
-    persist_review: Any = None,
     cross_target: dict[str, Any] | None = None,
 ) -> HarvestAgent:
     """Build the harvest deep agent (see the module docstring for the wiring).
@@ -530,14 +478,18 @@ def build_harvest_agent(
     ``model``/``effort``/``max_tokens`` configure the SUPERVISOR's model.
     ``subagent_config`` (optional ``{model, effort, max_tokens}``, resolved by
     ``resolve_model_config`` upstream) configures the model the dispatched
-    sub-agents run on — table-author, reference-author, context-extractor, AND
-    the benchmark solver/adjudicator. When None, the sub-agents use the
-    supervisor's config. ``reviewer_config`` does the same for the adversarial
-    ``reviewer`` ONLY — reviewing with a different model family than the one
-    that authored improves coverage (a fresh model doesn't share the author's
-    blind spots); when None the reviewer uses the sub-agents' config. Each
-    scope runs on a SEPARATE model instance so token usage meters per scope
-    (supervisor / subagents / reviewer — see steps.UsageForwarder).
+    sub-agents run on — table-author, reference-author, context-extractor. When
+    None, the sub-agents use the supervisor's config. ``reviewer_config`` does
+    the same for the adversarial ``reviewer`` ONLY — reviewing with a different
+    model family than the one that authored improves coverage (a fresh model
+    doesn't share the author's blind spots); when None the reviewer uses the
+    sub-agents' config. Each scope runs on a SEPARATE model instance so token
+    usage meters per scope (supervisor / subagents / reviewer — see
+    steps.UsageForwarder).
+
+    Benchmarking is NOT part of a harvest: the retired in-run RI loop's
+    ``run_benchmark`` tool is gone, and the standalone Benchmark Studio runs in
+    its own invocation mode (see ``harvest/benchmark/studio.py``).
     """
     from deepagents import create_deep_agent
     from deepagents.backends import (
@@ -545,6 +497,12 @@ def build_harvest_agent(
         FilesystemBackend,
         StateBackend,
     )
+    # deepagents 0.7.0 no longer includes TodoListMiddleware by default, and
+    # the supervisor prompts PLAN with `write_todos` (one item per table /
+    # reference / candidate) — so it is attached explicitly to the MAIN agent.
+    # Sub-agent prompts don't use todos; keeping their stacks lean is the 0.7
+    # default we want there.
+    from langchain.agents.middleware import TodoListMiddleware
 
     # QuickJS code interpreter → enables DYNAMIC subagents: the agent can write JS
     # that calls the task({description, subagentType}) global to fan out + collect
@@ -574,8 +532,8 @@ def build_harvest_agent(
     # including QuickJS task() sub-agents, which run on their own asyncio tasks
     # and never reach the run-config StepEmitter. TWO instances are always built:
     # the supervisor's, and the sub-agents' (which the four dynamic sub-agents
-    # are pinned to via their spec's "model", and the benchmark solver/
-    # adjudicator reuse). Separate instances are what make the per-scope usage
+    # are pinned to via their spec's "model"). Separate instances are what make
+    # the per-scope usage
     # split exact — attribution is by instance, no callback discrimination — and
     # what lets a run give sub-agents a DIFFERENT model/effort (subagent_config)
     # than the supervisor. Best-effort: if steps can't be imported, the models
@@ -619,16 +577,6 @@ def build_harvest_agent(
     link_graph = LinkGraph(dataset_root)
     engine = OKFGuardEngine(link_graph)
 
-    # Recursive improvement: when enabled, build the per-run benchmark session that
-    # backs the run_benchmark tool, and hand the guard a call budget so it refuses
-    # runaway looping past max_iterations (a backstop independent of the prompt).
-    from okf_core import recursive_improvement as ri
-
-    benchmark_session = None
-    benchmark_budget = None
-    if ri.is_enabled(ri_config):
-        benchmark_budget = ri_config.get(ri.FIELD_MAX_ITERATIONS, ri.MAX_ITERATIONS)
-
     # Cross-dataset mode: confine every write to the pair subtree. The prefix is
     # built here (not passed in) so the guard and the prompts can never disagree
     # about where the run may write. external_pair_prefix VALIDATES both
@@ -645,8 +593,16 @@ def build_harvest_agent(
     guard = OKFGuardMiddleware(
         engine,
         read_current=_make_read_current(dataset_root),
-        benchmark_budget=benchmark_budget,
         writable_prefix=writable_prefix,
+    )
+    # The verify-and-report sub-agents' guard: refuses EVERY write/edit (and,
+    # like the main guard, the recursive `delete` deepagents ≥0.7 exposes).
+    # deepagents hands every sub-agent the backend's write tools, so read-only
+    # must be enforced at the tool boundary, not promised by the prompt.
+    readonly_guard = OKFGuardMiddleware(
+        engine,
+        read_current=_make_read_current(dataset_root),
+        read_only=True,
     )
     # Tool-boundary safety net: a raising tool (e.g. a PermissionError from the
     # S3 Files mount mid-write) becomes a ToolMessage(status="error") the model
@@ -667,36 +623,12 @@ def build_harvest_agent(
     # NOT the default backend: deepagents only wires its built-in execute tool to
     # the default backend, and the bundle must stay on the FilesystemBackend mount
     # (finalize/reindex read from there) — so the sandbox is a separate tool only.
-    # Built BEFORE the benchmark session so the adjudicator can reuse the SAME tool
-    # for binary .context/ extraction.
     run_code_tool = None
     if sandbox is not None:
         from harvest.code_interpreter import make_run_code_tool
 
         run_code_tool = make_run_code_tool(sandbox)
         all_tools.append(run_code_tool)
-
-    # Build the benchmark session now that the models + tools exist. The solver
-    # and adjudicator run on the SUB-AGENT model (tokens meter into the subagents
-    # scope for free — the benchmark is dispatched work, not the supervisor):
-    # solver bundle-blind; adjudicator with read-only mount file tools
-    # (wiki/.metadata/.context) + the source tools (run_sql/sample_rows) +
-    # run_code for raw-data-vs-wiki gap diagnosis.
-    if ri.is_enabled(ri_config) and benchmark_questions:
-        benchmark_session = _build_benchmark_session(
-            ri_config=ri_config,
-            run=benchmark_run or {},
-            questions=benchmark_questions,
-            chat_model=subagent_chat_model,
-            source=source,
-            source_tools=source_tools,
-            dataset_root=dataset_root,
-            step_emitter=step_emitter,
-            persist_kpi=persist_kpi,
-            persist_review=persist_review,
-            run_code_tool=run_code_tool,
-        )
-        all_tools.append(_make_benchmark_tool(benchmark_session))
 
     # Containment: bundle files (bare paths like tables/races.md) go to the
     # dataset root on disk via the DEFAULT FilesystemBackend; deepagents'
@@ -791,11 +723,12 @@ def build_harvest_agent(
         "model": subagent_chat_model,
     }
 
-    # Adversarial reviewer — READ-ONLY. Verifies a link-cluster of authored docs'
-    # load-bearing claims (the stated grain, join keys, gotchas, SQL — plus
-    # cross-doc contradictions within the cluster) against LIVE data via
-    # run_sql/sample_rows, and reports only findings it could reproduce. No guard
-    # (it never writes); the supervisor applies the confirmed fixes.
+    # Adversarial reviewer — READ-ONLY (enforced by readonly_guard, which
+    # refuses every write/edit/delete at the tool boundary). Verifies a
+    # link-cluster of authored docs' load-bearing claims (the stated grain,
+    # join keys, gotchas, SQL — plus cross-doc contradictions within the
+    # cluster) against LIVE data via run_sql/sample_rows, and reports only
+    # findings it could reproduce; the supervisor applies the confirmed fixes.
     reviewer = {
         "name": "reviewer",
         "description": (
@@ -809,7 +742,7 @@ def build_harvest_agent(
         ),
         "system_prompt": build_reviewer_prompt(prompt_profile, gpt=reviewer_gpt),
         "tools": all_tools,  # source + graph tools; read_file comes from the backend
-        "middleware": [tool_errors],
+        "middleware": [readonly_guard, tool_errors],
         "model": reviewer_chat_model,
     }
 
@@ -818,9 +751,10 @@ def build_harvest_agent(
     # fact types (enums, joins, metrics, grain, caveats), verifies each against
     # live data, and returns a compact routed digest the supervisor threads into
     # the table-authors. Fanned out one-per-doc/group for a LARGE `.context/` so
-    # the heavy reading happens once, off the supervisor's and authors' context. No
-    # guard (it never writes bundle files); it gets the same source + graph +
-    # run_code tools (read_file comes from the backend).
+    # the heavy reading happens once, off the supervisor's and authors' context.
+    # READ-ONLY via readonly_guard (findings return as plain text, never as
+    # bundle writes); it gets the same source + graph + run_code tools
+    # (read_file comes from the backend).
     context_extractor = {
         "name": "context-extractor",
         "description": (
@@ -833,7 +767,7 @@ def build_harvest_agent(
         ),
         "system_prompt": build_context_extractor_prompt(prompt_profile, gpt=subagent_gpt),
         "tools": all_tools,  # source + graph + run_code; read_file from the backend
-        "middleware": [tool_errors],
+        "middleware": [readonly_guard, tool_errors],
         "model": subagent_chat_model,
     }
 
@@ -857,40 +791,20 @@ def build_harvest_agent(
         "model": subagent_chat_model,
     }
 
-    main_middleware = [guard, tool_errors]
+    main_middleware = [guard, tool_errors, TodoListMiddleware()]
     if interpreter_mw is not None:
         main_middleware.append(interpreter_mw)
-    # Compel the in-run benchmark loop: if RI is enabled, hook after_model on the
-    # MAIN supervisor only (never subagents — the supervisor owns the run's end) so
-    # the agent can't finish before the benchmark requirements are met. Gated on an
-    # actual session, so a normal harvest is completely untouched.
-    if benchmark_session is not None:
-        from harvest.benchmark.completion import (
-            BenchmarkCompletionMiddleware,
-            BenchmarkCompletionPolicy,
-        )
-
-        policy = BenchmarkCompletionPolicy(
-            enabled=True,
-            max_iterations=int(
-                ri_config.get(ri.FIELD_MAX_ITERATIONS, ri.MAX_ITERATIONS)
-            ),
-        )
-        main_middleware.append(
-            BenchmarkCompletionMiddleware(policy, benchmark_session)
-        )
 
     # Cross mode swaps the supervisor prompt and the authoring fan-out. The
-    # reviewer keeps its name/description/tools but differs in two ways:
-    # (1) the GUARD IS ATTACHED — deepagents hands every sub-agent the
-    # backend's write_file/edit_file, and in cross mode the reviewer reads a
-    # verbatim copy of ANOTHER dataset's wiki (an injection surface), so the
-    # pair-subtree confinement must hold on its write path too (the guard is
-    # inert for reads); (2) it runs the CROSS reviewer prompt — the standard
-    # table-doc checklist ("probe for a join the doc misses") makes cross
-    # reviewers re-do discovery with many slow cross-database queries; the
-    # cross body verifies what the pair docs CLAIM on a two-queries-per-doc
-    # budget instead.
+    # reviewer keeps its name/description/tools/READ-ONLY guard (deepagents
+    # hands every sub-agent the backend's write_file/edit_file, and in cross
+    # mode the reviewer reads a verbatim copy of ANOTHER dataset's wiki — the
+    # run's prompt-injection surface — so the hard write refusal matters MORE
+    # here, not less; its prompt says "READ-ONLY, you do NOT write files") but
+    # runs the CROSS reviewer prompt — the standard table-doc checklist
+    # ("probe for a join the doc misses") makes cross reviewers re-do
+    # discovery with many slow cross-database queries; the cross body verifies
+    # what the pair docs CLAIM on a two-queries-per-doc budget instead.
     if cross_target:
         system_prompt = build_cross_supervisor_prompt(
             prompt_profile, gpt=supervisor_gpt
@@ -900,12 +814,11 @@ def build_harvest_agent(
             "system_prompt": build_cross_reviewer_prompt(
                 prompt_profile, gpt=reviewer_gpt
             ),
-            "middleware": [guard, tool_errors],
+            "middleware": [readonly_guard, tool_errors],
         }
         subagents = [cross_author, cross_reviewer]
     else:
         system_prompt = build_supervisor_prompt(
-            recursive_improvement=benchmark_session is not None,
             profile=prompt_profile,
             gpt=supervisor_gpt,
         )
@@ -926,5 +839,4 @@ def build_harvest_agent(
         source=source,
         link_graph=link_graph,
         dataset_root=dataset_root,
-        benchmark_session=benchmark_session,
     )

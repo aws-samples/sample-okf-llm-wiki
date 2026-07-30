@@ -517,3 +517,18 @@ def test_redshift_session_policy_data_api_and_secret():
     ]
     # Inline session policies are capped at 2048 chars.
     assert len(json.dumps(policy)) < 2048
+
+
+def test_session_policy_grants_singular_and_batch_partition_reads():
+    """Athena prunes a PARTITIONED table with GetPartition/BatchGetPartition.
+
+    Regression: the policy carried only the bulk `GetPartitions`, so querying a
+    partitioned table died with AccessDenied at QUERY time (not plan time). The
+    session policy INTERSECTS the data role's grant, so both must list these —
+    granting them in IAM alone changes nothing.
+    """
+    sids = {s["Sid"]: s for s in _policy()["Statement"]}
+    actions = sids["GlueThisDb"]["Action"]
+    assert "glue:GetPartitions" in actions
+    assert "glue:GetPartition" in actions
+    assert "glue:BatchGetPartition" in actions

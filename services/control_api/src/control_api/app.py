@@ -590,6 +590,19 @@ def _r_trigger_annotation_harvest(cfg, params, body, query, caller):
     domain_meta = handlers.get_domain(
         cfg.ddb, registry_table=cfg.registry_table, data_domain=params["domain"]
     )
+    # Per-harvest model/effort selection — same optional override triple as a
+    # full harvest (supervisor / sub-agents / reviewer), validated against the
+    # same catalog trust boundary. Without this, applying annotations always ran
+    # on the runtime's deploy-time default regardless of what the operator had
+    # picked for full harvests of this dataset (see trigger_annotation_harvest's
+    # docstring) — a bug, not a deliberate restriction.
+    model, effort = _validated_model_pair(cfg, body or {}, "model", "effort")
+    subagent_model, subagent_effort = _validated_model_pair(
+        cfg, body or {}, "subagent_model", "subagent_effort"
+    )
+    reviewer_model, reviewer_effort = _validated_model_pair(
+        cfg, body or {}, "reviewer_model", "reviewer_effort"
+    )
     return 200, handlers.trigger_annotation_harvest(
         cfg.agentcore,
         cfg.ddb,
@@ -605,6 +618,12 @@ def _r_trigger_annotation_harvest(cfg, params, body, query, caller):
         scope=scope,
         annotation_ids=annotation_ids,
         cross_target=cross_target,
+        model=model,
+        effort=effort,
+        subagent_model=subagent_model,
+        subagent_effort=subagent_effort,
+        reviewer_model=reviewer_model,
+        reviewer_effort=reviewer_effort,
     )
 
 
@@ -713,43 +732,109 @@ def _r_inspect_benchmark(cfg, params, body, query, caller):
     )
 
 
-def _r_get_benchmark_review(cfg, params, body, query, caller):
-    # One round's per-question review (all buckets, incl. gold). Off-mount S3 read;
-    # 404 if the round hasn't persisted (or is an older run). iteration is 0-based.
-    try:
-        iteration = int(params["iteration"])
-    except (TypeError, ValueError) as e:
-        raise handlers.ApiError(400, "iteration must be an integer") from e
-    return 200, handlers.get_benchmark_review(
+# -- Benchmark Studio: standalone runs + reports ------------------------------
+
+
+def _r_start_benchmark_run(cfg, params, body, query, caller):
+    body = body or {}
+    if not cfg.harvest_runtime_arn:
+        raise handlers.ApiError(500, "harvest runtime is not configured")
+    # Two catalog-validated model pairs (solver + judge) — same trust boundary
+    # as the harvest overrides; absent pairs fall back to the runtime default.
+    solver_model, solver_effort = _validated_model_pair(
+        cfg, body, "solver_model", "solver_effort"
+    )
+    judge_model, judge_effort = _validated_model_pair(
+        cfg, body, "judge_model", "judge_effort"
+    )
+    return 200, handlers.start_benchmark_run(
+        cfg.agentcore,
+        cfg.ddb,
+        cfg.s3,
+        registry_table=cfg.registry_table,
+        runtime_arn=cfg.harvest_runtime_arn,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        checks=body.get("checks"),
+        runs=body.get("runs"),
+        solver_model=solver_model,
+        solver_effort=solver_effort,
+        judge_model=judge_model,
+        judge_effort=judge_effort,
+        version_id=str(body.get("version_id") or ""),
+        requested_by=(caller.ident if caller else "") or "",
+        behavior_live_sql=bool(body.get("behavior_live_sql")),
+    )
+
+
+def _r_list_benchmark_reports(cfg, params, body, query, caller):
+    return 200, handlers.list_benchmark_reports(
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_get_benchmark_report(cfg, params, body, query, caller):
+    return 200, handlers.get_benchmark_report(
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        report_id=params["report_id"],
+    )
+
+
+def _r_get_benchmark_report_traces(cfg, params, body, query, caller):
+    return 200, handlers.get_benchmark_report_traces(
         cfg.s3,
         bucket=cfg.bucket,
         data_domain=params["domain"],
         dataset=params["dataset"],
-        session_id=params["session"],
-        iteration=iteration,
+        report_id=params["report_id"],
     )
 
 
-def _r_get_ri_settings(cfg, params, body, query, caller):
-    return 200, handlers.get_dataset_ri_settings(
+def _r_delete_benchmark_report(cfg, params, body, query, caller):
+    return 200, handlers.delete_benchmark_report(
+        cfg.s3,
         cfg.ddb,
+        bucket=cfg.bucket,
         registry_table=cfg.registry_table,
         data_domain=params["domain"],
         dataset=params["dataset"],
+        report_id=params["report_id"],
     )
 
 
-def _r_set_ri_settings(cfg, params, body, query, caller):
+def _r_aggregate_report_annotations(cfg, params, body, query, caller):
+    if not cfg.harvest_runtime_arn:
+        raise handlers.ApiError(500, "harvest runtime is not configured")
+    return 200, handlers.start_annotation_aggregation(
+        cfg.agentcore,
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        runtime_arn=cfg.harvest_runtime_arn,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        report_id=params["report_id"],
+    )
+
+
+def _r_apply_report_annotations(cfg, params, body, query, caller):
     body = body or {}
-    # The whole recursive_improvement block is validated/clamped in the handler
-    # (the trust boundary). Accept it under either the nested key or the bare body.
-    settings = body.get("recursive_improvement", body)
-    return 200, handlers.set_dataset_ri_settings(
+    return 200, handlers.apply_report_annotations(
         cfg.ddb,
-        registry_table=cfg.registry_table,
+        annotations_table=cfg.annotations_table,
         data_domain=params["domain"],
         dataset=params["dataset"],
-        settings=settings,
+        user_sub=(caller.sub if caller else "") or "",
+        author=(caller.ident if caller else "") or "",
+        annotations=body.get("annotations"),
     )
 
 
@@ -942,18 +1027,33 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     # same API Gateway CORS reason as the chat rename above.
     ("GET", "/guidance/{domain}/{dataset}", _r_get_dataset_guidance),
     ("PUT", "/guidance/{domain}/{dataset}", _r_set_dataset_guidance),
-    # Recursive-improvement benchmark: off-mount CSV presign + saved settings +
-    # parsed question-count (fixed /questions suffix disambiguates from settings).
+    # Benchmark Studio: off-mount CSV presign + parsed per-check counts, then
+    # the standalone runs/reports surface (see okf_core.benchmark_report).
     ("POST", "/benchmark/{domain}/{dataset}/presign", _r_presign_benchmark),
     ("GET", "/benchmark/{domain}/{dataset}/questions", _r_inspect_benchmark),
-    # Per-round review (all buckets, gold-carrying); session + 0-based iteration.
+    ("POST", "/benchmark/{domain}/{dataset}/runs", _r_start_benchmark_run),
+    ("GET", "/benchmark/{domain}/{dataset}/runs", _r_list_benchmark_reports),
     (
         "GET",
-        "/benchmark/{domain}/{dataset}/reviews/{session}/{iteration}",
-        _r_get_benchmark_review,
+        "/benchmark/{domain}/{dataset}/runs/{report_id}/traces",
+        _r_get_benchmark_report_traces,
     ),
-    ("GET", "/benchmark/{domain}/{dataset}", _r_get_ri_settings),
-    ("PUT", "/benchmark/{domain}/{dataset}", _r_set_ri_settings),
+    (
+        "POST",
+        "/benchmark/{domain}/{dataset}/runs/{report_id}/aggregate",
+        _r_aggregate_report_annotations,
+    ),
+    (
+        "POST",
+        "/benchmark/{domain}/{dataset}/runs/{report_id}/annotations",
+        _r_apply_report_annotations,
+    ),
+    ("GET", "/benchmark/{domain}/{dataset}/runs/{report_id}", _r_get_benchmark_report),
+    (
+        "DELETE",
+        "/benchmark/{domain}/{dataset}/runs/{report_id}",
+        _r_delete_benchmark_report,
+    ),
     # Chat conversations (per-user sidebar list). thread_id is a single opaque
     # segment (a UUID the SPA generates), so it's a clean path param. Rename is
     # PUT (not PATCH) because the API Gateway CORS allow_methods + the CORS_HEADERS

@@ -290,6 +290,13 @@ function helperSource() {
       // frame). One series; data = [{from, to, flow}] edges. Nodes are colored
       // by first appearance so a node keeps ONE palette color on both sides of
       // its flows; the link is a gradient between its endpoints' colors.
+      // Optional per-series extras:
+      //   colors: { nodeName: paletteIndex | "muted" } — semantic node colors
+      //     (a pass node can be the palette's green regardless of appearance
+      //     order);
+      //   column: { nodeName: columnIndex } — pin nodes to stages, so a sink
+      //     that terminates early ("Passed") sits beside its stage peers
+      //     instead of being pushed to the last column.
       var sk = series[0] || { data: [] };
       var flows = sk.data || [];
       var nodes = [];
@@ -297,23 +304,36 @@ function helperSource() {
         if (f && f.from != null && nodes.indexOf(f.from) === -1) nodes.push(f.from);
         if (f && f.to != null && nodes.indexOf(f.to) === -1) nodes.push(f.to);
       });
+      var colorSpec = sk.colors || {};
       var nodeColor = function (name) {
         // FULL opacity: an alpha fill here blends with the page behind the
         // frame, so the same series color rendered lighter in light mode and
         // darker in dark mode — the color must be the theme token itself.
+        var c = colorSpec[name];
+        if (c === "muted") return rgb(P.mutedForeground || "115,115,115");
+        if (typeof c === "number") return rgb(SERIES[c % SERIES.length]);
+        if (typeof c === "string" && c.indexOf(",") > -1) return rgb(c); // raw "r, g, b"
         return rgb(seriesColor(Math.max(0, nodes.indexOf(name))));
       };
+      var skDs = {
+        label: sk.name || "",
+        data: flows,
+        colorFrom: function (c) { return nodeColor(c.dataset.data[c.dataIndex].from); },
+        colorTo: function (c) { return nodeColor(c.dataset.data[c.dataIndex].to); },
+        colorMode: "gradient",
+        borderWidth: 0,
+        color: rgb(P.foreground || "23,23,23") // node label text
+      };
+      if (sk.column) skDs.column = sk.column;
+      if (sk.priority) skDs.priority = sk.priority;
+      // Layout knobs (plugin options): nodePadding spaces the nodes within a
+      // column — larger values shrink the flow scale, so a single-source
+      // sankey branches visibly instead of drawing one edge-to-edge block.
+      if (sk.nodePadding != null) skDs.nodePadding = sk.nodePadding;
+      if (sk.nodeWidth != null) skDs.nodeWidth = sk.nodeWidth;
       return {
         type: "sankey",
-        data: { datasets: [{
-          label: sk.name || "",
-          data: flows,
-          colorFrom: function (c) { return nodeColor(c.dataset.data[c.dataIndex].from); },
-          colorTo: function (c) { return nodeColor(c.dataset.data[c.dataIndex].to); },
-          colorMode: "gradient",
-          borderWidth: 0,
-          color: rgb(P.foreground || "23,23,23") // node label text
-        }] },
+        data: { datasets: [skDs] },
         options: { plugins: { legend: { display: false } } }
       };
     }
@@ -328,6 +348,16 @@ function helperSource() {
       // key off a precomputed label→group map, never off _data.group.
       var tm = series[0] || { data: [] };
       var items = tm.data || [];
+      // Optional colors: { label: paletteIndex | "muted" } — semantic tile
+      // colors (pass-green / gap-red) instead of appearance order.
+      var tmColors = tm.colors || {};
+      function tileTriple(label, fallbackIdx) {
+        var c = tmColors[label];
+        if (c === "muted") return P.mutedForeground || "115,115,115";
+        if (typeof c === "number") return SERIES[c % SERIES.length];
+        if (typeof c === "string" && c.indexOf(",") > -1) return c; // raw "r, g, b"
+        return seriesColor(fallbackIdx);
+      }
       var hasGroups = items.some(function (d) { return d && d.group != null; });
       var groupNames = [];
       var groupOf = {}; // any node label (group OR leaf name) → palette index
@@ -369,7 +399,7 @@ function helperSource() {
             // palette slot rendered as a light tint in light mode and a dark
             // shade in dark mode — the tile must BE the theme's series color.
             var isHeader = hasGroups && o.group === "group";
-            return isHeader ? "transparent" : rgb(seriesColor(nodeIdx(c)));
+            return isHeader ? "transparent" : rgb(tileTriple(o.label, nodeIdx(c)));
           },
           labels: {
             display: true,
@@ -377,7 +407,10 @@ function helperSource() {
             // light (amber) to dark (cyan) — fixed white text would wash out
             // on the light ones, so pick by the FILL's luminance.
             color: function (c) {
-              return c.type === "data" ? inkOn(seriesColor(nodeIdx(c))) : "transparent";
+              var o = (c.raw && c.raw._data) || {};
+              return c.type === "data"
+                ? inkOn(tileTriple(o.label, nodeIdx(c)))
+                : "transparent";
             },
             formatter: function (c) {
               var o = (c.raw && c.raw._data) || {};
@@ -432,6 +465,11 @@ function helperSource() {
       throw new Error("unsupported chart type: " + JSON.stringify(type));
     }
     var horizontal = !!spec.horizontal;
+    // xTicks:false hides the INDEX-axis tick labels (a per-solve or per-item
+    // series has no readable category names — the tooltip carries identity).
+    if (spec.xTicks === false) {
+      (horizontal ? scalesHorizontal.y : scalesLinear.x).ticks = { display: false };
+    }
     // Value-axis chrome (the faint gridlines — ticks are already hidden).
     // Horizontal bars default to NONE: they're usually ranked lists where the
     // category labels carry the story and gridlines are just noise; values
@@ -441,37 +479,163 @@ function helperSource() {
     if (!showAxes) {
       (horizontal ? scalesHorizontal.x : scalesLinear.y).grid = { display: false };
     }
+    var datasets = series.map(function (s, i) {
+      // Per-series override for mixed charts; anything unrecognized falls
+      // back to the spec's base type rather than throwing mid-chart.
+      var sIsArea = s.type ? s.type === "area" : isArea;
+      var sType = s.type === "bar" ? "bar" : s.type === "line" || sIsArea ? "line" : chartType;
+      var base = {
+        type: sType,
+        label: s.name || ("Series " + (i + 1)),
+        data: s.data || [],
+        borderColor: rgb(seriesColor(i)),
+        backgroundColor: (sType === "bar") ? rgb(seriesColor(i)) : rgb(seriesColor(i), sIsArea ? 0.2 : 1),
+        // Bars get NO border: borderColor == fill so it adds nothing, and
+        // Chart.js paints a bar border as a second fill whose antialiased
+        // seam lets the page background bleed through as a thin inset line
+        // (visible on dark fills, worse at the elevated zoom ratios the
+        // crispness re-raster uses). Lines keep 2 — that IS the stroke.
+        borderWidth: (sType === "bar") ? 0 : 2,
+        borderRadius: (sType === "bar") ? 4 : 0,
+        tension: 0.3,
+        pointRadius: (sType === "line") ? 2 : 0
+      };
+      if (sIsArea) base.fill = true;
+      // A reference line (e.g. "average"): dashed, no points, no area.
+      if (s.dashed) {
+        base.borderDash = [6, 4];
+        base.pointRadius = 0;
+        base.pointHitRadius = 0;
+        base.fill = false;
+        base.borderWidth = 1.5;
+      }
+      // points:false — a dense series reads as a shape, not a dot cloud (the
+      // spec's markers carry the callout dots instead).
+      if (s.points === false) base.pointRadius = 0;
+      // badge: "21.7s" — a value pill pinned to the chart's left edge at this
+      // series' (first) y — the okfBadges plugin draws it.
+      if (s.badge != null) base.okfBadge = String(s.badge);
+      return base;
+    });
+
+    // spec.markers = [{index, value, label|label[]}] — callout points (min/max
+    // extremes) drawn ON the series: a prominent dot + a dashed drop-line to
+    // the x-axis (the okfMarkerLines plugin), with the marker's own tooltip
+    // text (the question behind the extreme) instead of the numeric default.
+    var markerTooltip = null;
+    if (Array.isArray(spec.markers) && spec.markers.length && !horizontal) {
+      var mData = labels.map(function () { return null; });
+      var mLabels = {};
+      spec.markers.forEach(function (m) {
+        if (!m || m.index == null) return;
+        mData[m.index] = m.value;
+        if (m.label != null) mLabels[m.index] = m.label;
+      });
+      datasets.push({
+        type: "line",
+        label: "extremes",
+        data: mData,
+        showLine: false,
+        spanGaps: false,
+        pointRadius: 5,
+        pointHoverRadius: 7,
+        pointBackgroundColor: rgb(P.foreground || "23,23,23"),
+        pointBorderColor: rgb(P.card || "255,255,255"),
+        pointBorderWidth: 1.5,
+        borderWidth: 0,
+        okfMarker: true,
+        okfLabels: mLabels
+      });
+      markerTooltip = {
+        callbacks: {
+          label: function (ctx) {
+            var l = ctx.dataset && ctx.dataset.okfLabels && ctx.dataset.okfLabels[ctx.dataIndex];
+            if (l != null) return l;
+            return (ctx.dataset.label ? ctx.dataset.label + ": " : "") + ctx.formattedValue;
+          }
+        }
+      };
+    }
+
+    var lineOpts = horizontal
+      ? { indexAxis: "y", scales: scalesHorizontal }
+      : { scales: scalesLinear };
+    // Line/area hover: nearest-x, no intersect — a dense (or dotless,
+    // points:false) series stays hoverable anywhere along its length, with the
+    // tooltip titled by that x's label.
+    if (chartType === "line") {
+      lineOpts.interaction = { mode: "index", intersect: false };
+    }
+    if (markerTooltip) {
+      lineOpts.plugins = { legend: { labels: { filter: function (item) { return item.text !== "extremes"; } } }, tooltip: markerTooltip };
+    }
     return {
       type: chartType,
-      data: { labels: labels, datasets: series.map(function (s, i) {
-        // Per-series override for mixed charts; anything unrecognized falls
-        // back to the spec's base type rather than throwing mid-chart.
-        var sIsArea = s.type ? s.type === "area" : isArea;
-        var sType = s.type === "bar" ? "bar" : s.type === "line" || sIsArea ? "line" : chartType;
-        var base = {
-          type: sType,
-          label: s.name || ("Series " + (i + 1)),
-          data: s.data || [],
-          borderColor: rgb(seriesColor(i)),
-          backgroundColor: (sType === "bar") ? rgb(seriesColor(i)) : rgb(seriesColor(i), sIsArea ? 0.2 : 1),
-          // Bars get NO border: borderColor == fill so it adds nothing, and
-          // Chart.js paints a bar border as a second fill whose antialiased
-          // seam lets the page background bleed through as a thin inset line
-          // (visible on dark fills, worse at the elevated zoom ratios the
-          // crispness re-raster uses). Lines keep 2 — that IS the stroke.
-          borderWidth: (sType === "bar") ? 0 : 2,
-          borderRadius: (sType === "bar") ? 4 : 0,
-          tension: 0.3,
-          pointRadius: (sType === "line") ? 2 : 0
-        };
-        if (sIsArea) base.fill = true;
-        return base;
-      }) },
-      options: horizontal
-        ? { indexAxis: "y", scales: scalesHorizontal }
-        : { scales: scalesLinear }
+      data: { labels: labels, datasets: datasets },
+      options: lineOpts
     };
   }
+
+  // Dashed drop-lines from each marker point (spec.markers) down to the x-axis
+  // — the "line emerging from the peak" callout. Registered per-chart via the
+  // okfMarker flag, so ordinary charts pay nothing.
+  var okfBadges = {
+    id: "okfBadges",
+    afterDatasetsDraw: function (chart) {
+      var area = chart.chartArea;
+      chart.data.datasets.forEach(function (ds, di) {
+        if (!ds.okfBadge) return;
+        var meta = chart.getDatasetMeta(di);
+        var pt = (meta.data || [])[0];
+        if (!pt) return;
+        var ctx = chart.ctx;
+        var text = ds.okfBadge;
+        ctx.save();
+        ctx.font = "600 10px " + getComputedStyle(document.body).fontFamily;
+        var w = Math.ceil(ctx.measureText(text).width) + 12;
+        var h = 17;
+        var x = area.left + 2;
+        var yy = Math.max(area.top + h / 2, Math.min(area.bottom - h / 2, pt.y));
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(x, yy - h / 2, w, h, 6);
+        else ctx.rect(x, yy - h / 2, w, h);
+        ctx.fillStyle = rgb(P.card || "255,255,255");
+        ctx.fill();
+        ctx.strokeStyle = gridColor(0.5);
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.fillStyle = rgb(P.foreground || "23,23,23");
+        ctx.textBaseline = "middle";
+        ctx.fillText(text, x + 6, yy + 0.5);
+        ctx.restore();
+      });
+    }
+  };
+
+  var okfMarkerLines = {
+    id: "okfMarkerLines",
+    afterDatasetsDraw: function (chart) {
+      var y = chart.scales && chart.scales.y;
+      if (!y) return;
+      chart.data.datasets.forEach(function (ds, di) {
+        if (!ds.okfMarker) return;
+        var meta = chart.getDatasetMeta(di);
+        var ctx = chart.ctx;
+        (meta.data || []).forEach(function (pt, i) {
+          if (ds.data[i] == null || !pt) return;
+          ctx.save();
+          ctx.strokeStyle = gridColor(0.55);
+          ctx.setLineDash([4, 3]);
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(pt.x, pt.y);
+          ctx.lineTo(pt.x, y.getPixelForValue(y.min));
+          ctx.stroke();
+          ctx.restore();
+        });
+      });
+    }
+  };
 
   var _chart = null;
   // Crisp-on-zoom: the canvas is a raster, so it blurs when the browser zooms past
@@ -501,6 +665,7 @@ function helperSource() {
     if (!window.Chart) throw new Error("charting library failed to load");
     if (!el) throw new Error("renderChart needs the provided canvas element");
     applyDefaults(window.Chart);
+    try { window.Chart.register(okfMarkerLines, okfBadges); } catch (e) {}
     if (_chart) { _chart.destroy(); _chart = null; }
     _lastSpec = spec;
     var cfg = toConfig(spec);
@@ -620,8 +785,10 @@ function bootstrapSource(userCode) {
 
 // Build the full srcdoc for one chart. `code` is the agent's script; `palette` is
 // the resolved rgb token set from resolveChartPalette(); `fontFamily` matches the
-// app so text in the frame reads consistently.
-export function buildChartSrcdoc({ code, palette, fontFamily }) {
+// app so text in the frame reads consistently. `height` is the chart box's CSS
+// height — 340 is the chat's reading size; dashboard-style widgets (the
+// benchmark summary) pass smaller to stay square-ish.
+export function buildChartSrcdoc({ code, palette, fontFamily, height = 340 }) {
   const lib = neutralizeScriptClose(CHART_JS_SRC)
   const sankey = neutralizeScriptClose(CHART_SANKEY_SRC)
   const treemap = neutralizeScriptClose(CHART_TREEMAP_SRC)
@@ -642,7 +809,7 @@ export function buildChartSrcdoc({ code, palette, fontFamily }) {
 <style>
   html, body { margin: 0; padding: 0; background: transparent; }
   #wrap { padding: 4px 2px; box-sizing: border-box; }
-  #chartbox { position: relative; width: 100%; height: 340px; }
+  #chartbox { position: relative; width: 100%; height: ${Number(height) || 340}px; }
   body { font-family: ${family}; -webkit-font-smoothing: antialiased; }
   canvas { max-width: 100%; }
 </style>
