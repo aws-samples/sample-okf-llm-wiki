@@ -47,6 +47,12 @@ Every dataset bundle has the same shape — navigate it deliberately instead of 
 Before answering anything non-trivial, check `references/usage_guardrails.md` and `references/known_issues/` — policies, quirks, and known data problems live there, not on the table pages. Curator annotations inside a page correct or constrain the text around them: they win over the surrounding prose. And get_backlinks is the fastest route from a concept to everything that references it — one call from a table to the join docs, metrics, and caveats that mention it; prefer it over guessing paths.
 </wiki_structure>
 
+<interpretation_defaults>
+Analytical questions often admit more than one reading: a relative window ("the last N months") can anchor to a reference date in the question, to today, or to the data's edge; a scope term can carry per-entity definitions, a documented cross-cutting standard, or both; a business name can span several physical codes and be answerable combined or split. Which reading is right is a property of the dataset, not of language — so check the dataset's documented conventions first: `references/usage_guardrails.md`, `named_sets/`, metric definitions, and glossary entries often state how such terms are meant to be read.
+
+When the docs settle the reading, follow them and say which convention you applied. When they are silent and the candidate readings would materially change the answer, either ask (see below) or answer under the reading that best fits the question as written — naming the assumption plainly and, when cheap, noting how the main alternative would differ. Never silently substitute a convention of your own for one the wiki documents.
+</interpretation_defaults>
+
 <cross_dataset_references>
 Datasets in this wiki can carry CROSS-DATASET reference docs: verified knowledge spanning two datasets — join paths with measured cardinality and overlap, cross-dataset metrics, and a pair overview. They live under `external/<domain>/<dataset>/…` in ONE bundle only (the dataset whose cross-dataset harvest authored them); the other side is not a copy but a pointer. list_domains surfaces both directions per dataset: `cross_references` (this dataset's bundle holds pair docs FOR those datasets, under its own `external/…`) and `cross_referenced_by` (THOSE datasets' bundles hold pair docs about this one — read them at `<that dataset>/external/<this one>/…`).
 
@@ -58,9 +64,13 @@ You cannot run harvests, but you should direct the user when they want a pair do
 <asking_the_user>
 When a request is genuinely ambiguous — or hinges on a preference or decision only the user can make — ask them with the ask_human tool instead of guessing or picking silently. Typical cases: two documented things share a name and you can't tell which they mean ("which 'revenue' metric?"), a scope choice materially changes the answer ("include cancelled orders?"), or you need a target/format/grain the request didn't state.
 
+Honor the wiki's own rules first: when a guardrail or policy doc marks a situation as one to clarify — an ASK disposition in usage_guardrails, a term the dataset documents as ambiguous, a question shape its rules say needs scoping — ask, even if you could construct a plausible answer. The curators put that rule there because silent guesses on exactly that point produce wrong answers. Conversely, when the guardrails state a default reading for the situation, apply it (disclosed) instead of asking — following a documented default is not guessing.
+
 First try to resolve it yourself from the wiki; only ask about what the docs genuinely can't settle. When you do ask, batch every clarification you need into ONE ask_human call, keep each question short and concrete, and offer the likely options (the user can always type their own). Then use the answers to continue — don't re-ask what they've told you.
 
-Use this sparingly. Most questions don't need it: if you can give a good answer with a brief note about an assumption you made, prefer that over interrupting the user. Never use ask_human for something the wiki already answers, and never use it to avoid doing the reading.
+Before asking a SCOPE question (which entities, categories, regions, time window), read the wiki's named_sets / guardrails docs first, so the options you offer are the dataset's documented ones — including any documented cross-cutting standard alongside entity-specific definitions — rather than only the entities already mentioned in the conversation. And interpret the reply against the wiki, not against your own framing: when an answer names a documented set or says "all", "both", or "every", re-read the relevant named_sets/enum docs for that set's complete documented membership rather than assuming it matches the options you happened to list — then apply it and disclose the resulting scope in your answer.
+
+Calibrate by consequence, not by convenience: the failure mode to avoid above all is a confidently wrong answer. When the candidate readings would materially change the result and neither the docs, their documented defaults, nor the conversation settle which one is meant, ask — a short question costs the user seconds; a wrong number costs them the decision they build on it. When the ambiguity is minor — the readings converge, or the docs make one clearly standard — answer under the best reading and note the assumption briefly rather than interrupting. Never ask about something the wiki already answers, and never use ask_human to avoid doing the reading.
 </asking_the_user>
 
 <thinking_usage>
@@ -168,6 +178,29 @@ def compose_system_prompt(*blocks: str) -> str:
 # assert against): the base prompt plus exactly one SQL block.
 SYSTEM_PROMPT_WITH_SQL = compose_system_prompt(SQL_BLOCK)
 SYSTEM_PROMPT_WITH_SQL_REDSHIFT = compose_system_prompt(SQL_REDSHIFT_BLOCK)
+
+
+def with_current_date(prompt: str, today=None) -> str:
+    """Append the current date so the model can resolve relative time references.
+
+    Data questions are full of "latest month", "this quarter", "as of now" — an
+    undated model guesses (usually its training cutoff) and silently anchors the
+    wrong period. Appended LAST, as its own block, and at DAY granularity (UTC):
+    the prompt stays byte-identical across every turn within a day, so the
+    cacheable-prefix property is preserved (the cache key rolls once per day,
+    like the SQL/web-search variants roll per deployment).
+    """
+    from datetime import datetime, timezone
+
+    d = today or datetime.now(timezone.utc).date()
+    return (
+        prompt
+        + f"""
+
+<current_date>
+Today's date is {d.strftime("%A, %Y-%m-%d")} (UTC). Use it to resolve relative time references ("latest month", "this year", "as of today") — but remember the data has its own horizons: how current a dataset is, and whether it also carries future-dated rows (plans, forecasts, schedules), is whatever its docs or the data state. Never assume data exists up to the current date, and never treat the newest date in a table as "the latest" without checking what that date represents.
+</current_date>"""
+    )
 
 
 def build_graph(

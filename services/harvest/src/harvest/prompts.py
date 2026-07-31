@@ -67,11 +67,12 @@ first — `SKILL.md` for the workflow, and its references on demand, especially:
   dialect, identifier quoting, type vocabulary, partitioning/cost, and gotchas.
   Use its rules for every SQL snippet you write.
 - `references/templates.md` — per-concept doc templates.
-- `references/fact-types.md` — the fact-extraction checklist: the ~20 fact types
+- `references/fact-types.md` — the fact-extraction checklist: the ~25 fact types
   worth capturing (business terms, metrics, joins, **code/enum legends**, filter
   rules, caveats, units, named sets, canonical recipes, …), the cue phrases to find each in a doc,
-  and WHERE each lands in the bundle. Use it whenever you read a `.context/` doc
-  or mine the source for gotchas/enums.
+  the data-side probes for when no docs exist, and WHERE each lands in the
+  bundle. Use it whenever you read a `.context/` doc or mine the source for
+  gotchas/enums.
 - `references/spec-condensed.md` — the normative OKF rules.
 The skill's QUALITY BARS are normative, not suggestions — apply them exactly as
 SKILL.md states them: the verified grain, context-as-hypothesis (live data

@@ -55,6 +55,28 @@ def _fill_dialect(text: str, dialect: str) -> str:
         raise ValueError(f"unfilled prompt token in: {filled[:200]}")
     return filled
 
+
+def with_run_date(prompt: str, today=None) -> str:
+    """Append today's date so relative time references resolve.
+
+    Benchmark questions are full of "latest month", "last quarter", "as of
+    now" — an undated model guesses (usually its training cutoff) and silently
+    anchors the wrong period. Applied at AGENT BUILD (solver, judge, grader,
+    reviewer), never to the module constants, so prompt-content tests and
+    callers that compose prompts keep exact-string semantics.
+    """
+    from datetime import datetime, timezone
+
+    d = today or datetime.now(timezone.utc).date()
+    return (
+        prompt
+        + f"""
+
+<current_date>
+Today's date is {d.strftime("%A, %Y-%m-%d")} (UTC). Use it to resolve relative time references ("latest month", "this year", "as of today") — but remember the data has its own horizons: how current a dataset is, and whether it also carries future-dated rows (plans, forecasts, schedules), is whatever its docs or the data state. Never assume data exists up to the current date, and never treat the newest date in a table as "the latest" without checking what that date represents.
+</current_date>"""
+    )
+
 # The shared wiki-exploration preamble every check's solver gets: the solver is
 # the simulated consumer, and its ONLY knowledge source is the wiki.
 _WIKI_PREAMBLE = """\
@@ -156,8 +178,14 @@ is missing, a term resolves to more than one documented thing, or the wiki's \
 guardrails direct agents to ASK for this kind of request — call it with your \
 specific question(s) instead of answering. Calling it ENDS the run: there is \
 no user here to reply, and the ask itself is recorded as your final answer. \
-Ask only when the docs cannot settle the reading — never to avoid the reading, \
-and never when the wiki supports a direct answer.
+When the wiki states a default reading for the situation, apply it and \
+disclose it instead of asking — following a documented default is not \
+guessing. Calibrate by consequence: the failure to avoid above all is a \
+confidently wrong answer — when candidate readings would materially change \
+the answer and neither the docs nor their stated defaults settle which is \
+meant, ask; when the ambiguity is minor, answer under the best-fitting \
+reading and note the assumption. Never ask to avoid the reading, and never \
+when the wiki supports a direct answer.
 
 Your FINAL message is your complete answer to the user — everything before it \
 is working (unless you end the run with `ask_human`, which IS the answer). \

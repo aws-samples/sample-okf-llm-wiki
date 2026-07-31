@@ -1037,7 +1037,11 @@ def test_sql_tool_absent_without_opt_in(monkeypatch):
 
     cap = _factory_tool_names(monkeypatch, sql_enabled=True, features=set())
     assert "run_sql" not in cap["tools"]
-    assert cap["prompt"] == SYSTEM_PROMPT  # base prompt: no SQL block appended
+    # Base prompt: no SQL block appended — only the day-granular <current_date>
+    # suffix rides after it (see graph.with_current_date).
+    assert cap["prompt"].startswith(SYSTEM_PROMPT)
+    assert "<sql_tool>" not in cap["prompt"]
+    assert cap["prompt"].rstrip().endswith("</current_date>")
 
 
 def test_sql_tool_absent_when_deploy_disabled(monkeypatch):
@@ -1049,7 +1053,8 @@ def test_sql_tool_absent_when_deploy_disabled(monkeypatch):
         monkeypatch, sql_enabled=False, features={"sql"}, has_athena=False
     )
     assert "run_sql" not in cap["tools"]
-    assert cap["prompt"] == SYSTEM_PROMPT
+    assert cap["prompt"].startswith(SYSTEM_PROMPT)
+    assert "<sql_tool>" not in cap["prompt"]
 
 
 def test_web_search_tool_wired_on_every_run_when_deploy_enabled(monkeypatch):

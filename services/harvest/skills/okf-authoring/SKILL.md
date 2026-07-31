@@ -65,6 +65,13 @@ disagree, that disagreement is itself knowledge worth capturing.
   still probe the plausible relationships the docs never mentioned, still measure
   the grain yourself. Context should *widen* your investigation, never cap it —
   the join a human wrote down is often not the only (or the best) one.
+- **Embedded documentation is context too.** Column comments, table
+  descriptions, and catalog properties — including anything an upstream tool
+  (dbt, DataZone, a modeling tool) synced into them — are human claims riding
+  along *inside* the primary source. Treat them exactly like an uploaded doc:
+  mine them through the fact-type lens, verify them against the data before
+  transcribing, and cite the source. A comment the data contradicts is a
+  `# Gotchas` finding, not a description to copy.
 - **Fuse, don't staple.** The essence of the data emerges from putting source and
   context in dialogue, not from concatenating them. A fact only the source
   reveals and a fact only the context explains both belong; a fact they
@@ -164,6 +171,16 @@ one `write` action. Steps per concept:
      tables; a per-row count vs a same-named detail table; per-period vs
      cumulative values). For each confusable pair, sample real values from both
      and write an explicit contrast — see the `# Gotchas` convention under Body.
+   - **Profile for meaning, not just structure.** When catalog comments and
+     uploaded context are thin, the semantics are still discoverable — from the
+     data. Run the cheap per-table probes in "No docs? Prospect in the data"
+     (`references/fact-types.md`): name morphology (`_cd`/`_flg`/`is_` →
+     candidate enum or flag), distinct-value samples of low-cardinality columns
+     (an undocumented enum), null share (a mostly-NULL column has a "populated
+     only when …" rule worth finding), value ranges (implied units; out-of-band
+     sentinels), and paired-null/ordering probes (exactly-one-of rules,
+     `end >= start` invariants). Every probe result is a hypothesis to verify,
+     never a fact to assert — and never full-scan a billed source to profile it.
    - **Discover joins yourself — don't wait to be told.** Find candidate
      relationships by grepping the cross-table column index for every shared key
      (`grep <name> .metadata/columns.tsv`), not just the joins a context doc
@@ -171,7 +188,13 @@ one `write` action. Steps per concept:
      documenting it — confirm the keys actually match on both sides and establish
      the cardinality (1:1, 1:many, many:many) with a real query, e.g.
      `SELECT COUNT(*) FROM a JOIN b ON a.k = b.k` vs the row counts, or a
-     duplicate-key probe on the presumed FK. Document only joins that hold; if a
+     duplicate-key probe on the presumed FK. Check the **orphans** too — which
+     side has keys the other lacks and what those rows mean, so the join doc can
+     say whether to inner- or left-join — and the **value format** (casing,
+     zero-padding, types): a join that only works through a cast or
+     `TRIM`/`UPPER` must carry that normalization in its documented `ON` clause.
+     Record what you measured (cardinality, orphan behavior, normalization) in
+     the join doc — see the join template. Document only joins that hold; if a
      context doc's asserted join fails or has surprising cardinality, that is a
      `# Gotchas`-worthy finding.
    - **Detect column families in wide tables.** If a table has many columns
@@ -201,12 +224,13 @@ caller explicitly uploaded — documents made available to you for this bundle
 such documents are present:
 
 - **Read them through the fact-type lens.** `references/fact-types.md` is the
-  extraction checklist: it names the ~20 fact types worth capturing (business
+  extraction checklist: it names the ~25 fact types worth capturing (business
   terms, metric definitions, join conditions, **code/enum legends**, filter
-  rules, grain, caveats, units, lineage, named sets, …), tells you the **cue
-  phrases to look for** in docs to find each, and — critically — **where each
-  fact lands in the bundle** (a `# Schema` description, a `# Gotchas` note, a
-  `references/` doc). Read it before authoring from an uploaded doc.
+  rules, grain, caveats, units, lineage, named sets, conditional population,
+  hierarchies, deprecations, …), tells you the **cue phrases to look for** in
+  docs to find each, and — critically — **where each fact lands in the bundle**
+  (a `# Schema` description, a `# Gotchas` note, a `references/` doc). Read it
+  before authoring from an uploaded doc.
 - **Read them, then augment** the relevant concept docs with what they actually
   state — following the augmentation rules (preserve the existing doc; add, don't
   shrink). One uploaded doc may inform multiple concepts.
@@ -343,8 +367,11 @@ meaning; use them when applicable:
 
 | Heading                  | Purpose                                                    |
 |--------------------------|------------------------------------------------------------|
+| `# Overview`             | Prose lead of an asset doc: what it is, the verified grain, time range, caveats. |
 | `# Schema`               | Structured description of an asset's columns/fields.       |
 | `# Common query patterns`| 1–3 short, realistic SQL (or query) snippets in fenced blocks. |
+| `# Joins`                | Bullet links to the `references/joins/*` docs this table participates in. |
+| `# Metrics`              | Bullet links to the `references/metrics/*` docs this table feeds. |
 | `# Gotchas`              | "Do NOT use X for Y; use Z" notes for columns/metrics an author would wrongly reach for. |
 | `# Examples`             | Concrete usage examples.                                   |
 | `# Citations`            | Numbered external sources backing claims. See below.       |
@@ -387,8 +414,9 @@ text-to-SQL consumer; a confusable concept without one is incomplete.
 A good asset doc body, in order: a 1–3 paragraph prose description (for a table,
 state the **verified grain** — "one row per X" — plus time range and any sampling/
 obfuscation caveats), then `# Schema`, then `# Common query patterns`, then
-`# Gotchas` (when the concept has a confusable sibling), then `# Citations`.
-Concept-type templates are in `references/templates.md`.
+`# Joins` and `# Metrics` (bullet links to the reference docs this table
+participates in), then `# Gotchas` (when the concept has a confusable sibling),
+then `# Citations`. Concept-type templates are in `references/templates.md`.
 
 Keep bodies clean: no preamble, no apologies, no reasoning narration. The body
 must be valid markdown a human or downstream agent consumes directly.
@@ -486,14 +514,15 @@ every asset's **grain is measured, not assumed**; wide tables **summarize
 repeating column families** instead of enumerating every column; every confusable
 column/metric carries a `# Gotchas` note; **every join/enum/metric taken from a
 context doc was verified against live data** (and joins beyond those the context
-mentioned were sought out); **volatile stats (row counts, sizes, freshness
-timestamps) are omitted** unless a magnitude is stable and decision-shaping;
-citations point to sources you actually used.
+mentioned were sought out); **every join doc states its measured cardinality and
+orphan behavior** (inner- vs left-join advice); **volatile stats (row counts,
+sizes, freshness timestamps) are omitted** unless a magnitude is stable and
+decision-shaping; citations point to sources you actually used.
 
 ## Files in this skill
 
 - `references/spec-condensed.md` — the normative OKF v0.1 rules, condensed.
 - `references/templates.md` — copy-paste frontmatter+body templates per concept type.
-- `references/fact-types.md` — the fact-extraction checklist: ~20 fact types (business terms, metrics, joins, code/enum legends, caveats, units, named sets, canonical recipes, …), the cue phrases to find each in docs, and where each lands in the bundle. Read it in Pass 3 (folding in uploaded context) and when mining the source for gotchas/enums.
+- `references/fact-types.md` — the fact-extraction checklist: ~25 fact types (business terms, metrics, joins, code/enum legends, caveats, units, named sets, conditional population, hierarchies, deprecations, canonical recipes, …), the cue phrases to find each in docs, the data-side probes for when no docs exist, and where each lands in the bundle. Read it in Pass 3 (folding in uploaded context) and when mining the source for gotchas/enums.
 - `references/cross-dataset.md` — the cross-dataset methodology: understand both wikis FIRST (business convergence + the plausibility gate — unrelated pairs author nothing), then the column-evidence lenses (shared/near-synonym keys, conformed dimensions, shared enum vocabularies, joined-only metrics), the per-candidate SQL verification bar (overlap, measured cardinality, orphans, format agreement), and the doc conventions for pair docs that are read by consumers of both datasets. Read it when a task names a counterpart dataset to document relationships against.
 - `references/sources/` — per-backend adapters (Athena+Glue, Redshift, …): source-specific schema extraction, `type`/`resource`/dialect conventions, type vocabulary, idioms, and gotchas. See `references/sources/index.md` to pick one or add a new one.

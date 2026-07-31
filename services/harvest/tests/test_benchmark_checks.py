@@ -134,7 +134,11 @@ def test_behavior_prompts_document_ask_human_and_sql_prompt_does_not():
     for p in (BEHAVIOR_SOLVER_PROMPT, BEHAVIOR_SOLVER_PROMPT_LIVE_SQL):
         assert "ask_human" in p
         assert "ENDS the run" in p
-        assert "never to avoid the reading" in p
+        assert "Never ask to avoid the reading" in p
+        # The ask policy is consequence-calibrated and honors documented
+        # defaults — same contract as the production chat agent's.
+        assert "confidently wrong answer" in p
+        assert "documented default is not guessing" in p
     assert "ask_human" not in SQL_SOLVER_PROMPT
 
 

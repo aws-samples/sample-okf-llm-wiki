@@ -595,6 +595,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         WEB_SEARCH_BLOCK,
         build_graph,
         compose_system_prompt,
+        with_current_date,
     )
     from chat.sql import AthenaSQL, RedshiftDataSQL, make_sql_tool
     from chat.tools import build_consumption_tools, make_agent_tools
@@ -761,11 +762,13 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # non-Bedrock model (a Mantle GPT catalog entry).
         # AskHumanMiddleware owns the human-in-the-loop interrupt for ask_human.
         middleware = [BedrockPromptCachingMiddleware(), AskHumanMiddleware()]
+        # Current date rides on the END of the prompt (day granularity, UTC) so
+        # relative time references resolve; see graph.with_current_date.
         return build_graph(
             chat_model,
             agent_tools,
             checkpointer,
-            system_prompt=compose_system_prompt(*blocks),
+            system_prompt=with_current_date(compose_system_prompt(*blocks)),
             middleware=middleware,
         )
 

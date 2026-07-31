@@ -230,8 +230,12 @@ COUNT(DISTINCT user_id)
 ## Join reference (`references/joins/<a>__<b>.md`)
 
 One canonical file per table pair, the two table names sorted alphabetically and
-joined by a double underscore. Owns the concrete `ON` clause. Both sides link to
-it from their `# Joins` section.
+joined by a double underscore. Owns the concrete `ON` clause — with any required
+normalization (cast/`TRIM`/`UPPER`) baked in, never left implicit. Both sides
+link to it from their `# Joins` section. State what you MEASURED this run: the
+cardinality, the orphan behavior (inner- vs left-join advice), and any key
+normalization — the same bar cross-dataset joins meet. A self-join (a hierarchy's
+`parent_id` → its own key) uses this same shape, named `<t>__<t>.md`.
 
 ```markdown
 ---
@@ -248,6 +252,14 @@ Join order rows to the customer who placed them.
 ```sql
 orders.customer_id = customers.id
 ```
+
+- **Cardinality (measured):** N:1 — many orders per customer; `customer_id` is
+  unique in `customers`.
+- **Orphans:** some orders carry a `customer_id` with no `customers` row (guest
+  checkouts) — LEFT JOIN to keep them; an INNER JOIN silently drops them.
+- **Normalization:** none needed. <!-- When keys match only through a cast or
+  TRIM/UPPER, bake it into the ON clause above and say so here — an undocumented
+  cast is a silent empty join for the next consumer. -->
 
 Use this join to attach customer attributes (segment, region) to each order.
 
@@ -310,11 +322,12 @@ served data, never guessed; if a value can't be resolved from the model, abstain
 ## Canonical recipe (`references/recipes/<slug>.md`)
 
 A transform that MUST be applied identically on every query of a table — most
-often a snapshot/firmness **dedup**. Authored ONCE as an atomic, copy-verbatim
-fragment; metric docs and `# Common query patterns` snippets on the affected table
-LINK it and never re-derive an ORDER BY. Verify with a before/after row-count that
-the collapse de-duplicates to the intended grain. See CANONICAL_RECIPE in
-fact-types.md.
+often a snapshot/firmness **dedup**, or an **as-of lookup** (the rate/dimension
+row in effect at each fact row's date, including any SCD2 current-row filter).
+Authored ONCE as an atomic, copy-verbatim fragment; metric docs and `# Common
+query patterns` snippets on the affected table LINK it and never re-derive an
+ORDER BY. Verify with a real query (for a dedup: a before/after row-count proves
+the collapse hits the intended grain). See CANONICAL_RECIPE in fact-types.md.
 
 ```markdown
 ---

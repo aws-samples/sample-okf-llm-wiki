@@ -30,6 +30,7 @@ _SOLVER_RECURSION_LIMIT = 40
 # The canonical per-check solver prompts live in harvest.benchmark.checks; this
 # alias keeps the historical name (and the SQL EX default) for existing callers.
 from harvest.benchmark.checks import SQL_SOLVER_PROMPT as SOLVER_SYSTEM_PROMPT
+from harvest.benchmark.checks import with_run_date
 
 
 def make_solver(
@@ -80,7 +81,9 @@ def make_solver(
             make_read_me_tool(),
             *(extra_tools or []),
         ],
-        system_prompt,
+        # Every solver knows the run date — benchmark questions lean on
+        # relative time references; see checks.with_run_date.
+        with_run_date(system_prompt),
     )
 
     async def solve(question: str) -> SolveResult:

@@ -37,24 +37,64 @@ in a data dictionary or code list you were given but didn't fully transcribe.
 Decode them (see the dedicated section below); that is usually the difference
 between a wiki an agent can query and one it can't.
 
+## No docs? Prospect in the data
+
+The "Look for" cues below live in documentation — but many enterprise datasets
+arrive with no `.context/` and empty catalog comments. The facts still exist;
+they are latent in the data. When docs are thin, run a cheap profiling pass per
+table (use the source adapter's sampling / cheap-count idioms — never full-scan
+a billed source) and hunt these signals:
+
+- **Name morphology** — suffixes and prefixes are hypotheses: `_cd` / `_code` /
+  `_type` / `_status` / `_flg` / `is_` / `has_` → candidate CODE_ENUM or boolean
+  flag; `_id` / `_key` / `_nbr` → candidate join key (grep the column index for
+  its mates); `_at` / `_ts` / `_date` → temporal; `amt` / `qty` / `_usd` /
+  `_pct` → MEASURE + MEASURED_IN. A name is a lead, never a conclusion —
+  confirm with values.
+- **Cardinality profile** — sample the distinct values of low-cardinality
+  columns. A handful of opaque codes is an undocumented CODE_ENUM: record the
+  observed values *as observed*, and decode meanings only where the data itself
+  reveals them (a code co-occurring with a spelled-out label column) — never
+  guess. Distinct counts near the row count mark a key candidate for the grain
+  probe.
+- **Null share** — a mostly-NULL column has a population rule waiting to be
+  found (CONDITIONAL_POPULATION): crosstab its null-ness against status/type
+  columns to find the "populated only when …" condition.
+- **Value shape** — min/max ranges expose implied units and out-of-band
+  sentinels (`9999`, `-1`, a blank); string samples expose zero-padding,
+  casing, and whitespace that silently break joins (the value-format checks
+  cross-dataset work demands apply to in-dataset join keys too).
+- **Cross-column probes** — paired-null crosstabs find exactly-one-of rules and
+  discriminator columns; ordering checks (`end >= start`) find interval
+  invariants (CONDITIONAL_POPULATION again).
+
+Each probe yields a *hypothesis* that then follows the same rules as a context
+claim: verify it before it enters the bundle, and never invent the part the
+data doesn't show (an enum whose meanings you can't determine ships as observed
+values flagged undecoded — see CODE_ENUM).
+
 ## Core fact types
 
 | # | Fact type | Look for in the docs | Lands in the OKF bundle |
 |---|-----------|----------------------|-------------------------|
 | 1 | **BUSINESS_TERM** | glossaries, "also known as / aka", acronym expansions, non-English labels, "the business calls this X" | the column's `# Schema` description; if it's a confusable alias, a `# Gotchas` note; a reusable term → `references/glossary/<term>.md` |
 | 2 | **METRIC_DEFINITION** | "calculated as", "defined as", KPI formulas, "= sum(...) / ...", numerator/denominator prose | `references/metrics/<slug>.md` (owns the SQL); tables link it from `# Metrics` |
-| 3 | **JOIN_CONDITION** | ER diagrams, "foreign key", "joins to … on …", "one-to-many", relationship tables — **plus joins no doc mentions:** `grep .metadata/columns.tsv` for shared keys | `references/joins/<a>__<b>.md` (owns the `ON` clause); both tables link it from `# Joins`. **Verify keys match + establish cardinality with a real query before documenting; a doc's asserted join that fails or fans out unexpectedly is a `# Gotchas` finding** |
+| 3 | **JOIN_CONDITION** | ER diagrams, "foreign key", "joins to … on …", "one-to-many", relationship tables — **plus joins no doc mentions:** `grep .metadata/columns.tsv` for shared keys | `references/joins/<a>__<b>.md` (owns the `ON` clause); both tables link it from `# Joins`. **Verify with a real query before documenting, and RECORD what you measured in the join doc: the cardinality, the orphan behavior (which side has unmatched keys and what they mean → inner- vs left-join advice), and any key normalization (a cast/`TRIM`/`UPPER`) baked into the `ON` clause. A doc's asserted join that fails or fans out unexpectedly is a `# Gotchas` finding** |
 | 4 | **CODE_ENUM** | data dictionaries, **code lists**, value tables, "1 = …, 2 = …", "valid values", category enumerations, status-flag legends | small set → inline in the `# Schema` row description; large set (>~15) → `references/enums/<column>.md`. **See below.** |
-| 5 | **FILTER_RULE** | "by default we exclude", "only count active", "unless stated we filter …", source-preference rules | `# Gotchas` (the rule) and/or the metric doc's `## When to use which`; a global default → dataset overview |
+| 5 | **FILTER_RULE** | "by default we exclude", "only count active", "unless stated we filter …", source-preference rules, test/internal accounts to exclude ("id 0 is the smoke-test customer") | `# Gotchas` (the rule) and/or the metric doc's `## When to use which`; a global default → dataset overview |
 | 6 | **GRAIN_STATEMENT** | "one row per", "each record represents", "unique by", primary-key notes | table prose ("one row per X") — **measure it, don't just copy** (grain-verification rule) |
 | 7 | **CAVEAT** | "note that", "be careful", "known issue", "caution", footnotes, "data quality" sections | `# Gotchas` on the affected table; a cross-cutting one → `references/known_issues/<slug>.md` |
-| 8 | **TEMPORAL_RULE** | fiscal-calendar definitions, timezone notes, "as of", partition/refresh/SLA docs, "snapshot vs event" | `# Gotchas` or table prose; partitioning goes in `# Schema`/prose per the source adapter |
+| 8 | **TEMPORAL_RULE** | fiscal-calendar definitions, timezone notes, "as of", partition/refresh/SLA docs, "snapshot vs event", effective dating (`valid_from`/`valid_to`, `is_current`, "effective date"), rate/price tables looked up as-of a date | `# Gotchas` or table prose; partitioning goes in `# Schema`/prose per the source adapter; **an SCD2 current-row filter or as-of lookup every query must repeat → `references/recipes/<slug>.md` (CANONICAL_RECIPE)** |
 | 9 | **MEASURED_IN** | units in parentheses/headers, "in USD", "in kg", "(%)", "amounts in thousands", scaling factors | the column's `# Schema` description (state the unit + any scale/implied decimals) |
 | 10 | **DATA_LINEAGE** | "sourced from", "derived from", ETL/pipeline docs, "upstream table", refresh diagrams | dataset/table `# Overview` prose. **Only what a doc/source states — never a guessed public origin** |
 | 11 | **QUERY_PATTERN** | example queries, FAQ "how do I …", saved reports, query logs, "typical analysis" | `# Common query patterns` (validate it runs, in the source's dialect) |
 | 12 | **BUSINESS_CONTEXT** | intro/overview sections, domain background, "about this dataset", purpose statements | the dataset doc's `# Overview` prose (`datasets/<dataset>.md`) |
 | 13 | **MEASURE** | "total", "sum of", "amount", "count of", numeric fact columns an analyst aggregates | mark it in the `# Schema` description as an aggregatable measure; feeds METRIC_DEFINITION |
 | 14 | **DIMENSION** | "by region / by month / per category", grouping attributes, categorical descriptors | mark it in the `# Schema` description as a grouping/filter dimension; often also a CODE_ENUM |
+| 15 | **CONDITIONAL_POPULATION** | "only populated when", "applies only to", "optional for", mostly-NULL columns in profiling, "exactly one of A/B", discriminator/type columns that govern which other fields are meaningful, "must be ≥ / after" cross-column rules | the column's `# Schema` description (state the rule: "NULL unless `status='shipped'`"); when it's a trap (aggregating a sparse column, filtering on a conditionally-populated field, trusting an invariant that has violations) → `# Gotchas` |
+| 16 | **HIERARCHY** | a self-referential FK (`parent_id` → the same table's key), level/depth columns, path strings, org/category/account trees, "rolls up to" | table prose (name the hierarchy, its roots, its depth) + a `# Common query patterns` self-join snippet; a reusable traversal → `references/joins/<t>__<t>.md` (the self-join uses the same pair-doc shape, both names the same table) |
+| 17 | **DEPRECATION** | "superseded by", "legacy", "do not use", "kept for history", versioned/copy twins (`_v2`, `_old`, `_final`, `_bak`), two tables covering the same entity | `# Gotchas` on BOTH tables — the stale one points at the authoritative one, the authoritative one warns off its twin. **Establish authority by comparing freshness/coverage in the data, never by name alone**; a dataset-wide "always use X" rule → `references/usage_guardrails.md` |
+| 18 | **MASKED_DATA** | "hashed", "masked", "anonymized", "pseudonymized", "obfuscated", "top-coded"/"bottom-coded", salted-id notes, "sampled extract" | the column's `# Schema` description (state the transform and what survives it — a hashed key still joins but is unreadable; a top-coded value caps aggregates); table-wide sampling/anonymization caveats → the table's `# Overview` prose |
 
 ## Governance fact types (extract only on explicit evidence)
 
@@ -65,12 +105,12 @@ them**, never by inference. When present they are `# Gotchas`-grade or their own
 
 | # | Fact type | Look for in the docs | Lands in the OKF bundle |
 |---|-----------|----------------------|-------------------------|
-| 15 | **NAMED_SET** | "the X group consists of …", region/segment definitions, "Europe = these countries", curated value lists | `references/named_sets/<name>.md` — the business name + its governed `IN (…)` list; reference it from any metric/filter that uses it |
-| 16 | **LIFECYCLE_STAGE** | status-workflow diagrams, "an order is 'open' when status in …", stage→code mappings | `references/named_sets/<name>.md` (a business stage → its set of raw status/event codes is named-set-shaped) — or a `# Gotchas` note for a single simple mapping |
-| 17 | **AMBIGUOUS_TERM** | the same word defined two ways, "depending on context", "this can mean either …" | `# Gotchas` on the table **AND** a line in `references/usage_guardrails.md` (see #19) — state each genuinely-different sense and which column/filter each maps to, forcing disambiguation |
-| 18 | **DISJOINT_MEASURES** | "do not add", "mutually exclusive", "gross vs net", "don't UNION these", overlapping-population warnings | `# Gotchas` **AND** `references/usage_guardrails.md` — an explicit never-sum/never-union warning naming the measures/tables and why |
-| 19 | **DATASET_GUARDRAIL** | any "how to work with this data correctly" rule that a consuming agent must obey to avoid a *confidently wrong* answer: measure additivity by type (flow vs stock/snapshot — what may be summed over time vs geography), when to ASK vs answer (a required dimension — period/region/grain/scope — is missing or a term resolves to >1 thing), when to BLOCK (a well-formed but semantically invalid computation, e.g. summing a non-additive stock over time; a metric the source explicitly withholds), when to REFUSE (out-of-domain / unserved capability), sentinel/reserved values that corrupt filters, default readings (a default scope/variant the data assumes), and "never fabricate — abstain if unresolvable" | `references/usage_guardrails.md` — the dataset's behavioural contract (see below). **Linked prominently from the dataset overview so a consumer reads it first.** |
-| 20 | **CANONICAL_RECIPE** | a non-trivial transform that MUST be applied identically on every query of a table — a snapshot/firmness dedup (`ROW_NUMBER` + a mandatory pre-filter), a required de-duplication, a standard collapse — anything where re-deriving it slightly differently changes the result | `references/recipes/<slug>.md` — the ONE authoritative, non-decomposable SQL fragment; every metric doc and every `# Common query patterns` snippet on the affected table LINKS it and never re-derives it (see the deep case below). |
+| 19 | **NAMED_SET** | "the X group consists of …", region/segment definitions, "Europe = these countries", curated value lists | `references/named_sets/<name>.md` — the business name + its governed `IN (…)` list; reference it from any metric/filter that uses it |
+| 20 | **LIFECYCLE_STAGE** | status-workflow diagrams, "an order is 'open' when status in …", stage→code mappings | `references/named_sets/<name>.md` (a business stage → its set of raw status/event codes is named-set-shaped) — or a `# Gotchas` note for a single simple mapping |
+| 21 | **AMBIGUOUS_TERM** | the same word defined two ways, "depending on context", "this can mean either …" | `# Gotchas` on the table **AND** a line in `references/usage_guardrails.md` (see #23) — state each genuinely-different sense and which column/filter each maps to, forcing disambiguation |
+| 22 | **DISJOINT_MEASURES** | "do not add", "mutually exclusive", "gross vs net", "don't UNION these", overlapping-population warnings | `# Gotchas` **AND** `references/usage_guardrails.md` — an explicit never-sum/never-union warning naming the measures/tables and why |
+| 23 | **DATASET_GUARDRAIL** | any "how to work with this data correctly" rule that a consuming agent must obey to avoid a *confidently wrong* answer: measure additivity by type (flow vs stock/snapshot — what may be summed over time vs geography), when to ASK vs answer (a required dimension — period/region/grain/scope — is missing or a term resolves to >1 thing), when to BLOCK (a well-formed but semantically invalid computation, e.g. summing a non-additive stock over time; a metric the source explicitly withholds), when to REFUSE (out-of-domain / unserved capability), sentinel/reserved values that corrupt filters, default readings (a default scope/variant the data assumes), and "never fabricate — abstain if unresolvable" | `references/usage_guardrails.md` — the dataset's behavioural contract (see below). **Linked prominently from the dataset overview so a consumer reads it first.** |
+| 24 | **CANONICAL_RECIPE** | a non-trivial transform that MUST be applied identically on every query of a table — a snapshot/firmness dedup (`ROW_NUMBER` + a mandatory pre-filter), a required de-duplication, a standard collapse, an as-of / effective-dated lookup — anything where re-deriving it slightly differently changes the result | `references/recipes/<slug>.md` — the ONE authoritative, non-decomposable SQL fragment; every metric doc and every `# Common query patterns` snippet on the affected table LINKS it and never re-derives it (see the deep case below). |
 
 ## DATASET_GUARDRAIL — the behavioural contract (`references/usage_guardrails.md`)
 
@@ -91,6 +131,15 @@ terms, default readings, filter traps) that otherwise scatter across per-table
 - **From uploaded `.context/` docs** that state working rules explicitly (a
   query-rules doc, a methodology PDF's "do not" section, an SME guardrails file).
   Cite them under `# Citations`.
+- **Interpretation conventions the sources establish.** Datasets differ in how
+  analytical questions should be read: how a relative time window ("the last N
+  months") anchors, whether a multi-entity scope term follows a documented
+  cross-cutting standard or each entity's own definition, at which grain a
+  business name spanning several physical codes should be answered. When (and
+  only when) the `.context/` docs or verified data settle such a convention,
+  record it as a guardrail rule so consumers read questions the way this dataset
+  intends. Where the sources are silent, do NOT legislate one — an invented
+  reading convention is an invented rule.
 - **Never invent a rule.** A guardrail is a *verified* fact like any other: if the
   data doesn't support "never sum X" and no doc states it, don't assert it. A
   wrong guardrail yields a confidently-wrong refusal, which is as harmful as a
@@ -99,8 +148,8 @@ terms, default readings, filter traps) that otherwise scatter across per-table
 Shape it so a consumer can act on each rule: name the concrete measure/column/
 term, the rule, and the correct alternative. Group by disposition where it helps
 (what to answer directly, what to ASK about, what to BLOCK, what to REFUSE). This
-doc is authored by the supervisor's `reference-author` fan-out and **must be
-linked from `datasets/<dataset>.md`** (the file a consumer lands on first).
+doc **must be linked from `datasets/<dataset>.md`** (the file a consumer lands
+on first).
 
 ## CANONICAL_RECIPE — the deep case (author a transform ONCE, apply it everywhere)
 
@@ -110,6 +159,13 @@ must pick exactly one row per business cell). When that recipe is described in
 prose, or shown slightly differently in two `# Common query patterns` snippets,
 consumers re-derive it inconsistently and silently change the result (a newer,
 non-final snapshot wins a cell it shouldn't).
+
+The other classic is the **as-of lookup**: attaching the rate/price/dimension
+row *in effect at* each fact row's date — a `BETWEEN valid_from AND valid_to`
+join, or the greatest effective date ≤ the fact date, plus any current-row
+filter an SCD2 dimension requires. Same failure mode: re-derived slightly
+differently (a `>=` where the boundary needs `>`, a dropped `is_current`
+filter), it silently shifts every number. Author it once, link it everywhere.
 
 **Author it as ONE atomic, non-decomposable fragment** in
 `references/recipes/<slug>.md`, and make every metric doc + every query-pattern
@@ -209,25 +265,27 @@ decode is worse than a missing one.
 ## Routing summary
 
 - **`# Schema` row description** — BUSINESS_TERM, small CODE_ENUM, MEASURED_IN,
-  MEASURE/DIMENSION marks.
+  MEASURE/DIMENSION marks, CONDITIONAL_POPULATION rules, MASKED_DATA transforms.
 - **`# Gotchas`** — CAVEAT, FILTER_RULE, TEMPORAL_RULE, AMBIGUOUS_TERM,
-  DISJOINT_MEASURES, confusable BUSINESS_TERM. (The behaviour-shaping ones —
-  AMBIGUOUS_TERM, DISJOINT_MEASURES, additivity, ASK/BLOCK/REFUSE triggers — also
-  roll up into `references/usage_guardrails.md` so a consumer sees them in one
-  place, not only on the table they happen to open.)
+  DISJOINT_MEASURES, DEPRECATION, confusable BUSINESS_TERM, trap-grade
+  CONDITIONAL_POPULATION. (The behaviour-shaping ones — AMBIGUOUS_TERM,
+  DISJOINT_MEASURES, additivity, ASK/BLOCK/REFUSE triggers — also roll up into
+  `references/usage_guardrails.md` so a consumer sees them in one place, not
+  only on the table they happen to open.)
 - **`references/usage_guardrails.md`** — DATASET_GUARDRAIL: the one behavioural
   contract read before querying (additivity, ASK/BLOCK/REFUSE rules, default
   readings, filter traps). Linked from the dataset overview.
 - **`references/recipes/<slug>.md`** — CANONICAL_RECIPE: a must-apply-identically
-  transform (e.g. snapshot dedup) authored once; metric + query-pattern docs LINK
-  it, never re-derive it.
+  transform (e.g. snapshot dedup, as-of lookup) authored once; metric +
+  query-pattern docs LINK it, never re-derive it.
 - **`# Common query patterns`** — QUERY_PATTERN. **On a snapshot/dedup table, the
   snippet LINKS the `references/recipes/` dedup fragment rather than re-deriving an
   ORDER BY. For any full-grain column omitted from the dedup `PARTITION BY`, state
   WHY it's safe to drop — it's collapsed by a mandatory pre-filter named INSIDE the
   subquery, or it stays in the partition.**
 - **`# Overview` prose** (in `datasets/<dataset>.md` or `tables/<table>.md`) —
-  GRAIN_STATEMENT, BUSINESS_CONTEXT, DATA_LINEAGE.
+  GRAIN_STATEMENT, BUSINESS_CONTEXT, DATA_LINEAGE, HIERARCHY, table-wide
+  MASKED_DATA caveats.
 - **`references/<type>/<slug>.md` docs** (all carry `type: Reference` +
   `title`/`description`, and `# Citations` when minted from an uploaded doc — see
   the templates). **Every extracted fact that becomes a standalone doc lives under

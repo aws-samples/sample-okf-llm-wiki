@@ -156,6 +156,28 @@ def test_compose_system_prompt_appends_blocks_in_order():
     assert compose_system_prompt("", SQL_BLOCK) == SYSTEM_PROMPT_WITH_SQL
 
 
+def test_with_current_date_appends_dated_block():
+    from datetime import date
+
+    from chat.graph import with_current_date
+
+    out = with_current_date(SYSTEM_PROMPT, today=date(2026, 7, 22))
+    assert out.startswith(SYSTEM_PROMPT)  # appended last — prefix untouched
+    assert "<current_date>" in out
+    assert "Wednesday, 2026-07-22" in out
+    # never assume data reaches today — the horizons caveat rides along
+    assert "Never assume data exists up to the current date" in out
+
+
+def test_with_current_date_defaults_to_today_utc():
+    from datetime import datetime, timezone
+
+    from chat.graph import with_current_date
+
+    out = with_current_date(SYSTEM_PROMPT)
+    assert datetime.now(timezone.utc).date().strftime("%Y-%m-%d") in out
+
+
 def test_prompt_teaches_cross_dataset_references():
     # The agent must know the cross-dataset capability: the one-home layout,
     # BOTH list_domains signal fields, prefer-verified-pair-docs over derived

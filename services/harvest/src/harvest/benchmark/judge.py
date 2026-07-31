@@ -455,13 +455,14 @@ def make_judge(
     def _ensure_built():
         if built:
             return built
+        from harvest.benchmark.checks import with_run_date
         from harvest.benchmark.react import SubmitToolNudgeMiddleware, make_react_agent
 
         resolved = tools() if callable(tools) else tools
         built["agent"] = make_react_agent(
             chat_model,
             [*resolved, _make_submit_verdict_tool()],
-            JUDGE_SYSTEM_PROMPT,
+            with_run_date(JUDGE_SYSTEM_PROMPT),
             extra_middleware=[
                 SubmitToolNudgeMiddleware(SUBMIT_VERDICT_TOOL, _VERDICT_NUDGE)
             ],
@@ -664,13 +665,14 @@ def make_behavior_grader(
     def _ensure_built():
         if built:
             return built
+        from harvest.benchmark.checks import with_run_date
         from harvest.benchmark.react import SubmitToolNudgeMiddleware, make_react_agent
 
         resolved = tools() if callable(tools) else tools
         built["agent"] = make_react_agent(
             chat_model,
             [*resolved, _make_submit_verdict_tool()],
-            BEHAVIOR_JUDGE_PROMPT,
+            with_run_date(BEHAVIOR_JUDGE_PROMPT),
             extra_middleware=[
                 SubmitToolNudgeMiddleware(SUBMIT_VERDICT_TOOL, _VERDICT_NUDGE)
             ],
@@ -804,13 +806,14 @@ def make_behavior_reviewer(
     def _ensure_built():
         if built:
             return built
+        from harvest.benchmark.checks import with_run_date
         from harvest.benchmark.react import SubmitToolNudgeMiddleware, make_react_agent
 
         resolved = tools() if callable(tools) else tools
         built["agent"] = make_react_agent(
             chat_model,
             [*resolved, _make_submit_review_tool()],
-            BEHAVIOR_REVIEW_PROMPT,
+            with_run_date(BEHAVIOR_REVIEW_PROMPT),
             extra_middleware=[
                 SubmitToolNudgeMiddleware(SUBMIT_REVIEW_TOOL, _REVIEW_NUDGE)
             ],
