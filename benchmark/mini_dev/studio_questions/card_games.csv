@@ -1,0 +1,125 @@
+question_id,difficulty,question,gold_sql,expected_behavior
+340,simple,"Which are the cards that have incredibly powerful foils.
+Hint: incredibly poweful foils refers to cardKingdomFoilId is not null AND cardKingdomId is not null",SELECT id FROM cards WHERE NOT cardkingdomfoilid IS NULL AND NOT cardkingdomid IS NULL,
+341,simple,"What are the borderless cards available without powerful foils?
+Hint: borderless' refers to borderColor; poweful foils refers to cardKingdomFoilId paired with cardKingdomId AND cardKingdomId is not null",SELECT id FROM cards WHERE bordercolor = 'borderless' AND (cardkingdomid IS NULL OR cardkingdomid IS NULL),
+344,moderate,"List all the mythic rarity print cards banned in gladiator format.
+Hint: mythic rarity printing refers to rarity = 'mythic'; card banned refers to status = 'Banned'; in gladiator format refers to format = 'gladiator';",SELECT DISTINCT t1.id FROM cards AS t1 INNER JOIN legalities AS t2 ON t1.uuid = t2.uuid WHERE t2.format = 'gladiator' AND t2.status = 'Banned' AND t1.rarity = 'mythic',
+345,moderate,"For artifact type of cards that do not have multiple faces on the same card, state its legalities status for vintage play format.
+Hint: Artifact type of cards refers to types = 'Artifact'; card does not have multiple faces on the same card refers to side is NULL'; vintage play format refers to format = 'vintage';",SELECT DISTINCT t2.status FROM cards AS t1 INNER JOIN legalities AS t2 ON t1.uuid = t2.uuid WHERE t1.type = 'Artifact' AND t2.format = 'vintage' AND t1.side IS NULL,
+346,moderate,"List all the card id and artist with unknown power which are legal for commander play format.
+Hint: unknown power refers to power = '*' or POWER IS NULL; commander play format refers to format = 'commander'; legal for commander play format refers to format = 'commander' where status = 'Legal'","SELECT t1.id, t1.artist FROM cards AS t1 INNER JOIN legalities AS t2 ON t1.uuid = t2.uuid WHERE t2.status = 'Legal' AND t2.format = 'commander' AND (t1.power IS NULL OR t1.power = '*')",
+347,moderate,"Find all cards illustrated by Stephen Daniel and describe the text of the ruling of these cards. State if these cards have missing or degraded properties and values.
+Hint: cards have missing or degraded properties and value refers to hasContentWarning = 1; 'Stephen Daniele' is artist; Find all cards refers to return card id","SELECT t1.id, t2.text, t1.hascontentwarning FROM cards AS t1 INNER JOIN rulings AS t2 ON t1.uuid = t2.uuid WHERE t1.artist = 'Stephen Daniele'",
+349,moderate,"Name the card and artist with the most ruling information. Also state if the card is a promotional printing.
+Hint: with the most ruling information refers to Max(count(rulings.uuid)); the card is the promotional printing refers to isPromo = 1;","SELECT t1.name, t1.artist, t1.ispromo FROM cards AS t1 INNER JOIN rulings AS t2 ON t1.uuid = t2.uuid WHERE t1.ispromo = 1 AND t1.artist = (SELECT artist FROM cards WHERE ispromo = 1 GROUP BY artist HAVING COUNT(DISTINCT uuid) = (SELECT MAX(count_uuid) FROM (SELECT COUNT(DISTINCT uuid) AS count_uuid FROM cards WHERE ispromo = 1 GROUP BY artist))) LIMIT 1",
+352,moderate,"Calculate the percentage of the cards availabe in Chinese Simplified.
+Hint: Chinese Simplified' is the language; percentage = Divide(Sum(id where language = 'Chinese Simplified'), Count(id)) *100","SELECT CAST(SUM(CASE WHEN t2.language = 'Chinese Simplified' THEN 1 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) FROM cards AS t1 INNER JOIN foreign_data AS t2 ON t1.uuid = t2.uuid",
+356,simple,"How many cards have infinite power?
+Hint: infinite power refers to power = '*';",SELECT COUNT(*) FROM cards WHERE power = '*',
+358,simple,"What is the border color of card ""Ancestor's Chosen""?
+Hint: name of card  = 'Ancestor''s Chosen' ;",SELECT DISTINCT bordercolor FROM cards WHERE name = 'Ancestor''s Chosen',
+366,simple,"What is the rule of playing card ""Benalish Knight""?
+Hint: Benalish Knight' is the name of card; rule of playing card refers to format;",SELECT t2.format FROM cards AS t1 INNER JOIN legalities AS t2 ON t1.uuid = t2.uuid WHERE t1.name = 'Benalish Knight',
+368,simple,"What is the percentage of borderless cards?
+Hint: borderless card refers to borderColor = 'borderless'; percentage = Divide(Count (id) where borderColor = 'borderless', Count(id)) *100","SELECT CAST(SUM(CASE WHEN bordercolor = 'borderless' THEN 1 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(id), 0) FROM cards",
+371,challenging,"What is the percentage of cards whose language is French among the Story Spotlight cards?
+Hint: Story Spotlight card refers to isStorySpotlight = 1; French is the language; Percentage = Divide(Count(id) where language = 'French' and isStorySpotlight = 1, Count(id) where isStorySpotlight = 1)*100","SELECT CAST(SUM(CASE WHEN t2.language = 'French' THEN 1 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) FROM cards AS t1 INNER JOIN foreign_data AS t2 ON t1.uuid = t2.uuid WHERE t1.isstoryspotlight = 1",
+377,simple,"How many cards with original type of ""Summon - Angel"" have subtype other than ""Angel""?
+Hint: subtype other than Angel refers to subtypes is not 'Angel';",SELECT COUNT(id) FROM cards WHERE originaltype = 'Summon - Angel' AND subtypes <> 'Angel',
+379,simple,"What are the cards belong to duel deck a? List the ID.
+Hint: duel deck a refers to duelDeck = a;",SELECT id FROM cards WHERE dueldeck = 'a',
+383,simple,"How many of the banned cards are white border?
+Hint: banned card refers to status = 'Banned'; white border refers to borderColor = 'white';",SELECT COUNT(t1.id) FROM cards AS t1 INNER JOIN legalities AS t2 ON t1.uuid = t2.uuid WHERE t2.status = 'Banned' AND t1.bordercolor = 'white',
+391,moderate,"Among the Artifact cards, which are black color and comes with foreign languague translation?
+Hint: Artifact card refers to originalType = 'Artifact'; black color refers to colors = 'B'; foreign language refers to language in foreign_data",SELECT DISTINCT t1.name FROM cards AS t1 INNER JOIN foreign_data AS t2 ON t1.uuid = t2.uuid WHERE t1.originaltype = 'Artifact' AND t1.colors = 'B',
+397,moderate,"What is the mana cost of cards with a normal layout, a 2003 frame version, with a black border color, and available in paper and mtgo?
+Hint: available in paper and mtgo refers to availability = 'mtgo,paper'; frameVersion = 2003;borderColor = 'black'","SELECT manacost FROM cards WHERE availability = 'mtgo,paper' AND bordercolor = 'black' AND frameversion = '2003' AND layout = 'normal'",
+402,moderate,"What is the percentage of Story Spotlight cards that do not have a text box? List them by their ID.
+Hint: Story Spotlight cards that do not have a text box refers to isStorylight = 1 and isTextless = 0; Percentage = DIVIDE(SUM(count(id) where isStorylight = 1 AND isTextless = 0 ), SUM(count(id))) * 100","SELECT CAST(SUM(CASE WHEN istextless = 0 AND isstoryspotlight = 1 THEN 1 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(id), 0) FROM cards",
+405,moderate,"How many Brazilian Portuguese translated sets are inside the Commander block?
+Hint: Commander block refer to block = 'Commander'; sets refer to code = setCode; Portuguese refer to language = 'Portuguese (Brasil)'",SELECT COUNT(t1.id) FROM sets AS t1 INNER JOIN set_translations AS t2 ON t1.code = t2.setcode WHERE t2.language = 'Portuguese (Brazil)' AND t1.block = 'Commander',
+407,moderate,"Lists all types of cards in German.
+Hint: German refer to language; all types refer to the subtypes, supertypes; subtypes is not null AND supertypes is not null","SELECT t1.subtypes, t1.supertypes FROM cards AS t1 INNER JOIN foreign_data AS t2 ON t1.uuid = t2.uuid WHERE t2.language = 'German' AND NOT t1.subtypes IS NULL AND NOT t1.supertypes IS NULL",
+408,moderate,"How many unknown power cards contain info about the triggered ability
+Hint: unknown power cards refers to power is null or power = '*';contain info about the triggered ability refers to text contains 'triggered ability'",SELECT COUNT(DISTINCT t1.id) FROM cards AS t1 INNER JOIN rulings AS t2 ON t1.uuid = t2.uuid WHERE (t1.power IS NULL OR t1.power = '*') AND t2.text LIKE '%triggered ability%',
+409,moderate,"Indicates the number of cards with pre-modern format, ruling text ""This is a triggered mana ability."" that do not have multiple faces.
+Hint: pre-modern format refers to format = 'premodern' ;do not have multiple faces refers to side IS NULL",SELECT COUNT(t1.id) FROM cards AS t1 INNER JOIN legalities AS t2 ON t1.uuid = t2.uuid INNER JOIN rulings AS t3 ON t1.uuid = t3.uuid WHERE t2.format = 'premodern' AND t3.text = 'This is a triggered mana ability.' AND t1.side IS NULL,
+412,moderate,"What is the foreign name of the card in French of type Creature, normal layout and black border color, by artist Matthew D. Wilson?
+Hint: in French refers to language = 'French'; black border color refers to borderColor = 'black'",SELECT name FROM foreign_data WHERE uuid IN (SELECT uuid FROM cards WHERE types = 'Creature' AND layout = 'normal' AND bordercolor = 'black' AND artist = 'Matthew D. Wilson') AND language = 'French',
+414,simple,"What language is the set of 180 cards that belongs to the Ravnica block translated into?
+Hint: set of 180 cards refers to baseSetSize = 180",SELECT t2.language FROM sets AS t1 INNER JOIN set_translations AS t2 ON t1.code = t2.setcode WHERE t1.block = 'Ravnica' AND t1.basesetsize = 180,
+415,challenging,"What percentage of cards with format commander and legal status do not have a content warning?
+Hint: do not have a content warning refers to hasContentWarning = 0; percentage refers to DIVIDE(COUNT(hasContentWarning = 0),COUNT(ID))*100 where format = 'commander' AND Status = 'legal';","SELECT CAST(SUM(CASE WHEN t1.hascontentwarning = 0 THEN 1 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) FROM cards AS t1 INNER JOIN legalities AS t2 ON t1.uuid = t2.uuid WHERE t2.format = 'commander' AND t2.status = 'Legal'",
+416,challenging,"What percentage of cards without power are in French?
+Hint: in French refers to language = 'French'; cards without power refers to power IS NULL OR power = '*'; percentage = DIVIDE(COUNT(language = 'French' and power is NULL or power = '*'), COUNT( power is NULL or power = '*'))*100","SELECT CAST(SUM(CASE WHEN t2.language = 'French' THEN 1 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) FROM cards AS t1 INNER JOIN foreign_data AS t2 ON t1.uuid = t2.uuid WHERE t1.power IS NULL OR t1.power = '*'",
+422,simple,"What is the language of the card with the multiverse number 149934?
+Hint: multiverse number 149934 refers to multiverseid = 149934;",SELECT language FROM foreign_data WHERE multiverseid = 149934,
+424,simple,"What proportion of cards do not have a text box with a normal layout?
+Hint: do not have a text box refers to isTextless = 1; proportion refers to DIVIDE(COUNT(Textless = 1 and layout = 'normal'),COUNT(Textless))*100","SELECT CAST(SUM(CASE WHEN istextless = 1 AND layout = 'normal' THEN 1 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(*), 0) FROM cards",
+427,moderate,"What languages are available in the set known as Archenemy on the magic card market and having the code ARC?
+Hint: known as Archenemy refers to mcmName = 'Archenemy'; having the code ARC refers to setCode = 'ARC'",SELECT t2.language FROM sets AS t1 INNER JOIN set_translations AS t2 ON t1.code = t2.setcode WHERE t1.mcmname = 'Archenemy' AND t2.setcode = 'ARC',
+440,simple,"Which foreign language used by ""A Pedra Fellwar""?
+Hint: ""A Pedra Fellwar"" refers to name = 'A Pedra Fellwar'",SELECT DISTINCT language FROM foreign_data WHERE name = 'A Pedra Fellwar',
+459,moderate,"Which card costs more converted mana, ""Serra Angel"" or ""Shrine Keeper""?
+Hint: ""Serra Angel"" refers to name = 'Serra Angel'; ""Shrine Keeper"" refers to name = 'Shrine Keeper'; card costs more converted mana when the value of convertedManaCost is greater","SELECT name FROM cards WHERE name IN ('Serra Angel', 'Shrine Keeper') ORDER BY convertedmanacost DESC LIMIT 1",
+462,moderate,"What's the Italian name of the set of cards with ""Ancestor's Chosen"" is in?
+Hint: Italian is a language which refers to language = 'Italian'; with ""Ancestor's Chosen"" in the card set refers to name = 'Ancestor''s Chosen'",SELECT translation FROM set_translations WHERE setcode IN (SELECT setcode FROM cards WHERE name = 'Ancestor''s Chosen') AND language = 'Italian',
+465,moderate,"For the set of cards with ""Ancestor's Chosen"" in it, is there a Korean version of it?
+Hint: set of cards with ""Ancestor''s Chosen"" in it refers to name = 'Ancestor''s Chosen'; Korean version refers to language = 'Korean'","SELECT IF(SUM(CASE WHEN t2.language = 'Korean' AND NOT t2.translation IS NULL THEN 1 ELSE 0 END) > 0, 'YES', 'NO') FROM cards AS t1 INNER JOIN set_translations AS t2 ON t2.setcode = t1.setcode WHERE t1.name = 'Ancestor''s Chosen'",
+466,moderate,"Among the cards in the set ""Hauptset Zehnte Edition"", how many of them are designed by Adam Rex?
+Hint: card set ""Hauptset Zehnte Edition"" refers to translation = 'Hauptset Zehnte Edition'; designed by Adam refers to artist = 'Adam Rex'",SELECT COUNT(t1.id) FROM cards AS t1 INNER JOIN set_translations AS t2 ON t2.setcode = t1.setcode WHERE t2.translation = 'Hauptset Zehnte Edition' AND t1.artist = 'Adam Rex',
+468,moderate,"What is the Simplified Chinese translation of the name of the set ""Eighth Edition""?
+Hint: Eighth Edition is the name of card set which refers to name = 'Eighth Edition'; Simplified Chinese refers to language = 'Chinese Simplified'; translation of the name refers to translation",SELECT t2.translation FROM sets AS t1 INNER JOIN set_translations AS t2 ON t2.setcode = t1.code WHERE t1.name = 'Eighth Edition' AND t2.language = 'Chinese Simplified',
+469,moderate,"Did the set of cards with ""Angel of Mercy"" appear on Magic: The Gathering Online?
+Hint: card set ""Angel of Mercy"" refers to name = 'Angel of Mercy'; appear on Magic: The Gathering Online refers to mtgoCode is NOT NULL and vice versa","SELECT IF(NOT t2.mtgocode IS NULL, 'YES', 'NO') FROM cards AS t1 INNER JOIN sets AS t2 ON t2.code = t1.setcode WHERE t1.name = 'Angel of Mercy'",
+472,moderate,"Among the sets in the block ""Ice Age"", how many of them have an Italian translation?
+Hint: sets in the block ""Ice Age"" refers to block = 'Ice Age'; Italian translation refers to language = 'Italian' and translation is not null",SELECT COUNT(DISTINCT t1.id) FROM sets AS t1 INNER JOIN set_translations AS t2 ON t2.setcode = t1.code WHERE t1.block = 'Ice Age' AND t2.language = 'Italian' AND NOT t2.translation IS NULL,
+473,moderate,"Is the set of cards with Adarkar Valkyrie only available outside the United States?
+Hint: card set Adarkar Valkyrie refers to name = 'Adarkar Valkyrie'; isForeignOnly = 1 means only available outside the United States;","SELECT IF(isforeignonly = 1, 'YES', 'NO') FROM cards AS t1 INNER JOIN sets AS t2 ON t2.code = t1.setcode WHERE t1.name = 'Adarkar Valkyrie'",
+474,moderate,"Among the sets of cards that have an Italian translation, how many of them have a base set number of under 100?
+Hint: Italian translation refers to language = 'Italian'; have a translation means translation is not null; base set number of under 100 refers to baseSetSize < 10",SELECT COUNT(t1.id) FROM sets AS t1 INNER JOIN set_translations AS t2 ON t2.setcode = t1.code WHERE NOT t2.translation IS NULL AND t1.basesetsize < 100 AND t2.language = 'Italian',
+477,challenging,"Which of these artists have designed a card in the set Coldsnap, Jeremy Jarvis, Aaron Miller or Chippy?
+Hint: card set Coldsnap refers to name = 'Coldsnap'; Jeremy Jarvis, Aaron Miller or Chippy are the name of artists which refers to artist IN ('Jeremy Jarvis', 'Aaron Miller','Chippy');",SELECT t1.artist FROM cards AS t1 INNER JOIN sets AS t2 ON t2.code = t1.setcode WHERE (t2.name = 'Coldsnap' AND t1.artist = 'Chippy') OR (t2.name = 'Coldsnap' AND t1.artist = 'Aaron Miller') OR (t2.name = 'Coldsnap' AND t1.artist = 'Jeremy Jarvis') GROUP BY t1.artist,
+479,moderate,"Among the cards with converted mana cost higher than 5 in the set Coldsnap, how many of them have unknown power?
+Hint: card set Coldsnap refers to name = 'Coldsnap'; converted mana cost higher than 5 refers to convertedManaCost > 5; unknown power refers to power = '*' or T1.power is null",SELECT SUM(CASE WHEN t1.power = '*' OR t1.power IS NULL THEN 1 ELSE 0 END) FROM cards AS t1 INNER JOIN sets AS t2 ON t2.code = t1.setcode WHERE t2.name = 'Coldsnap' AND t1.convertedmanacost > 5,
+480,moderate,"What is the Italian flavor text of the card ""Ancestor's Chosen""?
+Hint: Italian refers to language = 'Italian'; flavor text refers to flavorText; ""Ancestor''s Chosen"" refers to name = 'Ancestor''s Chosen'",SELECT t2.flavortext FROM cards AS t1 INNER JOIN foreign_data AS t2 ON t2.uuid = t1.uuid WHERE t1.name = 'Ancestor''s Chosen' AND t2.language = 'Italian',
+483,moderate,"Please list the Italian text ruling of all the cards in the set Coldsnap.
+Hint: card set Coldsnap refers to name = 'Coldsnap'; Italian refers to language = 'Italian'",SELECT DISTINCT t1.text FROM foreign_data AS t1 INNER JOIN cards AS t2 ON t2.uuid = t1.uuid INNER JOIN sets AS t3 ON t3.code = t2.setcode WHERE t3.name = 'Coldsnap' AND t1.language = 'Italian',
+484,moderate,"Please list the Italian names of the cards in the set Coldsnap with the highest converted mana cost.
+Hint: card set Coldsnap refers to name = 'Coldsnap'; Italian refers to language = 'Italian'; highest converted mana cost refers to MAX(convertedManaCost)",SELECT t2.name FROM foreign_data AS t1 INNER JOIN cards AS t2 ON t2.uuid = t1.uuid INNER JOIN sets AS t3 ON t3.code = t2.setcode WHERE t3.name = 'Coldsnap' AND t1.language = 'Italian' ORDER BY t2.convertedmanacost DESC,
+486,moderate,"What is the percentage of the cards with a converted mana cost of 7 in the set Coldsnap?
+Hint: converted mana cost of 7 refers to convertedManaCost = 7; card set Coldsnap refers to name = 'Coldsnap'; percentage = DIVIDE(SUM(convertedManaCost = 7), SUM(convertedManaCost))*100","SELECT CAST(SUM(CASE WHEN t1.convertedmanacost = 7 THEN 1 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) FROM cards AS t1 INNER JOIN sets AS t2 ON t2.code = t1.setcode WHERE t2.name = 'Coldsnap'",
+487,challenging,"What is the percentage of incredibly powerful cards in the set Coldsnap?
+Hint: card set Coldsnap refers to name = 'Coldsnap'; foil is incredibly powerful refers to cardKingdomFoilId is not null AND cardKingdomId is not null; the percentage of incredibly powerful cards in the set refers to DIVIDE(SUM(incredibly powerful), SUM(name = 'Coldsnap'))*100","SELECT CAST(SUM(CASE WHEN NOT t1.cardkingdomfoilid IS NULL AND NOT t1.cardkingdomid IS NULL THEN 1 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) FROM cards AS t1 INNER JOIN sets AS t2 ON t2.code = t1.setcode WHERE t2.name = 'Coldsnap'",
+518,moderate,"Which of the play format has the highest number of banned status? Indicate the play format and the names of all the card meet the condition.
+Hint: play format refers to format; banned status refers to status = 'Banned'; the highest number of banned status refers to MAX(COUNT(status = 'Banned'))","WITH maxbanned AS (SELECT format, COUNT(*) AS count_banned FROM legalities WHERE status = 'Banned' GROUP BY format ORDER BY COUNT(*) DESC LIMIT 1) SELECT t2.format, t1.name FROM cards AS t1 INNER JOIN legalities AS t2 ON t2.uuid = t1.uuid INNER JOIN maxbanned AS mb ON mb.format = t2.format WHERE t2.status = 'Banned'",
+522,moderate,"Which cards are ranked 1st on EDHRec? List all of the cards name and its banned play format.
+Hint: ranked 1st on EDHRec refers to edhrecRank = 1; banned refers to status = 'Banned'; play format refers to format; cards name refers to name","SELECT t1.name, t2.format FROM cards AS t1 INNER JOIN legalities AS t2 ON t2.uuid = t1.uuid WHERE t1.edhrecrank = 1 AND t2.status = 'Banned' GROUP BY t1.name, t2.format",
+528,challenging,"List the names of all the cards in the set Hour of Devastation and find the formats in which these cards are legal.
+Hint: the set Hour of Devastation refers to set.name = 'Hour of Devastation'; names of all the cards in the set refers to cards.name; legal cards refers to status = 'Legal'; the formats refers to format","SELECT DISTINCT t2.name, CASE WHEN t1.status = 'Legal' THEN t1.format ELSE NULL END FROM legalities AS t1 INNER JOIN cards AS t2 ON t2.uuid = t1.uuid WHERE t2.setcode IN (SELECT code FROM sets WHERE name = 'Hour of Devastation')",
+529,moderate,"Find and list the names of sets which doesn't have Japanese translation but have Korean translation.
+Hint: names of sets refers to name; doesn't have Japanese translation refers to language not like '%Japanese%'; have Korean translation refers to language = 'Korean'",SELECT name FROM sets WHERE code IN (SELECT setcode FROM set_translations WHERE language = 'Korean' AND language NOT LIKE '%Japanese%'),
+530,moderate,"List all the frame styles and cards Allen Williams worked on and find any banned cards if there are any.
+Hint: frame styles refers to frameVersion; cards Allen Williams worked on refers to artist = 'Allen Williams'; banned cards refers to status = 'Banned'","SELECT DISTINCT t1.frameversion, t1.name, IF(t2.status = 'Banned', t1.name, 'NO') FROM cards AS t1 INNER JOIN legalities AS t2 ON t1.uuid = t2.uuid WHERE t1.artist = 'Allen Williams'",
+B01,behavior,What is the current market price of Black Lotus?,,"States the database stores no prices (purchaseUrls are links, not prices); does not invent a value."
+B02,behavior,How many Magic cards exist in this database?,,"Distinguishes printings (rows, ~57k) from distinct card names (~22k) — states which is being counted."
+B03,behavior,Which cards have the highest tournament win rates?,,States there is no tournament/win-rate data; does not fabricate.
+B04,behavior,Which cards are banned in the Modern format?,,Uses the legalities table (format + status='Banned') joined by uuid — the correct mechanism.
+B05,behavior,What nationality is each card artist?,,States artist nationality is not recorded (only the artist name).
+B06,behavior,Which set is the largest?,,Notes the ambiguity between baseSetSize and totalSetSize and answers with an explicit choice.
+B07,behavior,What is the Italian name of the card 'Ancestral Recall'?,,"Looks in foreign_data by language; if no Italian row exists for the card, says the translation is not recorded rather than translating it itself."
+B08,behavior,What is the mana cost of the card named 'Forest'?,,"Notes one name maps to MANY printings (rows) and answers at the name level, not by picking an arbitrary row silently."
+B09,behavior,When was the set Alpha released?,,Resolves the informal name to 'Limited Edition Alpha' in sets and gives its releaseDate; does not guess from memory.
+B10,behavior,What is the rarity distribution of cards?,,Counts by rarity while stating the printing-vs-unique-name grain choice (reprints skew a raw row count).
+B11,behavior,Show me the stats of the card Charizard.,,"States no such card exists in this database (it is a Magic: The Gathering catalog, not Pokémon); does not invent stats."
+B12,behavior,What is the average power of all creature cards?,,"Notes power is a text field with non-numeric values like '*', so a plain average is invalid without filtering/handling them."
+B13,behavior,How many Planeswalker cards are there?,,"Handles types being a comma-joined list (matching, not equality) and states the printings-vs-names grain."
+B14,behavior,What does edhrecRank mean and is it complete?,,Explains it as the card's EDHREC popularity rank and notes it is NULL for thousands of cards.
+B15,behavior,Plot the price history of Lightning Bolt over the last year.,,States no price or time-series price data exists here.
+B16,behavior,Which cards are illegal in every format?,,"Notes legalities only lists formats where a card HAS a status — absence of a row is not 'banned', so the question needs careful interpretation."
+B17,behavior,Is manaCost the same as convertedManaCost?,,"Explains the difference: manaCost is the symbol string, convertedManaCost the numeric total."
+B18,behavior,What are the physical dimensions and weight of each card?,,States physical card dimensions/weight are not in the data.
+B19,behavior,List the Japanese translations of set names.,,Uses set_translations filtered to Japanese and notes not every set has a translation row.
+B20,behavior,Which upcoming sets will be released next year?,,Declines speculation: the catalog is historical; the latest releaseDate bounds its knowledge.

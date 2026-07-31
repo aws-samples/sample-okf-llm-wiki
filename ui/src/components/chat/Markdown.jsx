@@ -34,11 +34,15 @@ function urlTransform(url) {
   return defaultUrlTransform(url)
 }
 
-// Citations: the agent emits `<cite src="tables/races,https://example.com/x"></cite>`
-// after a claim (see the chat system prompt's <citations> block). Sources are wiki
-// concept ids and/or web URLs. We rewrite each tag into ONE markdown link carrying
-// the whole source list, using an internal `okf-cite:` scheme, then render that
-// link as a single grouped citation badge (the `a` component below → CitationGroup).
+// Citations: the agent emits the SHORT tag `<c src="bird/formula_1/tables/races,
+// https://example.com/x"></c>` after a claim (see the chat system prompt's
+// <citations> block — the tag was shortened to save output tokens); stored history
+// still carries the original `<cite …></cite>`, so BOTH parse: the short form is
+// canonicalized to the long one up front and every regex below handles one shape.
+// Sources are fully-qualified wiki doc addresses and/or web URLs. We rewrite each
+// tag into ONE markdown link carrying the whole source list, using an internal
+// `okf-cite:` scheme, then render that link as a single grouped citation badge
+// (the `a` component below → CitationGroup).
 // This rides the existing markdown link path — no rehype-raw / HTML-in-markdown
 // dependency. A trailing INCOMPLETE tag (mid-stream, e.g. `<cite src="tab`) is
 // stripped so it never flashes as raw text while tokens arrive.
@@ -59,13 +63,28 @@ function urlTransform(url) {
 const CITE_TAG_CONTENT_RE = /<cite\s+src="([^"]*)"\s*>[\s\S]*?<\/cite\s*>/gi
 const CITE_TAG_EMPTY_RE = /<cite\s+src="([^"]*)"\s*>\s*(?:<\/cite\s*>)?/gi
 const CITE_ORPHAN_CLOSE_RE = /<\/cite\s*>/gi
+// The agent now emits the SHORT tag `<c src="…"></c>`; canonicalize it to the
+// long form BEFORE any other rewrite so the regexes above handle one shape.
+// `\s+src` keeps `<c…` from ever matching a real tag (`<code>` has no boundary
+// after the c), and a self-closing slip (`<c src="…"/>`) loses its slash to
+// become the long EMPTY form. `</c\s*>` cannot match `</cite>` (the char after
+// `c` is `i`), so a long closer is never double-converted.
+const CITE_SHORT_OPEN_RE = /<c(\s+src="[^"]*"\s*)\/?>/gi
+const CITE_SHORT_CLOSE_RE = /<\/c\s*>/gi
+function canonicalizeShortCites(md) {
+  return md
+    .replace(CITE_SHORT_OPEN_RE, "<cite$1>")
+    .replace(CITE_SHORT_CLOSE_RE, "</cite>")
+}
 // A trailing PARTIAL tag at the very end of the (mid-stream) buffer — a partial
-// opener (`<cite src="tab`) OR a partial closer (`</cite` with no `>` yet). The
-// `\/?` is what makes it catch the closer too (the old version only stripped a
-// partial opener, so a streamed `…</cite` flashed as literal text before its `>`
-// arrived). Only matched once "cite" is fully present, so it can't clip legit
-// prose like a trailing "a <" at a frame boundary. Completed on the next frame.
-const CITE_PARTIAL_RE = /<\/?cite\b[^>]*$/i
+// opener (`<c src="tab`, `<cite src="tab`) OR a partial closer (`</c`/`</cite`
+// with no `>` yet). The `\/?` is what makes it catch the closer too (the old
+// version only stripped a partial opener, so a streamed `…</cite` flashed as
+// literal text before its `>` arrived). The `\b` after the name is what keeps
+// prose safe: `Vec<char` has no boundary after the `c`, so only a real bare
+// `<c`/`<cite` prefix (followed by space, quote, or end) is clipped. Completed
+// on the next frame.
+const CITE_PARTIAL_RE = /<\/?c(?:ite)?\b[^>]*$/i
 const CITE_SCHEME = "okf-cite:"
 
 // While the typewriter is still revealing a block, hold back / repair the
@@ -130,19 +149,23 @@ function mergeAdjacentCites(md) {
 }
 
 function preprocessCitations(md) {
-  // Guard on any `cite` tag — opener OR orphan closer (`</cite>` contains `</cite`,
-  // NOT `<cite`, so an `indexOf("<cite")` alone would skip a stray closer).
-  if (!md || md.indexOf("cite") === -1) return md || ""
-  // 0) Adjacent tags become one, so one claim yields one badge.
-  let out = mergeAdjacentCites(md)
-  // 1) Content-bearing tags first: `<cite src="…">gloss</cite>` → badge (gloss dropped,
+  // Guard on anything that could be a citation tag: an opener (`<c`, which
+  // `<cite` also contains) or an orphan closer (`</c`, which `</cite` also
+  // contains — note `</cite>` does NOT contain `<c`).
+  if (!md || (md.indexOf("<c") === -1 && md.indexOf("</c") === -1))
+    return md || ""
+  // 0) Short tags become long ones, so the rewrites below handle ONE form.
+  let out = canonicalizeShortCites(md)
+  // 1) Adjacent tags become one, so one claim yields one badge.
+  out = mergeAdjacentCites(out)
+  // 2) Content-bearing tags first: `<cite src="…">gloss</cite>` → badge (gloss dropped,
   //    closer consumed). Non-greedy so adjacent cites aren't swallowed as one span.
   out = out.replace(CITE_TAG_CONTENT_RE, (_m, src) => citeBadge(src))
-  // 2) Empty / self-adjacent tags: `<cite src="…"></cite>` or `<cite src="…">`.
+  // 3) Empty / self-adjacent tags: `<cite src="…"></cite>` or `<cite src="…">`.
   out = out.replace(CITE_TAG_EMPTY_RE, (_m, src) => citeBadge(src))
-  // 3) Drop a dangling partial OPENER/CLOSER at the very end (still streaming, e.g. `<cite src="tab`).
+  // 4) Drop a dangling partial OPENER/CLOSER at the very end (still streaming, e.g. `<c src="tab`).
   out = out.replace(CITE_PARTIAL_RE, "")
-  // 4) Belt-and-suspenders: strip any orphan `</cite>` left with no matching opener
+  // 5) Belt-and-suspenders: strip any orphan `</cite>` left with no matching opener
   //    (e.g. a mid-stream frame that delivered the closer before the opener, or a
   //    malformed tag) so a bare `</cite>` never renders as literal text.
   out = out.replace(CITE_ORPHAN_CLOSE_RE, "")

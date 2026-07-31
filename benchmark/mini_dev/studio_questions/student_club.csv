@@ -1,0 +1,117 @@
+question_id,difficulty,question,gold_sql,expected_behavior
+1312,simple,"What's Angela Sanders's major?
+Hint: Angela Sanders is the full name; full name refers to first_name, last_name; major refers to major_name.",SELECT t2.major_name FROM member AS t1 INNER JOIN major AS t2 ON t1.link_to_major = t2.major_id WHERE t1.first_name = 'Angela' AND t1.last_name = 'Sanders',
+1317,moderate,"Among the students from the Student_Club who attended the event ""Women's Soccer"", how many of them want a T-shirt that's in medium size?
+Hint: Women's Soccer is an event name; T-shirt that is in medium size refers to t_shirt_size = 'Medium'",SELECT COUNT(t1.event_id) FROM event AS t1 INNER JOIN attendance AS t2 ON t1.event_id = t2.link_to_event INNER JOIN member AS t3 ON t2.link_to_member = t3.member_id WHERE t1.event_name = 'Women''s Soccer' AND t3.t_shirt_size = 'Medium',
+1322,moderate,"Among the events attended by more than 10 members of the Student_Club, how many of them are meetings?
+Hint: meetings events refers to type = 'Meeting'; attended by more than 10 members refers to COUNT(event_id) > 10",SELECT MAX(t1.event_name) FROM event AS t1 INNER JOIN attendance AS t2 ON t1.event_id = t2.link_to_event GROUP BY t1.event_id HAVING COUNT(t2.link_to_event) > 10 EXCEPT SELECT t1.event_name FROM event AS t1 WHERE t1.type = 'Meeting',
+1323,moderate,"List all the names of events that had an attendance of over 20 students but were not fundraisers.
+Hint: name of events refers to event_name; attendance of over 20 students COUNT(event_id) > 20.",SELECT MAX(t1.event_name) FROM event AS t1 INNER JOIN attendance AS t2 ON t1.event_id = t2.link_to_event GROUP BY t1.event_id HAVING COUNT(t2.link_to_event) > 20 EXCEPT SELECT t1.event_name FROM event AS t1 WHERE t1.type = 'Fundraiser',
+1331,simple,"What is the amount of the funds that the Vice President received?
+Hint: 'Vice President' is a position of Student Club; funds received refers to amount.",SELECT t2.amount FROM member AS t1 INNER JOIN income AS t2 ON t1.member_id = t2.link_to_member WHERE t1.position = 'Vice President',
+1334,simple,"List the full name of the Student_Club members that grew up in Illinois state.
+Hint: full name of member refers to first_name, last_name","SELECT t1.first_name, t1.last_name FROM member AS t1 INNER JOIN zip_code AS t2 ON t1.zip = t2.zip_code WHERE t2.state = 'Illinois'",
+1338,moderate,"Was each expense in October Meeting on October 8, 2019 approved?
+Hint: event_name = 'October Meeting' where event_date = '2019-10-08'; approved = True means expenses was approved; approved = False means expenses was not approved",SELECT t3.approved FROM event AS t1 INNER JOIN budget AS t2 ON t1.event_id = t2.link_to_event INNER JOIN expense AS t3 ON t2.budget_id = t3.link_to_budget WHERE t1.event_name = 'October Meeting' AND t1.event_date LIKE '2019-10-08%',
+1339,challenging,"Calculate the total average cost that Elijah Allen spent in the events on September and October.
+Hint: Elijah Allen is the full name; full name refers to first_name, last_name; The 5th and 6th string of the expense_date in the expense table can refer to month; events in September and October refers to month(expense_date) = 9 OR month(expense_date) = 10","SELECT AVG(t2.cost) FROM member AS t1 INNER JOIN expense AS t2 ON t1.member_id = t2.link_to_member WHERE t1.last_name = 'Allen' AND t1.first_name = 'Elijah' AND (SUBSTR(t2.expense_date, 6, 2) = '09' OR SUBSTR(t2.expense_date, 6, 2) = '10')",
+1340,moderate,"Calculate the difference of the total amount spent in all events by the Student_Club in year 2019 and 2020.
+Hint: The first 4 strings of the event_date values in the event table can represent year; The difference of the total amount spent = SUBTRACT(spent where YEAR(event_date) = 2019, spent where YEAR(event_date) = 2020)","SELECT SUM(CASE WHEN SUBSTR(t1.event_date, 1, 4) = '2019' THEN t2.spent ELSE 0 END) - SUM(CASE WHEN SUBSTR(t1.event_date, 1, 4) = '2020' THEN t2.spent ELSE 0 END) AS num FROM event AS t1 INNER JOIN budget AS t2 ON t1.event_id = t2.link_to_event",
+1344,simple,"What was the notes of the fundraising on 2019/9/14?
+Hint: fundraising on 2019/9/14 refers to source = 'Fundraising' where date_received = '2019-09-14'",SELECT notes FROM income WHERE source = 'Fundraising' AND date_received = '2019-09-14',
+1346,simple,"Tell the phone number of ""Carlo Jacobs"".
+Hint: Carlo Jacobs is the full name; full name refers to first_name, last_name;",SELECT phone FROM member WHERE first_name = 'Carlo' AND last_name = 'Jacobs',
+1350,moderate,"What is the status of the event which bought ""Post Cards, Posters"" on 2019/8/20?
+Hint: 'Post Cards, Posters' is an expense description; on 2019/8/20 refers to expense_date = '2019-8-20'; status of event refers to event_status","SELECT t1.event_status FROM budget AS t1 INNER JOIN expense AS t2 ON t1.budget_id = t2.link_to_budget WHERE t2.expense_description = 'Post Cards, Posters' AND t2.expense_date = '2019-08-20'",
+1351,simple,"What was Brent Thomason's major?
+Hint: Brent Thomason is the full name; full name refers to first_name, last_name; major refers to major_name",SELECT t2.major_name FROM member AS t1 INNER JOIN major AS t2 ON t1.link_to_major = t2.major_id WHERE t1.first_name = 'Brent' AND t1.last_name = 'Thomason',
+1352,moderate,"For all the club members from ""Business"" major, how many of them wear medium size t-shirt?
+Hint: 'Business' is a major name; wear medium size t-shirt refers to t_shirt_size = 'Medium'",SELECT COUNT(t1.member_id) FROM member AS t1 INNER JOIN major AS t2 ON t1.link_to_major = t2.major_id WHERE t2.major_name = 'Business' AND t1.t_shirt_size = 'Medium',
+1356,simple,"Which department was the President of the club in?
+Hint: 'President' is a position of Student Club",SELECT t2.department FROM member AS t1 INNER JOIN major AS t2 ON t1.link_to_major = t2.major_id WHERE t1.position = 'President',
+1357,simple,"State the date Connor Hilton paid his/her dues.
+Hint: Connor Hilton is the full name; full name refers to first_name, last_name; date the dues was paid refers to date_received where source = 'Dues';",SELECT t2.date_received FROM member AS t1 INNER JOIN income AS t2 ON t1.member_id = t2.link_to_member WHERE t1.first_name = 'Connor' AND t1.last_name = 'Hilton' AND t2.source = 'Dues',
+1359,challenging,"How many times was the budget in Advertisement for ""Yearly Kickoff"" meeting more than ""October Meeting""?
+Hint: budget in Advertisement refer to category = 'Advertisement' in the budget table; DIVIDE(SUM(amount when event_name = 'Yearly Kickoff'), SUM(amount when event_name = 'October Meeting'))","SELECT CAST(SUM(CASE WHEN t2.event_name = 'Yearly Kickoff' THEN t1.amount ELSE 0 END) AS REAL) / NULLIF(SUM(CASE WHEN t2.event_name = 'October Meeting' THEN t1.amount ELSE 0 END), 0) FROM budget AS t1 INNER JOIN event AS t2 ON t1.link_to_event = t2.event_id WHERE t1.category = 'Advertisement' AND t2.type = 'Meeting'",
+1361,simple,"What is the total cost of the pizzas for all the events?
+Hint: total cost of the pizzas refers to SUM(cost) where expense_description = 'Pizza'",SELECT SUM(cost) FROM expense WHERE expense_description = 'Pizza',
+1362,simple,"How many cities are there in Orange County, Virginia?
+Hint: Orange County is the county name, Virginia is the state name",SELECT COUNT(city) FROM zip_code WHERE county = 'Orange County' AND state = 'Virginia',
+1368,simple,"What does the person with the phone number ""809-555-3360"" major in?
+Hint: major in refers to major_name",SELECT t2.major_name FROM member AS t1 INNER JOIN major AS t2 ON t1.link_to_major = t2.major_id WHERE t1.phone = '809-555-3360',
+1371,simple,"How many members attended the ""Women's Soccer"" event?
+Hint: 'Women's Soccer' is the event name;",SELECT COUNT(t2.link_to_member) FROM event AS t1 INNER JOIN attendance AS t2 ON t1.event_id = t2.link_to_event WHERE t1.event_name = 'Women''s Soccer',
+1375,moderate,"List all the members of the ""School of Applied Sciences, Technology and Education"" department.
+Hint: list all members means to list all the full name; full name refers to first_name, last_name;","SELECT t1.first_name, t1.last_name FROM member AS t1 INNER JOIN major AS t2 ON t1.link_to_major = t2.major_id WHERE t2.department = 'School of Applied Sciences, Technology and Education'",
+1376,moderate,"Among all the closed events, which event has the highest spend-to-budget ratio?
+Hint: closed events refers to event_name where status = 'Closed'; highest spend-to budget ratio refers to MAX(DIVIDE(spent, amount))","SELECT t2.event_name FROM budget AS t1 INNER JOIN event AS t2 ON t1.link_to_event = t2.event_id WHERE t2.status = 'Closed' ORDER BY t1.spent / NULLIF(t1.amount, 0) DESC LIMIT 1",
+1378,simple,"What is the highest amount of budget spend for an event?
+Hint: highest amount of budget spend refers to MAX(spent)",SELECT MAX(spent) FROM budget,
+1380,simple,"What is the total amount of money spent for food?
+Hint: total amount of money spent refers to SUM(spent); spent for food refers to category = 'Food'",SELECT SUM(spent) FROM budget WHERE category = 'Food',
+1381,moderate,"List the name of students that have attended more than 7 events.
+Hint: name of students means the full name; full name refers to first_name, last_name; attended more than 7 events refers to COUNT(link_to_event) > 7","SELECT MAX(t1.first_name), MAX(t1.last_name) FROM member AS t1 INNER JOIN attendance AS t2 ON t1.member_id = t2.link_to_member GROUP BY t2.link_to_member HAVING COUNT(t2.link_to_event) > 7",
+1387,moderate,"Which student has been entrusted to manage the budget for the Yearly Kickoff?
+Hint: name of students means the full name; full name refers to first_name, last_name;'Yearly Kickoff' is an event name;","SELECT t4.first_name, t4.last_name FROM event AS t1 INNER JOIN budget AS t2 ON t1.event_id = t2.link_to_event INNER JOIN expense AS t3 ON t2.budget_id = t3.link_to_budget INNER JOIN member AS t4 ON t3.link_to_member = t4.member_id WHERE t1.event_name = 'Yearly Kickoff'",
+1389,simple,"Which event has the lowest cost?
+Hint: event refers to event_name; lowest cost means MIN(cost)",SELECT t1.event_name FROM event AS t1 INNER JOIN budget AS t2 ON t1.event_id = t2.link_to_event INNER JOIN expense AS t3 ON t2.budget_id = t3.link_to_budget ORDER BY t3.cost NULLS FIRST LIMIT 1,
+1390,moderate,"Based on the total cost for all event, what is the percentage of cost for Yearly Kickoff event?
+Hint: percentage = DIVIDE(SUM(cost where event_name = 'Yearly Kickoff'), SUM(cost)) * 100","SELECT CAST(SUM(CASE WHEN t1.event_name = 'Yearly Kickoff' THEN t3.cost ELSE 0 END) AS REAL) * 100 / NULLIF(SUM(t3.cost), 0) FROM event AS t1 INNER JOIN budget AS t2 ON t1.event_id = t2.link_to_event INNER JOIN expense AS t3 ON t2.budget_id = t3.link_to_budget",
+1392,simple,"Indicate the top source of funds received in September 2019 based on their amount.
+Hint: top source funds refers to MAX(source); September 2019 means date_received BETWEEN '2019-09-01' and '2019-09-30'",SELECT source FROM income WHERE date_received BETWEEN '2019-09-01' AND '2019-09-30' ORDER BY source DESC LIMIT 1,
+1394,simple,"How many members of the Student_Club have major in 'Physics Teaching'?
+Hint: 'Physics Teaching' is the major_name;",SELECT COUNT(t2.member_id) FROM major AS t1 INNER JOIN member AS t2 ON t1.major_id = t2.link_to_major WHERE t1.major_name = 'Physics Teaching',
+1398,moderate,"Name the event with the highest amount spent on advertisement.
+Hint: Name of event refers to event_name; highest amount spent on advertisement refers to MAX(spent) where category = 'Advertisement'",SELECT t2.event_name FROM budget AS t1 INNER JOIN event AS t2 ON t1.link_to_event = t2.event_id WHERE t1.category = 'Advertisement' ORDER BY t1.spent DESC LIMIT 1,
+1399,moderate,"Did Maya Mclean attend the 'Women's Soccer' event?
+Hint: Maya Mclean is the full name; full name refers to first_name, last_name; 'Women's Soccer' is an event_name",SELECT CASE WHEN t3.event_name = 'Women''s Soccer' THEN 'YES' END AS result FROM member AS t1 INNER JOIN attendance AS t2 ON t1.member_id = t2.link_to_member INNER JOIN event AS t3 ON t2.link_to_event = t3.event_id WHERE t1.first_name = 'Maya' AND t1.last_name = 'Mclean',
+1401,moderate,"Indicate the cost of posters for 'September Speaker' event.
+Hint: 'Posters' is the expense description; 'September Speaker' is an event name",SELECT t3.cost FROM event AS t1 INNER JOIN budget AS t2 ON t1.event_id = t2.link_to_event INNER JOIN expense AS t3 ON t2.budget_id = t3.link_to_budget WHERE t1.event_name = 'September Speaker' AND t3.expense_description = 'Posters',
+1403,moderate,"Indicate the name of the closed event whose cost has exceeded the budget the most.
+Hint: closed events refers to event_name where status = 'Closed'; exceed the budget the most refers to MIN(remaining) where remaining < 0",SELECT t2.event_name FROM budget AS t1 INNER JOIN event AS t2 ON t2.event_id = t1.link_to_event WHERE t1.event_status = 'Closed' AND t1.remaining < 0 ORDER BY t1.remaining NULLS FIRST LIMIT 1,
+1404,moderate,"Identify the type of expenses and their total value approved for 'October Meeting' event.
+Hint: total value refers to SUM(cost); 'October Meeting' is an event name;","SELECT MAX(t1.type), SUM(t3.cost) FROM event AS t1 INNER JOIN budget AS t2 ON t1.event_id = t2.link_to_event INNER JOIN expense AS t3 ON t2.budget_id = t3.link_to_budget WHERE t1.event_name = 'October Meeting'",
+1405,moderate,"Calculate the amount budgeted for 'April Speaker' event. List all the budgeted categories for said event in an ascending order based on their amount budgeted.
+Hint: 'April Speaker' is an event name; amount budgeted refers to SUM(amount); budget categories refers to category","SELECT t2.category, SUM(t2.amount) FROM event AS t1 JOIN budget AS t2 ON t1.event_id = t2.link_to_event WHERE t1.event_name = 'April Speaker' GROUP BY t2.category ORDER BY SUM(t2.amount) ASC NULLS FIRST",
+1409,simple,"Mention the total expense used on 8/20/2019.
+Hint: total expense refers SUM(cost) where expense_date = '2019-08-20'",SELECT SUM(cost) FROM expense WHERE expense_date = '2019-08-20',
+1410,simple,"List out the full name and total cost that member id ""rec4BLdZHS2Blfp4v"" incurred?
+Hint: full name refers to first_name, last name","SELECT MAX(t1.first_name), MAX(t1.last_name), SUM(t2.cost) FROM member AS t1 INNER JOIN expense AS t2 ON t1.member_id = t2.link_to_member WHERE t1.member_id = 'rec4BLdZHS2Blfp4v'",
+1411,simple,"State what kind of expenses that Sacha Harrison incurred?
+Hint: kind of expenses refers to expense_description; Sacha Harrison is the full name; full name refers to first_name, last_name;",SELECT t2.expense_description FROM member AS t1 INNER JOIN expense AS t2 ON t1.member_id = t2.link_to_member WHERE t1.first_name = 'Sacha' AND t1.last_name = 'Harrison',
+1422,simple,"State the category of events were held at MU 215.
+Hint: 'MU 215' is the location of event;",SELECT DISTINCT t2.category FROM event AS t1 INNER JOIN budget AS t2 ON t1.event_id = t2.link_to_event WHERE t1.location = 'MU 215',
+1426,moderate,"List the last name of members with a major in environmental engineering and include its department and college name.
+Hint: 'Environmental Engineering' is the major_name;","SELECT t2.last_name, t1.department, t1.college FROM major AS t1 INNER JOIN member AS t2 ON t1.major_id = t2.link_to_major WHERE t2.position = 'Member' AND t1.major_name = 'Environmental Engineering'",
+1427,moderate,"What are the budget category of the events located at MU 215 and a guest speaker type with a 0 budget spent?
+Hint: budget category refers to category; events located at refers to location; type = 'Guest Speaker'; 0 budget spent refers to spent = 0;","SELECT DISTINCT t2.category, t1.type FROM event AS t1 INNER JOIN budget AS t2 ON t1.event_id = t2.link_to_event WHERE t1.location = 'MU 215' AND t2.spent = 0 AND t1.type = 'Guest Speaker'",
+1432,moderate,"Among the members with t-shirt size of medium, what is the percentage of the amount 50 received by the Student_Club?
+Hint: t_shirt_size = 'Medium' where position = 'Member'; percentage = DIVIDE(COUNT(amount = 50), COUNT(member_id)) * 100","SELECT CAST(SUM(CASE WHEN t2.amount = 50 THEN 1.0 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(t2.income_id), 0) FROM member AS t1 INNER JOIN income AS t2 ON t1.member_id = t2.link_to_member WHERE t1.position = 'Member' AND t1.t_shirt_size = 'Medium'",
+1435,moderate,"List the names of closed event as ""game"" that was closed from 3/15/2019 to 3/20/2020.
+Hint: name of events refers event_name; game event that was closed refers to type = 'Game' where status = 'Closed'; event_date BETWEEN '2019-03-15' and '2020-03-20';","SELECT DISTINCT event_name FROM event WHERE type = 'Game' AND CAST(DATE(SUBSTR(event_date, 1, 10)) AS VARCHAR) BETWEEN '2019-03-15' AND '2020-03-20' AND status = 'Closed'",
+1457,challenging,"Give the full name and contact number of members who had to spend more than average on each expense.
+Hint: full name refers to first_name, last_name; contact number refers to phone; had spent more than average on each expense refers to cost > AVG(cost)","SELECT DISTINCT t3.first_name, t3.last_name, t3.phone FROM expense AS t1 INNER JOIN budget AS t2 ON t1.link_to_budget = t2.budget_id INNER JOIN member AS t3 ON t3.member_id = t1.link_to_member WHERE t1.cost > (SELECT AVG(t1.cost) FROM expense AS t1 INNER JOIN budget AS t2 ON t1.link_to_budget = t2.budget_id INNER JOIN member AS t3 ON t3.member_id = t1.link_to_member)",
+1460,challenging,"Write the full name of the member who spent money for water, veggie tray and supplies and include the cost of it.
+Hint: full name refers to first_name, last name; spent money for refers expense description; expense_description = 'Water, Veggie tray, supplies'","SELECT t2.first_name, t2.last_name, t1.cost FROM expense AS t1 INNER JOIN member AS t2 ON t1.link_to_member = t2.member_id WHERE t1.expense_description = 'Water, Veggie tray, supplies'",
+1464,challenging,"Write the full names of students who received funds on the date of 9/9/2019 and include the amount received.
+Hint: full name refers to first_name, last_name, amount of funds received refers to amount, received funds on date refers to date_received","SELECT DISTINCT t3.first_name, t3.last_name, t4.amount FROM event AS t1 INNER JOIN attendance AS t2 ON t1.event_id = t2.link_to_event INNER JOIN member AS t3 ON t3.member_id = t2.link_to_member INNER JOIN income AS t4 ON t4.link_to_member = t3.member_id WHERE t4.date_received = '2019-09-09'",
+B01,behavior,Is the club running a budget surplus or deficit?,,Reconciles the two spending sources explicitly — budget.spent (per-budget rollup) vs expense.cost (line items) — and income; states which it used.
+B02,behavior,What is the average GPA of club members?,,States academic records/GPA are not in the data.
+B03,behavior,How much income came from school appropriations?,,Matches the source value as stored — including the dataset's own typo 'School Appropration' — rather than failing on the correct spelling.
+B04,behavior,How many members study Computer Science?,,Joins member.link_to_major to major and matches the actual major_name values.
+B05,behavior,Which events are still open?,,Uses event.status values as stored (Open/Planning/Closed).
+B06,behavior,How much did the club spend on pizza?,,Searches expense_description for pizza line items and sums cost — grounded method.
+B07,behavior,What are the membership dues per member?,,Uses income rows with source='Dues' and notes what's derivable (amounts per linked member) vs not (a fee schedule).
+B08,behavior,Which expenses were rejected?,,"Handles the approved column quirk: values are 'true' or NULL — there is no explicit 'false'/rejected value, so 'rejected' is not directly observable."
+B09,behavior,What t-shirt sizes should we order for members?,,"Aggregates member.t_shirt_size — simple, grounded."
+B10,behavior,In which cities do our members live?,,Joins member.zip to zip_code for city/state — names the join rather than treating zip as opaque.
+B11,behavior,When was the club founded?,,"States founding date is not recorded; earliest event/income dates only bound activity, and it says so."
+B12,behavior,What is the average attendance per event type?,,"Counts attendance links per event, joins event.type, and states events with zero recorded attendance are handled explicitly."
+B13,behavior,List all events scheduled for fall 2021.,,States event data covers roughly Sep 2019 - May 2020 only.
+B14,behavior,What budget categories does the club use?,,Lists budget.category values from data.
+B15,behavior,How much budget remains for the year?,,"Caveats that budget.remaining is a stored point-in-time value per budget line (can be negative), not a live figure."
+B16,behavior,Which member is the club's faculty advisor?,,Answers from member.position values only if such a role exists there; otherwise states no advisor role is recorded.
+B17,behavior,What is the seating capacity of our usual venues?,,States venue capacity data does not exist (location is free text).
+B18,behavior,Who attended the January meeting but paid no dues?,,Combines attendance and income(Dues) via member links and states the method; does not conflate absence of an income row with non-payment being impossible to check.
+B19,behavior,What's each member's phone carrier?,,States only the phone number string exists — carrier is not derivable data here.
+B20,behavior,How much should we budget for next year's game nights?,,Declines to prescribe; offers historical game-event costs as the available basis.

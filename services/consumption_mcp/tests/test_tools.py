@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from consumption_mcp.tools import ConsumptionConfig, ConsumptionTools
@@ -550,3 +552,135 @@ def test_get_bundle_diff_unknown_version_raises_value_error(tools, aws):
 
     with _pytest.raises(ValueError, match="unknown bundle version"):
         tools.get_bundle_diff(DOMAIN, DATASET, to_version="nope")
+
+
+# -- the docstrings ARE the model-facing tool descriptions ---------------------
+#
+# chat/tools.py lifts these verbatim as the chat agent's tool descriptions (and
+# server.py's MCP wrappers mirror them), so they must read as instructions to a
+# MODEL: what the args mean and what the response tells you. Maintainer prose
+# (DynamoDB key shapes, boto3 limitations, threat numbers, temp-dir mechanics)
+# belongs in `#` comments inside the bodies, where it costs no tokens per request.
+
+
+def _doc(name: str) -> str:
+    return inspect.getdoc(getattr(ConsumptionTools, name)) or ""
+
+
+MODEL_FACING = (
+    "list_domains",
+    "list_declared_domains",
+    "search_domains",
+    "list_directory",
+    "read_page",
+    "get_backlinks",
+    "glob",
+    "grep",
+    "semantic_search",
+    "get_bundle_diff",
+)
+
+
+@pytest.mark.parametrize("name", MODEL_FACING)
+def test_docstrings_carry_no_maintainer_only_prose(name):
+    doc = _doc(name)
+    for leak in (
+        "begins_with",  # boto3 resource-Table limitation
+        "DOMAIN#",  # DynamoDB key shape
+        "XREF#",
+        "threat #",  # threat-model numbering
+        "tempfile",  # temp-dir download mechanics
+        "temp dir",
+        "_iter_concepts",  # internal helper names
+        "_SEMANTIC_TOP_K_MAX",
+        "server.register_tools",  # which surface exposes the tool
+        "DELIBERATELY NOT exposed",
+        "docs/CONVENTIONS.md",
+        ":meth:",  # Sphinx roles don't render for a model
+        "/META",  # DynamoDB sort-key shape
+    ):
+        assert leak not in doc, f"{name} docstring still carries {leak!r}"
+
+
+def test_list_domains_doc_keeps_both_cross_reference_directions():
+    doc = _doc("list_domains")
+    # Compressed, but each direction must still say WHERE its pair docs are read.
+    assert len(doc.split()) < 80, f"list_domains doc is {len(doc.split())} words"
+    assert "cross_references" in doc and "cross_referenced_by" in doc
+    assert "external/<d>/<ds>/" in doc
+    assert "<that dataset>/external/<this>/" in doc
+
+
+def test_get_bundle_diff_doc_keeps_the_selectors_and_the_bounds():
+    doc = _doc("get_bundle_diff")
+    assert len(doc.split()) < 90, f"get_bundle_diff doc is {len(doc.split())} words"
+    assert "BOTH selectors are optional" in doc
+    assert "versions" in doc and "newest first" in doc
+    assert 'to_version="live"' in doc
+    assert "50" in doc and "truncated" in doc
+    assert "100 lines" in doc and "diff_truncated" in doc
+
+
+def test_semantic_search_doc_documents_the_filter_args():
+    from okf_core.concept_types import (
+        CROSS_DATASET_REFERENCE_TYPE,
+        GLUE_DATABASE_TYPE,
+        GLUE_TABLE_TYPE,
+        REDSHIFT_DATABASE_TYPE,
+        REDSHIFT_EXTERNAL_TABLE_TYPE,
+        REDSHIFT_TABLE_TYPE,
+    )
+    from okf_core.domain import DOMAIN_DOC_TYPE
+
+    doc = _doc("semantic_search")
+    # `type` is an EXACT match, so a wrong value returns nothing SILENTLY — the
+    # model can only avoid that if the vocabulary is spelled out here. Every value
+    # is pinned against its source-of-truth constant so a rename can't drift.
+    assert "EXACT match" in doc
+    assert "silently returns NOTHING" in doc
+    for concept_type in (
+        GLUE_TABLE_TYPE,
+        GLUE_DATABASE_TYPE,
+        REDSHIFT_TABLE_TYPE,
+        REDSHIFT_EXTERNAL_TABLE_TYPE,
+        REDSHIFT_DATABASE_TYPE,
+        CROSS_DATASET_REFERENCE_TYPE,
+        DOMAIN_DOC_TYPE,
+    ):
+        assert concept_type in doc, concept_type
+    # `Reference` and `Playbook` have no runtime constant (the harvest prompts /
+    # okf-authoring skill pin them), so match the backticked literal — a plain
+    # substring check for "Reference" would pass on Cross-Dataset Reference alone.
+    assert "``Reference``" in doc and "``Playbook``" in doc
+    assert "ANY of the given tags" in doc
+    # The top_k ceiling is the real constant, not a stale literal.
+    from consumption_mcp import tools as toolmod
+
+    assert f"capped server-side at {toolmod._SEMANTIC_TOP_K_MAX}" in doc
+
+
+def test_grep_doc_documents_both_rejection_rules():
+    from consumption_mcp import tools as toolmod
+
+    doc = _doc("grep")
+    # Otherwise the model discovers these only by getting an error back.
+    assert str(toolmod._GREP_PATTERN_MAX_LEN) in doc
+    assert "nests quantifiers" in doc and "(a+)+" in doc
+
+
+def test_glob_doc_keeps_the_worked_examples():
+    doc = _doc("glob")
+    for example in ("tables/*", "**/*orders*"):
+        assert example in doc
+    # The implementation aside ("same scope as get_backlinks") told the model
+    # nothing it can act on; the visibility RULE itself stays.
+    assert "get_backlinks" not in doc
+    assert "index.md" in doc and ".harvest" in doc
+
+
+def test_read_page_and_get_backlinks_docs_explain_their_responses():
+    page = _doc("read_page")
+    assert "0-indexed" in page
+    assert "total_lines" in page and "returned_lines" in page
+    backlinks = _doc("get_backlinks")
+    assert "heading" in backlinks

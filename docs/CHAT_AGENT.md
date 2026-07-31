@@ -824,10 +824,15 @@ domain our users' agents read. Missing icons are NORMAL and degrade to a monogra
 tile (host initial over a hue hashed from the host, so a list stays scannable). This
 is the one reason the CloudFront CSP allows `img-src … https:` (see `ui.tf`).
 
-**Citations are ONE badge per claim, and they take URLs.** `<cite src>` entries may
-now be concept ids *or* `http(s)://` URLs, freely mixed in a single tag, and
-`Markdown.preprocessCitations` additionally MERGES adjacent tags — so a claim backed
-by three sources renders as one pill (`favicon · host +2`), never a row of chips.
+**Citations are ONE badge per claim, and they take URLs.** The prompted tag is the
+SHORT form `<c src="…"></c>` (chosen to trim output tokens; the original
+`<cite …></cite>` lives on in stored history and in model imitation of its own old
+turns, so `Markdown.jsx` canonicalizes short → long up front and every downstream
+regex handles one shape — a self-closing slip `<c src="…"/>` is tolerated too).
+`src` entries may be wiki doc addresses *or* `http(s)://` URLs, freely mixed in a
+single tag, and `Markdown.preprocessCitations` additionally MERGES adjacent tags —
+so a claim backed by three sources renders as one pill (`favicon · host +2`), never
+a row of chips.
 Clicking pages through the sources with ← / → and an `i/N` counter
 (`components/chat/Citation.jsx`): a web source shows favicon + host, title, date and
 snippet, and links out; a wiki doc shows its kind, full concept path, and dataset.
@@ -838,6 +843,22 @@ comma (`parseCiteList` re-joins fragments that aren't valid sources), and
 `encodeURIComponent` does NOT escape parentheses — an unescaped `)` in
 `…/wiki/Golf_(car)` would terminate the internal markdown link early, so those are
 escaped explicitly.
+
+**Wiki citations are FULLY QUALIFIED.** The prompt requires
+`<data_domain>/<dataset>/<concept id>` (`bird/formula_1/tables/races` — the same
+shape as a semantic_search vector key), because a bare concept id doesn't name its
+bundle: the UI could only open it when the doc happened to appear in the turn's
+`read_page`/`get_backlinks` args or `semantic_search` results, so citations to docs
+discovered any other way (an overview page's wikilinks, `grep`/`glob` hits) rendered
+without an "Open page" action. `lib/sources.parseWikiSource` decomposes both forms
+(bare-first, so a deep bare id whose 3rd segment is a top-level dir is never misread
+as qualified); `Citation.jsx`'s DocCard resolves a qualified id from the id itself
+and falls back — for bare ids in stored history or model slips — to the
+conversation's tool-traffic index, then the conversation scope.
+`lib/sources.collectWikiSources` builds that index from EVERY feed that names
+concept ids with a location: located tool-call args, `read_page`/`glob`/`grep`
+results, `get_backlinks` results (located via their own call's args, matched by
+tool-call id), and `semantic_search` vector keys.
 
 ## 15. Open items / risks
 

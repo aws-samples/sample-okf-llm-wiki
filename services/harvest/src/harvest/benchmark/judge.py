@@ -123,14 +123,14 @@ class JudgeVerdict:
     usage: dict = field(default_factory=dict)
 
 
-JUDGE_SYSTEM_PROMPT = """\
-You are judging why a text-to-SQL agent (which had ONLY the data wiki — the \
-authored markdown docs, not the raw schema) failed a benchmark check. For each \
-case you see the question, the expected (gold) answer for that check, and EVERY \
-attempt across the independent runs — passing and failing — each with its \
-grading reason and the agent's own solve trace. Unlike that agent, you can see \
-everything, via these read-only tools:
-
+# The three judge hats hold the SAME toolset (studio._judge_toolset), so its
+# description is ONE shared block — the per-prompt copies had already started
+# drifting (wording diverged across hats while the tools stayed identical).
+# The `.traces/` block is SEPARATE and deliberately composed only into the two
+# hats that have trace files: the behavior GRADER runs before ``before_judge``
+# lays the traces down (its case's trace rides the user message instead), and
+# a primer naming files the agent can't find teaches it to make failing calls.
+_JUDGE_TOOLS_BLOCK = """\
 WIKI + source files:
 - `read_file(path)` — read a file by path. The WIKI docs the agent had are under \
 `tables/`, `references/`, `datasets/`, `index.md`. The schema snapshot is under \
@@ -138,12 +138,19 @@ WIKI + source files:
 Uploaded source docs are under `.context/`.
 - `glob(pattern)` / `grep(pattern)` / `ls(path)` — find and search across those \
 files (e.g. `grep` the wiki for a column name to see whether/how it's documented).
+- `run_code(code)` — WHEN AVAILABLE: Python in an isolated sandbox holding the \
+`.context/` files under `/tmp/okf_context/`. Use it to extract text from binary \
+uploads (PDF/DOCX/PPTX/XLSX) that `read_file` only base64-encodes — e.g. check \
+whether an uploaded spec states the fact the wiki missed.
 Live DATA:
 - `run_sql(query)` — read-only SQL against the real dataset; also `DESCRIBE \
 <table>`, `SHOW COLUMNS FROM <table>`, `SELECT DISTINCT <col> ... LIMIT` for \
 code legends.
 - `sample_rows(concept_id)` — a few sample rows for a table concept id like \
 `tables/races` (a concept id, NOT a file path).
+"""
+
+_JUDGE_TRACES_BLOCK = """\
 Solve traces on disk:
 - EVERY attempt's full solve trace — every question, every run, passing and \
 failing alike — is under `.traces/<check>/q<id>-run<n>.md` (e.g. \
@@ -151,7 +158,21 @@ failing alike — is under `.traces/<check>/q<id>-run<n>.md` (e.g. \
 steps; `read_file` a trace file for the full text, and `grep` ACROSS them for \
 systemic patterns no single case shows ("did ANY run find the doc that answers \
 this?", "do all failures pick the same wrong column?").
+"""
 
+JUDGE_SYSTEM_PROMPT = (
+    """\
+You are judging why a text-to-SQL agent (which had ONLY the data wiki — the \
+authored markdown docs, not the raw schema) failed a benchmark check. For each \
+case you see the question, the expected (gold) answer for that check, and EVERY \
+attempt across the independent runs — passing and failing — each with its \
+grading reason and the agent's own solve trace. Unlike that agent, you can see \
+everything, via these read-only tools:
+
+"""
+    + _JUDGE_TOOLS_BLOCK
+    + _JUDGE_TRACES_BLOCK
+    + """
 Your method for each case:
 1. From the failing attempts, identify what the agent got wrong (a column, join \
 key, code legend, unit, filter, grain).
@@ -183,6 +204,7 @@ failure isn't actionable in the docs.
 When done investigating, deliver the ruling by calling \
 `submit_verdict(verdict, comment, annotation)` — that tool call IS your \
 output; plain text is never read as a verdict. Submit once, then finish."""
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -553,29 +575,28 @@ class BehaviorGrade:
     usage: dict = field(default_factory=dict)
 
 
-BEHAVIOR_JUDGE_PROMPT = """\
+BEHAVIOR_JUDGE_PROMPT = (
+    """\
 You are grading ONE run of a wiki-consumer agent against a free-form \
 EXPECTED-BEHAVIOR specification written by the dataset's owner. The agent had \
 ONLY the data wiki (the authored markdown docs — not the raw schema, not the \
 data). You see its final answer and its full solve trace, and unlike the agent \
 you can see everything, via these read-only tools:
 
-WIKI + source files:
-- `read_file(path)` — the WIKI docs the agent had are under `tables/`, \
-`references/`, `datasets/`, `index.md`. The schema snapshot is under \
-`.metadata/` (e.g. `.metadata/tables/<name>.md`, `.metadata/columns.tsv`); \
-uploaded source docs are under `.context/`.
-- `glob(pattern)` / `grep(pattern)` / `ls(path)` — find and search across those \
-files.
-Live DATA:
-- `run_sql(query)` — read-only SQL against the real dataset; also `DESCRIBE \
-<table>`, `SHOW COLUMNS FROM <table>`, `SELECT DISTINCT <col> ... LIMIT`.
-- `sample_rows(concept_id)` — sample rows for a table concept id like \
-`tables/races` (a concept id, NOT a file path).
-
+"""
+    # No _JUDGE_TRACES_BLOCK: this hat grades BEFORE before_judge lays the
+    # trace files down — its one attempt's trace rides the user message.
+    + _JUDGE_TOOLS_BLOCK
+    + """
 The expectation is free-form: it may demand a correct value, a refusal, \
 honoring a stated policy, acknowledging that something isn't tracked, citing a \
-caveat — any nuance the owner wrote. Grade THIS run against it:
+caveat — any nuance the owner wrote. The agent may also have ended its run by \
+calling its `ask_human` escalation tool — its recorded answer then opens with \
+"[The agent ended the run by asking the user for clarification]" followed by \
+its questions. Grade an ask like any answer: an expectation that calls for \
+clarification is satisfied by a well-aimed ask (the right missing dimension, \
+specific questions), and an expectation the wiki lets the agent answer \
+directly is FAILED by an unnecessary ask. Grade THIS run against it:
 
 1. Break the expectation into its individual demands.
 2. Read the agent's final answer and its trace (what it opened, what it claimed).
@@ -598,6 +619,7 @@ expectation verbatim in the annotation; describe the missing or unclear FACT.
 When done investigating, deliver the ruling by calling \
 `submit_verdict(verdict, comment, annotation)` — that tool call IS your \
 output; plain text is never read as a verdict. Submit once, then finish."""
+)
 
 
 def render_behavior_case(case: BehaviorCase) -> str:
@@ -727,7 +749,8 @@ def make_behavior_grader(
 # Behavior synthesis review — one question-level summary over the graded runs
 # --------------------------------------------------------------------------- #
 
-BEHAVIOR_REVIEW_PROMPT = """\
+BEHAVIOR_REVIEW_PROMPT = (
+    """\
 You are writing the QUESTION-LEVEL summary for one Behavior benchmark case. A \
 wiki-consumer agent (which had ONLY the data wiki, not the raw schema or data) \
 answered this question once per independent run, and each run was already \
@@ -737,20 +760,10 @@ the independent gradings could not do: read ALL runs together and produce the \
 question-level diagnosis and ONE consolidated doc fix. You can see everything, \
 via these read-only tools:
 
-WIKI + source files:
-- `read_file(path)` — the WIKI docs the agent had are under `tables/`, \
-`references/`, `datasets/`, `index.md`. The schema snapshot is under \
-`.metadata/`; uploaded source docs are under `.context/`.
-- `glob(pattern)` / `grep(pattern)` / `ls(path)` — find and search across those \
-files.
-Live DATA:
-- `run_sql(query)` — read-only SQL against the real dataset.
-- `sample_rows(concept_id)` — sample rows for a table concept id like `tables/races`.
-Solve traces on disk:
-- every attempt's full solve trace is under `.traces/<check>/q<id>-run<n>.md`; \
-the per-run summaries in your prompt elide long steps — `read_file` a trace for \
-the full text.
-
+"""
+    + _JUDGE_TOOLS_BLOCK
+    + _JUDGE_TRACES_BLOCK
+    + """
 Method:
 1. Read the expectation, then every run: its answer, its ruling and the \
 grader's comment, and its trace.
@@ -768,6 +781,7 @@ pattern (systemic vs flaky, agent-fault vs docs-fault) and what went wrong.
 dataset-level doc fix an author can apply — merge the per-run suggestions; \
 leave it empty when the agent alone is at fault. NEVER restate the question \
 or the expectation verbatim; describe the missing or unclear FACT."""
+)
 
 
 def make_behavior_reviewer(

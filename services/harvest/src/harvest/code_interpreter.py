@@ -32,6 +32,7 @@ the SDK or AWS. All boto3/SDK use is lazy so the module imports cleanly offline.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -299,13 +300,52 @@ def build_sandbox() -> CodeSandbox | None:
         return None
 
 
+@contextlib.contextmanager
+def sandbox_session(context_root: str | Path, *, label: str = "harvest"):
+    """Yield a started CodeSandbox with ``<context_root>/.context/`` uploaded,
+    or None if unavailable.
+
+    Owns the sandbox lifecycle for one run: start the session, upload the
+    ``.context/`` docs so ``run_code`` can read them, and ALWAYS stop the
+    session on exit. Best-effort — a build/start/upload failure degrades the
+    caller to running WITHOUT the sandbox (yields None) rather than failing
+    it, so the offline path and any CI-unavailable environment still work.
+    """
+    sandbox = build_sandbox()
+    if sandbox is None:
+        yield None
+        return
+    try:
+        sandbox.start()
+        uploaded = sandbox.upload_context(context_root)
+        log.info(
+            "%s sandbox ready (%d context doc(s) uploaded)", label, len(uploaded)
+        )
+    except Exception:  # noqa: BLE001 - sandbox is an enhancement, never a hard dep
+        log.warning(
+            "Sandbox start/upload failed; %s runs without run_code.",
+            label,
+            exc_info=True,
+        )
+        sandbox.stop()
+        yield None
+        return
+    try:
+        yield sandbox
+    finally:
+        sandbox.stop()
+
+
 def make_run_code_tool(sandbox: CodeSandbox) -> Any:
     """A LangChain ``run_code`` tool bound to ``sandbox`` for the harvest agent."""
     from langchain_core.tools import tool
 
     @tool
     def run_code(code: str) -> dict[str, Any]:
-        """Execute Python in an isolated sandbox to extract text from `.context/` files.
+        # Raw docstring: the example below contains "\n" INSIDE a code sample —
+        # a non-raw docstring would bake a literal newline into the one Python
+        # example the model sees, making it syntactically invalid.
+        r"""Execute Python in an isolated sandbox to extract text from `.context/` files.
 
         Use this to read UPLOADED SOURCE DOCS the built-in `read_file` can't decode
         — PDF, Word (.docx), PowerPoint (.pptx), Excel (.xlsx), CSV, XML. The

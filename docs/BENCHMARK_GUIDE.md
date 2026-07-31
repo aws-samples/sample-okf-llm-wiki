@@ -25,8 +25,11 @@ result-set equality for **Accuracy (SQL EX)** (BIRD semantics: row order
 ignored, column order within a row meaningful, numeric cells compared by
 value so `3` and `3.0` match); for **Behavior** there is no
 deterministic grade at all: the **judge** rules on every run independently
-against your free-form expectation (with the real schema, live data, and the
-solver's own step-by-step trace in hand). After all runs finish, the same
+against your free-form expectation (with the real schema, live data, the
+uploaded `.context/` source docs — including binary PDF/DOCX/PPTX/XLSX
+uploads, extracted via a sandboxed `run_code` when the Code Interpreter is
+configured — and the solver's own step-by-step trace in hand). After all
+runs finish, the same
 judge (always on) reviews every failed Accuracy question once and rules each
 failure *confirmed* (the wiki's fault, with a comment and often a suggested
 doc fix) or *overturned* (bad gold, ambiguous question). Behavior failures
@@ -100,6 +103,14 @@ On the same page:
    verifies/executes. Accuracy solvers always stay SQL-blind (they could
    brute-force EX otherwise). Reports carry the flag ("live SQL" badge) —
    scores aren't comparable across different settings of it.
+   Behavior solvers (both variants) also hold a terminal **`ask_human`**
+   escalation tool: when the wiki's guardrails say a request must be
+   clarified (a missing period/region/grain/scope, an ambiguous term), the
+   solver can ASK instead of answering — the call ends the run and the ask
+   itself is recorded as the answer, so an `expected_behavior` like "should
+   ask which region" is graded on a clear-cut structural signal (the tool
+   call), not on prose the judge has to interpret. It cuts both ways: an
+   unnecessary ask on a question the wiki answers directly is a fail.
 2. **Solver model + effort** — the consumer being simulated. Benchmark with the
    model your agents will actually run on (often cheaper than the authoring
    model). **Judge model + effort** — the reviewer; usually keep it strong. The

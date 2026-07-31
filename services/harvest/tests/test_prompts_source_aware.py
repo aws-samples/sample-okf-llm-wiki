@@ -75,9 +75,7 @@ def test_default_profile_is_glue_backcompat():
 
 
 def test_annotation_prompt_is_source_aware():
-    rs = prompts.build_annotation_prompt(
-        dataset="orders_analytics",
-        annotations=[],
+    rs = prompts.build_annotation_supervisor_prompt(
         results_rel=".harvest/annotation_results.json",
         profile=REDSHIFT,
     )

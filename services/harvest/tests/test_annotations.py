@@ -18,16 +18,12 @@ from okf_core import annotations as anno
 # --- annotation prompt contract --------------------------------------------
 
 
-def test_annotation_prompt_encodes_verify_apply_resolve_contract():
-    p = prompts.build_annotation_prompt(
-        dataset="orders",
-        annotations=[
-            {"annotation_id": "a1", "concept_id": "tables/races",
-             "quote": "status 9 means refunds", "note": "9 is chargebacks"}
-        ],
+def test_annotation_supervisor_prompt_encodes_verify_apply_resolve_contract():
+    # The job spec is the SYSTEM prompt (mirrors cross mode) — the full-harvest
+    # supervisor body must not leak in (it prescribes a per-table fan-out and a
+    # whole-bundle review pass this scoped run must not do).
+    p = prompts.build_annotation_supervisor_prompt(
         results_rel=".harvest/annotation_results.json",
-        domain_description="Sales",
-        domain_context="ctx",
     )
     low = p.lower()
     # Data is the judge, not the reader's say-so.
@@ -37,13 +33,35 @@ def test_annotation_prompt_encodes_verify_apply_resolve_contract():
     assert "applied" in low and "rejected" in low
     assert ".harvest/annotation_results.json" in p
     assert "{results_rel}" not in p and "{{" not in p
-    # The annotation content is threaded in (on disk + inlined).
+    assert "annotations.json" in p
+    # Not the full-harvest workflow, and the runtime preamble appears ONCE.
+    assert "Adversarial review pass" not in p
+    assert "table-author" not in p
+    assert p.count("## FOLLOW THE SKILL") == 1
+
+
+def test_annotation_user_prompt_carries_run_facts_only():
+    p = prompts.build_annotation_user_prompt(
+        dataset="orders",
+        annotations=[
+            {"annotation_id": "a1", "concept_id": "tables/races",
+             "quote": "status 9 means refunds", "note": "9 is chargebacks"}
+        ],
+        results_rel=".harvest/annotation_results.json",
+        domain_description="Sales",
+        domain_context="ctx",
+    )
+    # The annotation content is threaded in (on disk + inlined)...
     assert "9 is chargebacks" in p
     assert "annotations.json" in p
+    assert "Sales" in p
+    # ...and the job spec / runtime preamble are NOT (they ride the system prompt).
+    assert "## FOLLOW THE SKILL" not in p
+    assert "arbiter" not in p.lower()
 
 
-def test_annotation_prompt_threads_dataset_guidance():
-    p = prompts.build_annotation_prompt(
+def test_annotation_user_prompt_threads_dataset_guidance():
+    p = prompts.build_annotation_user_prompt(
         dataset="orders",
         annotations=[
             {"annotation_id": "a1", "concept_id": "tables/races",
@@ -56,10 +74,10 @@ def test_annotation_prompt_threads_dataset_guidance():
     assert "Decode the status column from the dictionary." in p
 
 
-def test_annotation_prompt_guidance_only_run_has_no_annotations_task():
+def test_annotation_user_prompt_guidance_only_run_has_no_annotations_task():
     # Zero annotations + guidance → the prompt says it's guidance-only and asks for
     # an EMPTY results array (nothing to reconcile per-annotation).
-    p = prompts.build_annotation_prompt(
+    p = prompts.build_annotation_user_prompt(
         dataset="orders",
         annotations=[],
         results_rel=".harvest/annotation_results.json",
@@ -68,6 +86,16 @@ def test_annotation_prompt_guidance_only_run_has_no_annotations_task():
     assert "Ignore the staging tables." in p
     assert "guidance-only" in p.lower()
     assert "empty json array" in p.lower()
+
+
+def test_incremental_supervisor_prompt_is_scoped():
+    # Incremental mode gets a maintenance system prompt: propagate one change,
+    # never re-run the full-harvest workflow.
+    p = prompts.build_maintenance_supervisor_prompt()
+    assert "NOT a full" in p
+    assert "get_backlinks" in p
+    assert "Adversarial review pass" not in p
+    assert "one item per table" not in p
 
 
 def test_full_harvest_guidance_preamble():

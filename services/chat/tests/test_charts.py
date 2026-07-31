@@ -41,11 +41,24 @@ def test_chart_tool_description_documents_the_render_api():
     # Every supported chart type is offered to the model.
     for t in SUPPORTED_CHART_TYPES:
         assert t in RENDER_CHART_DESC
-    # The load-bearing guardrails: real data only + don't hard-code colors (match
-    # the app palette). These are what keep charts truthful + on-brand.
+    # The load-bearing guardrails: real data only + colors come from the app
+    # palette. These are what keep charts truthful + on-brand.
     low = RENDER_CHART_DESC.lower()
     assert "real" in low and "invent" in low
-    assert "--chart-1" in RENDER_CHART_DESC and "color" in low
+    assert "color" in low
+    # The palette range must match ui/src/lib/chartIframe.js PALETTE_VARS, which
+    # is --chart-1 … --chart-10 (an under-stated range hides half the palette).
+    assert "--chart-1 … --chart-10" in RENDER_CHART_DESC
+    # Colors are stated as NOT settable — the renderer ignores spec colors, so a
+    # rule permitting an exception would describe a mechanism that doesn't exist.
+    assert "colors are not configurable in the spec" in low
+    assert "ignores any color you set" in low
+
+
+def test_chart_description_states_the_code_is_a_function_body_once():
+    # The "your code is a function body, not a module" rule was stated three times;
+    # once is enough and the repetition is pure token cost.
+    assert RENDER_CHART_DESC.lower().count("not a module") == 1
 
 
 # --- the ack (what flows back to the model, not a render result) ------------

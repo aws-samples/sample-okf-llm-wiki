@@ -50,6 +50,20 @@ log = logging.getLogger("chat.sql")
 _SQL_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
 _READ_ONLY_HEADS = ("select", "with", "show", "describe", "explain")
 
+# The read verbs each ENGINE advertises — the guard accepts the union
+# (_READ_ONLY_HEADS), but the error text and the tool description must agree per
+# engine or the model is told to fix a query one way and rejected the other:
+# Redshift has no DESCRIBE, so its description forbids it and its error text must
+# not suggest it. Kept as the single source for both strings per engine.
+_ATHENA_READ_VERBS = "SELECT / WITH / SHOW / DESCRIBE / EXPLAIN"
+_REDSHIFT_READ_VERBS = "SELECT / WITH / SHOW / EXPLAIN"
+
+
+def _read_only_error(verbs: str) -> str:
+    """The guard's rejection text for an engine, naming only ITS read verbs."""
+    return f"run_sql accepts a single read-only statement only ({verbs})."
+
+
 # Athena terminal states — CANCELLED has two L's (matches harvest's glue_source).
 _ATHENA_TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
 
@@ -124,7 +138,7 @@ class AthenaSQL:
     @property
     def tool_description(self) -> str:
         """The run_sql tool description the model sees for this engine."""
-        return _RUN_SQL_DESC
+        return _RUN_SQL_DESC.format(max_rows=self.max_rows)
 
     def run(self, sql: str, *, default_database: str | None = None) -> dict[str, Any]:
         """Execute one read-only query; return ``{columns, rows, row_count, truncated}``.
@@ -136,10 +150,7 @@ class AthenaSQL:
         for a non-read query and ``RuntimeError``/``TimeoutError`` on Athena failure.
         """
         if not is_read_only(sql):
-            raise ValueError(
-                "run_sql accepts a single read-only statement only "
-                "(SELECT / WITH / SHOW / DESCRIBE / EXPLAIN)."
-            )
+            raise ValueError(_read_only_error(_ATHENA_READ_VERBS))
         ctx: dict[str, Any] = {"Catalog": self.catalog}
         if default_database:
             ctx["Database"] = default_database
@@ -249,7 +260,9 @@ class RedshiftDataSQL:
     @property
     def tool_description(self) -> str:
         """The run_sql tool description the model sees (names the pinned DB)."""
-        return _RUN_SQL_DESC_REDSHIFT.format(database=self.database)
+        return _RUN_SQL_DESC_REDSHIFT.format(
+            database=self.database, max_rows=self.max_rows
+        )
 
     def run(self, sql: str, *, default_database: str | None = None) -> dict[str, Any]:
         """Execute one read-only statement; return ``{columns, rows, row_count,
@@ -262,10 +275,9 @@ class RedshiftDataSQL:
         statement is best-effort cancelled first).
         """
         if not is_read_only(sql):
-            raise ValueError(
-                "run_sql accepts a single read-only statement only "
-                "(SELECT / WITH / SHOW / DESCRIBE / EXPLAIN)."
-            )
+            # Redshift has no DESCRIBE — naming it here would tell the model to fix
+            # its query with a verb this engine's description forbids.
+            raise ValueError(_read_only_error(_REDSHIFT_READ_VERBS))
         params: dict[str, Any] = {
             "Sql": sql,
             "Database": self.database,
@@ -351,6 +363,8 @@ def _rs_cell(datum: dict[str, Any]) -> str | None:
 
 # The tool description the model sees. Explicit about read-only + qualifying names
 # so the agent uses it correctly (it can't see the guard/IAM, only this text).
+# ``{max_rows}`` is filled from the ENGINE's configured cap so the number the model
+# is told matches the row limit it will actually hit (OKF_CHAT_SQL_MAX_ROWS).
 _RUN_SQL_DESC = (
     "Run a read-only SQL query against the organization's data catalog via Amazon "
     "Athena (Trino SQL) and return the result rows. Use this to answer questions "
@@ -359,13 +373,17 @@ _RUN_SQL_DESC = (
     "read from the wiki first.\n"
     "Rules: exactly ONE statement, SELECT/WITH/SHOW/DESCRIBE/EXPLAIN only (no "
     "INSERT/UPDATE/DELETE/CREATE/DROP). Qualify tables as \"database\".\"table\" "
-    "(the catalog spans many databases). Add your own LIMIT; large results are "
-    "truncated. Ground the query in schema you read from the wiki."
+    "(the catalog spans many databases). Add your own LIMIT: at most {max_rows} "
+    "rows come back, and any beyond that are dropped with `truncated: true` in the "
+    "result — aggregate in SQL instead of paging. Ground the query in schema you "
+    "read from the wiki."
 )
 
 # The Redshift variant: pinned to the @-scoped dataset's database, Postgres-
 # derived dialect, schema-qualified names (a Redshift database holds many
-# schemas — unqualified names resolve via the connection's search_path).
+# schemas — unqualified names resolve via the connection's search_path). NOTE the
+# verb list omits DESCRIBE (Redshift has none) — _REDSHIFT_READ_VERBS keeps the
+# guard's rejection text saying the same thing.
 _RUN_SQL_DESC_REDSHIFT = (
     "Run a read-only SQL query against `{database}` — the Amazon Redshift "
     "database behind this conversation's @-mentioned dataset (amazon-redshift "
@@ -374,10 +392,12 @@ _RUN_SQL_DESC_REDSHIFT = (
     "docs don't state (counts, sums, distinct values, spot-checks) — NOT to "
     "rediscover schema, which you should read from the wiki first.\n"
     "Rules: exactly ONE statement, SELECT/WITH/SHOW/EXPLAIN only (no "
-    "INSERT/UPDATE/DELETE/CREATE/DROP). The connection is pinned to "
-    "`{database}`; qualify tables as \"schema\".\"table\" (the wiki's concept ids "
-    "are already schema-qualified). Add your own LIMIT; large results are "
-    "truncated. Ground the query in schema you read from the wiki."
+    "INSERT/UPDATE/DELETE/CREATE/DROP; Redshift has no DESCRIBE). The connection "
+    "is pinned to `{database}`; qualify tables as \"schema\".\"table\" (the wiki's "
+    "concept ids are already schema-qualified). Add your own LIMIT: at most "
+    "{max_rows} rows come back, and any beyond that are dropped with "
+    "`truncated: true` in the result — aggregate in SQL instead of paging. Ground "
+    "the query in schema you read from the wiki."
 )
 
 

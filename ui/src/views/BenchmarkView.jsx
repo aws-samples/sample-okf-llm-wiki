@@ -248,8 +248,11 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
   }
 
   return (
-    <Card>
-      <CardHeader className="border-b">
+    // Cap the card at the view column's height (natural height below it) and
+    // let ONLY the Reports list scroll: header + question set stay put, so the
+    // min-h-0 shrink chain runs Card → CardContent → reports section → list.
+    <Card className="max-h-full min-h-0">
+      <CardHeader className="shrink-0 border-b">
         <CardTitle className="flex items-center gap-2">
           <GaugeIcon className="size-4" />
           Benchmark Studio
@@ -274,10 +277,10 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
           </Button>
         </div>
       </CardHeader>
-      <CardContent className="flex flex-col gap-6">
+      <CardContent className="flex min-h-0 flex-col gap-6">
         {/* The dataset's standing answer key — lands OFF the okf/ mount so the
             gold stays hidden from every LLM role. */}
-        <div className="flex flex-col gap-2">
+        <div className="flex shrink-0 flex-col gap-2">
           <Label>Question set</Label>
           <p className="text-sm text-muted-foreground">
             A CSV with a <code>question</code> column and one gold column per
@@ -310,8 +313,8 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
         <Separator />
 
         {/* Report history. */}
-        <div className="flex flex-col gap-2">
-          <div className="flex items-baseline justify-between gap-2">
+        <div className="flex min-h-0 flex-col gap-2">
+          <div className="flex shrink-0 items-baseline justify-between gap-2">
             <Label>Reports</Label>
           </div>
           {listError ? (
@@ -331,7 +334,7 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
                 : "No reports yet — upload a question set to run your first benchmark."}
             </p>
           ) : (
-            <div className="flex flex-col gap-2">
+            <div className="okf-thin-scroll flex min-h-0 flex-col gap-2 overflow-y-auto pr-1">
               {reports.map((r) => (
                 <ReportRow
                   key={r.report_id}

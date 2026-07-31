@@ -13,7 +13,6 @@ module load; deepagents/boto3 are pulled in by ``agent.build_harvest_agent`` and
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -27,11 +26,17 @@ from harvest.annotations import (
     resolve_annotation,
     revert_to_open,
 )
-from harvest.code_interpreter import build_sandbox
+from harvest.code_interpreter import sandbox_session
 from harvest.finalize import finalize_bundle, mark_in_progress
 from harvest.fsutil import clean_authored_output, remove_tree, write_text
 from harvest.metadata_export import export_metadata, export_target_metadata
-from harvest.prompts import build_annotation_prompt, build_cross_run_prompt
+from harvest.prompts import (
+    build_annotation_supervisor_prompt,
+    build_annotation_user_prompt,
+    build_cross_run_prompt,
+    build_maintenance_supervisor_prompt,
+    guidance_block,
+)
 
 
 def _prompt_is_gpt(model: str | None) -> bool:
@@ -134,35 +139,14 @@ def _run_agent(agent, prompt: str, config: dict[str, Any], emitter) -> None:
             emitter.emit_subagent_event(chunk)
 
 
-@contextlib.contextmanager
 def _sandbox_for(dataset_root: str | Path):
-    """Yield a started CodeSandbox with .context/ uploaded, or None if unavailable.
+    """A started CodeSandbox with .context/ uploaded, or None if unavailable.
 
-    Owns the sandbox lifecycle for one crawl: start the session, upload the
-    dataset's ``.context/`` docs so the agent's ``run_code`` can read them, and
-    ALWAYS stop the session on exit. Best-effort — a build/start/upload failure
-    degrades the harvest to running WITHOUT the sandbox (yields None) rather than
-    failing it, so the offline path and any CI-unavailable environment still work.
+    The lifecycle contextmanager lives in harvest.code_interpreter
+    (``sandbox_session``) — shared with Benchmark Studio's judge; this wrapper
+    just brands the log lines for the crawl.
     """
-    sandbox = build_sandbox()
-    if sandbox is None:
-        yield None
-        return
-    try:
-        sandbox.start()
-        uploaded = sandbox.upload_context(dataset_root)
-        log.info("Harvest sandbox ready (%d context doc(s) uploaded)", len(uploaded))
-    except Exception:  # noqa: BLE001 - sandbox is an enhancement, never a hard dep
-        log.warning(
-            "Sandbox start/upload failed; running without run_code.", exc_info=True
-        )
-        sandbox.stop()
-        yield None
-        return
-    try:
-        yield sandbox
-    finally:
-        sandbox.stop()
+    return sandbox_session(dataset_root, label="Harvest")
 
 
 def _table_versions(source: Source) -> dict[str, str]:
@@ -182,26 +166,13 @@ def _table_versions(source: Source) -> dict[str, str]:
 
 
 def _guidance_preamble(dataset_guidance: str | None) -> str:
-    """A prompt block carrying the operator's dataset guidance, or "" when none.
+    """The operator-guidance prompt block, or "" when none.
 
-    Framed as authoritative, dataset-specific instructions the author MUST honour
-    — but still subordinate to the live data (guidance is a lead to verify, like a
-    .context/ doc, not a fact to transcribe blindly). Shared by all three run modes
-    so the guidance steers full, incremental, and annotation harvests identically.
+    Thin alias over :func:`harvest.prompts.guidance_block` — the ONE canonical
+    rendering shared by all three run modes (this used to be a second,
+    near-identical copy that was drifting from the annotation mode's).
     """
-    text = (dataset_guidance or "").strip()
-    if not text:
-        return ""
-    return (
-        "## Operator guidance for THIS dataset (authoritative)\n"
-        "The operator provided the following dataset-specific instructions. Treat "
-        "them as high-priority steering for how to author this bundle — what to "
-        "emphasize, decode, exclude, or interpret. They reflect real domain "
-        "knowledge the catalog can't convey. Still verify any factual claim against "
-        "live data (guidance is a lead, not gospel; where the data disagrees, note "
-        "the discrepancy), but follow the operator's intent about focus and framing:\n\n"
-        f"{text}\n\n"
-    )
+    return guidance_block(dataset_guidance)
 
 
 def run_full_harvest(
@@ -302,16 +273,17 @@ def run_full_harvest(
                 "it in the dataset overview and use it to frame table descriptions "
                 "and known issues.\n\n"
             )
+        # Run facts only — the supervisor SYSTEM prompt owns the workflow
+        # (fan-outs, reference ownership, review pass); restating it here drifted
+        # once already (this message used to assign the supervisor work the
+        # system prompt routes to sub-agents).
         prompt = (
             f"{domain_preamble}"
             f"{_guidance_preamble(dataset_guidance)}"
             f"Harvest the Glue database `{dataset}` (data domain `{data_domain}`) into "
             f"a complete OKF bundle. It has {len(tables)} table(s): "
-            f"{', '.join(tables)}.\n\n"
-            f"Plan the work with write_todos, dispatch one `table-author` sub-agent "
-            f"per table, then author the dataset overview, known_issues, joins, and "
-            f"metrics. Validate query patterns with run_sql. Use get_backlinks when "
-            f"you change a referenced doc."
+            f"{', '.join(tables)}. Follow your supervisor workflow end to end, "
+            f"including the review pass."
         )
         # Open the code-execution sandbox for the crawl and upload .context/ docs
         # into it so the agent can extract text from binary formats. Best-effort:
@@ -471,6 +443,13 @@ def run_incremental_harvest(
                 step_emitter=emitter,
                 subagent_config=subagent_model_config,
                 reviewer_config=reviewer_model_config,
+                # Scoped system prompt: the full-harvest supervisor body would
+                # prescribe a per-table fan-out + whole-bundle review, which an
+                # incremental run must NOT do.
+                supervisor_prompt=build_maintenance_supervisor_prompt(
+                    source.prompt_profile,
+                    gpt=_prompt_is_gpt(resolved_config.get("model")),
+                ),
                 **resolved_config,
             )
             config = _invoke_config(recursion_limit, emitter)
@@ -919,17 +898,18 @@ def run_annotation_harvest(
                 exc_info=True,
             )
 
-        prompt = build_annotation_prompt(
+        # Job spec = the annotation SUPERVISOR system prompt; the user message
+        # carries only the run facts. This used to be one combined user prompt,
+        # which shipped the runtime preamble TWICE (the system prompt was the
+        # full-harvest supervisor's) and instructed a scoped-edit run to fan out
+        # per table and review the whole bundle.
+        prompt = build_annotation_user_prompt(
             dataset=dataset,
             annotations=annotations,
             results_rel=ANNOTATION_RESULTS_REL,
             domain_description=domain_description,
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
-            profile=source.prompt_profile,
-            # The annotation job is the SUPERVISOR's user prompt — key the
-            # GPT-family addendum to the supervisor's resolved model.
-            gpt=_prompt_is_gpt(resolved_config.get("model")),
         )
         emitter = _build_emitter(
             data_domain=data_domain, dataset=dataset, session_id=session_id
@@ -942,6 +922,12 @@ def run_annotation_harvest(
                 step_emitter=emitter,
                 subagent_config=subagent_model_config,
                 reviewer_config=reviewer_model_config,
+                supervisor_prompt=build_annotation_supervisor_prompt(
+                    results_rel=ANNOTATION_RESULTS_REL,
+                    profile=source.prompt_profile,
+                    # Keyed to the SUPERVISOR's resolved model.
+                    gpt=_prompt_is_gpt(resolved_config.get("model")),
+                ),
                 **resolved_config,
             )
             config = _invoke_config(recursion_limit, emitter)

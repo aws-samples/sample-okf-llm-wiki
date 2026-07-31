@@ -288,3 +288,59 @@ def test_make_run_code_tool_delegates_to_sandbox():
     assert "/tmp/okf_context/" in tool.description
     assert "markitdown" in tool.description
     assert "network-isolated" in tool.description.lower()
+
+
+# -- sandbox_session (shared lifecycle: harvest crawl + benchmark judge) ------
+
+
+class _FakeLifecycleSandbox:
+    def __init__(self, fail_upload=False):
+        self.started = False
+        self.stopped = False
+        self.uploaded_from = None
+        self._fail_upload = fail_upload
+
+    def start(self):
+        self.started = True
+
+    def upload_context(self, root):
+        if self._fail_upload:
+            raise RuntimeError("upload boom")
+        self.uploaded_from = root
+        return ["spec.pdf"]
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_sandbox_session_starts_uploads_and_always_stops(tmp_path, monkeypatch):
+    import harvest.code_interpreter as ci
+
+    fake = _FakeLifecycleSandbox()
+    monkeypatch.setattr(ci, "build_sandbox", lambda: fake)
+    with ci.sandbox_session(tmp_path, label="Test") as sb:
+        assert sb is fake
+        assert fake.started is True
+        assert fake.uploaded_from == tmp_path
+        assert fake.stopped is False
+    assert fake.stopped is True
+
+
+def test_sandbox_session_yields_none_when_unavailable(monkeypatch):
+    import harvest.code_interpreter as ci
+
+    monkeypatch.setattr(ci, "build_sandbox", lambda: None)
+    with ci.sandbox_session("/nowhere") as sb:
+        assert sb is None
+
+
+def test_sandbox_session_degrades_and_cleans_up_on_upload_failure(
+    tmp_path, monkeypatch
+):
+    import harvest.code_interpreter as ci
+
+    bad = _FakeLifecycleSandbox(fail_upload=True)
+    monkeypatch.setattr(ci, "build_sandbox", lambda: bad)
+    with ci.sandbox_session(tmp_path) as sb:
+        assert sb is None  # caller degrades to no run_code
+    assert bad.stopped is True  # the failed session was still closed

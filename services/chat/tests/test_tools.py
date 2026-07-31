@@ -100,6 +100,23 @@ def test_scoped_tool_description_lifted_from_method_docstring():
     assert "concept" in tools["read_page"].description.lower()
 
 
+def test_descriptions_are_cleandoc_normalized_markdown():
+    """A docstring's continuation indent and RST double-backticks are tokens the
+    model pays for on EVERY request and learns nothing from. Descriptions must be
+    cleandoc'd (no leading whitespace on continuation lines) and use Markdown
+    single backticks.
+    """
+    for tool in make_agent_tools(FakeConsumptionTools()):
+        desc = tool.description
+        assert "``" not in desc, f"{tool.name} still has RST double-backticks"
+        for line in desc.splitlines():
+            # Indented lines are legitimate INSIDE a doc (bullet continuations,
+            # literal blocks); what must be gone is the uniform docstring indent,
+            # i.e. every non-blank line after the first being indented.
+            assert not line.startswith(" " * 8), f"{tool.name}: 8-space indent kept"
+        assert desc == desc.strip()
+
+
 # --- tool errors come back as a RESULT, not a crash --------------------------
 
 
@@ -198,6 +215,31 @@ def test_submit_annotation_defaults_to_dataset_wide_sentinel():
     err = _json.loads(tool.func(note="x", concept_id="bad##id"))
     assert "invalid concept_id" in err["error"]
     assert len(table.items) == 1
+
+
+def test_submit_annotation_description_is_cleandoc_and_explains_extra_args():
+    from chat.tools import make_submit_annotation_tool
+
+    table = _FakeTable()
+    scoped = make_submit_annotation_tool(
+        table, dataset_scope={"data_domain": "sales", "dataset": "orders"},
+        user_sub="s",
+    )
+    unscoped = make_submit_annotation_tool(table, user_sub="s")
+    # cleandoc'd: no 8-space continuation indent from the nested triple-quote.
+    for tool in (scoped, unscoped):
+        assert not any(
+            line.startswith(" " * 8) for line in tool.description.splitlines()
+        )
+    # The UNSCOPED variant takes two more args, so it must explain them — this is
+    # the only place data_domain/dataset are documented for the model.
+    assert "data_domain" not in scoped.description
+    assert "`data_domain`/`dataset` name the dataset" in unscoped.description
+    assert "list_domains" in unscoped.description
+    # Both keep the shared body (confirm-first + the concept_id semantics).
+    for tool in (scoped, unscoped):
+        assert "ALWAYS confirm" in tool.description
+        assert "`concept_id` targets one" in tool.description
 
 
 def test_submit_annotation_unscoped_takes_dataset_args():

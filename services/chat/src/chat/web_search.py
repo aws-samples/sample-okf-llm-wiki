@@ -425,7 +425,7 @@ _WEB_SEARCH_DESC = (
     'steel tariffs Q2 2026") and check each result\'s publication date before '
     "treating it as evidence for that period.\n"
     "Every result you rely on must be attributed with its URL inside a citation "
-    'tag — <cite src="https://…"></cite> — the same tag wiki docs use; put every '
+    'tag — <c src="https://…"></c> — the same tag wiki docs use; put every '
     "source for one claim in ONE tag, comma-separated. Treat snippets as claims by "
     "their source, not as facts: say who reported what, and never present a web "
     "figure as if it came from this organization's data."

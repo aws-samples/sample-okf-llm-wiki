@@ -735,7 +735,16 @@ their ruling through a tool call (``submit_verdict`` / the reviewer's
 ``submit_review`` — args are the output, structured by construction, no fence
 parsing), and a ``SubmitToolNudgeMiddleware`` steers a hat that tries to
 finish without submitting — at most twice, then the unparseable-output path
-rules the case a fail with ``judge_error`` set.
+rules the case a fail with ``judge_error`` set. The judge hats see
+everything the solver can't: their file tools are rooted at the JUDGE tree
+(wiki docs + `.metadata/` + `.context/` + the `.traces/` solve traces), and
+when that tree carries `.context/` files the run also opens a Code
+Interpreter sandbox session (`harvest/code_interpreter.py sandbox_session` —
+the same `OKF_CODE_INTERPRETER_ID` interpreter the harvester uses) and hands
+the hats `run_code`, so binary context uploads (PDF/DOCX/PPTX/XLSX) that
+`read_file` only base64-encodes stay readable evidence. Best-effort like the
+harvest's: no interpreter configured, or a start/upload failure, just means
+the judge reads text context only.
 
 **Report artifacts (off-mount, human-facing).** The run persists
 `benchmark/<d>/<ds>/reports/<report_id>/report.json` — config recap, per-check

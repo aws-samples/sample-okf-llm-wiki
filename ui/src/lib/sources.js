@@ -4,20 +4,49 @@
 // citation UI:
 //   - a WIKI DOC, identified by its concept id (`tables/races`);
 //   - a WEB PAGE, identified by its URL (from the web_search tool).
-// The agent cites both with `<cite src="…">`; everything below is what lets one
-// badge describe a mixed set of them.
+// The agent cites both with `<c src="…"></c>` (legacy history: `<cite …>`);
+// everything below is what lets one badge describe a mixed set of them.
 
 // A concept id: one of the OKF bundle's top-level dirs followed by 1+ slash-
 // joined segments (mirrors okf_core.paths). Used to tell an id from a URL.
+// `external/` is a citable top dir too (cross-dataset pair docs).
 const CONCEPT_ID_RE =
-  /^(datasets|tables|references)\/[A-Za-z0-9_][A-Za-z0-9_.-]*(\/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$/
+  /^(datasets|tables|references|external)\/[A-Za-z0-9_][A-Za-z0-9_.-]*(\/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$/
+
+// A FULLY-QUALIFIED wiki source: `<data_domain>/<dataset>/<concept id>` — the
+// form the agent is prompted to cite (and the shape of a semantic_search vector
+// key). Groups: 1 = domain, 2 = dataset, 3 = the concept id.
+const QUALIFIED_ID_RE =
+  /^([A-Za-z0-9_][A-Za-z0-9_.-]*)\/([A-Za-z0-9_][A-Za-z0-9_.-]*)\/((?:datasets|tables|references|external)\/[A-Za-z0-9_][A-Za-z0-9_.-]*(?:\/[A-Za-z0-9_][A-Za-z0-9_.-]*)*)$/
 
 export function isWebSource(item) {
   return typeof item === "string" && /^https?:\/\//i.test(item)
 }
 
+// Decompose a wiki source into its parts, or null when it isn't one.
+// A BARE id (`tables/races` — old history, or a model slip) has no location:
+// `{conceptId, dataDomain: null, dataset: null}`. A QUALIFIED id
+// (`bird/formula_1/tables/races`) carries its own. Bare is checked FIRST so a
+// deep bare id (`references/known_issues/tables/x`) is never misread as a
+// qualified one whose domain happens to be named like a top-level dir.
+export function parseWikiSource(item) {
+  if (typeof item !== "string") return null
+  if (CONCEPT_ID_RE.test(item))
+    return { conceptId: item, dataDomain: null, dataset: null }
+  const m = QUALIFIED_ID_RE.exec(item)
+  if (m) return { conceptId: m[3], dataDomain: m[1], dataset: m[2] }
+  return null
+}
+
 export function isConceptId(item) {
-  return typeof item === "string" && CONCEPT_ID_RE.test(item)
+  return parseWikiSource(item) !== null
+}
+
+// The bare concept id of a wiki source, qualified or not — what glyphs, kind
+// labels, and doc-peek lookups key on. Non-wiki items pass through unchanged.
+export function conceptIdOf(item) {
+  const wiki = parseWikiSource(item)
+  return wiki ? wiki.conceptId : String(item ?? "")
 }
 
 // The display host of a URL ("reuters.com"), or "" when it won't parse.
@@ -41,7 +70,7 @@ export function faviconUrl(url) {
   return host ? `https://${host}/favicon.ico` : ""
 }
 
-// Split a `<cite src="…">` value into individual sources.
+// Split a `<c src="…">` (or legacy `<cite src="…">`) value into individual sources.
 //
 // Comma-separated, but a URL may legally CONTAIN a comma — so after splitting we
 // re-join any fragment that is neither a URL nor a concept id back onto the
@@ -108,20 +137,32 @@ export function collectWebSources(events) {
 }
 
 // Build a concept-id → {data_domain, dataset} index from the conversation's
-// wiki tool traffic, so a cited doc can be OPENED (the chat's doc-peek panel)
-// even in an unscoped conversation, where the concept id alone doesn't name its
-// bundle. Two feeds:
+// wiki tool traffic, so a cited BARE concept id can still be OPENED (the chat's
+// doc-peek panel) in an unscoped conversation. New citations are fully
+// qualified and don't need this; it's the fallback for stored history and model
+// slips. The agent may cite any doc a tool SHOWED it — not just ones it
+// read_page'd — so every feed that names concept ids contributes:
 //   - tool CALL args carrying {data_domain, dataset, concept_id} (read_page /
 //     get_backlinks — for scoped conversations the server folds the scope into
 //     the args, so the event always shows the resolved location);
+//   - read_page / glob / grep RESULTS, which echo their location;
+//   - get_backlinks RESULTS ({id, …} — located via their own call's args);
 //   - semantic_search RESULTS, whose `concept_id` is the full vector key
 //     `<domain>/<dataset>/<concept path>`.
 // First writer wins, so a doc read twice keeps its first (authoritative)
-// location. Includes external/ pair docs (citable, but not in CONCEPT_ID_RE).
+// location. Includes external/ pair docs.
 const WIKI_TOP_RE = /^(datasets|tables|references|external)\//
 
 export function collectWikiSources(events) {
   const index = new Map()
+  const add = (cid, dd, ds) => {
+    if (typeof cid !== "string" || !WIKI_TOP_RE.test(cid)) return
+    if (!dd || !ds || index.has(cid)) return
+    index.set(cid, { data_domain: String(dd), dataset: String(ds) })
+  }
+  // Each call's location by tool-call id, so results that name concept ids
+  // WITHOUT one (get_backlinks) inherit it. Starts stream before results.
+  const callLoc = new Map()
   for (const ev of events || []) {
     if (ev.type !== "tool") continue
     const content = coerce(ev.content)
@@ -129,29 +170,35 @@ export function collectWikiSources(events) {
       if (!content || typeof content !== "object") continue
       const dd = content.data_domain
       const ds = content.dataset
-      const cid = content.concept_id
-      if (
-        dd &&
-        ds &&
-        typeof cid === "string" &&
-        WIKI_TOP_RE.test(cid) &&
-        !index.has(cid)
-      ) {
-        index.set(cid, { data_domain: String(dd), dataset: String(ds) })
-      }
+      if (!dd || !ds) continue
+      if (ev.id) callLoc.set(ev.id, { dd, ds })
+      add(content.concept_id, dd, ds)
       continue
     }
-    if (ev.tool_name !== "semantic_search") continue
-    const results = Array.isArray(content)
-      ? content
-      : Array.isArray(content?.results)
-        ? content.results
-        : []
-    for (const r of results) {
-      const key = typeof r?.concept_id === "string" ? r.concept_id : ""
-      const m = /^([^/]+)\/([^/]+)\/(.+)$/.exec(key)
-      if (m && WIKI_TOP_RE.test(m[3]) && !index.has(m[3])) {
-        index.set(m[3], { data_domain: m[1], dataset: m[2] })
+    if (ev.tool_name === "read_page") {
+      if (content && typeof content === "object")
+        add(content.concept_id, content.data_domain, content.dataset)
+    } else if (ev.tool_name === "glob") {
+      if (Array.isArray(content))
+        for (const r of content) add(r?.concept_id, r?.data_domain, r?.dataset)
+    } else if (ev.tool_name === "grep") {
+      const matches = Array.isArray(content?.matches) ? content.matches : []
+      for (const r of matches)
+        add(r?.concept_id, content.data_domain, content.dataset)
+    } else if (ev.tool_name === "get_backlinks") {
+      const loc = callLoc.get(ev.id)
+      if (loc && Array.isArray(content))
+        for (const r of content) add(r?.id, loc.dd, loc.ds)
+    } else if (ev.tool_name === "semantic_search") {
+      const results = Array.isArray(content)
+        ? content
+        : Array.isArray(content?.results)
+          ? content.results
+          : []
+      for (const r of results) {
+        const key = typeof r?.concept_id === "string" ? r.concept_id : ""
+        const m = /^([^/]+)\/([^/]+)\/(.+)$/.exec(key)
+        if (m) add(m[3], m[1], m[2])
       }
     }
   }

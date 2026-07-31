@@ -27,7 +27,7 @@ the same protocol, so no per-row signal leaks.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from okf_core.benchmark_questions import (
     CHECK_BEHAVIOR,
@@ -37,6 +37,23 @@ from okf_core.benchmark_questions import (
 
 from harvest.benchmark.extract import extract_sql, extract_text
 from harvest.benchmark.grader import Grader, QuestionResult
+from harvest.glue_source import GlueAthenaSource
+
+# The SQL-writing solver prompts carry the source's dialect (same ⟪…⟫ token
+# scheme as harvest.prompts._fill): Benchmark Studio has no source-type gate,
+# so a Redshift dataset can be benchmarked — a solver told to write Athena/Trino
+# against a Redshift grader would be mis-measured. The module constants below
+# are the GLUE build (back-compat); solver_protocol fills the run's real
+# dialect from source.prompt_profile.
+_DIALECT_TOKEN = "⟪DIALECT⟫"
+_GLUE_DIALECT = GlueAthenaSource.prompt_profile.dialect
+
+
+def _fill_dialect(text: str, dialect: str) -> str:
+    filled = text.replace(_DIALECT_TOKEN, dialect)
+    if "⟪" in filled:
+        raise ValueError(f"unfilled prompt token in: {filled[:200]}")
+    return filled
 
 # The shared wiki-exploration preamble every check's solver gets: the solver is
 # the simulated consumer, and its ONLY knowledge source is the wiki.
@@ -62,10 +79,10 @@ values / units / filters the docs call out (e.g. "status is an int code, \
 1=active", "revenue excludes refunds").
 """
 
-SQL_SOLVER_PROMPT = (
+_SQL_SOLVER_PROMPT_TMPL = (
     _WIKI_PREAMBLE
     + """\
-4. Write ONE Athena/Trino SQL query that answers the question, using the exact \
+4. Write ONE ⟪DIALECT⟫ SQL query that answers the question, using the exact \
 names and semantics the docs specify.
 
 When you have the answer, output the final query as a single fenced SQL block:
@@ -74,6 +91,8 @@ SELECT ...
 ```
 Output nothing after the block."""
 )
+
+SQL_SOLVER_PROMPT = _fill_dialect(_SQL_SOLVER_PROMPT_TMPL, _GLUE_DIALECT)
 
 # The Behavior solver is the closest simulation of a REAL wiki consumer, so its
 # prompt carries what a production agent would know: the wiki's structure and
@@ -91,12 +110,12 @@ CANNOT query the database, see its raw schema, or sample data. This mirrors a \
 real agent serving users with only the wiki to go on.
 """
 
-_BEHAVIOR_INTRO_LIVE_SQL = """\
+_BEHAVIOR_INTRO_LIVE_SQL_TMPL = """\
 You are a data agent handling ONE user request about a dataset. Your GUIDANCE \
 comes from the dataset's data wiki — authored markdown docs about the data — \
 explored with read-only tools (`read_file`, `glob`, `grep`, `ls`), plus \
 `read_me` (a short usage primer). You also have `run_sql` — read-only \
-Athena/Trino SQL against the LIVE dataset — to execute what the wiki led you \
+⟪DIALECT⟫ SQL against the LIVE dataset — to execute what the wiki led you \
 to and to check facts. This mirrors a real agent serving users with the wiki \
 plus query access. The wiki LEADS and SQL verifies: take table names, join \
 keys, coded values, filters, and policies from the docs, and honor the wiki's \
@@ -130,11 +149,25 @@ columns, values, or numbers.
 4. Honor any policies, usage caveats, or restrictions the wiki states, even \
 when the request pushes against them.
 
+Asking the user: you also have `ask_human(questions)` — the escalation path a \
+production agent has. When the request genuinely cannot be answered safely \
+without the user's input — a required dimension (period, region, grain, scope) \
+is missing, a term resolves to more than one documented thing, or the wiki's \
+guardrails direct agents to ASK for this kind of request — call it with your \
+specific question(s) instead of answering. Calling it ENDS the run: there is \
+no user here to reply, and the ask itself is recorded as your final answer. \
+Ask only when the docs cannot settle the reading — never to avoid the reading, \
+and never when the wiki supports a direct answer.
+
 Your FINAL message is your complete answer to the user — everything before it \
-is working. Make it self-contained and honest about any limits."""
+is working (unless you end the run with `ask_human`, which IS the answer). \
+Make it self-contained and honest about any limits."""
 
 BEHAVIOR_SOLVER_PROMPT = _BEHAVIOR_INTRO_WIKI_ONLY + _BEHAVIOR_BODY
-BEHAVIOR_SOLVER_PROMPT_LIVE_SQL = _BEHAVIOR_INTRO_LIVE_SQL + _BEHAVIOR_BODY
+_BEHAVIOR_SOLVER_LIVE_SQL_TMPL = _BEHAVIOR_INTRO_LIVE_SQL_TMPL + _BEHAVIOR_BODY
+BEHAVIOR_SOLVER_PROMPT_LIVE_SQL = _fill_dialect(
+    _BEHAVIOR_SOLVER_LIVE_SQL_TMPL, _GLUE_DIALECT
+)
 
 @dataclass(frozen=True)
 class CheckSpec:
@@ -175,20 +208,47 @@ CHECK_SPECS: dict[str, CheckSpec] = {
 }
 
 
+class SolverProtocol(NamedTuple):
+    """One run's resolved solver protocol: the prompt and its tool grants.
+
+    The prompt and the grants travel TOGETHER (the module invariant): a solver
+    is never told about a tool it doesn't hold, or handed one its prompt
+    disclaims. ``wants_ask`` grants the terminal ``ask_human`` escalation tool
+    — Behavior only, on every question uniformly (gold-blind), so "should ask
+    for clarification" expectations become a clear-cut structural outcome (the
+    tool CALL) instead of judge-interpreted prose. SQL EX never gets it: its
+    contract is one fenced query, and asking is not a gradable SQL outcome.
+    """
+
+    prompt: str
+    wants_sql: bool
+    wants_ask: bool
+
+
 def solver_protocol(
-    spec: CheckSpec, *, behavior_live_sql: bool = False
-) -> tuple[str, bool]:
-    """Resolve a run's solver protocol for ``spec``: ``(system_prompt, wants_sql)``.
+    spec: CheckSpec, *, behavior_live_sql: bool = False, dialect: str | None = None
+) -> SolverProtocol:
+    """Resolve a run's solver protocol for ``spec`` (see :class:`SolverProtocol`).
 
     ``behavior_live_sql`` is the run-config toggle: True gives the BEHAVIOR
     solver the live-SQL prompt (and tells the caller to hand it the ``run_sql``
     tool). It NEVER applies to the SQL EX check — its solver stays data-blind
     by design (live queries would let it iterate empirically to the answer,
     measuring persistence instead of the wiki), whatever the flag says.
+
+    ``dialect`` is the run's SQL dialect (``source.prompt_profile.dialect``) —
+    the SQL-writing prompts name it so a Redshift dataset's solver is never
+    told to write Athena/Trino. None defaults to the Glue dialect (back-compat
+    for the module constants and legacy callers).
     """
+    d = dialect or _GLUE_DIALECT
     if spec.check == CHECK_BEHAVIOR and behavior_live_sql:
-        return BEHAVIOR_SOLVER_PROMPT_LIVE_SQL, True
-    return spec.solver_prompt, False
+        return SolverProtocol(
+            _fill_dialect(_BEHAVIOR_SOLVER_LIVE_SQL_TMPL, d), True, True
+        )
+    if spec.check == CHECK_SQL:
+        return SolverProtocol(_fill_dialect(_SQL_SOLVER_PROMPT_TMPL, d), False, False)
+    return SolverProtocol(spec.solver_prompt, False, spec.check == CHECK_BEHAVIOR)
 
 
 def make_grade_fn(

@@ -221,31 +221,35 @@ class ConsumptionTools:
     # -- list_domains ----------------------------------------------------
 
     def list_domains(self) -> list[dict[str, Any]]:
-        """Registered ``(data_domain, dataset)`` pairs from ``okf-registry``.
+        """Every ``(data_domain, dataset)`` pair you can read.
 
-        Domain mapping items are ``pk="DOMAIN#<data_domain>",
-        sk="DATASET#<dataset>"`` (docs/CONVENTIONS.md). We query ``pk
-        begins_with "DOMAIN#"``; the boto3 resource ``Table`` does not support a
-        begins_with on the *partition* key, so we use a ``scan`` with a filter
-        (fine at demo scale) — the registry is tiny.
-
-        Filters out the ``_domain`` pseudo-dataset (the domain's concept doc) and
-        enriches each result with the declared domain's description (if available)
-        plus the CROSS-DATASET reference signal (below).
-
-        **Cross-dataset references.** Pair docs authored by a cross harvest live
-        in ONE bundle (the initiating dataset's, under
-        ``external/<other_domain>/<other_dataset>/``), so a consumer scoped to
-        the OTHER side would never see them by browsing. The reindex worker
-        derives ``XREF#`` rows from the bundle's object events (see
-        docs/CONVENTIONS.md), and they sit on the same ``DOMAIN#`` partitions
-        this scan already reads — so both directions are surfaced here for free:
+        Each carries its domain's description plus its CROSS-DATASET reference
+        signal:
 
         * ``cross_references`` — datasets this one holds pair docs FOR (read them
           under this dataset's ``external/<d>/<ds>/``).
         * ``cross_referenced_by`` — datasets whose bundle holds pair docs about
           THIS one (read them under ``<that dataset>/external/<this>/…``).
+
+        Start here to find out what exists before drilling into a dataset.
         """
+        # Implementation notes (deliberately not in the model-facing docstring):
+        #
+        # Domain mapping items are pk="DOMAIN#<data_domain>", sk="DATASET#<dataset>"
+        # (docs/CONVENTIONS.md). We want pk begins_with "DOMAIN#", but the boto3
+        # resource `Table` does not support begins_with on the PARTITION key, so we
+        # scan with a filter — fine at demo scale, the registry is tiny.
+        #
+        # The `_domain` pseudo-dataset (the domain's own concept doc) is filtered
+        # out of the listing.
+        #
+        # Cross-dataset references: pair docs authored by a cross harvest live in
+        # ONE bundle (the initiating dataset's, under
+        # external/<other_domain>/<other_dataset>/), so a consumer scoped to the
+        # OTHER side would never see them by browsing. The reindex worker derives
+        # XREF# rows from the bundle's object events (see docs/CONVENTIONS.md), and
+        # they sit on the same DOMAIN# partitions this scan already reads — so both
+        # directions are surfaced here for free.
         from boto3.dynamodb.conditions import Attr
 
         mappings: list[dict[str, Any]] = []
@@ -312,11 +316,12 @@ class ConsumptionTools:
     # -- list_declared_domains ----------------------------------------------
 
     def list_declared_domains(self) -> list[dict[str, Any]]:
-        """Return all declared domains (DOMAIN#/META rows) with description + context.
+        """Every declared data domain with its description and context.
 
-        Exposes the operator-declared domain catalog so an agent can discover
-        which domains exist and what they cover before drilling into datasets.
+        The operator-declared domain catalog: use it to see which domains exist
+        and what they cover before drilling into their datasets.
         """
+        # Reads the DOMAIN#<domain> / sk="META" rows (docs/CONVENTIONS.md).
         from boto3.dynamodb.conditions import Attr
 
         out: list[dict[str, Any]] = []
@@ -346,10 +351,10 @@ class ConsumptionTools:
     def search_domains(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
         """Semantic search over declared domain descriptions/context.
 
-        Wraps :meth:`semantic_search` with ``type="Domain"`` so the agent can
-        discover which domain best matches a natural-language question before
-        drilling into its datasets. Returns the same shape as ``semantic_search``.
+        Finds which domain best matches a natural-language question, before you
+        drill into its datasets. Same result shape as ``semantic_search``.
         """
+        # Just semantic_search pinned to type="Domain".
         return self.semantic_search(query, type=DOMAIN_DOC_TYPE, top_k=top_k)
 
     # -- list_directory --------------------------------------------------
@@ -434,13 +439,15 @@ class ConsumptionTools:
         offset: int = 0,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        """Return a concept's markdown from S3, optionally paginated by lines.
+        """Return a concept's markdown, optionally paginated by lines.
 
-        ``offset``/``limit`` are line-based (0-indexed offset) so an agent can
-        page through a very large table doc without pulling it all into context
-        at once. Validates the resolved key stays under the dataset bundle
-        prefix (path-traversal guard).
+        ``offset`` (0-indexed) and ``limit`` are LINE-based, so a very large table
+        doc can be read a page at a time instead of all at once. The response's
+        ``total_lines`` vs ``returned_lines`` tell you whether more remains: page
+        again from ``offset + returned_lines``.
         """
+        # The concept_id is validated and the resolved key checked to stay under
+        # the dataset bundle prefix (path-traversal guard).
         if offset < 0:
             raise ValueError("offset must be >= 0")
         prefix = bundle_prefix(data_domain, dataset)
@@ -486,14 +493,16 @@ class ConsumptionTools:
     ) -> list[dict[str, str]]:
         """Concepts in the dataset subtree that link *to* ``concept_id``.
 
-        Reuses ``okf_core.links.extract_links_with_headings`` (the same link
-        resolver the harvest agent uses) so consumption and authoring agree on
-        what counts as a backlink. We download the dataset subtree's ``.md``
-        files into a temp dir, then resolve each doc's links relative to the
-        bundle root; any doc whose resolved links include ``concept_id`` is a
-        backlink. The heading is the section in the *referencing* doc where the
-        link sits, so the agent knows where the reference lives.
+        The fastest route from a concept to everything that references it. Each
+        result names the referencing page (``id`` + ``title``) AND the ``heading``
+        — the section of that page where the link sits — so you know where the
+        reference lives before reading it.
         """
+        # Reuses okf_core.links.extract_links_with_headings (the same link resolver
+        # the harvest agent uses) so consumption and authoring agree on what counts
+        # as a backlink. We download the dataset subtree's .md files into a temp
+        # dir, then resolve each doc's links relative to the bundle root; any doc
+        # whose resolved links include concept_id is a backlink.
         prefix = bundle_prefix(data_domain, dataset)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -586,8 +595,9 @@ class ConsumptionTools:
         - ``*``           -> top-level concepts only
 
         Reserved (index.md/log.md) and dot-prefixed (.harvest/.context) paths are
-        never matched — same scope as ``get_backlinks``. Results are sorted.
+        never matched. Results are sorted.
         """
+        # Visibility scope is _iter_concepts' — the same one get_backlinks uses.
         prefix = bundle_prefix(data_domain, dataset)
         # Normalise the pattern the same way concept ids are (strip wrapping
         # slashes) so a leading "/" or ".md" suffix in the pattern still matches.
@@ -624,6 +634,9 @@ class ConsumptionTools:
         by concept id then line number) and the response flags whether the cap was
         hit so the agent can narrow the query. Use this for exact tokens (a column
         name, an enum value, a table name); use ``semantic_search`` for meaning.
+
+        Two patterns are REJECTED with an error rather than run: one over 1000
+        characters, and one that nests quantifiers (e.g. ``(a+)+``) — simplify it.
         """
         if max_results <= 0:
             raise ValueError("max_results must be >= 1")
@@ -680,19 +693,32 @@ class ConsumptionTools:
         tags: list[str] | None = None,
         top_k: int = 10,
     ) -> list[dict[str, Any]]:
-        """Embed ``query`` (Titan V2) and query S3 Vectors with a hierarchy filter.
+        """Find concepts by MEANING (embedding search), then ``read_page`` the hits.
 
-        Returns candidate concepts ranked by cosine distance. Each result is the
-        vector's key (which is the deterministic concept path = ``<domain>/
-        <dataset>/<concept_id>``) plus the non-filterable metadata the reindex
-        worker stored: ``title``, ``description``, ``s3_key``. The agent then
-        ``read_page``s the ones it wants — we never stuff bulk markdown into the
-        vector store.
+        Returns candidates ranked by cosine distance: each is the concept path
+        ``<domain>/<dataset>/<concept_id>`` plus its ``title``, ``description``,
+        and ``s3_key`` — never the doc body, so read the ones you want.
 
-        ``top_k`` is clamped server-side to ``[1, _SEMANTIC_TOP_K_MAX]`` so a
-        client can't drive an oversized fan-out (each call is a Titan V2 embed +
-        an S3 Vectors query — a cost/throttle DoS lever, threat #13).
+        ``data_domain``/``dataset``/``table`` narrow the search to one part of the
+        hierarchy. ``type`` is an EXACT match on the doc's frontmatter type — a
+        value outside this vocabulary silently returns NOTHING, so omit it unless
+        you mean it: ``Glue Table``, ``Glue Database``, ``Redshift Table``,
+        ``Redshift External Table``, ``Redshift Database``, ``Reference``,
+        ``Cross-Dataset Reference``, ``Playbook``, ``Domain``. ``tags`` matches a
+        doc carrying ANY of the given tags. ``top_k`` is capped server-side at 20.
         """
+        # The `type` vocabulary in the docstring is the set of frontmatter types
+        # that actually reach the vector index: the runtime-pinned concept types
+        # (okf_core.concept_types — Glue*/Redshift*/Cross-Dataset Reference), the
+        # `Reference` docs the harvest prompts pin, `Domain` (okf_core.domain
+        # DOMAIN_DOC_TYPE), and `Playbook` from the okf-authoring type vocabulary
+        # (skills/okf-authoring/SKILL.md). Keep it in sync with those. NOT listed:
+        # `Index` — index.md is a RESERVED file that reindex never embeds, so
+        # filtering on it can only ever return nothing.
+        #
+        # top_k is clamped to [1, _SEMANTIC_TOP_K_MAX] so a client can't drive an
+        # oversized fan-out (each call is a Titan V2 embed + an S3 Vectors query —
+        # a cost/throttle DoS lever, threat #13).
         top_k = max(1, min(int(top_k), _SEMANTIC_TOP_K_MAX))
         embedding = embed_text(self.bedrock_runtime, query)
         metadata_filter = build_hierarchy_filter(
@@ -736,22 +762,17 @@ class ConsumptionTools:
     ) -> dict[str, Any]:
         """What changed between two published versions of this dataset's docs.
 
-        DELIBERATELY NOT exposed over the MCP server (no wrapper in
-        server.register_tools): version history is an operator concern, so only
-        the built-in chat agent gets this tool (chat/tools.py _TOOL_NAMES) —
-        external MCP agents see the published bundle only.
-
-        A *version* is one completed harvest (or repromote) of the dataset —
-        identified by an opaque ``version_id``. Both selectors are optional:
-        omitted, the diff answers "what changed in the last harvest" (previous
-        version -> current). Pass version ids from the ``versions`` list this
-        tool returns (newest first, so you can self-serve identifiers without a
-        second call), or ``to_version="live"`` to compare against the current
-        working files. Returns per-file unified diffs with ``summary`` counts;
-        output is bounded — ``max_files`` entries (server cap 50, ``truncated``
-        flag set beyond: narrow with explicit versions) and 100 diff lines per
-        file (``diff_truncated``).
+        A version is one completed harvest. Returns per-file unified diffs plus
+        ``summary`` counts. BOTH selectors are optional — omitted, you get the last harvest (previous
+        -> current). Use ids from the returned ``versions`` list (newest first), or
+        ``to_version="live"`` for the current working files. Bounded:
+        ``max_files`` entries, capped at 50, sets ``truncated``; each diff is
+        capped at 100 lines and sets ``diff_truncated``.
         """
+        # DELIBERATELY NOT exposed over the MCP server (no wrapper in
+        # server.register_tools): version history is an operator concern, so only
+        # the built-in chat agent gets this tool (chat/tools.py _TOOL_NAMES) —
+        # external MCP agents see the published bundle only.
         from okf_aws import s3_versions
 
         max_files = max(1, min(int(max_files), _DIFF_MAX_FILES_CAP))

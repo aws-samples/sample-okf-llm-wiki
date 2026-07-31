@@ -136,17 +136,22 @@ leading bold word is a convention, not a requirement.
 ## Citations
 
 Claims sourced from external material SHOULD be listed under a bottom `# Citations`
-heading, numbered:
+heading, numbered. Cite ONLY sources you actually read in this authoring run —
+typically the concept's own source `resource` identifier and any provided context
+documents:
 
 ```markdown
 # Citations
 
-[1] [Source Title](https://example.com/...)
-[2] [Another Source](https://example.com/...)
+[1] arn:aws:glue:us-east-1:123456789012:table/sales/orders (source table)
+[2] `.context/data_dictionary.xlsx` — provided data dictionary
 ```
 
-Citation links MAY be absolute URLs, bundle-relative paths, or paths into a
-`references/` subdirectory that mirrors external material as OKF concepts.
+Citation links MAY be bundle-relative paths, source resource identifiers, or
+provided-document paths. Never cite a URL you could not open from this runtime
+(public datasets, docs sites, blogs, repositories) and never attribute a schema
+to an external origin from prior knowledge — an omitted citation is better than
+a fabricated one.
 
 ## Conformance (§9)
 

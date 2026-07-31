@@ -964,6 +964,24 @@ function Console({ auth, api }) {
                     })
                   }
                 />
+              ) : section === "benchmark" ? (
+                // Benchmark gets its own full-height column (not the shared
+                // scrolling one) so the card can cap at the viewport and scroll
+                // only its Reports list — the header and question-set status
+                // stay visible however long the report history grows.
+                <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col p-1">
+                  <BenchmarkView
+                    api={api}
+                    selection={selection}
+                    onOpenReport={(id) =>
+                      push({
+                        section: "benchmark",
+                        selectionKey,
+                        concept: id,
+                      })
+                    }
+                  />
+                </div>
               ) : (
                 // p-1 gives the cards' ring/shadow room so the vertical scroll
                 // container doesn't clip them — including the first card's top edge,
@@ -983,19 +1001,6 @@ function Console({ auth, api }) {
                       api={api}
                       selection={selection}
                       datasets={datasets}
-                    />
-                  )}
-                  {section === "benchmark" && (
-                    <BenchmarkView
-                      api={api}
-                      selection={selection}
-                      onOpenReport={(id) =>
-                        push({
-                          section: "benchmark",
-                          selectionKey,
-                          concept: id,
-                        })
-                      }
                     />
                   )}
                   {section === "credentials" && (
