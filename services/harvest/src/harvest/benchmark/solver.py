@@ -115,7 +115,17 @@ def make_solver(
             else:
                 error = f"{type(e).__name__}: {e}"
         wall_ms = int((time.monotonic() - started) * 1000)
-        prediction = "" if error else parse(_last_ai_text(messages) if messages else "")
+        if error:
+            prediction = ""
+        else:
+            # An ask_human call is the run's outcome, structurally — it wins
+            # over whatever text follows (see _extract_ask).
+            asked = _extract_ask(messages)
+            prediction = (
+                render_ask(asked)
+                if asked is not None
+                else parse(_last_ai_text(messages) if messages else "")
+            )
         # Capture BEFORE emitting so a trace exists even for a run that errored (the
         # error itself is the most useful thing to show). Never let it break a solve.
         try:
@@ -158,6 +168,81 @@ def fold_usage(messages: list) -> dict:
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
     }
+
+
+# The canonical rendering of an ask-ended run: the prediction the judge grades
+# and the report shows. The PREFIX is a stable sentinel (the judge prompt names
+# it), followed by the numbered questions.
+ASKED_PREFIX = "[The agent ended the run by asking the user for clarification]"
+
+
+def render_ask(questions: list[str]) -> str:
+    """Render an ask-ended run's questions as the canonical prediction string."""
+    lines = [ASKED_PREFIX]
+    if questions:
+        lines.extend(f"{i}. {q}" for i, q in enumerate(questions, 1))
+    else:
+        lines.append("(no questions given)")
+    return "\n".join(lines)
+
+
+def _extract_ask(messages: list) -> list[str] | None:
+    """The questions from the run's LAST ``ask_human`` call, or None.
+
+    STRUCTURAL: the tool CALL is the ask signal — authoritative over any prose
+    the model emits after it, so a solver that asks and then rambles is still
+    recorded as having asked (the same principle as the judge's submit tools).
+    Only the Behavior protocol holds the tool, so other checks never match.
+    """
+    for msg in reversed(messages or []):
+        for tc in getattr(msg, "tool_calls", None) or []:
+            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
+            if name != "ask_human":
+                continue
+            args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+            qs = args.get("questions") if isinstance(args, dict) else None
+            return [str(q).strip() for q in (qs or []) if str(q).strip()]
+    return None
+
+
+# Gold-blind and identical for every question (no per-row signal): the tool
+# mirrors the escalation path a production agent has, so "should ask" behaviors
+# become a clear-cut structural outcome instead of judge-interpreted prose.
+_ASK_HUMAN_DESC = (
+    "Ask the user clarifying question(s) and END the run — the escalation path "
+    "a production agent has. Use it ONLY when the docs cannot settle the "
+    "reading: a required dimension (period, region, grain, scope) is missing "
+    "from the request, a term resolves to more than one documented thing, or "
+    "the wiki's guardrails direct agents to ASK before answering this kind of "
+    "request. `questions` is a short list of specific questions. There is no "
+    "user here to reply: calling this records the ask as your final answer. "
+    "Never use it to avoid the reading, and never when the wiki supports a "
+    "direct answer."
+)
+
+
+def make_ask_human_tool() -> Any:
+    """The Behavior solver's terminal ``ask_human`` escalation tool.
+
+    ``return_direct=True`` ends the ReAct loop at the call (no further model
+    turns where supported); the tool result says the run is complete as a
+    belt-and-braces stop for frameworks that keep going. Either way the
+    recorded outcome comes from :func:`_extract_ask` — the CALL is the signal,
+    not the loop's shutdown behavior.
+    """
+    from langchain_core.tools import tool
+
+    @tool(return_direct=True)
+    def ask_human(questions: list[str]) -> str:
+        """Ask the user clarifying question(s); calling this ends the run."""
+        return (
+            "Your clarification request has been recorded as this run's final "
+            "answer. There is no user available to reply — the run is complete; "
+            "output nothing further."
+        )
+
+    ask_human.description = _ASK_HUMAN_DESC
+    return ask_human
 
 
 def make_read_me_tool() -> Any:

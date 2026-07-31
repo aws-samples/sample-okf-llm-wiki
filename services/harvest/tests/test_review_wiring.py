@@ -38,7 +38,7 @@ def test_supervisor_review_must_run_in_subagents_not_the_executor():
     # author's bias. The prompt must explicitly forbid self-review and name the
     # bias rationale so the independence isn't optimized away.
     p = prompts.SUPERVISOR_PROMPT
-    assert "Do NOT review the docs yourself" in p
+    assert "Never review the docs yourself" in p
     assert "bias" in p.lower()
 
 

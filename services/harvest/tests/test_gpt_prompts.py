@@ -58,15 +58,13 @@ def test_supervisor_prompt_has_no_benchmark_loop():
 
 
 def test_gpt_annotation_prompt_carries_the_addendum():
-    p = prompts.build_annotation_prompt(
-        dataset="db", annotations=[], results_rel=".harvest/x.json", gpt=True
+    p = prompts.build_annotation_supervisor_prompt(
+        results_rel=".harvest/x.json", gpt=True
     )
     for block in _BLOCKS:
         assert block in p
     # And not without the flag.
-    p_plain = prompts.build_annotation_prompt(
-        dataset="db", annotations=[], results_rel=".harvest/x.json"
-    )
+    p_plain = prompts.build_annotation_supervisor_prompt(results_rel=".harvest/x.json")
     assert "<persistence>" not in p_plain
 
 

@@ -26,6 +26,7 @@ tries to finish with an empty store while candidates exist, it is nudged once.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -189,11 +190,10 @@ def _execute(payload: dict, report_id: str) -> tuple[dict, dict]:
         make_behavior_reviewer,
         make_judge,
     )
-    from harvest.benchmark.report_run import execute_report
-    from harvest.benchmark.solver import make_readonly_file_tools, make_solver
+    from harvest.benchmark.solver import make_ask_human_tool, make_solver
     from harvest.clients import build_source
+    from harvest.code_interpreter import sandbox_session
     from harvest.source_tools import make_source_tools
-    from harvest.status import build_registry_client
 
     data_domain = payload["data_domain"]
     dataset = payload["dataset"]
@@ -259,89 +259,175 @@ def _execute(payload: dict, report_id: str) -> tuple[dict, dict]:
         behavior_live_sql = bool(payload.get(br.FIELD_BEHAVIOR_LIVE_SQL))
 
         def make_solve(spec):
-            prompt, wants_sql = solver_protocol(
-                spec, behavior_live_sql=behavior_live_sql
+            proto = solver_protocol(
+                spec,
+                behavior_live_sql=behavior_live_sql,
+                # The run's real SQL dialect — a Redshift dataset's solver must
+                # not be told to write Athena/Trino (there is no source-type
+                # gate on benchmarks, unlike cross mode).
+                dialect=source.prompt_profile.dialect,
             )
-            extra = None
-            if wants_sql:
-                extra = [
+            extra = []
+            if proto.wants_sql:
+                extra.extend(
                     t
                     for t in make_source_tools(source)
                     if getattr(t, "name", "") == "run_sql"
-                ]
+                )
+            if proto.wants_ask:
+                # Behavior only: the terminal ask_human escalation — a "should
+                # ask" expectation becomes a structural outcome (the CALL ends
+                # the run and is recorded as the answer).
+                extra.append(make_ask_human_tool())
             return make_solver(
                 solver_model,
                 solver_dir,
-                system_prompt=prompt,
+                system_prompt=proto.prompt,
                 parse=spec.parse,
-                extra_tools=extra,
+                extra_tools=extra or None,
             )
 
-        # The judge's diagnostician toolset over the JUDGE tree (wiki +
-        # .metadata/ + .context/) plus live data. Factory-deferred, mirroring
-        # the solver, so deepagents imports happen at first judge use. The
-        # behavior grader is the SAME judge model + toolset wearing its other
-        # hat (per-run grading instead of failure review).
-        def judge_tools():
-            return [
-                *make_readonly_file_tools(judge_dir, scope="dataset"),
-                *make_source_tools(source),
-            ]
-
-        judge = make_judge(judge_model, judge_tools)
-        grade_behavior = make_behavior_grader(judge_model, judge_tools)
-        review_behavior = make_behavior_reviewer(judge_model, judge_tools)
-
-        progress = RowProgress(
-            build_registry_client(),
-            data_domain=data_domain,
-            dataset=dataset,
-            report_id=report_id,
-            total_runs=runs,
+        # The judge's `.context/` copy can hold binary uploads (PDF/DOCX/…)
+        # that read_file only base64-encodes — the same Code Interpreter
+        # sandbox the harvester uses makes them readable via run_code. Only
+        # started when the judge tree actually has context files (most
+        # benchmarks don't); best-effort like everywhere else — no sandbox
+        # just means the judge reads text context only.
+        judge_context = Path(judge_dir) / ".context"
+        has_context = judge_context.is_dir() and any(
+            p.is_file() for p in judge_context.rglob("*")
+        )
+        judge_sandbox_cm = (
+            sandbox_session(judge_dir, label="Benchmark judge")
+            if has_context
+            else contextlib.nullcontext()
         )
 
-        config_recap = {
-            "data_domain": data_domain,
-            "dataset": dataset,
-            br.FIELD_CHECKS: checks,
-            br.FIELD_RUNS: runs,
-            br.FIELD_SOLVER_MODEL: solver_cfg["model"],
-            br.FIELD_SOLVER_EFFORT: solver_cfg["effort"],
-            br.FIELD_JUDGE_MODEL: judge_cfg["model"],
-            br.FIELD_JUDGE_EFFORT: judge_cfg["effort"],
-            br.FIELD_VERSION_ID: version_id,
-            br.FIELD_BEHAVIOR_LIVE_SQL: behavior_live_sql,
-            "questions": {
-                "total": len(loaded.questions),
-                "dropped": loaded.dropped,
-                "check_counts": loaded.check_counts,
-            },
-        }
+        with judge_sandbox_cm as judge_sandbox:
+            # The judge's diagnostician toolset over the JUDGE tree (wiki +
+            # .metadata/ + .context/) plus live data (+ run_code when the
+            # sandbox came up). Factory-deferred, mirroring the solver, so
+            # deepagents imports happen at first judge use. The behavior
+            # grader is the SAME judge model + toolset wearing its other hat
+            # (per-run grading instead of failure review).
+            def judge_tools():
+                return _judge_toolset(judge_dir, source, judge_sandbox)
 
-        questions_by_id = {q.q_id: q for q in loaded.questions}
-        report_doc, traces_doc = asyncio.run(
-            execute_report(
+            judge = make_judge(judge_model, judge_tools)
+            grade_behavior = make_behavior_grader(judge_model, judge_tools)
+            review_behavior = make_behavior_reviewer(judge_model, judge_tools)
+
+            return _run_engine(
                 report_id=report_id,
                 checks=checks,
                 runs=runs,
-                questions=loaded.questions,
+                loaded=loaded,
                 make_solve=make_solve,
                 grader=grader,
                 judge=judge,
                 grade_behavior=grade_behavior,
                 review_behavior=review_behavior,
-                config_recap=config_recap,
-                progress=progress,
-                before_judge=lambda attempts: _write_judge_traces(
-                    judge_dir, questions_by_id, attempts
-                ),
+                judge_dir=judge_dir,
+                data_domain=data_domain,
+                dataset=dataset,
+                solver_cfg=solver_cfg,
+                judge_cfg=judge_cfg,
+                version_id=version_id,
+                behavior_live_sql=behavior_live_sql,
             )
-        )
-        report_doc["completed_at"] = _now_iso()
-        return report_doc, traces_doc
     finally:
         shutil.rmtree(solver_dir, ignore_errors=True)
         shutil.rmtree(judge_dir, ignore_errors=True)
+
+
+def _judge_toolset(judge_dir: str, source, sandbox) -> list:
+    """The judge hats' shared tools: read-only files over the judge tree,
+    live source access, and — when a sandbox is up — run_code for binary
+    ``.context/`` uploads."""
+    from harvest.benchmark.solver import make_readonly_file_tools
+    from harvest.code_interpreter import make_run_code_tool
+    from harvest.source_tools import make_source_tools
+
+    tools = [
+        *make_readonly_file_tools(judge_dir, scope="dataset"),
+        *make_source_tools(source),
+    ]
+    if sandbox is not None:
+        tools.append(make_run_code_tool(sandbox))
+    return tools
+
+
+def _run_engine(
+    *,
+    report_id,
+    checks,
+    runs,
+    loaded,
+    make_solve,
+    grader,
+    judge,
+    grade_behavior,
+    review_behavior,
+    judge_dir,
+    data_domain,
+    dataset,
+    solver_cfg,
+    judge_cfg,
+    version_id,
+    behavior_live_sql,
+) -> tuple[dict, dict]:
+    """Progress row + config recap + the async engine run (inside the judge
+    sandbox's lifetime — the judge may call run_code until the report is done)."""
+    from harvest.benchmark.report_run import execute_report
+    from harvest.status import build_registry_client
+
+    progress = RowProgress(
+        build_registry_client(),
+        data_domain=data_domain,
+        dataset=dataset,
+        report_id=report_id,
+        total_runs=runs,
+    )
+
+    config_recap = {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        br.FIELD_CHECKS: checks,
+        br.FIELD_RUNS: runs,
+        br.FIELD_SOLVER_MODEL: solver_cfg["model"],
+        br.FIELD_SOLVER_EFFORT: solver_cfg["effort"],
+        br.FIELD_JUDGE_MODEL: judge_cfg["model"],
+        br.FIELD_JUDGE_EFFORT: judge_cfg["effort"],
+        br.FIELD_VERSION_ID: version_id,
+        br.FIELD_BEHAVIOR_LIVE_SQL: behavior_live_sql,
+        "questions": {
+            "total": len(loaded.questions),
+            "dropped": loaded.dropped,
+            "check_counts": loaded.check_counts,
+        },
+    }
+
+    questions_by_id = {q.q_id: q for q in loaded.questions}
+    report_doc, traces_doc = asyncio.run(
+        execute_report(
+            report_id=report_id,
+            checks=checks,
+            runs=runs,
+            questions=loaded.questions,
+            make_solve=make_solve,
+            grader=grader,
+            judge=judge,
+            grade_behavior=grade_behavior,
+            review_behavior=review_behavior,
+            config_recap=config_recap,
+            progress=progress,
+            before_judge=lambda attempts: _write_judge_traces(
+                judge_dir, questions_by_id, attempts
+            ),
+        )
+    )
+    report_doc["completed_at"] = _now_iso()
+    return report_doc, traces_doc
 
 
 # --------------------------------------------------------------------------- #

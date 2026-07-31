@@ -56,15 +56,9 @@ The user is shown a short form, answers each question, and submits; their answer
     "kind": "single",                       // "single" | "multi" | "text"
     "options": ["Daily", "Weekly", "Monthly"] }   // required for single/multi; omit for text
 
-Kinds:
-- "single" — the user picks exactly one option.
-- "multi"  — the user picks any number of options.
-- "text"   — free-form prose answer; do NOT provide options.
+Kinds: "single" = pick exactly one; "multi" = pick any number; "text" = free prose, no options.
 
 For "single" and "multi" the user can ALWAYS also type their own answer instead of picking (an "Other" choice is added automatically) — so list the likely options, you don't have to be exhaustive. Keep prompts short and concrete; keep options mutually distinct.
-
-Args:
-  questions: the list of clarifying questions to ask, as described above.
 """
 
 

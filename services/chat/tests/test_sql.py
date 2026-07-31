@@ -359,6 +359,56 @@ def test_make_sql_tool_uses_engine_description():
     assert "Trino" not in rs_tool.description or "NOT Athena/Trino" in rs_tool.description
 
 
+def test_tool_descriptions_own_the_statement_rules_the_prompt_dropped():
+    # graph.SQL_BLOCK no longer restates the verb allowlist / qualification /
+    # LIMIT mechanics — they are per-engine, so the DESCRIPTION is authoritative.
+    athena = make_sql_tool(AthenaSQL(athena=_FakeAthena([]))).description
+    redshift = make_sql_tool(_rs_engine(_FakeRedshiftData([]))).description
+    for desc in (athena, redshift):
+        assert "exactly ONE statement" in desc
+        assert "INSERT/UPDATE/DELETE/CREATE/DROP" in desc
+        assert "Add your own LIMIT" in desc
+    assert '"database"."table"' in athena  # catalog-wide: qualify the database
+    assert '"schema"."table"' in redshift  # pinned db: qualify the schema
+
+
+def test_guard_error_matches_each_engines_advertised_verbs():
+    """The guard's rejection text must not advertise a verb its own engine's
+    description forbids — Redshift has NO DESCRIBE, so telling the model to try
+    DESCRIBE there sends it into a second, equally doomed query.
+    """
+    athena = AthenaSQL(athena=_FakeAthena([]))
+    redshift = _rs_engine(_FakeRedshiftData([]))
+
+    with pytest.raises(ValueError) as ath_err:
+        athena.run("DELETE FROM t")
+    with pytest.raises(ValueError) as rs_err:
+        redshift.run("DELETE FROM t")
+
+    assert "DESCRIBE" in str(ath_err.value)
+    assert "DESCRIBE" in athena.tool_description
+    # Redshift: absent from BOTH the error and the description, and the dialect.
+    assert "DESCRIBE" not in str(rs_err.value)
+    assert "SELECT / WITH / SHOW / EXPLAIN" in str(rs_err.value)
+    assert "SELECT/WITH/SHOW/EXPLAIN only" in redshift.tool_description
+
+
+def test_descriptions_state_the_actual_row_cap_and_truncated_flag():
+    # "large results are truncated" told the model nothing actionable; the real
+    # cap comes from the engine (OKF_CHAT_SQL_MAX_ROWS, default 200) and the
+    # response carries a `truncated` flag.
+    athena = AthenaSQL(athena=_FakeAthena([]), max_rows=200)
+    assert "at most 200 rows" in athena.tool_description
+    assert "`truncated: true`" in athena.tool_description
+    # A non-default cap is reflected, not hardcoded — both engines interpolate.
+    assert "at most 25 rows" in AthenaSQL(
+        athena=_FakeAthena([]), max_rows=25
+    ).tool_description
+    assert "at most 25 rows" in _rs_engine(
+        _FakeRedshiftData([]), max_rows=25
+    ).tool_description
+
+
 # --- feature normalization --------------------------------------------------
 
 

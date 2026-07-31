@@ -274,10 +274,19 @@ def test_cross_supervisor_prompt_carries_the_mode_rules():
     assert "live ONLY in this bundle" in p
     assert "cross-reference signal" in low
     # Links go to BOTH sides: home file-relative (stitches the link graph) and
-    # the counterpart via the bundle-escaping address form (may dangle).
-    assert "../../../../tables/<t>.md" in p
-    assert "../../../../../../<target_domain>/<target_dataset>/tables/<t>.md" in p
+    # the counterpart via the bundle-escaping address form (may dangle). The
+    # exact `../` spellings live in the skill + the cross-author prompt (which
+    # writes most of the docs); the supervisor carries the rule and the pointer.
+    assert "bundle-escaping address" in p
+    assert "cross-dataset.md" in p
     assert "dangle" in low
+    from harvest.prompts import build_cross_author_prompt
+
+    author = build_cross_author_prompt()
+    assert "../../../../tables/<t>.md" in author
+    assert (
+        "../../../../../../<target_domain>/<target_dataset>/tables/<t>.md" in author
+    )
     # Verification is qualified SQL, candidates verified BEFORE authoring.
     assert '"<db>"."<table>"' in p or '`"db"."table"`' in p
     assert "cross-author" in p
@@ -422,7 +431,7 @@ def test_cross_agent_wiring_in_source():
     # must hold on its write path too) AND the cross-specific reviewer prompt
     # (the standard table-doc checklist makes cross reviewers re-do discovery).
     assert "build_cross_reviewer_prompt(" in src
-    assert '"middleware": [guard, tool_errors],' in src
+    assert '"middleware": [guard, tool_errors, prompt_cache],' in src
     assert "subagents = [cross_author, cross_reviewer]" in src
     assert "writable_prefix" in src
     # The prefix is built through the segment-VALIDATING helper, not f-strings.

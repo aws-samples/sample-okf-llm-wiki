@@ -88,25 +88,54 @@ def test_solver_protocol_grants_live_sql_to_behavior_only():
         solver_protocol,
     )
 
-    # Default: every check keeps its own prompt, no SQL grant.
+    # Default: every check keeps its own prompt (the Glue build — the prompts
+    # are rebuilt per run with the source's dialect, so compare by content),
+    # no SQL grant.
     for spec in CHECK_SPECS.values():
-        prompt, wants_sql = solver_protocol(spec)
-        assert prompt is spec.solver_prompt
-        assert wants_sql is False
+        proto = solver_protocol(spec)
+        assert proto.prompt == spec.solver_prompt
+        assert proto.wants_sql is False
 
     # Flag ON: only the Behavior check flips to the live-SQL protocol — the
     # SQL EX solver stays data-blind whatever the run config says (live
     # queries would let it iterate empirically to the answer).
-    prompt, wants_sql = solver_protocol(
-        CHECK_SPECS[CHECK_BEHAVIOR], behavior_live_sql=True
+    proto = solver_protocol(CHECK_SPECS[CHECK_BEHAVIOR], behavior_live_sql=True)
+    assert proto.prompt == BEHAVIOR_SOLVER_PROMPT_LIVE_SQL
+    assert proto.wants_sql is True
+    proto = solver_protocol(CHECK_SPECS[CHECK_SQL], behavior_live_sql=True)
+    assert proto.prompt == CHECK_SPECS[CHECK_SQL].solver_prompt
+    assert proto.wants_sql is False
+
+
+def test_solver_protocol_grants_ask_human_to_behavior_only():
+    # The terminal ask_human escalation makes "should ask" expectations a
+    # structural outcome. Behavior holds it on EVERY question uniformly
+    # (gold-blind — no per-row signal), with or without live SQL; SQL EX never
+    # (its contract is one fenced query; asking is not a gradable SQL outcome).
+    from harvest.benchmark.checks import solver_protocol
+    assert solver_protocol(CHECK_SPECS[CHECK_BEHAVIOR]).wants_ask is True
+    assert (
+        solver_protocol(CHECK_SPECS[CHECK_BEHAVIOR], behavior_live_sql=True).wants_ask
+        is True
     )
-    assert prompt is BEHAVIOR_SOLVER_PROMPT_LIVE_SQL
-    assert wants_sql is True
-    prompt, wants_sql = solver_protocol(
-        CHECK_SPECS[CHECK_SQL], behavior_live_sql=True
+    assert solver_protocol(CHECK_SPECS[CHECK_SQL]).wants_ask is False
+    assert (
+        solver_protocol(CHECK_SPECS[CHECK_SQL], behavior_live_sql=True).wants_ask
+        is False
     )
-    assert prompt is CHECK_SPECS[CHECK_SQL].solver_prompt
-    assert wants_sql is False
+
+
+def test_behavior_prompts_document_ask_human_and_sql_prompt_does_not():
+    # The prompt and the grant travel together: both Behavior variants explain
+    # the tool and that calling it ENDS the run; the SQL solver (which never
+    # holds it) must not mention it.
+    from harvest.benchmark.checks import BEHAVIOR_SOLVER_PROMPT_LIVE_SQL
+
+    for p in (BEHAVIOR_SOLVER_PROMPT, BEHAVIOR_SOLVER_PROMPT_LIVE_SQL):
+        assert "ask_human" in p
+        assert "ENDS the run" in p
+        assert "never to avoid the reading" in p
+    assert "ask_human" not in SQL_SOLVER_PROMPT
 
 
 def test_live_sql_prompt_is_capability_accurate_and_gold_blind():
@@ -121,3 +150,27 @@ def test_live_sql_prompt_is_capability_accurate_and_gold_blind():
     # Same gold-blindness contract as every solver prompt.
     assert "gold" not in BEHAVIOR_SOLVER_PROMPT_LIVE_SQL.lower()
     assert "expectation" not in BEHAVIOR_SOLVER_PROMPT_LIVE_SQL.lower()
+
+
+def test_solver_protocol_is_dialect_aware():
+    # Benchmark Studio has no source-type gate (unlike cross mode), so a
+    # Redshift dataset can be benchmarked — its SQL-writing solvers must be
+    # told the run's REAL dialect, never a hardcoded Athena/Trino.
+    from harvest.benchmark.checks import solver_protocol
+    from okf_core.benchmark_questions import CHECK_SQL
+
+    proto = solver_protocol(CHECK_SPECS[CHECK_SQL], dialect="amazon-redshift")
+    assert "amazon-redshift" in proto.prompt
+    assert "Athena/Trino" not in proto.prompt
+
+    live = solver_protocol(
+        CHECK_SPECS[CHECK_BEHAVIOR],
+        behavior_live_sql=True,
+        dialect="amazon-redshift",
+    )
+    assert live.wants_sql is True
+    assert "amazon-redshift" in live.prompt
+    assert "Athena/Trino" not in live.prompt
+
+    # Default stays the Glue dialect (back-compat for the module constants).
+    assert "Athena/Trino" in solver_protocol(CHECK_SPECS[CHECK_SQL]).prompt

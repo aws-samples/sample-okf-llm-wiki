@@ -348,3 +348,16 @@ def test_invalid_tool_call_raw_args_are_recovered(monkeypatch):
     v = asyncio.run(judge([_case()]))[0]
     assert v.verdict == "fail"
     assert v.comment == "join key undocumented"
+
+
+def test_behavior_judge_knows_the_ask_outcome():
+    # The Behavior solver can end a run via its terminal ask_human tool; the
+    # grader must recognize the canonical rendering and grade it BOTH ways
+    # (a well-aimed ask satisfies a clarification expectation; an unnecessary
+    # ask on a directly-answerable question fails).
+    from harvest.benchmark.judge import BEHAVIOR_JUDGE_PROMPT
+    from harvest.benchmark.solver import ASKED_PREFIX
+
+    assert "ask_human" in BEHAVIOR_JUDGE_PROMPT
+    assert ASKED_PREFIX in BEHAVIOR_JUDGE_PROMPT
+    assert "unnecessary ask" in BEHAVIOR_JUDGE_PROMPT

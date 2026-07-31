@@ -57,51 +57,50 @@ SUPPORTED_CHART_TYPES = (
 # advertises charting rules it can't act on, and the SYSTEM_PROMPT stays a static,
 # brace-free cacheable prefix (see chat.graph). It documents the exact global the
 # sandboxed iframe exposes (``renderChart(el, spec)``), the spec shape, the palette
-# variables, and the house rules that keep charts on-brand.
+# variables (``--chart-1`` … ``--chart-10`` — keep in step with ``PALETTE_VARS`` in
+# ui/src/lib/chartIframe.js), and the house rules that keep charts on-brand.
 RENDER_CHART_DESC = """Render a data visualization (chart) inline in your answer, shown to the user in the chat.
 
-Call this when a chart communicates the answer better than prose or a table — comparisons across categories, a trend over time, parts of a whole, or a distribution. Prefer a small markdown table for a handful of exact numbers; reach for a chart when the SHAPE of the data is the point. Do not announce the chart ("here is a chart…") — just call the tool where it belongs in your answer, then continue explaining what it shows. One chart per distinct point; don't over-visualize.
+Call this for comparisons across categories, a trend over time, parts of a whole, a distribution. A handful of exact numbers belongs in a small markdown table; reach for a chart when the SHAPE of the data is the point. Don't announce it ("here is a chart…") — call the tool where it belongs, then continue explaining what it shows. One chart per distinct point; don't over-visualize.
 
-HOW IT RENDERS: your `code` runs inside a sandboxed browser frame that already has a Chart.js-backed helper on the global scope:
+HOW IT RENDERS: your `code` is the BODY of a function receiving `el` — statements, not a module. It runs in a sandboxed browser frame with a Chart.js-backed helper on the global scope:
 
     renderChart(el, spec)
 
-`el` is the <canvas> your code must draw into (already in the DOM — do not create your own). `spec` is a plain object:
+`el` is the <canvas> to draw into — already in the DOM, don't create your own. `spec` is a plain object:
 
     renderChart(el, {
       type: "bar",                       // bar | line | area | pie | doughnut | radar | scatter | bubble | polarArea | sankey | treemap
-      title: "Race wins by constructor", // optional heading shown above the chart
-      labels: ["Ferrari", "McLaren", "Mercedes"],   // x-axis / category labels
-      series: [                          // one entry per data series
+      title: "Race wins by constructor", // optional heading above the chart
+      labels: ["Ferrari", "McLaren", "Mercedes"],   // category / x-axis labels
+      series: [                          // one entry per series
         { name: "Wins", data: [243, 183, 125] }
       ],
       // optional: stacked: true (bar/area), yLabel: "Wins", xLabel: "Team",
-      // horizontal: true (bar/line/area — swaps the axes; use for long category
-      // names or ranked "top N" lists, which read better as horizontal bars),
-      // axes: true|false (show/hide the value-axis gridlines; horizontal charts
-      // default to false — a clean ranked list — vertical charts to true)
+      // horizontal: true (bar/line/area — swaps the axes; use it for long
+      // category names and ranked "top N" lists),
+      // axes: true|false (value-axis gridlines; defaults false on horizontal
+      // charts — a clean ranked list — true on vertical)
     });
 
-For scatter, each series' `data` is an array of {x, y} points and `labels` is omitted. For bubble, points are {x, y, r} (r = radius in px, scale it to your third dimension). polarArea is like pie/doughnut (one series; each slice's RADIUS encodes the value).
+Types whose `data` shape differs, all omitting `labels`: scatter takes [{x, y}]; bubble [{x, y, r}] (r = radius in px, scaled to your third dimension); sankey (flow between stages) one series of [{from, to, flow}] edges, node names as strings, flow = magnitude; treemap (share of total) one series of [{label, value}] leaves plus an optional `group` for one nesting level. polarArea takes one series like pie, each slice's RADIUS encoding the value.
 
-For sankey (FLOW between stages/categories — sources, transitions, allocations), one series whose `data` is [{from, to, flow}] edges (node names as strings, flow = the magnitude); `labels` is omitted. For treemap (share-of-total across many items, optionally grouped), one series whose `data` is [{label, value}] leaves — add a `group` field ({label, value, group}) for one level of nesting; `labels` is omitted.
+MIXED charts: a per-series `type` (bar | line | area) overlays that series on the base type — monthly bars with a cumulative line is type: "bar", series: [{ name: "Monthly", data: [...] }, { name: "Cumulative", type: "line", data: [...] }].
 
-MIXED charts: give an individual series its own `type` to overlay it on the base type — e.g. monthly bars with a cumulative line: type: "bar", series: [{ name: "Monthly", data: [...] }, { name: "Cumulative", type: "line", data: [...] }]. Per-series `type` accepts bar | line | area.
-
-Your `code` is the BODY of a function that receives `el` — write statements, not a module. Example value for the `code` argument:
+A complete `code` value:
 
     renderChart(el, { type: "bar", title: "Race wins", labels: ["Ferrari","McLaren"], series: [{ name: "Wins", data: [243, 183] }] });
 
-DESIGN — match the app's visual language, don't fight it:
-- Do NOT hard-code colors. The helper applies the app's chart palette automatically (CSS variables --chart-1 … --chart-5) and the current light/dark theme. Only set a color if the user explicitly asks.
-- Keep it clean: no chartjunk, no 3-D, no gratuitous gridlines. The helper already sets sensible axis/legend/tooltip defaults that match the UI.
-- Give every chart a short, descriptive `title` and label axes when the unit isn't obvious.
+DESIGN — match the app's visual language:
+- Colors are NOT configurable in the spec: the helper applies the app's chart palette (CSS variables --chart-1 … --chart-10) and the current light/dark theme itself, and ignores any color you set.
+- Keep it clean: no chartjunk, no 3-D, no gratuitous gridlines. The helper already sets UI-matching axis/legend/tooltip defaults.
+- Give every chart a short, descriptive `title`, and label axes when the unit isn't obvious.
 
-DATA — the chart is only as truthful as its numbers. Use REAL values you obtained from the wiki or a tool result (e.g. run_sql), never invented or "rough" figures. If you don't have the numbers, get them first or answer in prose instead. Cite the underlying wiki docs in your prose exactly as you normally would; the chart itself doesn't take a citation.
+DATA — a chart is only as truthful as its numbers. Use REAL values from the wiki or a tool result (e.g. run_sql), never invented or "rough" figures; if you don't have them, get them first or answer in prose. Cite the underlying docs in your prose as usual; the chart itself takes no citation.
 
 Args:
-  code: JavaScript that calls renderChart(el, spec) to draw the chart into the provided `el` canvas. Real data only.
-  title: A short human title for the chart (also shown if the chart fails to render). Keep it under ~80 chars.
+  code: statements that call renderChart(el, spec). Real data only.
+  title: a short human title, also shown if the chart fails to render (~80 chars max).
 """
 
 

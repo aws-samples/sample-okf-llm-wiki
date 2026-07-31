@@ -214,10 +214,15 @@ function OutcomeBadge({ status, outcome }) {
 function AnnotationCard({ ann, onOpenConcept, onDelete, deleting }) {
   return (
     // bg-card + shadow lift the card off the sheet's popover background so each
-    // note reads as a distinct object.
-    <li className="flex flex-col gap-1.5 rounded-xl border border-border/60 bg-card p-3 text-sm shadow-sm">
-      <div className="flex items-center justify-between gap-2">
-        <span className="flex items-center gap-1.5">
+    // note reads as a distinct object. min-w-0 + overflow-wrap:anywhere keep the
+    // card bounded by the panel: Radix ScrollArea's viewport wraps content in a
+    // `display:table; min-width:100%` div, so any unbreakable min-content — the
+    // nowrap concept-id chip, a long code token in a note — otherwise widens the
+    // WHOLE list past the sheet and pushes the right-aligned controls (concept
+    // chip, Delete) out of view, clipping every card's text at a phantom edge.
+    <li className="flex min-w-0 flex-col gap-1.5 rounded-xl border border-border/60 bg-card p-3 text-sm shadow-sm [overflow-wrap:anywhere]">
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <span className="flex shrink-0 items-center gap-1.5">
           <OutcomeBadge status={ann.status} outcome={ann.outcome} />
           {/* Filed by the chat agent on the user's behalf (provenance). */}
           {ann.submitted_via === "agent" && (
@@ -227,13 +232,13 @@ function AnnotationCard({ ann, onOpenConcept, onDelete, deleting }) {
           )}
         </span>
         {ann.concept_id === "_dataset" ? (
-          <span className="truncate font-mono text-xs text-muted-foreground">
+          <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
             whole dataset
           </span>
         ) : (
           <button
             type="button"
-            className="truncate font-mono text-xs text-muted-foreground hover:text-foreground hover:underline"
+            className="min-w-0 truncate font-mono text-xs text-muted-foreground hover:text-foreground hover:underline"
             title={ann.concept_id}
             onClick={() => onOpenConcept?.(ann.concept_id)}
           >
@@ -351,8 +356,16 @@ export function AnnotationSidebar({
         <AlertDescription>{emptyCopy}</AlertDescription>
       </Alert>
     ) : (
-      <ScrollArea className="min-h-0 flex-1">
-        <ul className={cn("flex flex-col gap-2 pr-3")}>
+      // Radix ScrollArea wraps content in an inline-styled `display:table;
+      // min-width:100%` div, which sizes to the content's INTRINSIC min-width —
+      // a nowrap concept-id chip or a long code token in a note widens the whole
+      // list past the sheet, so every card wraps at a phantom edge and the
+      // right-aligned controls (concept chip, Delete) are pushed out of view
+      // (min-w-0 on the chip can't help: intrinsic contributions ignore it).
+      // Forcing the wrapper back to block makes the viewport width bind; the
+      // cards' [overflow-wrap:anywhere] then wraps long tokens within it.
+      <ScrollArea className="min-h-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!">
+        <ul className={cn("flex w-full flex-col gap-2 pr-3")}>
           {items.map((a) => (
             <AnnotationCard
               key={a.annotation_id}

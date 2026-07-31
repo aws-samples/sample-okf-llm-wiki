@@ -32,6 +32,12 @@ class _BoomAgent:
 
 
 class _Src:
+    # Real Source classes always carry a prompt profile (source_base contract);
+    # the incremental path reads it to build the scoped maintenance prompt.
+    from harvest.glue_source import GlueAthenaSource as _G
+
+    prompt_profile = _G.prompt_profile
+
     def table_names(self):
         return ["races"]
 

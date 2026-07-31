@@ -27,13 +27,20 @@ import { useState } from "react"
 
 import { DocIcon, SourceIcon } from "@/components/chat/SourceIcon"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
-import { formatPublished, hostOf, isWebSource } from "@/lib/sources"
+import {
+  conceptIdOf,
+  formatPublished,
+  hostOf,
+  isWebSource,
+  parseWikiSource,
+} from "@/lib/sources"
 
 // A concept id's top-level kind → a human label.
 const CITE_KIND = {
   tables: "Table",
   references: "Reference",
   datasets: "Dataset",
+  external: "Cross-dataset",
 }
 
 // The badge's inline label. A web source reads best as its host ("reuters.com");
@@ -78,16 +85,25 @@ function WebCard({ url, meta }) {
 }
 
 function DocCard({ id, datasetScope, wikiSources, onOpenDoc }) {
-  const kind = CITE_KIND[String(id).split("/")[0]] || "Doc"
-  // Where this doc lives: the conversation's tool traffic first (exact — it
-  // names the bundle the doc was actually read from), then the conversation
+  // A FULLY-QUALIFIED id (`bird/formula_1/tables/races` — what the agent is
+  // prompted to emit) carries its own location; a bare one (old history, model
+  // slips) falls back to the conversation's tool traffic, then the conversation
   // scope. Unresolvable → the card stays a plain, non-clickable summary.
-  const loc = wikiSources?.get(String(id)) || datasetScope || null
+  const wiki = parseWikiSource(id)
+  const conceptId = wiki?.conceptId || String(id)
+  const kind = CITE_KIND[conceptId.split("/")[0]] || "Doc"
+  const loc =
+    (wiki?.dataDomain
+      ? { data_domain: wiki.dataDomain, dataset: wiki.dataset }
+      : null) ||
+    wikiSources?.get(conceptId) ||
+    datasetScope ||
+    null
   const dataset = loc ? `${loc.data_domain}/${loc.dataset}` : null
   const body = (
     <>
       <span className="flex items-center gap-1.5">
-        <DocIcon conceptId={id} size={14} />
+        <DocIcon conceptId={conceptId} size={14} />
         <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
           {kind} · wiki
         </span>
@@ -99,7 +115,7 @@ function DocCard({ id, datasetScope, wikiSources, onOpenDoc }) {
         ) : null}
       </span>
       <span className="font-mono text-xs break-all text-foreground group-hover:underline">
-        {id}
+        {conceptId}
       </span>
       {dataset ? (
         <span className="text-xs text-muted-foreground">
@@ -116,7 +132,7 @@ function DocCard({ id, datasetScope, wikiSources, onOpenDoc }) {
           onOpenDoc({
             dataDomain: loc.data_domain,
             dataset: loc.dataset,
-            conceptId: String(id),
+            conceptId,
           })
         }
         className="group flex w-full cursor-pointer flex-col gap-1.5 text-left"
@@ -164,9 +180,10 @@ export function CitationGroup({
           ) : (
             // text-primary: the kind glyph joins the badge's cyan family (cn
             // merges it over DocIcon's muted default). Favicons keep their own
-            // colors — the site's mark IS the signal there.
+            // colors — the site's mark IS the signal there. conceptIdOf strips a
+            // qualified id's domain/dataset prefix so the glyph keys on the kind.
             <DocIcon
-              conceptId={first}
+              conceptId={conceptIdOf(first)}
               size={11}
               className="okf-cite-icon text-primary"
             />

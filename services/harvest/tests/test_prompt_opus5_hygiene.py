@@ -10,26 +10,40 @@ instructions that compound with the model's own self-checking.
 
 from harvest import prompts
 
-ALL_PROMPTS = (
+# The roles that WRITE bundle docs get the authoring contract (_AUTHORING_TMPL);
+# the read-only roles must never see it — a write contract in a prompt whose own
+# body says "READ-ONLY, you do NOT write files" is a standing contradiction.
+WRITER_PROMPTS = (
     prompts.SUPERVISOR_PROMPT,
     prompts.TABLE_AUTHOR_PROMPT,
     prompts.REFERENCE_AUTHOR_PROMPT,
-    prompts.REVIEWER_PROMPT,
-    prompts.CONTEXT_EXTRACTOR_PROMPT,
     prompts.ANNOTATION_PROMPT,
     prompts.build_cross_supervisor_prompt(),
     prompts.build_cross_author_prompt(),
+)
+READONLY_PROMPTS = (
+    prompts.REVIEWER_PROMPT,
+    prompts.CONTEXT_EXTRACTOR_PROMPT,
     prompts.build_cross_reviewer_prompt(),
 )
+ALL_PROMPTS = WRITER_PROMPTS + READONLY_PROMPTS
 
 
-def test_every_prompt_right_sizes_written_docs():
-    # Written deliverables run long on Opus 5 — the shared runtime carries
+def test_writer_prompts_right_size_written_docs():
+    # Written deliverables run long on Opus 5 — the authoring fragment carries
     # explicit length calibration (substance, then stop; no filler/boilerplate),
     # so every agent that writes docs inherits it.
-    for p in ALL_PROMPTS:
+    for p in WRITER_PROMPTS:
         assert "Right-size every doc" in p
         assert "boilerplate" in p
+
+
+def test_readonly_prompts_never_carry_the_write_contract():
+    for p in READONLY_PROMPTS:
+        assert "READ-ONLY, you do NOT write" in p
+        assert "## Authoring (write path + guard)" not in p
+        assert "Right-size every doc" not in p
+        assert "augment, don't" not in p
 
 
 def test_supervisor_prescribes_delegation_exactly():
@@ -45,8 +59,10 @@ def test_supervisor_prescribes_delegation_exactly():
 
 def test_review_pass_is_bounded_to_a_single_pass():
     for p in (prompts.SUPERVISOR_PROMPT, prompts.build_cross_supervisor_prompt()):
-        assert "do NOT re-review docs after" in p
-        assert "do NOT add verification passes of your own" in p
+        # Stated once per prompt: step 7 forbids the re-review, and the
+        # delegation-discipline paragraph owns the no-extra-verification bound.
+        assert "re-review docs after" in p
+        assert "add NO further verification" in p
 
 
 def test_supervisor_final_summary_is_length_calibrated():

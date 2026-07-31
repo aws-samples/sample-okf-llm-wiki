@@ -2,8 +2,10 @@
 
 Copy-paste starting points per concept kind. Replace placeholders; delete
 sections that don't apply. All examples are valid OKF and mirror real bundle
-output. `timestamp` is ISO 8601 UTC; set it to the time of the change (or let
-your tooling fill it).
+output. `timestamp` is ISO 8601 UTC — **omit it when your runtime auto-fills it
+(most do: a write-guard or generator stamps it)**; only set it yourself when
+nothing fills it for you. The literal timestamps below are placeholders, not an
+instruction to write one.
 
 > **Dialect warning.** The SQL in these templates uses **Amazon Athena (Trino,
 > engine v3) DML** — double-quoted `"db"."table"` identifiers and Athena/Trino
@@ -370,7 +372,8 @@ A freshness alert fires when `orders` lags >30 min behind its SLA. See the
 [orders table](../tables/orders.md).
 
 # Steps
-1. Check the [ingestion job dashboard](https://example.com/dash).
+1. Check the upstream ingestion job's most recent run (see the operations
+   runbook cited below, if one was provided).
 2. ...
 ```
 

@@ -33,6 +33,23 @@ from consumption_mcp.tools import ConsumptionConfig, ConsumptionTools
 _SCOPE_PARAMS = ("data_domain", "dataset")
 
 
+def _model_description(doc: str | None, fallback: str) -> str:
+    """Normalize a Python docstring into the text the MODEL sees as a description.
+
+    Two cheap wins on every request's tool block (the descriptions are re-sent on
+    every turn, so the waste compounds):
+
+    * ``inspect.cleandoc`` strips the 8-space continuation indent a nested
+      triple-quoted string carries — those leading spaces are tokens the model
+      pays for and learns nothing from.
+    * RST double-backticks (``x``) become single backticks (`x`) — Markdown is
+      what an LLM tool description is read as, and the doubled pair costs an
+      extra token per span while rendering as a stray backtick.
+    """
+    text = inspect.cleandoc(doc or fallback)
+    return text.replace("``", "`").strip()
+
+
 def build_consumption_tools(
     *, s3, s3vectors, bedrock_runtime, ddb, config: ConsumptionConfig
 ) -> ConsumptionTools:
@@ -94,7 +111,7 @@ def _make_tool(
     return StructuredTool.from_function(
         func=wrapper,
         name=method.__name__,
-        description=(method.__doc__ or method.__name__).strip(),
+        description=_model_description(method.__doc__, method.__name__),
     )
 
 
@@ -129,7 +146,10 @@ def make_submit_annotation_tool(annotations_table, *, user_sub, dataset_scope=No
     from okf_core import annotations as anno
     from okf_core.paths import parse_concept_id
 
-    _DOC = """File wiki feedback on the user's behalf when the conversation uncovers a
+    # cleandoc'd (like the read tools' descriptions) so the model isn't billed for
+    # this nested string's 8-space continuation indent on every request.
+    _DOC = inspect.cleandoc(
+        """File wiki feedback on the user's behalf when the conversation uncovers a
         doc problem (a wrong join, a stale enum, a missing caveat). ALWAYS confirm
         with the user first (ask_human or a direct question) before filing — this
         writes feedback in their name. `note` is the feedback text (be specific:
@@ -137,6 +157,14 @@ def make_submit_annotation_tool(annotations_table, *, user_sub, dataset_scope=No
         page (e.g. `tables/races`); leave it empty for dataset-level feedback that
         doesn't belong to a single page. The note enters the user's annotation
         queue and steers the next annotation-mode re-harvest."""
+    )
+    # The unscoped variant takes two MORE args than the scoped one, so it needs the
+    # extra clause explaining them. (Assigning `_DOC` to __doc__ below would
+    # otherwise discard the only place they were documented.)
+    _UNSCOPED_ARGS_DOC = (
+        "`data_domain`/`dataset` name the dataset the feedback is about "
+        "(see list_domains)."
+    )
 
     def _file(note: str, data_domain: str, dataset: str, concept_id: str) -> str:
         cleaned = (note or "").strip()
@@ -176,23 +204,24 @@ def make_submit_annotation_tool(annotations_table, *, user_sub, dataset_scope=No
     if dataset_scope:
         dd = dataset_scope["data_domain"]
         ds = dataset_scope["dataset"]
+        description = _DOC
 
         def submit_annotation(note: str, concept_id: str = "") -> str:
             return _file(note, dd, ds, concept_id)
 
     else:
+        description = f"{_DOC} {_UNSCOPED_ARGS_DOC}"
 
         def submit_annotation(
             note: str, data_domain: str, dataset: str, concept_id: str = ""
         ) -> str:
-            """`data_domain`/`dataset` name the dataset the feedback is about."""
             return _file(note, data_domain, dataset, concept_id)
 
-    submit_annotation.__doc__ = _DOC
+    submit_annotation.__doc__ = description
     return StructuredTool.from_function(
         func=submit_annotation,
         name="submit_annotation",
-        description=_DOC,
+        description=description,
     )
 
 
@@ -204,6 +233,8 @@ def make_agent_tools(
     ``dataset_scope`` (``{"data_domain", "dataset"}``) pre-binds the location args
     on the tools that accept them; ``None`` (default) lets the agent read the
     whole wiki. Descriptions are lifted from the ``ConsumptionTools`` method
-    docstrings so tool semantics stay defined in one place.
+    docstrings (via :func:`_model_description`) so tool semantics stay defined in
+    one place — which is why those docstrings are written MODEL-facing, with the
+    maintainer notes in body comments instead.
     """
     return [_make_tool(getattr(tools, name), dataset_scope) for name in _TOOL_NAMES]

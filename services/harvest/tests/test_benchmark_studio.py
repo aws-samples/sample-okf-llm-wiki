@@ -412,3 +412,23 @@ def test_write_judge_traces_is_best_effort(tmp_path):
     blocker.write_text("x")
     attempts = [Attempt(q_id=0, check="sql", run_index=0, trace=SolverTrace())]
     _write_judge_traces(str(blocker), {}, attempts)  # must not raise
+
+
+def test_judge_toolset_includes_run_code_only_with_a_sandbox(tmp_path):
+    pytest.importorskip("deepagents")
+    from harvest.benchmark.studio import _judge_toolset
+
+    class _Sandbox:
+        def run_code(self, code):
+            return {"stdout": "", "stderr": "", "is_error": False}
+
+    with_sandbox = {
+        t.name for t in _judge_toolset(str(tmp_path), object(), _Sandbox())
+    }
+    # The diagnostician set: judge-tree files + live data + the binary-context
+    # extractor (only when the sandbox actually came up).
+    assert {"read_file", "grep", "run_sql", "sample_rows", "run_code"} <= with_sandbox
+
+    without = {t.name for t in _judge_toolset(str(tmp_path), object(), None)}
+    assert "run_code" not in without
+    assert {"read_file", "run_sql"} <= without

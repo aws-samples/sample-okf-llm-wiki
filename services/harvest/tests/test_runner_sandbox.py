@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import harvest.code_interpreter as code_interpreter
 import harvest.runner as runner
 
 
@@ -30,6 +31,12 @@ class _FakeSandbox:
 
 
 class _Src:
+    # Real Source classes always carry a prompt profile (source_base contract);
+    # the incremental path reads it to build the scoped maintenance prompt.
+    from harvest.glue_source import GlueAthenaSource as _G
+
+    prompt_profile = _G.prompt_profile
+
     def table_names(self):
         return ["new"]
 
@@ -63,7 +70,7 @@ def test_full_harvest_starts_uploads_and_stops_sandbox(tmp_path, monkeypatch):
     fake = _FakeSandbox()
     captured: dict = {}
     _patch_common(monkeypatch, captured)
-    monkeypatch.setattr(runner, "build_sandbox", lambda: fake)
+    monkeypatch.setattr(code_interpreter, "build_sandbox", lambda: fake)
 
     runner.run_full_harvest(
         source=_Src(), dataset_root=root, data_domain="sport", dataset="f1"
@@ -81,7 +88,7 @@ def test_incremental_harvest_uses_sandbox(tmp_path, monkeypatch):
     fake = _FakeSandbox()
     captured: dict = {}
     _patch_common(monkeypatch, captured)
-    monkeypatch.setattr(runner, "build_sandbox", lambda: fake)
+    monkeypatch.setattr(code_interpreter, "build_sandbox", lambda: fake)
 
     runner.run_incremental_harvest(
         source=_Src(),
@@ -99,7 +106,7 @@ def test_harvest_runs_without_sandbox(tmp_path, monkeypatch):
     root.mkdir(parents=True)
     captured: dict = {}
     _patch_common(monkeypatch, captured)
-    monkeypatch.setattr(runner, "build_sandbox", lambda: None)
+    monkeypatch.setattr(code_interpreter, "build_sandbox", lambda: None)
 
     state = runner.run_full_harvest(
         source=_Src(), dataset_root=root, data_domain="sport", dataset="f1"
@@ -119,7 +126,7 @@ def test_sandbox_start_failure_degrades_gracefully(tmp_path, monkeypatch):
             raise RuntimeError("upload boom")
 
     bad = _BadSandbox()
-    monkeypatch.setattr(runner, "build_sandbox", lambda: bad)
+    monkeypatch.setattr(code_interpreter, "build_sandbox", lambda: bad)
 
     # The harvest must complete even though the sandbox failed to prepare.
     state = runner.run_full_harvest(

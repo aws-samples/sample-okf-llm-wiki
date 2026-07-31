@@ -466,6 +466,7 @@ def build_harvest_agent(
     sandbox: Any = None,
     step_emitter: Any = None,
     cross_target: dict[str, Any] | None = None,
+    supervisor_prompt: str | None = None,
 ) -> HarvestAgent:
     """Build the harvest deep agent (see the module docstring for the wiring).
 
@@ -474,6 +475,13 @@ def build_harvest_agent(
     fan-out is a single ``cross-author`` sub-agent (plus the reviewer), and the
     guard confines every write to the pair subtree
     ``external/<target_domain>/<target_dataset>/``. None = a normal build.
+
+    ``supervisor_prompt`` replaces the full-harvest supervisor SYSTEM prompt for
+    the SCOPED run modes (annotation / incremental — see
+    ``prompts.build_annotation_supervisor_prompt`` /
+    ``build_maintenance_supervisor_prompt``): those jobs must not inherit the
+    full-harvest workflow (per-table fan-out + whole-bundle review). Sub-agents
+    are unchanged. Mutually exclusive with ``cross_target``.
 
     ``model``/``effort``/``max_tokens`` configure the SUPERVISOR's model.
     ``subagent_config`` (optional ``{model, effort, max_tokens}``, resolved by
@@ -611,6 +619,19 @@ def build_harvest_agent(
     # below (sub-agent middleware REPLACES — same footgun as the guard).
     tool_errors = ToolErrorMiddleware()
 
+    # Bedrock prompt caching — the same setup as the chat agent and the
+    # benchmark's ReAct roles (chat/server.py, benchmark/react.py). A harvest
+    # re-sends its ~3k-token static prefix (plus the growing conversation) on
+    # EVERY turn of the supervisor and every sub-agent across a multi-hour run;
+    # with the middleware, ChatBedrockConverse inserts cachePoint blocks at
+    # request time and that traffic bills as cache READS (~0.1x input) instead
+    # of full price. On a Mantle GPT model it warns once and no-ops (the
+    # Responses API caches prefixes implicitly server-side). Attached to the
+    # MAIN agent and EVERY sub-agent (middleware REPLACES, never inherits).
+    from langchain_aws.middleware import BedrockPromptCachingMiddleware
+
+    prompt_cache = BedrockPromptCachingMiddleware()
+
     source_tools = make_source_tools(source)
     graph_tools = make_graph_tools(link_graph)
     all_tools = [*source_tools, *graph_tools]
@@ -696,7 +717,7 @@ def build_harvest_agent(
         ),
         "system_prompt": build_table_author_prompt(prompt_profile, gpt=subagent_gpt),
         "tools": all_tools,
-        "middleware": [guard, tool_errors],
+        "middleware": [guard, tool_errors, prompt_cache],
         "model": subagent_chat_model,
     }
 
@@ -719,7 +740,7 @@ def build_harvest_agent(
         ),
         "system_prompt": build_reference_author_prompt(prompt_profile, gpt=subagent_gpt),
         "tools": all_tools,
-        "middleware": [guard, tool_errors],
+        "middleware": [guard, tool_errors, prompt_cache],
         "model": subagent_chat_model,
     }
 
@@ -742,7 +763,7 @@ def build_harvest_agent(
         ),
         "system_prompt": build_reviewer_prompt(prompt_profile, gpt=reviewer_gpt),
         "tools": all_tools,  # source + graph tools; read_file comes from the backend
-        "middleware": [readonly_guard, tool_errors],
+        "middleware": [readonly_guard, tool_errors, prompt_cache],
         "model": reviewer_chat_model,
     }
 
@@ -767,7 +788,7 @@ def build_harvest_agent(
         ),
         "system_prompt": build_context_extractor_prompt(prompt_profile, gpt=subagent_gpt),
         "tools": all_tools,  # source + graph + run_code; read_file from the backend
-        "middleware": [readonly_guard, tool_errors],
+        "middleware": [readonly_guard, tool_errors, prompt_cache],
         "model": subagent_chat_model,
     }
 
@@ -787,11 +808,11 @@ def build_harvest_agent(
         ),
         "system_prompt": build_cross_author_prompt(prompt_profile, gpt=subagent_gpt),
         "tools": all_tools,
-        "middleware": [guard, tool_errors],
+        "middleware": [guard, tool_errors, prompt_cache],
         "model": subagent_chat_model,
     }
 
-    main_middleware = [guard, tool_errors, TodoListMiddleware()]
+    main_middleware = [guard, tool_errors, prompt_cache, TodoListMiddleware()]
     if interpreter_mw is not None:
         main_middleware.append(interpreter_mw)
 
@@ -806,6 +827,8 @@ def build_harvest_agent(
     # discovery with many slow cross-database queries; the cross body verifies
     # what the pair docs CLAIM on a two-queries-per-doc budget instead.
     if cross_target:
+        if supervisor_prompt is not None:
+            raise ValueError("supervisor_prompt and cross_target are mutually exclusive")
         system_prompt = build_cross_supervisor_prompt(
             prompt_profile, gpt=supervisor_gpt
         )
@@ -814,11 +837,14 @@ def build_harvest_agent(
             "system_prompt": build_cross_reviewer_prompt(
                 prompt_profile, gpt=reviewer_gpt
             ),
-            "middleware": [readonly_guard, tool_errors],
+            "middleware": [readonly_guard, tool_errors, prompt_cache],
         }
         subagents = [cross_author, cross_reviewer]
     else:
-        system_prompt = build_supervisor_prompt(
+        # Scoped modes (annotation / incremental) hand in their own supervisor
+        # prompt; the sub-agent roster stays standard (their prompts tell them
+        # not to fan out, and an unused sub-agent definition costs nothing).
+        system_prompt = supervisor_prompt or build_supervisor_prompt(
             profile=prompt_profile,
             gpt=supervisor_gpt,
         )

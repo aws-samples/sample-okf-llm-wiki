@@ -71,7 +71,11 @@ def register_tools(mcp, tools: ConsumptionTools) -> None:
     def list_domains() -> list[dict]:
         """List the registered (data_domain, dataset) pairs available to read.
 
-        Each result includes the dataset's parent domain description (if declared).
+        Each result includes the dataset's parent domain description (if declared)
+        plus its cross-dataset reference signal: `cross_references` names datasets
+        THIS one holds pair docs for (read them under its own `external/<d>/<ds>/`),
+        and `cross_referenced_by` names datasets whose bundle holds pair docs about
+        this one (read them at `<that dataset>/external/<this>/…`).
         """
         return tools.list_domains()
 
@@ -112,12 +116,20 @@ def register_tools(mcp, tools: ConsumptionTools) -> None:
         offset: int = 0,
         limit: int | None = None,
     ) -> dict:
-        """Return a concept's markdown from S3 (paginate large docs by lines)."""
+        """Return a concept's markdown from S3 (paginate large docs by lines).
+
+        `offset` is 0-indexed; the response's `total_lines` vs `returned_lines`
+        tell you whether to page again.
+        """
         return tools.read_page(concept_id, data_domain, dataset, offset, limit)
 
     @mcp.tool()
     def get_backlinks(concept_id: str, data_domain: str, dataset: str) -> list[dict]:
-        """Return the concepts in the dataset that link to this concept."""
+        """Return the concepts in the dataset that link to this concept.
+
+        Each result names the referencing page AND the `heading` the link sits
+        under, so you know where the reference lives.
+        """
         return tools.get_backlinks(concept_id, data_domain, dataset)
 
     @mcp.tool()
@@ -161,7 +173,14 @@ def register_tools(mcp, tools: ConsumptionTools) -> None:
         tags: list[str] | None = None,
         top_k: int = 10,
     ) -> list[dict]:
-        """Semantic search over concepts; returns candidates to then read_page."""
+        """Semantic search over concepts; returns candidates to then read_page.
+
+        `type` is an EXACT frontmatter match — a value outside this vocabulary
+        silently returns nothing, so omit it unless you mean it: `Glue Table`,
+        `Glue Database`, `Redshift Table`, `Redshift External Table`,
+        `Redshift Database`, `Reference`, `Cross-Dataset Reference`, `Playbook`,
+        `Domain`. `tags` matches ANY given tag. `top_k` is capped at 20.
+        """
         return tools.semantic_search(
             query,
             data_domain=data_domain,

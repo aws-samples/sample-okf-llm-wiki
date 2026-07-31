@@ -296,6 +296,13 @@ def test_tool_shape_and_description():
     # result count is stated so the model can reason about asking for more/less.
     assert "no date filter" in tool.description
     assert "default 10" in tool.description
+    # The date guidance lives HERE (not in graph.WEB_SEARCH_BLOCK, which is static
+    # and can't carry today's date): time is steered by the query text, with the
+    # worked example, and each result's date must be checked before use.
+    assert "RELEVANCE, not date" in tool.description
+    assert "put the period in the query itself" in tool.description
+    assert "EU steel tariffs Q2 2026" in tool.description
+    assert "publication date before" in tool.description
 
 
 def test_tool_returns_errors_as_results_never_raises():

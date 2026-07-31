@@ -94,7 +94,9 @@ anyway.
 
 Authoring a bundle runs through the passes below. Run pass 1 always; run pass 2 to
 cross-link; run pass 3 only when the caller provided uploaded context documents
-worth folding in; always finish with pass 4 (indexes + conformance). When your
+worth folding in; pass 4 (indexes + conformance) is the definition of done — but
+most runtimes run it FOR you after authoring, so check the pass before running
+anything yourself. When your
 runtime supports independent verification (e.g. reviewer sub-agents), run pass 5 —
 an adversarial review — over the finished bundle.
 
@@ -252,20 +254,21 @@ speculate about where the data "comes from," do not add links to public datasets
 docs sites, or repositories, and do not attribute a schema to an external origin
 you did not read. An unverifiable citation is worse than none.
 
-### Pass 4 — Generate indexes and validate (always)
+### Pass 4 — Indexes and conformance (usually your runtime's job)
 
-1. **Regenerate `index.md`** at every directory level for progressive disclosure
+Most runtimes regenerate indexes and validate conformance **for you automatically
+after authoring** (and enforce frontmatter on every write) — in which case there
+is NOTHING to run here: just make sure every doc you wrote is conformant. Only if
+your environment does not do this, use whatever index/validate tooling it
+provides. The two outcomes either way:
+
+1. **`index.md` regenerated** at every directory level for progressive disclosure
    (so a reader/agent can see what's available before opening files).
-2. **Validate conformance** against §9 (every non-reserved `.md` has parseable
+2. **Conformance validated** against §9 (every non-reserved `.md` has parseable
    frontmatter with a non-empty `type`).
 
-How these run depends on your environment: many runtimes regenerate indexes and
-validate conformance **for you automatically after authoring** (and enforce
-frontmatter on every write), in which case you do not run anything here — just
-make sure every doc you wrote is conformant. If your environment does not, use
-whatever index/validate tooling it provides. Either way, the **Conformance
-checklist** at the end of this skill is the definition of done — verify against
-it, and never hand-write `index.md` files.
+The **Conformance checklist** at the end of this skill is the definition of
+done — verify against it, and never hand-write `index.md` files.
 
 ### Pass 5 — Adversarial review (when your runtime supports it)
 

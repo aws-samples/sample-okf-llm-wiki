@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from chat.graph import (
     SQL_BLOCK,
+    SQL_REDSHIFT_BLOCK,
     SYSTEM_PROMPT,
     SYSTEM_PROMPT_WITH_SQL,
     WEB_SEARCH_BLOCK,
@@ -25,8 +26,10 @@ def test_prompt_covers_the_load_bearing_instructions():
     assert "wiki" in p and "read_page" in p and "semantic_search" in p
     # the cardinal no-hallucination rule
     assert "invent" in p or "fabricate" in p
-    # citation format the UI parses: <cite src="...">
-    assert '<cite src="' in SYSTEM_PROMPT
+    # citation format the UI parses: the SHORT tag <c src="..."> (the long
+    # <cite ...> form is legacy — parsed from stored history, never prompted)
+    assert '<c src="' in SYSTEM_PROMPT
+    assert "<cite" not in SYSTEM_PROMPT
     # read-only posture
     assert "read-only" in p
 
@@ -38,15 +41,25 @@ def test_prompt_groups_sources_into_one_tag_and_allows_urls():
     low = SYSTEM_PROMPT.lower()
     assert "never emit two tags back to back" in low
     assert "http(s)://" in SYSTEM_PROMPT
-    assert 'src="tables/orders,https://' in SYSTEM_PROMPT
+    assert 'src="sales/orders_db/tables/orders,https://' in SYSTEM_PROMPT
+
+
+def test_prompt_requires_fully_qualified_wiki_citations():
+    # A bare concept id (`tables/races`) is only resolvable when the UI happens to
+    # have seen that doc in the turn's tool traffic — hit-or-miss, and the badge
+    # renders without an "Open page" action when it misses. The prompt must demand
+    # the full `<data_domain>/<dataset>/<concept id>` address and show the form.
+    assert "<data_domain>/<dataset>/<concept id>" in SYSTEM_PROMPT
+    assert '<c src="bird/formula_1/tables/races"></c>' in SYSTEM_PROMPT
+    assert "NEVER cite a bare concept id" in SYSTEM_PROMPT
 
 
 def test_prompt_forbids_content_bearing_cite_tags():
-    # The <cite> tag MUST be empty — the model wrapping gloss text inside it
-    # (`<cite src="x">gloss</cite>`) breaks the UI's citation renderer (leaks a
-    # stray </cite>). The prompt must state the tag is empty and show the form.
+    # The <c> tag MUST be empty — the model wrapping gloss text inside it
+    # (`<c src="x">gloss</c>`) breaks the UI's citation renderer (leaks a
+    # stray </c>). The prompt must state the tag is empty and show the form.
     assert "ALWAYS EMPTY" in SYSTEM_PROMPT
-    assert '<cite src="..."></cite>' in SYSTEM_PROMPT
+    assert '<c src="..."></c>' in SYSTEM_PROMPT
 
 
 def test_prompt_mentions_charts_without_the_authoring_details():
@@ -59,6 +72,16 @@ def test_prompt_mentions_charts_without_the_authoring_details():
     assert "real" in SYSTEM_PROMPT.lower()
     # The verbose authoring API lives in charts.RENDER_CHART_DESC, not the prompt.
     assert "renderChart(el, spec)" not in SYSTEM_PROMPT
+    block = SYSTEM_PROMPT.split("<charts>")[1].split("</charts>")[0]
+    low = block.lower()
+    # Budget-pinned: the tool description is UNCONDITIONAL (render_chart is always
+    # wired), so anything it already says is pure duplication here. The block keeps
+    # only when-to-reach-for-a-chart + never-invent-numbers.
+    assert len(block.split()) < 80, f"charts block grew to {len(block.split())} words"
+    assert "shape of the data" in low
+    assert "never invented" in low
+    # Rules the tool description owns must NOT be restated here.
+    assert "palette" not in low and "theme" not in low
 
 
 def test_prompt_carries_opus5_verbosity_and_correction_tuning():
@@ -79,8 +102,24 @@ def test_sql_variant_extends_base_and_mentions_run_sql():
     assert SYSTEM_PROMPT_WITH_SQL.startswith(SYSTEM_PROMPT)
     assert "run_sql" in SYSTEM_PROMPT_WITH_SQL
     assert "run_sql" not in SYSTEM_PROMPT
-    # read-only SQL is spelled out (the write verbs are explicitly forbidden)
-    assert "SELECT" in SYSTEM_PROMPT_WITH_SQL and "never" in SYSTEM_PROMPT_WITH_SQL.lower()
+    # The read-only framing stays in the block; the VERB ALLOWLIST and the
+    # qualification/LIMIT mechanics are the tool description's job (they differ
+    # per engine, so a prompt copy can only drift — see test_sql.py).
+    assert "READ-ONLY" in SYSTEM_PROMPT_WITH_SQL
+    for mechanic in ("SELECT", "INSERT", '"database"."table"', "LIMIT"):
+        assert mechanic not in SYSTEM_PROMPT_WITH_SQL, mechanic
+
+
+def test_sql_blocks_keep_when_to_reach_for_it_and_read_first():
+    # Both engine variants must carry the same two policies (the parts the tool
+    # description does NOT own): when to reach for SQL at all, and read the doc
+    # before writing the query.
+    for block in (SQL_BLOCK, SQL_REDSHIFT_BLOCK):
+        low = block.lower()
+        assert "prefer the wiki" in low
+        assert "live data or aggregates the docs don't state" in low
+        assert "read the relevant table doc first" in low
+        assert "never fabricate" in low
 
 
 def test_web_search_block_documents_when_to_reach_for_it():
@@ -94,15 +133,18 @@ def test_web_search_block_documents_when_to_reach_for_it():
     assert "external" in low
     # It must NOT be used for what the data means — the wiki owns that.
     assert "wiki is authoritative" in low
-    # Time is steered by the QUERY (the tool has no date filter — deliberately),
-    # and attribution rides the SAME <cite src> tag as wiki docs (the UI renders
-    # one grouped badge per tag), not loose markdown links.
-    assert "no date filter" in low
-    assert "put the period in the query" in low
-    assert '<cite src="https://' in WEB_SEARCH_BLOCK
-    assert "one tag" in low
+    # Attribution rides the SAME <c src> tag as wiki docs (the UI renders one
+    # grouped badge per tag), not loose markdown links.
+    assert '<c src="https://' in WEB_SEARCH_BLOCK
+    assert "one comma-separated tag" in low
     # Correlation is not causation: candidate explanations, not proven causes.
     assert "speculative" in low
+    # The date guidance is ARGUMENT-level and lives in the tool description (which
+    # also carries today's date — see test_web_search.py); this static block must
+    # not duplicate it.
+    assert "no date filter" not in low
+    assert "put the period in the query" not in low
+    assert "q2 2026" not in low
 
 
 def test_compose_system_prompt_appends_blocks_in_order():
@@ -147,3 +189,26 @@ def test_prompt_teaches_the_wiki_structure_leanly():
         assert token in SYSTEM_PROMPT
     block = SYSTEM_PROMPT.split("<wiki_structure>")[1].split("</wiki_structure>")[0]
     assert len(block) < 1500, f"wiki_structure block grew to {len(block)} chars"
+
+
+def test_wiki_structure_block_agrees_with_the_wiki_primer():
+    # <wiki_structure> is the chat-tuned prose rendering of the same contract
+    # okf_core.wiki_primer serves external MCP agents via read_me. The two are
+    # deliberately separate texts (each tuned for its surface; chat gets no
+    # read_me tool — its system prompt already carries the block, cached), so
+    # this pin is the drift guard: a bundle-layout or navigation-contract
+    # change must land in BOTH or fail here.
+    from okf_core.wiki_primer import MCP_PRIMER
+
+    shared_facts = (
+        "references/usage_guardrails.md",  # the traps doc, by exact path
+        "known_issues",                    # ...and the known-issues folder
+        "index.md",                        # index-first navigation
+        "get_backlinks",                   # the "fastest route" move
+        "annotations",                     # curator annotations override prose
+        "tables/",                         # per-table docs location
+        "references/",                     # cross-cutting docs location
+    )
+    for fact in shared_facts:
+        assert fact in SYSTEM_PROMPT, f"chat <wiki_structure> lost: {fact}"
+        assert fact in MCP_PRIMER, f"wiki_primer lost: {fact}"

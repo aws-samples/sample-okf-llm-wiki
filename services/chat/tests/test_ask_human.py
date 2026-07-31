@@ -136,3 +136,18 @@ def test_tool_shape():
     assert tool.name == "ask_human"
     assert set(tool.args) == {"questions"}
     assert "clarifying questions" in tool.description.lower()
+
+
+def test_description_states_each_kind_and_drops_the_vacuous_args_block():
+    from chat.ask_human import ASK_HUMAN_DESC
+
+    # All three kinds keep their semantics, compressed to one line.
+    assert (
+        '"single" = pick exactly one; "multi" = pick any number; '
+        '"text" = free prose, no options' in ASK_HUMAN_DESC
+    )
+    # The `questions` schema example and the "Other" rule are load-bearing — keep.
+    assert '"kind": "single"' in ASK_HUMAN_DESC
+    assert '"Other" choice is added automatically' in ASK_HUMAN_DESC
+    # The Args: block only restated the arg name; it's gone.
+    assert "Args:" not in ASK_HUMAN_DESC
