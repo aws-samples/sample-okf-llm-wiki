@@ -42,9 +42,11 @@ data "aws_iam_policy_document" "reindex" {
 }
 
 # Incremental orchestrator: read Glue, read/write freshness + registry, write the
-# pending diff to S3, invoke the harvest runtime, consume its SQS.
+# pending diff to S3, invoke the harvest runtime, consume its SQS. With policy
+# builds on, it is also the AR rebuild authority (policy_rebuild events + the
+# nightly reconcile that completes/repairs policies).
 data "aws_iam_policy_document" "incremental" {
-  # checkov:skip=CKV_AWS_356:glue:Get* (read-only metadata) targets the whole catalog by design — the source database being reconciled is not known until an event arrives and Glue read actions carry no cross-database data exposure here. InvokeAgentRuntime IS scoped to the single harvest runtime (local.harvest_invoke_resources) below. All write paths (DynamoDB, S3, SQS) are resource-scoped.
+  # checkov:skip=CKV_AWS_356:glue:Get* (read-only metadata) targets the whole catalog by design — the source database being reconciled is not known until an event arrives and Glue read actions carry no cross-database data exposure here. InvokeAgentRuntime IS scoped to the single harvest runtime (local.harvest_invoke_resources) below. The automated-reasoning-policy/guardrail grants use the account-namespace patterns because policies/guardrails are runtime-created per dataset. All write paths (DynamoDB, S3, SQS) are resource-scoped.
   statement {
     actions   = ["glue:GetTable", "glue:GetTableVersions", "glue:GetTables", "glue:GetDatabases"]
     resources = ["*"]
@@ -66,6 +68,76 @@ data "aws_iam_policy_document" "incremental" {
   statement {
     actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
     resources = [aws_sqs_queue.incremental.arn]
+  }
+
+  # Automated Reasoning rebuild authority (var.enable_policy_build). Reached
+  # two ways — a `policy_rebuild` event on the existing EventBridge->SQS path,
+  # and the nightly reconcile (which also FINISHES `building` workflows: poll
+  # -> create policy version -> create/update the per-dataset guardrail with
+  # the cross-region profile -> capture the fidelity report -> stamp the
+  # DATASET# row). Both Lambdas (incremental_fn, reconcile_fn) share this one
+  # document, so one block covers both entrypoints. Same ARN patterns as the
+  # harvest role's build grants; NO Delete* — dataset deletion is the Control
+  # API's purge path.
+  dynamic "statement" {
+    for_each = local.ar_build_enabled ? [1] : []
+    content {
+      sid = "ArPolicyRebuild"
+      actions = [
+        "bedrock:CreateAutomatedReasoningPolicy",
+        "bedrock:UpdateAutomatedReasoningPolicy",
+        "bedrock:CreateAutomatedReasoningPolicyVersion",
+        "bedrock:GetAutomatedReasoningPolicy",
+        "bedrock:ListAutomatedReasoningPolicies",
+        "bedrock:StartAutomatedReasoningPolicyBuildWorkflow",
+        "bedrock:GetAutomatedReasoningPolicyBuildWorkflow",
+        "bedrock:GetAutomatedReasoningPolicyBuildWorkflowResultAssets",
+        "bedrock:ListAutomatedReasoningPolicyBuildWorkflows",
+        "bedrock:ExportAutomatedReasoningPolicyVersion",
+      ]
+      resources = local.ar_policy_resources
+    }
+  }
+  dynamic "statement" {
+    for_each = local.ar_build_enabled ? [1] : []
+    content {
+      sid = "ArGuardrailRebuild"
+      actions = [
+        "bedrock:CreateGuardrail",
+        "bedrock:UpdateGuardrail",
+        "bedrock:CreateGuardrailVersion",
+        "bedrock:GetGuardrail",
+        "bedrock:ListGuardrails",
+      ]
+      # LIVE-VERIFIED (AccessDenied, 2026-08-01): Create/UpdateGuardrail with an
+      # automatedReasoningPolicyConfig authorizes against the referenced AR
+      # POLICY (version) resource as well as the guardrail + profile — so the
+      # policy namespace must be in this statement's resources too.
+      resources = concat(
+        local.ar_guardrail_resources,
+        local.ar_guardrail_profile_resources,
+        local.ar_policy_resources,
+      )
+    }
+  }
+
+  # NO model grants here by design: the Lambda's AR work is DETERMINISTIC
+  # (snapshot restores + build completion via the control plane). Anything
+  # needing a model — the rules-authoring agent — is dispatched to the harvest
+  # runtime with mode="ar_rules" through the InvokeAgentRuntime grant above.
+
+  # The AR source fingerprint (ar_source_hash) is computed by LISTING the
+  # source prefix and GETting each file. The S3 statement above has Put/Get on
+  # ".../*" but NO bucket-level ListBucket, so the gather step would
+  # AccessDeny on ListObjectsV2 without this (moto doesn't enforce IAM — only
+  # a live deploy catches it, the BatchGetItem class of bug).
+  dynamic "statement" {
+    for_each = local.ar_build_enabled ? [1] : []
+    content {
+      sid       = "ArSourceList"
+      actions   = ["s3:ListBucket"]
+      resources = [local.d.bundle_bucket_arn]
+    }
   }
 }
 
@@ -147,6 +219,38 @@ data "aws_iam_policy_document" "control_api" {
       "cognito-idp:DescribeUserPoolClient",
     ]
     resources = [local.d.user_pool_arn]
+  }
+
+  # `policy_rebuild` publish from the REPROMOTE success path (a non-blocking
+  # accelerator: after the restore commits, one UpdateItem flags the dataset
+  # row stale and one PutEvents starts the repair — milliseconds; repromote
+  # never waits on a build). Correctness still comes from the fingerprint
+  # gate, so a lost event only costs freshness until the nightly reconcile.
+  # Publish-only, scoped to the DEFAULT bus every rule in this stack lives on.
+  dynamic "statement" {
+    for_each = local.ar_enabled ? [1] : []
+    content {
+      sid       = "PolicyRebuildPublish"
+      actions   = ["events:PutEvents"]
+      resources = [local.event_bus_arn]
+    }
+  }
+
+  # Dataset DELETION purges the AR policy + its guardrail alongside the bundle
+  # and benchmark objects (handlers.delete_domain_mapping) — a re-registered,
+  # same-named dataset must not inherit the previous owner's policy, and the
+  # 100-policy account quota makes leaks expensive. Delete-only additions (the
+  # build path lives on the harvest/incremental roles).
+  dynamic "statement" {
+    for_each = local.ar_enabled ? [1] : []
+    content {
+      sid = "ArPolicyPurge"
+      actions = [
+        "bedrock:DeleteAutomatedReasoningPolicy",
+        "bedrock:DeleteGuardrail",
+      ]
+      resources = concat(local.ar_policy_resources, local.ar_guardrail_resources)
+    }
   }
 
   # Redshift source pickers (var.enable_redshift): the UI lists clusters/workgroups

@@ -216,6 +216,24 @@ export function makeApi(token) {
     repromoteStatus: (domain, dataset) =>
       request(token, "GET", `/bundle/${domain}/${dataset}/repromote`),
 
+    // Reasoning (Automated Reasoning policy) enrollment — the Reasoning page.
+    // Enrollment is per-dataset opt-in; enrolling queues the first policy
+    // build (minutes, async), unenrolling DELETES the policy + its artifacts
+    // (the page confirms first), and sync queues a manual rebuild — the
+    // fail-safe when the wiki moved and the automatic trigger was missed.
+    getReasoning: (domain, dataset) =>
+      request(token, "GET", `/reasoning/${domain}/${dataset}`),
+    setReasoningEnrollment: (domain, dataset, enrolled) =>
+      request(token, "PUT", `/reasoning/${domain}/${dataset}/enrollment`, {
+        enrolled,
+      }),
+    triggerReasoningSync: (domain, dataset) =>
+      request(token, "POST", `/reasoning/${domain}/${dataset}/sync`),
+    // The ar_rules.md the policy is built from (the Reasoning page's document
+    // viewer). Fetched on open, never with the polled status call.
+    getReasoningDocument: (domain, dataset) =>
+      request(token, "GET", `/reasoning/${domain}/${dataset}/document`),
+
     // Annotations (user-scoped feedback on concept docs). All calls are scoped
     // server-side to the caller's Cognito sub — you only ever see/act on your
     // own. `concept` (a slash path like tables/races) rides in the query string

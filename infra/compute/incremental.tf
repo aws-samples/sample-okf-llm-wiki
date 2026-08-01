@@ -9,8 +9,11 @@ resource "aws_sqs_queue" "incremental_dlq" {
 }
 
 resource "aws_sqs_queue" "incremental" {
-  name                       = "${var.name_prefix}-incremental"
-  visibility_timeout_seconds = 360
+  name = "${var.name_prefix}-incremental"
+  # >= 6x the consuming Lambda's timeout (the reindex.tf invariant). The
+  # incremental_fn timeout rises to 120s when AR builds are on (snapshot
+  # restores run in-process), so the visibility window rises with it.
+  visibility_timeout_seconds = local.ar_build_enabled ? 720 : 360
   sqs_managed_sse_enabled    = true # SSE-SQS at rest (CKV_AWS_27)
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.incremental_dlq.arn
@@ -28,10 +31,17 @@ data "aws_iam_policy_document" "incremental_sqs" {
       type        = "Service"
       identifiers = ["events.amazonaws.com"]
     }
+    # Every rule that may deliver to this queue must be listed here. A rule
+    # missing from this condition is DENIED SILENTLY — EventBridge drops the
+    # delivery and neither side logs an error, so a policy_rebuild path missing
+    # from this list would look like "the event never fired".
     condition {
       test     = "ArnEquals"
       variable = "aws:SourceArn"
-      values   = [aws_cloudwatch_event_rule.glue_table_change.arn]
+      values = concat(
+        [aws_cloudwatch_event_rule.glue_table_change.arn],
+        local.ar_enabled ? [aws_cloudwatch_event_rule.policy_rebuild[0].arn] : [],
+      )
     }
   }
 }
@@ -56,16 +66,52 @@ resource "aws_cloudwatch_event_target" "glue_table_change" {
   arn  = aws_sqs_queue.incremental.arn
 }
 
+# --- policy_rebuild events (AR policy freshness accelerator) -------------------
+# A custom-source event that rides the SAME EventBridge -> SQS -> incremental
+# handler path the Glue change events use: same rule shape, same queue, same
+# handler host, one new detail-type. Published by (a) the Control API's
+# repromote success path and (b) the chat runtime's policy_check when it lazily
+# discovers a stale policy. Duplicate events are harmless — the build start is a
+# conditional flip of ar_build_status to "building" on the DATASET# row, so N
+# events collapse to one build.
+#
+# `source` is our OWN custom source ("okf.policy" — okf_core.policy_rebuild),
+# NOT an aws.* service source. Match on source AND detail-type so a future
+# okf.* event can't be swallowed by this rule.
+resource "aws_cloudwatch_event_rule" "policy_rebuild" {
+  count = local.ar_enabled ? 1 : 0
+  name  = "${var.name_prefix}-policy-rebuild"
+  event_pattern = jsonencode({
+    source        = ["okf.policy"]
+    "detail-type" = ["policy_rebuild"]
+  })
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_event_target" "policy_rebuild" {
+  count = local.ar_enabled ? 1 : 0
+  rule  = aws_cloudwatch_event_rule.policy_rebuild[0].name
+  arn   = aws_sqs_queue.incremental.arn
+}
+
 module "incremental_fn" {
   source      = "../modules/lambda"
   name        = "${var.name_prefix}-incremental"
   handler     = "incremental.handler.lambda_handler"
   source_dir  = "${local.build_root}/incremental"
   policy_json = data.aws_iam_policy_document.incremental.json
-  timeout     = 60
+  # 120s: a policy_rebuild event either restores a snapshot in-process (a few
+  # control-plane calls + S3 copies, seconds) or fire-and-forgets an authoring
+  # run to the harvest runtime (milliseconds) — no model calls happen here.
+  # The queue's visibility_timeout stays >= 6x this (the reindex.tf invariant).
+  timeout     = local.ar_build_enabled ? 120 : 60
   memory_size = 512
   environment = merge(local.common_env, {
     OKF_HARVEST_RUNTIME_ARN = try(aws_bedrockagentcore_agent_runtime.harvest[0].agent_runtime_arn, "")
+    # AR rebuild authority knobs (inert while enable_policy_build is off).
+    # No model config: the authoring agent runs on the HARVEST runtime.
+    OKF_POLICY_BUILD_ENABLED     = tostring(local.ar_build_enabled)
+    OKF_POLICY_GUARDRAIL_PROFILE = local.ar_guardrail_profile
   })
   tags = var.tags
 }
@@ -94,6 +140,11 @@ module "reconcile_fn" {
   memory_size = 512
   environment = merge(local.common_env, {
     OKF_HARVEST_RUNTIME_ARN = try(aws_bedrockagentcore_agent_runtime.harvest[0].agent_runtime_arn, "")
+    # The nightly pass completes `building` AR workflows (snapshotting the
+    # result), restores moved-back states, and dispatches authoring runs to
+    # the harvest runtime (inert while enable_policy_build is off).
+    OKF_POLICY_BUILD_ENABLED     = tostring(local.ar_build_enabled)
+    OKF_POLICY_GUARDRAIL_PROFILE = local.ar_guardrail_profile
   })
   tags = var.tags
 }

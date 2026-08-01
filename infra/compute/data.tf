@@ -77,6 +77,66 @@ locals {
     "arn:aws:secretsmanager:${var.region}:${local.account_id}:secret:${var.redshift_secret_name_prefix}*",
   ]
 
+  # --- Automated Reasoning (AR) policy checks ---------------------------------
+  # AR policies + per-dataset guardrails are RUNTIME-managed via boto3 (there is
+  # no aws_bedrock_automated_reasoning_policy resource in hashicorp/aws ~> 6.0 —
+  # only awscc has one; aws_bedrock_guardrail DOES exist, but the per-dataset
+  # guardrails are created dynamically per registered dataset, so they stay
+  # runtime-managed too — the S3 Vectors posture. Do not "fix" this later).
+  # Terraform contributes IAM only, so these are ARN PATTERNS over the account's
+  # own namespace, not references to TF-managed resources.
+  ar_policy_resources = [
+    "arn:aws:bedrock:${var.region}:${local.account_id}:automated-reasoning-policy/*",
+  ]
+  ar_guardrail_resources = [
+    "arn:aws:bedrock:${var.region}:${local.account_id}:guardrail/*",
+  ]
+
+  # A guardrail carrying an AR policy REQUIRES a cross-region guardrail profile
+  # (guardrailProfileIdentifier, e.g. us.guardrail.v1:0) — omitting it is a
+  # ValidationException. ApplyGuardrail then authorizes against the guardrail in
+  # the SOURCE region AND the profile object in EVERY DESTINATION region of that
+  # profile (AWS "Permissions for using cross-Region inference with Amazon
+  # Bedrock Guardrails"). A missing destination is an AccessDenied at check
+  # time, so the destination set is enumerated per source region here. Keep
+  # this map consistent with var.policy_guardrail_profile — an EU profile with
+  # US destinations (or vice versa) fails at runtime, not at plan.
+  ar_profile_destinations = {
+    "us-east-1"    = ["us-east-1", "us-east-2", "us-west-2"]
+    "us-east-2"    = ["us-east-1", "us-east-2", "us-west-2"]
+    "us-west-2"    = ["us-east-1", "us-east-2", "us-west-2"]
+    "eu-central-1" = ["eu-central-1", "eu-west-1", "eu-west-3", "eu-north-1", "eu-south-1", "eu-south-2"]
+    "eu-west-1"    = ["eu-central-1", "eu-west-1", "eu-west-3", "eu-north-1", "eu-south-1", "eu-south-2"]
+    "eu-west-3"    = ["eu-central-1", "eu-west-1", "eu-west-3", "eu-north-1", "eu-south-1", "eu-south-2"]
+  }
+  # The profile FAMILY must match the deployment region (live-verified:
+  # CreateGuardrail in eu-west-1 with us.guardrail.v1:0 is a
+  # ValidationException). Empty var -> derive from the region.
+  ar_guardrail_profile = (
+    var.policy_guardrail_profile != "" ? var.policy_guardrail_profile :
+    startswith(var.region, "eu-") ? "eu.guardrail.v1:0" : "us.guardrail.v1:0"
+  )
+  ar_guardrail_profile_resources = [
+    for r in lookup(local.ar_profile_destinations, var.region, [var.region]) :
+    "arn:aws:bedrock:${r}:${local.account_id}:guardrail-profile/${local.ar_guardrail_profile}"
+  ]
+
+  # AR checks are region-limited (six regions as of mid-2026 — notably NOT
+  # ap-southeast-2). In an unsupported region the feature degrades to ABSENT
+  # (the build hook no-ops with ar_build_status="unsupported_region" and
+  # policy_check reports "no policy"), and the grants are withheld too.
+  ar_supported_regions = [
+    "us-east-1", "us-east-2", "us-west-2",
+    "eu-central-1", "eu-west-1", "eu-west-3",
+  ]
+  ar_enabled       = var.enable_policy_checks && contains(local.ar_supported_regions, var.region)
+  ar_build_enabled = local.ar_enabled && var.enable_policy_build
+
+  # The default EventBridge bus — this stack creates no custom bus; every rule
+  # (reindex, glue_table_change, policy_rebuild) lives on "default".
+  event_bus_arn  = "arn:aws:events:${var.region}:${local.account_id}:event-bus/default"
+  event_bus_name = "default"
+
   # OTEL/ADOT env shared by BOTH AgentCore runtime containers. These are
   # self-built images (not AgentCore-CLI builds); opentelemetry-instrument + the
   # installed aws-opentelemetry-distro run in agent-observability mode.

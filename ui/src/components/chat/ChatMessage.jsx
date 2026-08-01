@@ -108,7 +108,16 @@ const Block = memo(
     blockSig(prev.block) === blockSig(next.block)
 )
 
-function ChatMessageImpl({ turn, streaming, datasetScope, wikiSources, onOpenDoc }) {
+function ChatMessageImpl({
+  turn,
+  streaming,
+  datasetScope,
+  wikiSources,
+  onOpenDoc,
+  turnKey,
+  policyOpen = false,
+  onPolicyCheck,
+}) {
   const aiEvents = turn.aiMessage || []
   const isEnd = aiEvents.length > 0 && aiEvents[aiEvents.length - 1]?.end === true
   const blocks = useMemo(
@@ -195,7 +204,13 @@ function ChatMessageImpl({ turn, streaming, datasetScope, wikiSources, onOpenDoc
             )
           })}
           {showActions ? (
-            <ResponseActions text={answerText} stats={tokenStats} />
+            <ResponseActions
+              text={answerText}
+              stats={tokenStats}
+              turnKey={turnKey}
+              policyOpen={policyOpen}
+              onPolicyCheck={onPolicyCheck}
+            />
           ) : null}
         </div>
       </div>

@@ -91,6 +91,22 @@ resource "aws_bedrockagentcore_agent_runtime" "harvest" {
     # Cap concurrent dynamic-subagent (task()) crawls; the rest queue.
     OKF_HARVEST_MAX_SUBAGENT_CONCURRENCY = tostring(var.harvest_max_subagent_concurrency)
 
+    # Automated Reasoning policy build (var.enable_policy_build). Best-effort
+    # hook at finalize, AFTER the commit marker: a failed build never fails a
+    # harvest. Also off in a region without AR checks (local.ar_build_enabled)
+    # -> the hook no-ops with ar_build_status="unsupported_region".
+    OKF_POLICY_BUILD_ENABLED = tostring(local.ar_build_enabled)
+    # Cross-region guardrail profile the per-dataset guardrail MUST carry (an
+    # AR-carrying guardrail without one is a ValidationException). Must match
+    # local.ar_guardrail_profile_resources in the IAM grants — a mismatch is an
+    # AccessDenied on ApplyGuardrail at check time, not at build time.
+    OKF_POLICY_GUARDRAIL_PROFILE = local.ar_guardrail_profile
+    # Model for the ar_rules.md AUTHORING AGENT (harvest.ar_author — full
+    # reasoning; rules distillation is judgment work). Effort/thinking-budget
+    # knobs are code-level env (OKF_POLICY_AUTHOR_EFFORT, default xhigh;
+    # OKF_POLICY_AUTHOR_THINKING_BUDGET for pre-adaptive models like Haiku 4.5).
+    OKF_POLICY_PREPROCESS_MODEL = var.policy_preprocess_model
+
     # Observability trajectory identity. service.name is what the CloudWatch
     # GenAI Observability console keys the agent card on.
     OTEL_RESOURCE_ATTRIBUTES = "service.name=${var.name_prefix}_harvest"
@@ -284,6 +300,22 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     OKF_WEB_SEARCH_REGION      = local.web_search_enabled ? "us-east-1" : ""
     OKF_WEB_SEARCH_TOOL_NAME   = local.web_search_enabled ? local.web_search_tool_name : ""
     OKF_WEB_SEARCH_MAX_RESULTS = tostring(var.web_search_max_results)
+
+    # Automated Reasoning policy check (var.enable_policy_checks): the
+    # post-turn, advisory `policy_check` request type. Master switch — with it
+    # off the request type returns a disabled envelope, and the role carries no
+    # bedrock:ApplyGuardrail grant anyway. Also OFF automatically in a region
+    # where AR checks don't exist (local.ar_enabled), so the feature degrades
+    # to ABSENT rather than to an error.
+    OKF_CHAT_POLICY_CHECK_ENABLED = tostring(local.ar_enabled)
+    # Pre-pass (transcript + question rewrite) model — extraction, not
+    # reasoning: minimal effort on GPT, thinking-off + temperature 0 on
+    # Converse. chat_mantle_enabled derives the Mantle grants from this var
+    # too, so an openai.* value (the default) or a Converse id both just work.
+    OKF_CHAT_POLICY_CHECK_MODEL = var.chat_policy_check_model
+    # v2: run the check post-turn instead of on-click. Changes only WHEN the
+    # pipeline runs, nothing else.
+    OKF_CHAT_POLICY_CHECK_EAGER = tostring(var.chat_policy_check_eager)
 
     OTEL_RESOURCE_ATTRIBUTES = "service.name=${var.name_prefix}_chat"
 

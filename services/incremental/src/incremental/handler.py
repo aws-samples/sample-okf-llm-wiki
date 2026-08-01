@@ -26,6 +26,11 @@ changedPartitions}`` we:
 ``process_event`` is a pure function with every AWS client injected so it is
 unit-testable with moto + fakes. ``lambda_handler`` is the thin SQS wrapper that
 builds clients from the environment and returns partial-batch failures.
+
+The same queue also carries ``policy_rebuild`` events (source ``okf.policy`` —
+repromote and the chat runtime's stale discovery publish them): those are
+dispatched on the EventBridge detail-type to :mod:`incremental.ar_rebuild`
+instead of the Glue path, behind ``OKF_POLICY_BUILD_ENABLED``.
 """
 
 from __future__ import annotations
@@ -36,10 +41,11 @@ import os
 from typing import Any, Callable
 
 from okf_aws.s3_bundle import is_bundle_ready
+from okf_core import policy_rebuild
 from okf_core.session import runtime_session_id
 from okf_core.sources import build_glue_source
 
-from incremental import store
+from incremental import ar_rebuild, store
 from incremental.diff import compute_column_diff
 
 log = logging.getLogger("incremental.handler")
@@ -274,18 +280,30 @@ def process_event(
 
 # -- SQS record parsing ------------------------------------------------------
 
+#: EventBridge detail-types this Lambda's queue receives. Glue is the default
+#: for bare (envelope-less) bodies because that was the only producer before
+#: ``policy_rebuild`` existed — old in-flight messages must keep their meaning.
+DETAIL_TYPE_GLUE_TABLE_CHANGE = "Glue Data Catalog Table State Change"
 
-def _extract_detail(record_body: str) -> dict[str, Any]:
-    """Pull the Glue event ``detail`` out of an SQS record body.
+
+def _extract_detail(record_body: str) -> tuple[str, dict[str, Any]]:
+    """``(detail_type, detail)`` from an SQS record body.
 
     EventBridge -> SQS delivers the full EventBridge envelope as the SQS message
     body: ``{"source", "detail-type", "detail": {...}, ...}``. Some setups wrap
-    it further, so we accept a bare detail too (has ``databaseName``).
+    it further, so we accept a bare detail too (has ``databaseName``), which is
+    always a Glue change — the ``policy_rebuild`` producers all publish real
+    EventBridge envelopes.
     """
     parsed = json.loads(record_body)
-    if isinstance(parsed, dict) and "detail" in parsed:
-        return parsed["detail"] or {}
-    return parsed if isinstance(parsed, dict) else {}
+    if not isinstance(parsed, dict):
+        return DETAIL_TYPE_GLUE_TABLE_CHANGE, {}
+    if "detail" in parsed:
+        return (
+            parsed.get("detail-type") or DETAIL_TYPE_GLUE_TABLE_CHANGE,
+            parsed["detail"] or {},
+        )
+    return DETAIL_TYPE_GLUE_TABLE_CHANGE, parsed
 
 
 def _client_factory():
@@ -296,6 +314,11 @@ def _client_factory():
     return {
         "glue": boto3.client("glue", region_name=region),
         "ddb": boto3.resource("dynamodb", region_name=region),
+        # The AR helpers speak the TYPED wire shape. A resource's
+        # ``.meta.client`` is NOT equivalent: boto3 attaches the resource's
+        # document transformations to it, so typed ExpressionAttributeValues
+        # silently match nothing. Always a separate low-level client.
+        "ddb_client": boto3.client("dynamodb", region_name=region),
         "s3": boto3.client("s3", region_name=region),
         "agentcore": boto3.client("bedrock-agentcore", region_name=region),
     }
@@ -320,7 +343,18 @@ def lambda_handler(
     for record in event.get("Records", []):
         message_id = record.get("messageId", "")
         try:
-            detail = _extract_detail(record.get("body", "{}"))
+            detail_type, detail = _extract_detail(record.get("body", "{}"))
+            if detail_type == policy_rebuild.DETAIL_TYPE_POLICY_REBUILD:
+                _process_policy_rebuild(
+                    detail,
+                    ddb_client=clients.get("ddb_client"),
+                    s3=clients["s3"],
+                    agentcore=clients["agentcore"],
+                    bundle_bucket=bundle_bucket,
+                    registry_table=registry_table,
+                    harvest_runtime_arn=harvest_runtime_arn,
+                )
+                continue
             process_event(
                 detail,
                 glue=clients["glue"],
@@ -337,3 +371,43 @@ def lambda_handler(
             failures.append({"itemIdentifier": message_id})
 
     return {"batchItemFailures": failures}
+
+
+def _process_policy_rebuild(
+    detail: dict[str, Any],
+    *,
+    ddb_client,
+    s3,
+    agentcore,
+    bundle_bucket: str,
+    registry_table: str,
+    harvest_runtime_arn: str,
+) -> None:
+    """Handle one ``policy_rebuild`` event: a freshness accelerator, never a retry.
+
+    A malformed detail is logged and dropped rather than raised — retrying it
+    forever cannot fix its shape, and correctness never depends on this event
+    (the nightly reconcile hash-verifies everything). Duplicates are harmless:
+    a snapshot restore is idempotent behind the ``building`` flip, and an
+    authoring dispatch collapses on the harvest runtime's own flip.
+    ``ddb_client`` must be a LOW-LEVEL client (see ``_client_factory``).
+    """
+    if not ar_rebuild.rebuild_enabled():
+        log.info("policy_rebuild event ignored: OKF_POLICY_BUILD_ENABLED is off")
+        return
+    try:
+        data_domain, dataset = policy_rebuild.parse_detail(detail)
+    except ValueError:
+        log.warning("Malformed policy_rebuild detail dropped: %s", detail)
+        return
+    result = ar_rebuild.run_rebuild(
+        data_domain,
+        dataset,
+        ddb=ddb_client or ar_rebuild.ddb_client(),
+        table=registry_table,
+        s3=s3,
+        bucket=bundle_bucket,
+        agentcore=agentcore,
+        harvest_runtime_arn=harvest_runtime_arn,
+    )
+    log.info("policy_rebuild %s/%s -> %s", data_domain, dataset, result)

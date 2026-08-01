@@ -14,6 +14,7 @@ import { ChatHistory } from "@/components/ChatHistory"
 import { ChatThread } from "@/components/ChatThread"
 import { DocPeek } from "@/components/chat/DocPeek"
 import { PanelShell } from "@/components/chat/PanelShell"
+import { PolicyCheckPanel } from "@/components/chat/PolicyCheckPanel"
 import { CHAT_CONFIGURED } from "@/lib/chatApi"
 import { useChatSession } from "@/hooks/useChatSession"
 import { usePanelWidth } from "@/hooks/usePanelWidth"
@@ -32,6 +33,8 @@ function Conversation({
   datasets,
   onScopeChange,
   onOpenDoc,
+  policyTurn,
+  onPolicyCheck,
 }) {
   const {
     chatTurns,
@@ -110,6 +113,8 @@ function Conversation({
       datasetScope={conv.datasetScope}
       onScopeChange={onScopeChange}
       onOpenDoc={onOpenDoc}
+      policyTurn={policyTurn}
+      onPolicyCheck={onPolicyCheck}
     />
   )
 }
@@ -140,20 +145,41 @@ export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
 
   const getToken = () => auth?.user?.access_token
 
-  // Doc peek: the citation-opened doc reader. Open flag and target are separate
-  // so closing collapses the clip while the content stays mounted (no blank
-  // panel mid-animation), and reopening the same doc is instant. A conversation
-  // switch clears both — another thread's doc is stale context here.
-  const [peekOpen, setPeekOpen] = useState(false)
+  // ONE side-panel slot, two occupants (the benchmark report's pattern): the
+  // citation-opened doc reader, or a turn's policy check. Opening one replaces the
+  // other — they compete for the same space and both are "the detail beside the
+  // conversation". `open` is separate from `occupant`/its selection so closing
+  // collapses the clip while the content stays MOUNTED (no blank panel
+  // mid-animation), and reopening the same doc or check is instant. A conversation
+  // switch clears everything — another thread's doc or check is stale context.
+  const [slot, setSlot] = useState({ open: false, occupant: null, turnKey: null })
   const [peekTarget, setPeekTarget] = useState(null)
+  const closePanel = useCallback(
+    () => setSlot((cur) => ({ ...cur, open: false })),
+    []
+  )
   const openDoc = useCallback((target) => {
     setPeekTarget(target)
-    setPeekOpen(true)
+    setSlot((cur) => ({ ...cur, open: true, occupant: "doc" }))
+  }, [])
+  // The shield TOGGLES: clicking the turn whose check is already showing closes
+  // the panel. The functional update reads the open turn without a dep, keeping
+  // this callback stable — ChatMessage is memo'd on a shallow compare, so a fresh
+  // identity here would re-render every completed turn on each stream flush.
+  const openPolicyCheck = useCallback(({ turnKey }) => {
+    setSlot((cur) => ({
+      open: !(cur.open && cur.occupant === "policy" && cur.turnKey === turnKey),
+      occupant: "policy",
+      turnKey,
+    }))
   }, [])
   useEffect(() => {
-    setPeekOpen(false)
+    setSlot({ open: false, occupant: null, turnKey: null })
     setPeekTarget(null)
   }, [conv.threadId])
+  // Only a VISIBLE check presses its turn's shield.
+  const openPolicyTurn =
+    slot.open && slot.occupant === "policy" ? slot.turnKey : null
 
   // Resizable width: dragged from the panel's left-edge handle, persisted as a
   // preference. While a drag is live the clip's width TRANSITION is disabled —
@@ -194,33 +220,46 @@ export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
           datasets={datasets}
           onScopeChange={onScopeChange}
           onOpenDoc={openDoc}
+          policyTurn={openPolicyTurn}
+          onPolicyCheck={openPolicyCheck}
         />
       </div>
 
-      {/* Doc peek — opened by clicking a wiki citation. Same width-animated
-          clip pattern as the history drawer below, so it PUSHES the chat
-          (transcript + doc readable side by side) instead of overlaying it.
-          Width is user-resizable (the panel's left-edge handle) — inline style
-          rather than a class since it's a live number. */}
+      {/* The side panel — a cited doc, or a turn's policy check. Same
+          width-animated clip pattern as the history drawer below, so it PUSHES
+          the chat (transcript + detail readable side by side) instead of
+          overlaying it. Width is user-resizable (the panel's left-edge handle) —
+          inline style rather than a class since it's a live number. */}
       <div
         className={cn(
           "h-full shrink-0 overflow-hidden",
           !peekDragging &&
             "transition-[width] duration-300 ease-in-out motion-reduce:transition-none"
         )}
-        style={{ width: peekOpen ? peekWidth : 0 }}
-        aria-hidden={!peekOpen}
+        style={{ width: slot.open ? peekWidth : 0 }}
+        aria-hidden={!slot.open}
       >
         <div
-          className={cn("h-full", !peekOpen && "invisible")}
+          className={cn("h-full", !slot.open && "invisible")}
           style={{ width: peekWidth }}
         >
-          {peekTarget ? (
+          {slot.occupant === "policy" ? (
+            <PolicyCheckPanel
+              threadId={conv.threadId}
+              getToken={getToken}
+              turnKey={slot.turnKey}
+              datasetScope={conv.datasetScope}
+              onOpenDoc={openDoc}
+              onClose={closePanel}
+              onResizeStart={startPeekResize}
+              resizing={peekDragging}
+            />
+          ) : peekTarget ? (
             <DocPeek
               api={api}
               target={peekTarget}
               onTarget={setPeekTarget}
-              onClose={() => setPeekOpen(false)}
+              onClose={closePanel}
               onResizeStart={startPeekResize}
               resizing={peekDragging}
             />

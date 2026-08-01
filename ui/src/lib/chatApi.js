@@ -157,6 +157,38 @@ export async function stopAPI({ threadId, getToken }) {
   }
 }
 
+// Run (or re-read) the advisory policy check for ONE completed turn, addressed by
+// its ordinal in the rebuilt history. Non-streaming: the runtime returns a JSON
+// report envelope, persisted per (thread, turn) — a second call re-reads the stored
+// report unless `force`. Nothing here ever touches the conversation.
+//
+// Control types answer HTTP 200 even on failure (the runtime's `_error_chunk`
+// envelope), so `res.ok` is NOT the success test — the envelope's own `type` is. A
+// runtime that predates this request type answers with an SSE stream instead, which
+// is why a non-JSON content type is reported as unavailable rather than parsed.
+export async function policyCheckAPI({
+  threadId,
+  getToken,
+  turnKey,
+  force = false,
+  signal,
+}) {
+  const input = { type: "policy_check", turn_key: turnKey }
+  if (force) input.force = true
+  const res = await post(threadId, getToken, input, { signal })
+  if (!(res.headers.get("content-type") || "").includes("application/json")) {
+    throw new Error("policy checks aren’t available on this runtime")
+  }
+  const data = await res.json()
+  if (!res.ok) {
+    throw new Error(data?.message || `policy check failed (${res.status})`)
+  }
+  if (data?.type === "error") {
+    throw new Error(data.message || data.error_code || "policy check failed")
+  }
+  return data
+}
+
 // Optional keep-warm: reset the runtime's idle timer with no LLM call. Fire and
 // forget; never affects the visible conversation (server emits only `end`).
 export async function prepareAPI({ threadId, getToken }) {

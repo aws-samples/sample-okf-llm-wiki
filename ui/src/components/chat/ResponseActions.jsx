@@ -1,15 +1,17 @@
-// The action bar under a completed AI response: copy the answer, and give
-// like/dislike feedback. Rendered only for finished turns that produced text
-// (no bar while streaming or on a tool-only/empty turn).
+// The action bar under a completed AI response: copy the answer, inspect its token
+// usage, open its policy check, and give like/dislike feedback. Rendered only for
+// finished turns that produced text (no bar while streaming or on a tool-only/empty
+// turn) — which is also the "assistant turn, complete" gate the policy check needs.
 //
 // Feedback is LOCAL toggle state (mutually exclusive, click again to clear) — the
 // chat has no feedback sink yet, so this is a UI affordance; wiring it to a
 // backend later just means lifting `feedback` up + a POST. Copy uses the same
 // CopyButton primitive as the code viewer.
 
-import { GaugeIcon, ThumbsDownIcon, ThumbsUpIcon } from "lucide-react"
+import { GaugeIcon, ShieldCheckIcon, ThumbsDownIcon, ThumbsUpIcon } from "lucide-react"
 import { memo, useCallback, useState } from "react"
 
+import { POLICY_CHECK_ENABLED } from "@/components/chat/PolicyCheckPanel"
 import { Button } from "@/components/ui/button"
 import { CopyButton } from "@/components/ui/copy-button"
 import {
@@ -110,7 +112,13 @@ function UsageAction({ stats }) {
   )
 }
 
-export const ResponseActions = memo(function ResponseActions({ text, stats }) {
+export const ResponseActions = memo(function ResponseActions({
+  text,
+  stats,
+  turnKey,
+  policyOpen = false,
+  onPolicyCheck,
+}) {
   const [feedback, setFeedback] = useState(null) // "up" | "down" | null
   const copy = (text || "").trim()
 
@@ -125,6 +133,27 @@ export const ResponseActions = memo(function ResponseActions({ text, stats }) {
     <div className="mt-1 flex items-center gap-1">
       <CopyButton text={copy} label="Copy response" />
       {stats ? <UsageAction stats={stats} /> : null}
+      {POLICY_CHECK_ENABLED && onPolicyCheck ? (
+        // Unlike the usage gauge (hidden when it has nothing to show), this is
+        // always offered on a finished turn: whether the turn is even eligible
+        // isn't known until the check runs. Neutral by design — no badge, no
+        // outcome tint, so the row can't imply a verdict before it's asked for.
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          aria-label="Check this answer against the dataset's documented rules"
+          title="Policy check"
+          aria-pressed={policyOpen}
+          onClick={() => onPolicyCheck({ turnKey })}
+          className={cn(
+            "size-7 rounded-md text-muted-foreground hover:text-foreground",
+            policyOpen && "text-primary hover:text-primary"
+          )}
+        >
+          <ShieldCheckIcon className="size-3.5" />
+        </Button>
+      ) : null}
         <Button
           type="button"
           variant="ghost"

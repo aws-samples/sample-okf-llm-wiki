@@ -35,6 +35,11 @@ module "control_api_fn" {
     # reads/renames/deletes for the UI (GET/PUT/DELETE /chat/threads).
     OKF_CHAT_THREADS_TABLE    = local.d.chat_table
     OKF_CHAT_CHECKPOINT_TABLE = local.d.chat_checkpoints_table
+    # Bus for the repromote-success `policy_rebuild` publish. Doubles as the
+    # accelerator's deploy switch: empty string = build the events client not
+    # at all, publish nothing, never flag a row stale. "default" — this stack
+    # creates no custom bus.
+    OKF_EVENT_BUS_NAME = local.ar_enabled ? local.event_bus_name : ""
   })
   tags = var.tags
 }

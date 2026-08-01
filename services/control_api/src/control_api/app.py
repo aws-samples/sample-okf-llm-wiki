@@ -84,6 +84,8 @@ class Config:
         annotations_table: str = "okf-annotations",
         chat_threads_table: str = "okf-chat",
         chat_checkpoint_table: str = "okf-chat-checkpoints",
+        events=None,
+        bedrock=None,
     ):
         self.bucket = bucket
         self.registry_table = registry_table
@@ -115,6 +117,15 @@ class Config:
         # unset, the feed endpoint returns an empty batch (feature degrades off).
         self.logs = logs
         self.harvest_log_group = harvest_log_group
+        # EventBridge publisher for the AR policy-rebuild accelerator (repromote
+        # flags the dataset row stale + publishes policy_rebuild). None = the
+        # accelerator is off (handlers treat it as a structural switch) — the
+        # nightly reconcile remains the correctness path either way.
+        self.events = events
+        # Bedrock CONTROL plane, used only by the dataset-deletion purge (the AR
+        # policy + guardrail must not outlive their dataset — the account's
+        # 100-policy quota makes leaks expensive). None skips the purge.
+        self.bedrock = bedrock
         # The allowed (model, effort) catalog the UI's picker offers; used to
         # VALIDATE a per-harvest model/effort selection before it reaches the
         # runtime + Bedrock. Defaults to okf_core's built-in catalog when the
@@ -174,6 +185,15 @@ class Config:
             chat_checkpoint_table=os.environ.get(
                 "OKF_CHAT_CHECKPOINT_TABLE", "okf-chat-checkpoints"
             ),
+            # OKF_EVENT_BUS_NAME doubles as the accelerator's deploy switch:
+            # unset/empty means no rebuild authority is listening, so repromote
+            # publishes nothing and never flips a row to stale.
+            events=(
+                boto3.client("events", region_name=region)
+                if os.environ.get("OKF_EVENT_BUS_NAME")
+                else None
+            ),
+            bedrock=boto3.client("bedrock", region_name=region),
         )
 
 
@@ -369,7 +389,8 @@ def _r_upsert_domain(cfg, params, body, query, caller):
 def _r_delete_domain(cfg, params, body, query, caller):
     # Deletes the mapping AND everything the dataset owns: the S3 bundle (which
     # cascades to vector cleanup via Object-Deleted -> reindex), the freshness
-    # rows, and the harvest status row. See handlers.delete_domain_mapping.
+    # rows, the harvest status row, and the AR policy/guardrail + policy/
+    # artifacts when the dataset has them. See handlers.delete_domain_mapping.
     return 200, handlers.delete_domain_mapping(
         cfg.ddb,
         registry_table=cfg.registry_table,
@@ -378,6 +399,7 @@ def _r_delete_domain(cfg, params, body, query, caller):
         s3=cfg.s3,
         bundle_bucket=cfg.bucket,
         freshness_table=cfg.freshness_table,
+        bedrock=cfg.bedrock,
     )
 
 
@@ -980,6 +1002,52 @@ def _r_repromote_bundle(cfg, params, body, query, caller):
         dataset=params["dataset"],
         version_id=str(handlers._require(body, "version_id")),
         requested_by=caller.ident,
+        events=cfg.events,
+    )
+
+
+def _r_get_reasoning(cfg, params, body, query, caller):
+    return 200, handlers.get_reasoning_status(
+        cfg.ddb,
+        cfg.s3,
+        registry_table=cfg.registry_table,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_set_reasoning_enrollment(cfg, params, body, query, caller):
+    enrolled = bool((body or {}).get("enrolled"))
+    return 200, handlers.set_reasoning_enrollment(
+        cfg.ddb,
+        cfg.s3,
+        cfg.bedrock,
+        cfg.events,
+        registry_table=cfg.registry_table,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        enrolled=enrolled,
+    )
+
+
+def _r_reasoning_sync(cfg, params, body, query, caller):
+    return 200, handlers.trigger_reasoning_sync(
+        cfg.ddb,
+        cfg.events,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_reasoning_document(cfg, params, body, query, caller):
+    return 200, handlers.get_reasoning_document(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
     )
 
 
@@ -1069,6 +1137,11 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("GET", "/bundle/{domain}/{dataset}/diff", _r_bundle_diff),
     ("POST", "/bundle/{domain}/{dataset}/repromote", _r_repromote_bundle),
     ("GET", "/bundle/{domain}/{dataset}/repromote", _r_repromote_status),
+    # Reasoning (AR policy) enrollment — the UI's Reasoning page.
+    ("GET", "/reasoning/{domain}/{dataset}", _r_get_reasoning),
+    ("PUT", "/reasoning/{domain}/{dataset}/enrollment", _r_set_reasoning_enrollment),
+    ("POST", "/reasoning/{domain}/{dataset}/sync", _r_reasoning_sync),
+    ("GET", "/reasoning/{domain}/{dataset}/document", _r_reasoning_document),
     ("GET", "/bundle/{domain}/{dataset}", _r_list_bundle),
 ]
 

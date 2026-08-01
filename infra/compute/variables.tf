@@ -470,6 +470,85 @@ variable "harvest_log_group" {
   EOT
 }
 
+# --- Automated Reasoning policy checks ---------------------------------------
+
+variable "enable_policy_checks" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Master deploy switch for the Automated Reasoning policy check — a post-turn,
+    ADVISORY check of a chat turn's data claims against the dataset's documented
+    rules (Bedrock Guardrails Automated Reasoning checks). It never blocks,
+    gates, or feeds back into the model; it is a trust surface for the human.
+
+    When true: the chat runtime's role gains bedrock:ApplyGuardrail (scoped to
+    this account's guardrails + the cross-region guardrail-profile objects),
+    the registry stale-flag write, and events:PutEvents; the Control API gains
+    events:PutEvents + the delete-path purge actions; and the policy_rebuild
+    EventBridge rule is created onto the incremental queue. Policies and
+    guardrails themselves are RUNTIME-managed via boto3 (hashicorp/aws ~> 6.0
+    has no AR policy resource) — Terraform contributes IAM only, the same
+    posture as S3 Vectors.
+
+    Automatically inert in a region where AR checks don't exist (see
+    local.ar_supported_regions): the feature degrades to ABSENT, never to an
+    error. Costs ~1-2 cents per inspected turn, spent only on click.
+  EOT
+}
+
+variable "enable_policy_build" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Build/refresh AR policies from the wiki (requires var.enable_policy_checks).
+    Adds the policy/build/guardrail action set to the HARVEST runtime role (the
+    finalize hook: gather sources -> preprocess -> ensure policy -> start an
+    async INGEST_CONTENT build workflow, best-effort AFTER the commit marker)
+    and to the INCREMENTAL role (the rebuild authority: policy_rebuild events +
+    the nightly reconcile that finishes `building` workflows and hash-verifies
+    every AR-enabled dataset).
+
+    Separate from enable_policy_checks so a deployment can consume policies
+    built elsewhere, or turn checks on before the build pipeline is trusted.
+    100 AR policies per account (non-adjustable) bounds dataset coverage.
+  EOT
+}
+
+variable "policy_guardrail_profile" {
+  type        = string
+  default     = ""
+  description = <<-EOT
+    Cross-region guardrail profile id the per-dataset guardrails carry. An
+    AR-policy-carrying guardrail REQUIRES one (omitting it is a
+    ValidationException), and the profile FAMILY must match the deployment
+    region — CreateGuardrail in an EU region with us.guardrail.v1:0 is a
+    ValidationException at build time (live-verified in eu-west-1). Empty
+    (the default) derives the right family from var.region:
+    eu-* -> eu.guardrail.v1:0, otherwise us.guardrail.v1:0 — see
+    local.ar_guardrail_profile. Set explicitly only to pin a specific
+    profile version; keep local.ar_profile_destinations consistent, or
+    ApplyGuardrail fails with AccessDenied at check time.
+  EOT
+}
+
+variable "chat_policy_check_model" {
+  type        = string
+  default     = "openai.gpt-5.6-luna"
+  description = "Pre-pass model for the policy check's transcript + question-rewrite extraction, run at the provider's minimal reasoning level — this is extraction, not reasoning, so a small fast id is right. An openai.* id is fully supported: chat_mantle_enabled derives the role's Mantle grants from this var too (gated on enable_policy_checks), so no extra wiring is needed to point it at GPT or back at a Converse id."
+}
+
+variable "chat_policy_check_eager" {
+  type        = bool
+  default     = false
+  description = "Run the policy check automatically post-turn instead of on-click (v2). Changes only WHEN the pipeline runs — the check itself is identical. Leave false until the false-INVALID rate on human-correct answers is measured at ~0."
+}
+
+variable "policy_preprocess_model" {
+  type        = string
+  default     = "openai.gpt-5.6-luna"
+  description = "Model for the ar_rules.md authoring agent (harvest.ar_author), run with FULL reasoning — turning wiki prose into decidable rules is judgment work, and it runs only when policy sources actually change. Runs exclusively on the harvest runtime (mode=\"ar_rules\"); harvest_mantle_enabled derives the Mantle grants from this var (gated on enable_policy_build). Kept separate from chat_policy_check_model — different services, different env namespaces."
+}
+
 variable "tags" {
   type    = map(string)
   default = { project = "okf-on-aws", managed_by = "terraform" }

@@ -1386,11 +1386,14 @@ def build_app(
     chat_config: Any = None,
     build_agent: Callable | None = None,
     index_writer: Callable | None = None,
+    policy_clients: dict[str, Any] | None = None,
 ):
     """Build the FastAPI app wired to live deps. Requires fastapi + the stack.
 
-    ``chat_config`` / ``build_agent`` / ``index_writer`` are injectable for tests;
-    in the container they default to env-resolved live clients.
+    ``chat_config`` / ``build_agent`` / ``index_writer`` / ``policy_clients`` are
+    injectable for tests; in the container they default to env-resolved live
+    clients (``policy_clients`` lazily, on the first ``policy_check`` request —
+    most deployments run with the feature off and must build nothing for it).
     """
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
@@ -1523,6 +1526,40 @@ def build_app(
         if req_type == "stop":
             try:
                 data = await stop_run(user_sub, client_thread_id)
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(
+                    _error_chunk("internal_error", str(exc)), headers=CORS_HEADERS
+                )
+            return JSONResponse(data, headers=CORS_HEADERS)
+
+        # Post-turn advisory policy check (chat.policy_check). JSON envelope
+        # like stop / get_session_history — no SSE, no new chunk vocabulary.
+        # Master-switched: with the flag off the type isn't served at all, so
+        # the deployment behaves exactly as before the feature existed.
+        if req_type == "policy_check":
+            if not getattr(chat_config, "policy_check_enabled", False):
+                return JSONResponse(
+                    _error_chunk(
+                        "disabled", "policy check is not enabled on this deployment"
+                    ),
+                    headers=CORS_HEADERS,
+                )
+            nonlocal policy_clients
+            try:
+                from chat import policy_check as pc
+
+                if policy_clients is None:
+                    policy_clients = pc.build_policy_clients(chat_config)
+                data = pc.run_policy_check(
+                    input_data,
+                    user_sub=user_sub,
+                    client_thread_id=client_thread_id,
+                    internal_thread_id=internal_id,
+                    chat_config=chat_config,
+                    build_agent=build_agent,
+                    checkpointer=checkpointer,
+                    clients=policy_clients,
+                )
             except Exception as exc:  # noqa: BLE001
                 return JSONResponse(
                     _error_chunk("internal_error", str(exc)), headers=CORS_HEADERS

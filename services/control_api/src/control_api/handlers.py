@@ -21,11 +21,13 @@ from typing import Any
 
 from datetime import timedelta
 
+from okf_aws import ar_policy
 from okf_aws import bundle_prefix, is_bundle_ready, parse_bundle_key, state_marker_key
 from okf_aws import s3_versions
 from okf_core import annotations as anno
 from okf_core import chat_threads as ct
 from okf_core import guidance as gd
+from okf_core import policy_rebuild
 from okf_core.domain import DOMAIN_DATASET
 from okf_core.links import extract_links_with_headings
 from okf_core.paths import is_external_concept_id, parse_concept_id
@@ -847,6 +849,7 @@ def delete_domain_mapping(
     s3=None,
     bundle_bucket: str | None = None,
     freshness_table: str | None = None,
+    bedrock=None,
 ) -> dict[str, Any]:
     """Delete a dataset and ALL state it owns. Idempotent throughout.
 
@@ -879,12 +882,25 @@ def delete_domain_mapping(
     purged_objects = 0
     purged_freshness = 0
 
-    # 1. Bundle + benchmark objects (+ cascade to vectors via Object-Deleted
-    #    events for the .md keys).
+    # 0. The Automated Reasoning policy + guardrail, read off the mapping row
+    #    BEFORE it goes. A re-registered same-named dataset must not inherit the
+    #    previous owner's policy, and the 100-policy account cap makes leaked
+    #    policies expensive. Best-effort (loud log): a Bedrock hiccup must not
+    #    leave the dataset half-deleted — the leak is operator-recoverable, a
+    #    wedged deletion is worse.
+    ar_purged = _purge_ar_policy(
+        ddb, bedrock, registry_table=registry_table,
+        data_domain=data_domain, dataset=dataset,
+    )
+
+    # 1. Bundle + benchmark + AR policy artifacts (+ cascade to vectors via
+    #    Object-Deleted events for the .md keys). policy/<d>/<ds>/ holds the
+    #    derived ar_rules.md + grounding.json — off-mount, like benchmark/.
     if s3 is not None and bundle_bucket:
         for prefix in (
             bundle_prefix(data_domain, dataset),
             _benchmark_prefix(data_domain, dataset),
+            ar_policy.policy_prefix(data_domain, dataset),
         ):
             purged_objects += _purge_s3_prefix(s3, bucket=bundle_bucket, prefix=prefix)
 
@@ -912,7 +928,54 @@ def delete_domain_mapping(
         "purged_bundle_objects": purged_objects,
         "purged_freshness_rows": purged_freshness,
         "purged_report_rows": purged_reports,
+        "purged_ar_policy": ar_purged,
     }
+
+
+def _purge_ar_policy(
+    ddb, bedrock, *, registry_table: str, data_domain: str, dataset: str
+) -> bool:
+    """Delete the dataset's AR guardrail then its policy. True when both are gone.
+
+    Guardrail first: it references the policy version, so deleting the policy
+    under it would raise ResourceInUse. Attempted only when the mapping row
+    actually carries AR identifiers (a never-built dataset makes no Bedrock
+    calls at all), and only with a ``bedrock`` client wired. Every failure is
+    logged and swallowed — see the caller's step-0 comment.
+    """
+    try:
+        row = (
+            ddb.get_item(
+                TableName=registry_table,
+                Key={
+                    "pk": {"S": f"DOMAIN#{data_domain}"},
+                    "sk": {"S": f"DATASET#{dataset}"},
+                },
+            ).get("Item")
+            or {}
+        )
+        policy_arn = ((row.get("ar_policy_arn") or {}).get("S")) or ""
+        guardrail_id = ((row.get("ar_guardrail_id") or {}).get("S")) or ""
+        if bedrock is None or not (policy_arn or guardrail_id):
+            return False
+        if guardrail_id:
+            bedrock.delete_guardrail(guardrailIdentifier=guardrail_id)
+        if policy_arn:
+            # force=True: versions/test artifacts go with the policy — nothing
+            # under a deleted dataset's policy is worth preserving.
+            bedrock.delete_automated_reasoning_policy(policyArn=policy_arn, force=True)
+        return True
+    except Exception:  # noqa: BLE001 - a leaked policy beats a wedged deletion
+        import logging
+
+        logging.getLogger("control_api").warning(
+            "AR policy purge failed for %s/%s (delete the policy/guardrail "
+            "manually to reclaim the account quota)",
+            data_domain,
+            dataset,
+            exc_info=True,
+        )
+        return False
 
 
 def _purge_s3_prefix(s3, *, bucket: str, prefix: str) -> int:
@@ -3123,6 +3186,349 @@ def acquire_repromote_lease(
         raise
 
 
+#: Publisher breadcrumb on the ``policy_rebuild`` detail. Only ever reaches the
+#: consumer's log — the rebuild pipeline is the same whatever moved the wiki —
+#: but it makes a bare detail classifiable when read off the queue.
+_POLICY_REBUILD_REASON = "repromote"
+
+
+def _signal_policy_rebuild(
+    ddb,
+    events,
+    *,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+) -> dict[str, Any]:
+    """Nudge the AR rebuild authority after a wiki mutation no harvest covered.
+
+    A repromote replaces the live bundle without a finalize, so any Automated
+    Reasoning policy built off the superseded content now describes the wrong
+    wiki. This flags the dataset's registry row ``stale`` (which is what the
+    check-time usability gate reads) and publishes one ``policy_rebuild`` event
+    so the incremental service starts the repair in minutes instead of at the
+    next nightly reconcile.
+
+    Purely an accelerator, hence total: it never raises and never blocks. The
+    fingerprint gate makes a policy built off older sources unusable rather than
+    wrong, and the nightly hash-verify rebuilds it regardless, so a swallowed
+    failure here costs freshness, never truth. A dataset with no AR attrs flags
+    nothing — the conditional write must never CREATE policy state for a dataset
+    that has none.
+
+    ``events`` doubles as the accelerator's structural off switch — handlers read
+    no environment, so an unconfigured publisher is how "policy builds are off"
+    reaches this code, and None then skips BOTH halves: with no rebuild authority
+    listening there is nothing to accelerate, and the row must not be moved out
+    of ``ready`` with no one able to move it back.
+
+    Returns a small status dict (what actually happened, for logging and for
+    tests to assert on); never raises. Deliberately NOT surfaced in the
+    repromote response: the restore's outcome does not depend on it.
+    """
+    if events is None:
+        return {"flagged": False, "published": False, "reason": "no events client"}
+    flagged = False
+    published = False
+    try:
+        flagged = ar_policy.flag_stale(
+            ddb, registry_table, data_domain=data_domain, dataset=dataset
+        )
+        resp = events.put_events(
+            Entries=[
+                {
+                    "Source": policy_rebuild.EVENT_SOURCE,
+                    "DetailType": policy_rebuild.DETAIL_TYPE_POLICY_REBUILD,
+                    "Detail": json.dumps(
+                        policy_rebuild.build_detail(
+                            data_domain, dataset, reason=_POLICY_REBUILD_REASON
+                        )
+                    ),
+                }
+            ]
+        )
+        # PutEvents reports per-entry rejections INSIDE a 200 response, so a
+        # clean return is not delivery.
+        failed = (resp or {}).get("FailedEntryCount", 0)
+        published = not failed
+        if failed:
+            import logging
+
+            logging.getLogger("control_api").warning(
+                "policy_rebuild event rejected for %s/%s: %s",
+                data_domain,
+                dataset,
+                (resp.get("Entries") or [{}])[0].get("ErrorCode", ""),
+            )
+    except Exception as e:  # noqa: BLE001 - the accelerator must never fail a repromote
+        import logging
+
+        logging.getLogger("control_api").warning(
+            "policy rebuild signal failed for %s/%s: %s",
+            data_domain,
+            dataset,
+            type(e).__name__,
+        )
+        return {"flagged": flagged, "published": published, "reason": type(e).__name__}
+    return {"flagged": flagged, "published": published}
+
+
+# --------------------------------------------------------------------------- #
+# Reasoning (AR policy) enrollment — the UI's Reasoning page
+# --------------------------------------------------------------------------- #
+#
+# Enrollment is the per-dataset OPT-IN under the deploy-wide flags: the build
+# paths (harvest finalize, incremental rebuild authority) and the chat check
+# all read `ar_enrolled` off the mapping row and skip datasets without it. The
+# 100-policy account cap (non-adjustable) is why this is opt-in: the cap is a
+# budget the user spends per dataset, never a race between harvests.
+
+
+def _reasoning_row(ddb, registry_table: str, data_domain: str, dataset: str) -> dict:
+    """The raw mapping row, or ApiError(404) — reasoning needs a registered dataset."""
+    item = ddb.get_item(
+        TableName=registry_table,
+        Key={
+            "pk": {"S": f"DOMAIN#{data_domain}"},
+            "sk": {"S": f"DATASET#{dataset}"},
+        },
+    ).get("Item")
+    if not item:
+        raise ApiError(404, f"no such dataset: {data_domain}/{dataset}")
+    return item
+
+
+def _row_str(item: dict[str, Any], name: str) -> str:
+    return str((item.get(name) or {}).get("S") or "")
+
+
+def _publish_policy_rebuild(events, *, data_domain: str, dataset: str, reason: str) -> bool:
+    """Publish one ``policy_rebuild`` event; True when accepted. Never raises.
+
+    The rebuild authority's conditional ``building`` flip makes duplicates
+    harmless, and the nightly reconcile makes a lost event a freshness delay,
+    never a correctness problem — so publishing is always best-effort.
+    """
+    if events is None:
+        return False
+    try:
+        resp = events.put_events(
+            Entries=[
+                {
+                    "Source": policy_rebuild.EVENT_SOURCE,
+                    "DetailType": policy_rebuild.DETAIL_TYPE_POLICY_REBUILD,
+                    "Detail": json.dumps(
+                        policy_rebuild.build_detail(data_domain, dataset, reason=reason)
+                    ),
+                }
+            ]
+        )
+        return not (resp or {}).get("FailedEntryCount", 0)
+    except Exception:  # noqa: BLE001 - the nightly reconcile is the safety net
+        import logging
+
+        logging.getLogger("control_api").warning(
+            "policy_rebuild publish failed for %s/%s", data_domain, dataset,
+            exc_info=True,
+        )
+        return False
+
+
+def get_reasoning_status(
+    ddb,
+    s3,
+    *,
+    registry_table: str,
+    bucket: str,
+    data_domain: str,
+    dataset: str,
+) -> dict[str, Any]:
+    """Everything the Reasoning page renders, in one call.
+
+    ``up_to_date`` is the user-facing face of the fingerprint gate: the stored
+    ``ar_source_hash`` (what the policy was built from) against a hash computed
+    from the LIVE wiki right now. ``sources`` is the live source-file set —
+    what a build started today would ingest — and ``rules`` is the built
+    policy's grounding map (empty until the first build completes), each rule
+    quoting the wiki page it came from.
+    """
+    item = _reasoning_row(ddb, registry_table, data_domain, dataset)
+    enrolled = ar_policy.is_enrolled(item)
+    status = _row_str(item, ar_policy.ATTR_BUILD_STATUS)
+    stored_hash = _row_str(item, ar_policy.ATTR_SOURCE_HASH)
+
+    wiki_ready = is_bundle_ready(s3, bucket, data_domain, dataset)
+    sources = ar_policy.gather_sources(s3, bucket, data_domain, dataset)
+    fresh_hash = ar_policy.hash_sources(sources)
+
+    up_to_date: bool | None = None
+    if stored_hash:
+        up_to_date = bool(fresh_hash) and fresh_hash == stored_hash
+
+    rules: list[dict[str, Any]] = []
+    if enrolled and status:
+        grounding = ar_policy.read_grounding(
+            s3, bucket=bucket, data_domain=data_domain, dataset=dataset
+        )
+        rules = [
+            {
+                "id": rule_id,
+                "text": (entry or {}).get("rule_text") or "",
+                "source_page": (entry or {}).get("rule_source_page") or "",
+            }
+            for rule_id, entry in sorted(grounding.items())
+            if isinstance(entry, dict)
+        ]
+
+    return {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "enrolled": enrolled,
+        # Enrollability: a wiki must exist first (the policy is derived FROM
+        # it), and a wiki without any policy-source files can enroll but has
+        # nothing to build — the page says so instead of showing a dead state.
+        "can_enroll": wiki_ready,
+        "reason": None if wiki_ready else "no wiki yet — run a harvest first",
+        "has_sources": bool(sources),
+        "status": status,
+        "built_at": _row_str(item, "ar_built_at"),
+        "build_detail": _row_str(item, "ar_build_detail"),
+        "policy_version": _row_str(item, "ar_policy_version"),
+        "fidelity_coverage": float(
+            (item.get("ar_fidelity_coverage") or {}).get("N") or 0
+        ),
+        "fidelity_accuracy": float(
+            (item.get("ar_fidelity_accuracy") or {}).get("N") or 0
+        ),
+        "up_to_date": up_to_date,
+        "sources": [rel for rel, _content in sources],
+        "rules": rules,
+    }
+
+
+def set_reasoning_enrollment(
+    ddb,
+    s3,
+    bedrock,
+    events,
+    *,
+    registry_table: str,
+    bucket: str,
+    data_domain: str,
+    dataset: str,
+    enrolled: bool,
+) -> dict[str, Any]:
+    """Flip the dataset's reasoning enrollment. Idempotent in both directions.
+
+    ENROLL sets the flag and publishes one ``policy_rebuild`` event — the first
+    build runs on the rebuild authority (minutes-scale Bedrock work has no
+    place in a 30s Lambda). Refused while no complete wiki exists: the policy
+    is derived from the bundle, so there is nothing to derive from yet.
+
+    UNENROLL is DELETE semantics (operator decision): the guardrail, the
+    policy (reclaiming its slot under the account's 100-policy cap), the
+    ``policy/<d>/<ds>/`` artifacts, and every ``ar_*`` row attribute all go.
+    Strict, not best-effort — the user asked for a deletion, so a failed
+    Bedrock delete surfaces as an error to retry rather than silently leaking
+    a policy the row no longer knows about. Refused while a build is in
+    flight (the workflow must finish or fail before its policy can go).
+    """
+    item = _reasoning_row(ddb, registry_table, data_domain, dataset)
+    already = ar_policy.is_enrolled(item)
+
+    if enrolled:
+        if events is None:
+            raise ApiError(409, "reasoning is not enabled on this deployment")
+        if not already:
+            if not is_bundle_ready(s3, bucket, data_domain, dataset):
+                raise ApiError(
+                    409, "no wiki yet — run a harvest before enrolling in reasoning"
+                )
+            ar_policy.set_enrolled(
+                ddb, registry_table, data_domain=data_domain, dataset=dataset
+            )
+        queued = _publish_policy_rebuild(
+            events, data_domain=data_domain, dataset=dataset, reason="enroll"
+        )
+        return {"enrolled": True, "queued": queued}
+
+    if not already:
+        return {"enrolled": False, "deleted": False}
+    if _row_str(item, ar_policy.ATTR_BUILD_STATUS) == ar_policy.BUILD_BUILDING:
+        raise ApiError(
+            409,
+            "a policy build is in flight — wait for it to finish before unenrolling",
+        )
+    policy_arn = _row_str(item, "ar_policy_arn")
+    guardrail_id = _row_str(item, "ar_guardrail_id")
+    try:
+        # Guardrail first: it references the policy version.
+        if bedrock is not None and guardrail_id:
+            bedrock.delete_guardrail(guardrailIdentifier=guardrail_id)
+        if bedrock is not None and policy_arn:
+            bedrock.delete_automated_reasoning_policy(policyArn=policy_arn, force=True)
+    except Exception as e:  # noqa: BLE001 - surface, don't leak silently
+        raise ApiError(
+            502, f"could not delete the reasoning policy ({type(e).__name__}) — try again"
+        ) from e
+    _purge_s3_prefix(
+        s3, bucket=bucket, prefix=ar_policy.policy_prefix(data_domain, dataset)
+    )
+    ar_policy.clear_ar_attrs(
+        ddb, registry_table, data_domain=data_domain, dataset=dataset
+    )
+    return {"enrolled": False, "deleted": True}
+
+
+def trigger_reasoning_sync(
+    ddb,
+    events,
+    *,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+) -> dict[str, Any]:
+    """The Reasoning page's manual fail-safe: queue one rebuild now.
+
+    Just the event — the rebuild authority owns the pipeline, and its
+    rebuild-iff-changed skip means syncing an already-current policy is a
+    clean no-op rather than a wasted build.
+    """
+    item = _reasoning_row(ddb, registry_table, data_domain, dataset)
+    if not ar_policy.is_enrolled(item):
+        raise ApiError(409, "dataset is not enrolled in reasoning")
+    if events is None:
+        raise ApiError(409, "reasoning is not enabled on this deployment")
+    queued = _publish_policy_rebuild(
+        events, data_domain=data_domain, dataset=dataset, reason="manual_sync"
+    )
+    return {"queued": queued}
+
+
+def get_reasoning_document(
+    s3,
+    *,
+    bucket: str,
+    data_domain: str,
+    dataset: str,
+) -> dict[str, Any]:
+    """The dataset's ``ar_rules.md`` — the document its policy is built from.
+
+    A separate endpoint (not a ``get_reasoning_status`` field) because the
+    status call is polled every few seconds during a build and this document
+    can be tens of kilobytes: it is fetched only when the user opens the
+    viewer. The live file is version-faithful by construction — authoring
+    rewrites it at build time and a snapshot restore rewrites it from the
+    restored era — so no version parameter exists. Absent (never authored,
+    or unenrolled) reads as ``exists: false`` rather than an error: the page
+    decides how to render that.
+    """
+    text = ar_policy.read_ar_rules(
+        s3, bucket=bucket, data_domain=data_domain, dataset=dataset
+    )
+    return {"exists": text is not None, "text": text or ""}
+
+
 def repromote_bundle(
     s3,
     ddb,
@@ -3133,6 +3539,7 @@ def repromote_bundle(
     dataset: str,
     version_id: str,
     requested_by: str,
+    events=None,
 ) -> dict[str, Any]:
     """Make an older bundle version the new head. Synchronous; seconds.
 
@@ -3152,6 +3559,11 @@ def repromote_bundle(
     the UI confirm dialog). Failure mid-write releases the lease as ``failed``
     and leaves the marker ``in_progress`` — the same posture as a crashed
     harvest; the recovery is retrying (idempotent) or re-harvesting.
+
+    ``events`` is the EventBridge publisher for the AR policy-rebuild
+    accelerator (:func:`_signal_policy_rebuild`); None turns the accelerator off
+    entirely. It fires once the restore is committed and never affects the
+    outcome, so a repromote behaves identically with it wired or not.
     """
     markers = s3_versions.list_complete_markers(
         s3, bucket=bucket, data_domain=data_domain, dataset=dataset
@@ -3265,6 +3677,17 @@ def repromote_bundle(
             dataset=dataset,
             status="complete",
             detail=f"repromoted to {label}",
+        )
+        # Signal only from here: with the copy done AND the fresh ``complete``
+        # marker written, "the live wiki is now the restored version" is durably
+        # true. Vector convergence is a LATER, separately polled concept — the
+        # rebuild must not wait on it (this is a 30s-capped Lambda).
+        _signal_policy_rebuild(
+            ddb,
+            events,
+            registry_table=registry_table,
+            data_domain=data_domain,
+            dataset=dataset,
         )
         return {
             "status": "complete",

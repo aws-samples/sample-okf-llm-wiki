@@ -14,13 +14,19 @@ locals {
   harvest_mantle_enabled = anytrue(concat(
     [startswith(var.harvest_model, "openai.")],
     [for m in var.harvest_model_catalog : startswith(m.model, "openai.")],
+    # The AR rules-preprocessing pass runs in the harvest runtime at finalize;
+    # a GPT preprocess id is only reachable when policy builds are on.
+    [local.ar_build_enabled && startswith(var.policy_preprocess_model, "openai.")],
   ))
 
   # Same reasoning for the chat runtime: grant Mantle when a GPT id is reachable
-  # at chat time (the deploy-time default OR any catalog entry the picker offers).
+  # at chat time (the deploy-time default, any catalog entry the picker offers,
+  # or the policy check's pre-pass model — the documented footgun: the pre-pass
+  # id never passes through the catalog, so it must be listed here explicitly).
   chat_mantle_enabled = anytrue(concat(
     [startswith(var.chat_model, "openai.")],
     [for m in var.chat_model_catalog : startswith(m.model, "openai.")],
+    [local.ar_enabled && startswith(var.chat_policy_check_model, "openai.")],
   ))
 }
 
@@ -321,6 +327,8 @@ data "aws_iam_policy_document" "harvest" {
       # carry in lambda_policies.tf.
       "s3:GetObjectVersion", "s3:ListBucketVersions",
     ]
+    # Off-mount derived artifacts (benchmark/, policy/) ride this same
+    # bucket-wide grant — no separate policy/* statement is needed.
     resources = [
       local.d.bundle_bucket_arn,
       "${local.d.bundle_bucket_arn}/*",
@@ -329,12 +337,73 @@ data "aws_iam_policy_document" "harvest" {
 
   # The agent reports its own lifecycle back to the registry status row
   # (queued -> running -> complete|failed) so the UI's GET /harvest reflects
-  # reality. UpdateItem only (touches status/updated_at/detail); the Control
-  # API owns the initial put. Scoped to the single registry table.
+  # reality, and the AR build hook reads the DATASET# row's ar_build_status /
+  # ar_source_hash for its rebuild-iff-changed skip before conditionally
+  # flipping it to `building`. GetItem + UpdateItem only; the Control API owns
+  # the initial put. Scoped to the single registry table.
   statement {
-    sid       = "RegistryStatusWrite"
-    actions   = ["dynamodb:UpdateItem"]
+    sid       = "RegistryStatusReadWrite"
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
     resources = [local.d.registry_table_arn]
+  }
+
+  # Automated Reasoning policy BUILD (var.enable_policy_build): at harvest
+  # finalize, AFTER the commit marker, the runner gathers the source set,
+  # preprocesses it into policy/<d>/<ds>/ar_rules.md, ensures the policy exists
+  # (create with the pre-seeded variable schema if absent) and STARTS an async
+  # INGEST_CONTENT build workflow — then returns. Builds are minutes-scale; the
+  # harvest never waits, and a failed build never fails a harvest.
+  #
+  # Scoped to the account's own automated-reasoning-policy + guardrail
+  # namespaces (both are runtime-created, so no ARN is plan-known) plus the
+  # cross-region guardrail-profile objects the per-dataset guardrail must
+  # carry. NO Delete* here — deletion is the Control API's dataset-purge path,
+  # and the harvest role must not be able to destroy another dataset's policy.
+  dynamic "statement" {
+    for_each = local.ar_build_enabled ? [1] : []
+    content {
+      sid = "HarvestArPolicyBuild"
+      actions = [
+        "bedrock:CreateAutomatedReasoningPolicy",
+        "bedrock:UpdateAutomatedReasoningPolicy",
+        "bedrock:CreateAutomatedReasoningPolicyVersion",
+        "bedrock:GetAutomatedReasoningPolicy",
+        "bedrock:ListAutomatedReasoningPolicies",
+        "bedrock:StartAutomatedReasoningPolicyBuildWorkflow",
+        "bedrock:GetAutomatedReasoningPolicyBuildWorkflow",
+        "bedrock:GetAutomatedReasoningPolicyBuildWorkflowResultAssets",
+        "bedrock:ListAutomatedReasoningPolicyBuildWorkflows",
+        "bedrock:ExportAutomatedReasoningPolicyVersion",
+      ]
+      resources = local.ar_policy_resources
+    }
+  }
+
+  # The per-dataset guardrail that CARRIES the policy (max 2 AR policies per
+  # guardrail -> one guardrail per dataset). Create/UpdateGuardrail need the
+  # guardrail-profile ARNs in Resource too, because the create call names a
+  # cross-region profile (mandatory for an AR-carrying guardrail).
+  dynamic "statement" {
+    for_each = local.ar_build_enabled ? [1] : []
+    content {
+      sid = "HarvestArGuardrail"
+      actions = [
+        "bedrock:CreateGuardrail",
+        "bedrock:UpdateGuardrail",
+        "bedrock:CreateGuardrailVersion",
+        "bedrock:GetGuardrail",
+        "bedrock:ListGuardrails",
+      ]
+      # LIVE-VERIFIED (AccessDenied, 2026-08-01): Create/UpdateGuardrail with an
+      # automatedReasoningPolicyConfig authorizes against the referenced AR
+      # POLICY (version) resource as well as the guardrail + profile — so the
+      # policy namespace must be in this statement's resources too.
+      resources = concat(
+        local.ar_guardrail_resources,
+        local.ar_guardrail_profile_resources,
+        local.ar_policy_resources,
+      )
+    }
   }
 
   # Annotation-mode re-harvest write-back. When the run finishes, the RUNNER
@@ -513,6 +582,58 @@ data "aws_iam_policy_document" "chat" {
     sid       = "RegistryRead"
     actions   = ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:Scan"]
     resources = [local.d.registry_table_arn]
+  }
+
+  # Automated Reasoning policy check (var.enable_policy_checks): the post-turn,
+  # advisory answer/process check runs bedrock-runtime ApplyGuardrail in DETECT
+  # mode against the touched dataset's per-dataset guardrail. Read-only by
+  # construction — ApplyGuardrail never mutates content and the findings never
+  # re-enter the model. Scoped to the account's own guardrail namespace (the
+  # guardrails are runtime-created by the build path, so their ids aren't
+  # plan-known) PLUS every DESTINATION-region guardrail-profile object of the
+  # cross-region profile the guardrails carry — a guardrail with an AR policy
+  # MUST have a profile, and ApplyGuardrail authorizes against the profile in
+  # each destination region as well (see local.ar_guardrail_profile_resources).
+  # Omitting the profile ARNs is an AccessDenied on every check, not a warning.
+  # bedrock:InvokeAutomatedReasoningPolicy is REQUIRED alongside ApplyGuardrail
+  # for an AR-carrying guardrail (AWS AR permissions doc, verified 2026-08-01).
+  dynamic "statement" {
+    for_each = local.ar_enabled ? [1] : []
+    content {
+      sid       = "ChatApplyGuardrail"
+      actions   = ["bedrock:ApplyGuardrail"]
+      resources = concat(local.ar_guardrail_resources, local.ar_guardrail_profile_resources)
+    }
+  }
+  dynamic "statement" {
+    for_each = local.ar_enabled ? [1] : []
+    content {
+      sid       = "ChatInvokeArPolicy"
+      actions   = ["bedrock:InvokeAutomatedReasoningPolicy"]
+      resources = local.ar_policy_resources
+    }
+  }
+
+  # policy_check's stale discovery (design §7.5): a fresh-hash mismatch flags
+  # the dataset row `stale` (a CONDITIONAL UpdateItem that only transitions
+  # from ready|degraded — it can never create AR state or clobber a build) and
+  # publishes a `policy_rebuild` event so the click starts the repair. One
+  # write action on one table + publish-only on the default bus.
+  dynamic "statement" {
+    for_each = local.ar_enabled ? [1] : []
+    content {
+      sid       = "ChatRegistryStaleFlag"
+      actions   = ["dynamodb:UpdateItem"]
+      resources = [local.d.registry_table_arn]
+    }
+  }
+  dynamic "statement" {
+    for_each = local.ar_enabled ? [1] : []
+    content {
+      sid       = "ChatPolicyRebuildPublish"
+      actions   = ["events:PutEvents"]
+      resources = [local.event_bus_arn]
+    }
   }
 
   # Conversation memory: the DynamoDBSaver checkpoint table (full item R/W —

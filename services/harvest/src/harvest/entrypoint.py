@@ -96,6 +96,18 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
         run_aggregate_annotations(payload, session_id=session_id)
         return
 
+    # AR rules maintenance — the rebuild authority invokes this when a policy
+    # needs (re)authoring and no content-addressed snapshot covers the current
+    # wiki state. Hosted here (the container owns the model factory and the
+    # authoring agent) but NOT a harvest: no lease, no mount — it reads the
+    # bundle from S3 and writes only the off-mount policy/<d>/<ds>/ artifacts.
+    if mode == "ar_rules":
+        from harvest.ar_build import maybe_build_policy
+
+        outcome = maybe_build_policy(data_domain=data_domain, dataset=dataset)
+        log.info("ar_rules run for %s/%s -> %s", data_domain, dataset, outcome)
+        return
+
     root = dataset_root(MOUNT_PATH, data_domain, dataset)
     # The Control API threads the resolved source descriptor ({type, ...config})
     # into the payload; build_source dispatches on its type. Absent (an older
@@ -311,6 +323,11 @@ def _validate(payload: dict) -> str | None:
         from harvest.benchmark.studio import validate_aggregate_payload
 
         return validate_aggregate_payload(payload)
+    if mode == "ar_rules":
+        for key in ("data_domain", "dataset"):
+            if not payload.get(key):
+                return f"missing required field: {key}"
+        return None
     for key in ("data_domain", "dataset"):
         if not payload.get(key):
             return f"missing required field: {key}"

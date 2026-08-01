@@ -20,6 +20,7 @@ import {
   NetworkIcon,
   PanelLeftIcon,
   PlayIcon,
+  ShieldCheckIcon,
   SunIcon,
 } from "lucide-react"
 
@@ -85,6 +86,8 @@ import ContextView from "@/views/ContextView.jsx"
 import CredentialsView from "@/views/CredentialsView.jsx"
 import HarvestView from "@/views/HarvestView.jsx"
 import BenchmarkView from "@/views/BenchmarkView.jsx"
+import ReasoningView from "@/views/ReasoningView.jsx"
+import { POLICY_CHECK_ENABLED } from "@/components/chat/PolicyCheckPanel"
 import BenchmarkReportView from "@/views/BenchmarkReportView.jsx"
 import BrowseView from "@/views/BrowseView.jsx"
 import GraphView from "@/views/GraphView.jsx"
@@ -112,6 +115,19 @@ const NAV = [
     icon: GaugeIcon,
     needsSelection: true,
   },
+  // Reasoning: per-dataset Automated Reasoning enrollment + the built policy.
+  // Shown whenever the deploy exposes policy checks (same display gate as the
+  // chat toggle); the Control API is the real boundary.
+  ...(POLICY_CHECK_ENABLED
+    ? [
+        {
+          key: "reasoning",
+          label: "Reasoning",
+          icon: ShieldCheckIcon,
+          needsSelection: true,
+        },
+      ]
+    : []),
   { key: "browse", label: "Browse", icon: BoxesIcon, needsSelection: true },
   { key: "graph", label: "Graph", icon: NetworkIcon, needsSelection: true },
   // Chat spans the whole wiki (the "@" picker narrows it), so it needs no
@@ -1002,6 +1018,9 @@ function Console({ auth, api }) {
                       selection={selection}
                       datasets={datasets}
                     />
+                  )}
+                  {section === "reasoning" && (
+                    <ReasoningView api={api} selection={selection} />
                   )}
                   {section === "credentials" && (
                     <CredentialsView api={api} email={email} />

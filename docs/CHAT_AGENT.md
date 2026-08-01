@@ -366,6 +366,16 @@ via the shared `_thinking_fields`; GPT `reasoning_effort`) to produce reasoning.
 
 ## 9. Keep-warm / prepare
 
+**Deploy draining (live-verified, 2026-08-01):** an AgentCore session is
+pinned to the runtime **version** it started on, and the chat session id is
+the conversation's thread UUID — deliberately sticky. So after an image
+deploy, **conversations opened before the deploy keep running the OLD code**
+(including their `policy_check` calls) until they idle out
+(`chat_idle_runtime_session_timeout`, default 30 min); a NEW conversation
+lands on the new version immediately. This is ordinary connection-drain
+semantics — the checkpointer makes the eventual cutover lossless — but it
+reads as "my fix didn't deploy" if you test in a pre-deploy thread.
+
 **Important nuance (verified):** AG-UI has **no native `prepare`** concept, and
 **`GET /ping` does NOT keep a session warm** — `/ping` is AgentCore's container
 health probe; only a real invocation to the *same* `runtimeSessionId` resets the
@@ -859,6 +869,100 @@ conversation's tool-traffic index, then the conversation scope.
 concept ids with a location: located tool-call args, `read_page`/`glob`/`grep`
 results, `get_backlinks` results (located via their own call's args, matched by
 tool-call id), and `semantic_search` vector keys.
+
+## 14f. Policy check (`policy_check`) — post-turn, advisory — BUILT
+
+A **finished** turn's data claims can be validated against the dataset's
+documented rules by Bedrock Guardrails **Automated Reasoning checks** (an SMT
+solver over formal rules derived from the wiki), and the findings shown in a
+sidebar. Deploy-gated by `OKF_CHAT_POLICY_CHECK_ENABLED` (default off, so with
+the flag unset the type is refused like any unknown type and the UI affordance is
+absent); the policy build side, the `DATASET#` row state machine, and the S3
+artifacts are in CONVENTIONS.md §"Automated Reasoning policy checks".
+
+**Never in the live turn path.** The check runs strictly after the turn
+completed, on its own request, out of band: findings never enter the model's
+message history, no answer is regenerated or altered, and nothing about a turn
+changes because it was (or wasn't) checked. `apply_guardrail` is called in
+detect mode only. This is a trust surface for the human, not a control loop for
+the agent — which is also why the toggle carries no alert badge.
+
+**Request type** — a new non-streaming branch of the `type`-discriminated
+`input` envelope (sibling of `get_session_history` / `delete_history` / `stop`):
+
+```json
+{"input": {"type": "policy_check", "turn_key": 3, "force": false}}
+```
+
+- `turn_key` (int, required) — the **server-side turn ordinal**, i.e. the index
+  of the turn in the history the server rebuilds (`_messages_to_turns` labels
+  them `turn_<n>`). Conversations are append-only, so an ordinal is stable
+  forever and needs no new id plumbing: the browser sends its `chatTurns` array
+  index and the server validates the range. `policy_check` reads history WITHOUT
+  `inflight_user_message` (the get_session_history path drops the in-flight
+  turn — this one must still see it, in order to *reject* it), and a `turn_key`
+  pointing at a turn whose run is still streaming gets `status: "running"`.
+- `force` (bool, optional, default false) — re-run a check whose report row is
+  already cached. Without it a stored `complete` / `not_eligible` row is returned
+  as-is.
+
+**Response — always HTTP 200**, a JSON envelope with `CORS_HEADERS`, like every
+other control type (the browser reads the runtime directly, so a non-200 would
+surface as an opaque transport failure rather than a renderable state):
+
+```json
+{"type": "policy_check", "status": "complete",
+ "standalone_question": "average points per team for the 2019 season",
+ "rewritten": true, "eligible": true, "reason": null,
+ "transcript": "…", "assumptions": ["'season' interpreted as calendar year"],
+ "datasets": [
+   {"dataset": "bird/formula_1", "verdict": "violation",
+    "findings": [{"type": "INVALID", "claim": "…",
+                  "rule_text": "…",
+                  "rule_source_page": "references/usage_guardrails.md",
+                  "scenario": "…", "confidence": 0.92}]}
+ ]}
+```
+
+`status` ∈ `complete | not_eligible | unavailable | running`. A per-dataset
+`verdict` is one of `violation`, `consistent`, `not_checkable`, `not_enrolled`
+(the dataset hasn't opted into reasoning — the sidebar points at the Reasoning
+page instead of implying a build that never comes), `no_policy`,
+`stale`, `building`; finding types map on as INVALID/IMPOSSIBLE → `violation`,
+SATISFIABLE/VALID → `consistent`, NO_TRANSLATIONS/TOO_COMPLEX/
+TRANSLATION_AMBIGUOUS → `not_checkable`, and the dataset verdict is the worst
+finding present (no findings at all → `consistent`). A turn with no data claims
+(no executed SQL, no answered `ask_human`, no fenced SQL in the answer) is
+`not_eligible` and never reaches a model or the solver.
+
+**Errors ride the standard error chunk**, again at HTTP 200:
+`{"type": "error", "error_code": "…", "message": "…"}` (`_error_chunk`) — a
+missing, non-integer, or out-of-range `turn_key` is `bad_request`; an internal
+failure is `internal_error`. With the flag off there is no branch at all, so the
+request falls through to the `!= "send"` guard and is refused as an unknown type
+— which answers as an SSE stream, not a JSON envelope, so the client treats a
+non-JSON content type as "not available on this runtime". A failed *check* is
+NOT an error: the pre-pass and the AR call both **fail open** to
+`status: "unavailable"`, whose copy is "couldn't check", never "check failed =
+answer wrong".
+
+**Report persistence** — one row per (thread, turn) in the `okf-chat` table
+(shapes owned by `okf_core.chat_threads`, full contract in CONVENTIONS.md):
+
+```
+pk = "CHAT#<user_sub>"                      # structural per-user isolation
+sk = "POLICY#<thread_id>#<turn_key>"        # turn_key = the server turn ordinal
+attrs {status, created_at, model, eligible, standalone_question,
+       report_json (stringified), policy_versions_used, expires_at?}
+```
+
+Per-user isolation is the same structural argument as the conversation row: the
+caller's verified `sub` is the partition, so a `turn_key` under another user's
+thread simply never resolves. `complete` and `not_eligible` are cached (only
+`force` re-runs them); `unavailable` is not persisted as terminal, so re-clicking
+retries. `expires_at` mirrors the thread's TTL when set. The UI reads the panel
+state from `report_json`, so a history reload re-renders a past check without
+re-running it.
 
 ## 15. Open items / risks
 

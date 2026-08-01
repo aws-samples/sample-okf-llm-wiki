@@ -18,7 +18,7 @@ import logging
 import os
 from typing import Any, Callable
 
-from incremental import store
+from incremental import ar_rebuild, store
 from incremental.handler import _client_factory, process_event
 
 log = logging.getLogger("incremental.reconcile")
@@ -51,12 +51,23 @@ def reconcile(
     registry_table: str,
     freshness_table: str,
     harvest_runtime_arn: str,
+    ddb_client=None,
+    bedrock=None,
 ) -> dict[str, Any]:
     """Scan all mapped datasets and enqueue incrementals for drifted tables.
 
     Returns a summary ``{scanned_datasets, scanned_tables, enqueued, drifted}``.
     Per-table errors are logged and counted but never abort the whole pass — a
     single broken table must not block reconciliation of the rest.
+
+    When ``OKF_POLICY_BUILD_ENABLED`` is on, the AR policy reconcile
+    (:func:`incremental.ar_rebuild.reconcile_policies` — complete in-flight
+    builds, hash-verify, restore-or-dispatch stale/moved ones) runs at the END,
+    after the table sweep: a drifted table just enqueued a re-harvest whose
+    finalize will move the source fingerprint again, but the fingerprint gate
+    makes running "too early" merely redundant, never wrong. Its summary rides
+    under ``"ar"``; a failure there never fails the sweep (``bedrock`` is its
+    test seam; authoring dispatches reuse ``agentcore`` + the runtime ARN).
     """
     reg = ddb.Table(registry_table)
     scanned_datasets = 0
@@ -108,13 +119,32 @@ def reconcile(
                 errors += 1
                 log.exception("Reconcile failed for %s.%s", database, table_name)
 
-    summary = {
+    summary: dict[str, Any] = {
         "scanned_datasets": scanned_datasets,
         "scanned_tables": scanned_tables,
         "enqueued": enqueued,
         "errors": errors,
         "drifted": drifted,
     }
+
+    if ar_rebuild.rebuild_enabled():
+        try:
+            # NOT ddb.meta.client: a resource's client carries the resource's
+            # document transformations, which silently break the AR helpers'
+            # typed expressions. ddb_client is the dedicated low-level client.
+            summary["ar"] = ar_rebuild.reconcile_policies(
+                ddb=ddb_client or ar_rebuild.ddb_client(),
+                table=registry_table,
+                s3=s3,
+                bucket=bundle_bucket,
+                bedrock=bedrock,
+                agentcore=agentcore,
+                harvest_runtime_arn=harvest_runtime_arn,
+            )
+        except Exception:  # noqa: BLE001 - advisory pass, never fails the sweep
+            log.exception("AR policy reconcile pass failed")
+            summary["ar"] = {"error": True}
+
     log.info("Reconcile complete: %s", summary)
     return summary
 
@@ -127,6 +157,7 @@ def reconcile_handler(
     return reconcile(
         glue=clients["glue"],
         ddb=clients["ddb"],
+        ddb_client=clients.get("ddb_client"),
         s3=clients["s3"],
         agentcore=clients["agentcore"],
         bundle_bucket=os.environ["OKF_BUNDLE_BUCKET"],

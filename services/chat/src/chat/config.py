@@ -56,6 +56,26 @@ DEFAULT_BEDROCK_MAX_ATTEMPTS = 5
 # runtime's own AWS_REGION.
 DEFAULT_MANTLE_REGION = "us-east-2"
 
+# The policy check's pre-pass (chat/policy_check.py) is EXTRACTION — rewrite the
+# question, narrate the chain — so it runs on the cheapest capable id rather than
+# the conversation's own model. Deploy-time only: unlike the per-run chat model
+# this never comes from a client, so it deliberately bypasses the catalog trust
+# boundary (`resolve_model_effort`). An openai.* default means the chat role's
+# Mantle grants must be on — infra derives that from var.chat_policy_check_model
+# (see agentcore_iam.tf chat_mantle_enabled).
+DEFAULT_POLICY_CHECK_MODEL = "openai.gpt-5.6-luna"
+
+# The pre-pass emits one JSON object (question + transcript + assumptions); a few
+# thousand tokens is the whole budget, and a cap this low also bounds a runaway
+# transcript before it reaches the solver.
+POLICY_CHECK_MAX_TOKENS = 4000
+
+# Effort is meaningless with reasoning off on Converse; on Mantle it maps to
+# "low" via GPT_EFFORT_MAP (the floor's NAME varies by model generation —
+# gpt-5.6-luna rejects "minimal", older ids reject "none"; "low" is the lowest
+# fleet-wide value) — one constant covers both builders.
+POLICY_CHECK_EFFORT = "none"
+
 
 def _int_env(name: str, default: int, env: dict[str, str]) -> int:
     raw = env.get(name)
@@ -134,6 +154,16 @@ class ChatConfig:
     web_search_tool_name: str = ""
     web_search_max_results: int = 10
 
+    # Post-turn Automated Reasoning policy check (chat/policy_check.py). Master
+    # switch, default OFF: with it unset the ``policy_check`` request type isn't
+    # served at all and the role carries no ApplyGuardrail grant, so the feature
+    # degrades to absent. ``policy_check_eager`` is read and carried but not yet
+    # acted on — it will move the check from on-click to post-turn, changing only
+    # WHEN the same pipeline runs.
+    policy_check_enabled: bool = False
+    policy_check_model: str = DEFAULT_POLICY_CHECK_MODEL
+    policy_check_eager: bool = False
+
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ChatConfig":
         env = env if env is not None else dict(os.environ)
@@ -182,6 +212,13 @@ class ChatConfig:
             web_search_region=env.get("OKF_WEB_SEARCH_REGION") or "us-east-1",
             web_search_tool_name=env.get("OKF_WEB_SEARCH_TOOL_NAME", ""),
             web_search_max_results=_int_env("OKF_WEB_SEARCH_MAX_RESULTS", 10, env),
+            policy_check_enabled=env.get("OKF_CHAT_POLICY_CHECK_ENABLED", "").lower()
+            in ("true", "1", "yes"),
+            policy_check_model=env.get(
+                "OKF_CHAT_POLICY_CHECK_MODEL", DEFAULT_POLICY_CHECK_MODEL
+            ),
+            policy_check_eager=env.get("OKF_CHAT_POLICY_CHECK_EAGER", "").lower()
+            in ("true", "1", "yes"),
         )
 
     def resolve_model_effort(
@@ -246,4 +283,47 @@ def build_chat_model(cfg: ChatConfig, model: str, effort: str, max_tokens: int |
         # runs but returns no reasoning_content — the "LLM is reasoning but I see
         # nothing" symptom. Harvest leaves this off. (Matches Sparky's Opus 4.8.)
         summarize_reasoning=True,
+    )
+
+
+def build_policy_check_model(cfg: ChatConfig):
+    """Build the policy check's pre-pass client: minimal reasoning, pinned output.
+
+    The pre-pass rewrites a question and narrates a finished chain — extraction,
+    not reasoning — and its output feeds an SMT solver, so determinism matters
+    more than depth. On Converse, thinking is turned OFF (not merely dialed
+    down — Converse rejects a caller-set temperature while thinking is on) and
+    temperature pinned to 0. On the GPT path the lever is the effort FLOOR
+    (``"none"`` maps to ``"low"`` — the lowest fleet-wide value; the literal
+    floor names are model-generation-specific and 400): GPT-5.x reasoning
+    models reject a non-default temperature outright, so none is sent — a 400
+    on every pre-pass call would read as "policy check is down".
+
+    Not a plain :func:`build_chat_model` call with a small model: that one always
+    configures adaptive thinking (the conversation wants it) and validates
+    nothing here, since ``policy_check_model`` is deploy-time config rather than a
+    client-supplied pair.
+    """
+    from okf_aws import model_factory as mf
+
+    model = cfg.policy_check_model
+    if mf.is_openai_model(model):
+        return mf.build_mantle_openai(
+            model,
+            POLICY_CHECK_EFFORT,
+            POLICY_CHECK_MAX_TOKENS,
+            region=cfg.mantle_region,
+            use_responses_api=cfg.mantle_use_responses_api,
+            base_url=cfg.mantle_base_url,
+            timeout=cfg.bedrock_read_timeout,
+            max_retries=cfg.bedrock_max_attempts,
+        )
+    return mf.build_bedrock_converse(
+        model,
+        POLICY_CHECK_EFFORT,
+        POLICY_CHECK_MAX_TOKENS,
+        region=cfg.region,
+        botocore_config=_bedrock_config(cfg),
+        thinking=False,
+        temperature=0,
     )

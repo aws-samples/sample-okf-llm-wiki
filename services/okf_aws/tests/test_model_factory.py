@@ -89,6 +89,17 @@ def test_gpt_effort_unknown_falls_back_to_xhigh():
     assert mf.gpt_effort("banana") == mf.DEFAULT_GPT_REASONING_EFFORT == "xhigh"
 
 
+@pytest.mark.parametrize("effort", ["none", "minimal"])
+def test_gpt_effort_no_reasoning_maps_to_the_floor_not_the_fallback(effort):
+    # The extraction efforts must NOT hit the unknown-value fallthrough: billing a
+    # max-reasoning run for a pass that asked for none is the silent-upgrade bug.
+    # The floor is "low", NOT a literal floor name: the floor's NAME varies by
+    # model generation (gpt-5.6-luna 400s on "minimal", older ids 400 on
+    # "none" — live-verified), while "low" is accepted fleet-wide.
+    assert mf.gpt_effort(effort) == mf.FLOOR_GPT_REASONING_EFFORT == "low"
+    assert mf.gpt_effort(effort) != mf.DEFAULT_GPT_REASONING_EFFORT
+
+
 def test_gpt_effort_empty_rejected():
     with pytest.raises(ValueError):
         mf.gpt_effort("")
@@ -216,6 +227,24 @@ def test_build_mantle_openai_summary_uses_reasoning_object(monkeypatch):
     assert captured["output_version"] == "responses/v1"
 
 
+def test_build_mantle_openai_omits_temperature_by_default(monkeypatch):
+    # Absent kwarg -> the model's own default; the agent paths must be untouched.
+    captured, _state = _install_openai_stubs(monkeypatch)
+    mf.build_mantle_openai("openai.gpt-5.6-sol", "high", 32000, region="us-east-2")
+    assert "temperature" not in captured
+
+
+def test_build_mantle_openai_forwards_zero_temperature(monkeypatch):
+    # 0 is FALSY: the forward must test `is not None`, or the one value an
+    # extraction pass actually asks for is the one value silently dropped.
+    captured, _state = _install_openai_stubs(monkeypatch)
+    mf.build_mantle_openai(
+        "openai.gpt-5.6-sol", "minimal", 4096, region="us-east-2", temperature=0
+    )
+    assert captured["temperature"] == 0
+    assert captured["reasoning_effort"] == "low"
+
+
 def test_build_mantle_openai_summary_ignored_on_chat_completions(monkeypatch):
     # Chat Completions (gpt-oss) has no reasoning-summary concept; fall back to the
     # plain reasoning_effort even if a summary was requested.
@@ -253,6 +282,159 @@ def test_mantle_token_provider_caches_then_remints(monkeypatch):
     assert state["mints"] == 2
 
 
+# --- Converse builder wiring (stubbed SDK) -----------------------------------
+
+
+def _install_converse_stub(monkeypatch):
+    """Stub ``langchain_aws.ChatBedrockConverse`` with a kwarg recorder.
+
+    The twin of :func:`_install_openai_stubs` for the Converse path. Returns the
+    captured-kwargs dict, which is the whole assertion surface: the builder's
+    contract is exactly which constructor kwargs it does and does NOT pass.
+    """
+    captured: dict = {}
+
+    class _FakeConverse:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    law = types.ModuleType("langchain_aws")
+    law.ChatBedrockConverse = _FakeConverse
+    monkeypatch.setitem(sys.modules, "langchain_aws", law)
+    return captured
+
+
+def test_build_bedrock_converse_passes_botocore_config(monkeypatch):
+    captured = _install_converse_stub(monkeypatch)
+
+    sentinel = object()
+    mf.build_bedrock_converse(
+        "us.anthropic.claude-opus-4-8",
+        "high",
+        128000,
+        region="us-east-1",
+        botocore_config=sentinel,
+    )
+    assert captured["config"] is sentinel
+    # default: adaptive thinking with NO streamed summary (harvest's shape)
+    assert captured["additional_model_request_fields"]["thinking"] == {"type": "adaptive"}
+
+
+def test_build_bedrock_converse_summarize_reasoning_sets_display(monkeypatch):
+    captured = _install_converse_stub(monkeypatch)
+
+    mf.build_bedrock_converse(
+        "us.anthropic.claude-opus-4-8",
+        "high",
+        128000,
+        region="us-east-1",
+        summarize_reasoning=True,
+    )
+    # summarize -> the model streams a reasoning summary (chat's shape)
+    assert captured["additional_model_request_fields"]["thinking"] == {
+        "type": "adaptive",
+        "display": "summarized",
+    }
+
+
+def test_build_bedrock_converse_thinking_off_omits_request_fields(monkeypatch):
+    # thinking=False must OMIT the key, not pass None/an empty dict: Converse has
+    # no encoding for "adaptive thinking, disabled", so the only way to run the
+    # model as a plain completion client is to send no thinking config at all.
+    captured = _install_converse_stub(monkeypatch)
+
+    mf.build_bedrock_converse(
+        "us.anthropic.claude-haiku-4-5",
+        "low",
+        4096,
+        region="us-east-1",
+        thinking=False,
+    )
+    assert "additional_model_request_fields" not in captured
+    assert captured["model"] == "us.anthropic.claude-haiku-4-5"
+    assert captured["max_tokens"] == 4096
+
+
+def test_build_bedrock_converse_thinking_off_ignores_effort(monkeypatch):
+    # With thinking off, effort is never consulted — so an effort that
+    # thinking_fields() would REJECT must not reach it and must not raise.
+    captured = _install_converse_stub(monkeypatch)
+
+    mf.build_bedrock_converse(
+        "us.anthropic.claude-haiku-4-5", "", 4096, region="us-east-1", thinking=False
+    )
+    assert "additional_model_request_fields" not in captured
+
+
+def test_build_bedrock_converse_omits_temperature_by_default(monkeypatch):
+    # Absent kwarg -> the model's own default; the agent paths must be untouched.
+    captured = _install_converse_stub(monkeypatch)
+
+    mf.build_bedrock_converse(
+        "us.anthropic.claude-opus-4-8", "high", 128000, region="us-east-1"
+    )
+    assert "temperature" not in captured
+
+
+def test_build_bedrock_converse_forwards_zero_temperature(monkeypatch):
+    # 0 is FALSY: the forward must test `is not None`, or the one value an
+    # extraction pass actually asks for is the one value silently dropped.
+    captured = _install_converse_stub(monkeypatch)
+
+    mf.build_bedrock_converse(
+        "us.anthropic.claude-haiku-4-5",
+        "low",
+        4096,
+        region="us-east-1",
+        thinking=False,
+        temperature=0,
+    )
+    assert captured["temperature"] == 0
+    assert "additional_model_request_fields" not in captured
+
+
+def test_build_bedrock_converse_defaults_unchanged(monkeypatch):
+    # The regression guard for every existing agent call site: with neither new
+    # kwarg passed, the constructor sees the SAME kwarg set as before — adaptive
+    # thinking on, no temperature.
+    captured = _install_converse_stub(monkeypatch)
+
+    mf.build_bedrock_converse(
+        "us.anthropic.claude-opus-4-8", "xhigh", 128000, region="us-east-1"
+    )
+    assert set(captured) == {
+        "model",
+        "region_name",
+        "max_tokens",
+        "additional_model_request_fields",
+        "config",
+        "callbacks",
+    }
+    assert captured["additional_model_request_fields"] == mf.thinking_fields("xhigh")
+
+
+def test_build_bedrock_converse_thinking_budget_uses_the_pre_adaptive_form(monkeypatch):
+    # Haiku 4.5 (pre-4.6) rejects thinking.type=adaptive — a token budget is its
+    # only thinking encoding, and effort must NOT ride along in output_config.
+    captured = _install_converse_stub(monkeypatch)
+    mf.build_bedrock_converse(
+        "global.anthropic.claude-haiku-4-5", "xhigh", 64000,
+        region="us-east-1", thinking_budget=48000,
+    )
+    assert captured["additional_model_request_fields"] == {
+        "thinking": {"type": "enabled", "budget_tokens": 48000}
+    }
+
+
+def test_thinking_budget_is_ignored_when_thinking_is_off(monkeypatch):
+    captured = _install_converse_stub(monkeypatch)
+    mf.build_bedrock_converse(
+        "global.anthropic.claude-haiku-4-5", "none", 4000,
+        region="us-east-1", thinking=False, thinking_budget=48000,
+    )
+    assert "additional_model_request_fields" not in captured
+
+
 # --- dispatcher --------------------------------------------------------------
 
 
@@ -270,15 +452,7 @@ def test_build_model_dispatches_gpt_to_mantle(monkeypatch):
 
 
 def test_build_model_dispatches_claude_to_converse(monkeypatch):
-    captured: dict = {}
-
-    class _FakeConverse:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    law = types.ModuleType("langchain_aws")
-    law.ChatBedrockConverse = _FakeConverse
-    monkeypatch.setitem(sys.modules, "langchain_aws", law)
+    captured = _install_converse_stub(monkeypatch)
 
     mf.build_model("us.anthropic.claude-opus-4-8", "xhigh", 128000, region="eu-west-1")
 
@@ -289,53 +463,4 @@ def test_build_model_dispatches_claude_to_converse(monkeypatch):
     assert captured["additional_model_request_fields"]["thinking"] == {"type": "adaptive"}
     assert captured["additional_model_request_fields"]["output_config"] == {
         "effort": "xhigh"
-    }
-
-
-def test_build_bedrock_converse_passes_botocore_config(monkeypatch):
-    captured: dict = {}
-
-    class _FakeConverse:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    law = types.ModuleType("langchain_aws")
-    law.ChatBedrockConverse = _FakeConverse
-    monkeypatch.setitem(sys.modules, "langchain_aws", law)
-
-    sentinel = object()
-    mf.build_bedrock_converse(
-        "us.anthropic.claude-opus-4-8",
-        "high",
-        128000,
-        region="us-east-1",
-        botocore_config=sentinel,
-    )
-    assert captured["config"] is sentinel
-    # default: adaptive thinking with NO streamed summary (harvest's shape)
-    assert captured["additional_model_request_fields"]["thinking"] == {"type": "adaptive"}
-
-
-def test_build_bedrock_converse_summarize_reasoning_sets_display(monkeypatch):
-    captured: dict = {}
-
-    class _FakeConverse:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    law = types.ModuleType("langchain_aws")
-    law.ChatBedrockConverse = _FakeConverse
-    monkeypatch.setitem(sys.modules, "langchain_aws", law)
-
-    mf.build_bedrock_converse(
-        "us.anthropic.claude-opus-4-8",
-        "high",
-        128000,
-        region="us-east-1",
-        summarize_reasoning=True,
-    )
-    # summarize -> the model streams a reasoning summary (chat's shape)
-    assert captured["additional_model_request_fields"]["thinking"] == {
-        "type": "adaptive",
-        "display": "summarized",
     }
