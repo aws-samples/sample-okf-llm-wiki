@@ -21,6 +21,13 @@
 // "generating…" reveal. Any reasoning/tools after the chart open a NEW think block.
 const CHART_TOOL = "render_chart"
 
+// Steering notes (server "steer" chunks — chat.steering's course-correction
+// reminders) are shown in the thinking timeline by default; set
+// VITE_CHAT_SHOW_STEERING=false to hide them. Display-only: the model was
+// steered server-side either way.
+const SHOW_STEERING =
+  String(import.meta.env.VITE_CHAT_SHOW_STEERING ?? "true") !== "false"
+
 // Pass 1: fold all tool events (start + result, possibly out of order) into a map
 // keyed by tool id, so a block always has the latest known state for each tool.
 // render_chart IS included — its folded ack marks the chart block complete.
@@ -173,6 +180,15 @@ export function buildMessageBlocks(events, isEnd) {
       const last = tb.contentSegments[tb.contentSegments.length - 1]
       if (last?.type === "text") last.content += ev.content
       else tb.contentSegments.push({ type: "text", content: ev.content })
+      continue
+    }
+
+    // A steering note joins the working timeline as its own segment (rendered
+    // with a bulb marker). It arrives whole — no accumulation.
+    if (ev.type === "steer" && ev.content) {
+      if (!SHOW_STEERING) continue
+      const tb = openThink()
+      tb.contentSegments.push({ type: "steer", content: ev.content })
       continue
     }
 

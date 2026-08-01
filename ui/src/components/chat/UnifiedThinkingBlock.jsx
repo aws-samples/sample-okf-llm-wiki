@@ -9,7 +9,14 @@
 // a formatted name + status + expandable args/result (see wikiTools.js). No
 // sub-agent/browser/canvas categories.
 
-import { ChevronDown, CircleCheck, ClockFading, Code2, Table2 } from "lucide-react"
+import {
+  ChevronDown,
+  CircleCheck,
+  ClockFading,
+  Code2,
+  Lightbulb,
+  Table2,
+} from "lucide-react"
 import { memo, useCallback, useMemo, useState } from "react"
 
 import { CodeView } from "@/components/chat/CodeView"
@@ -310,6 +317,22 @@ const ThinkingStep = memo(function ThinkingStep({ segments, isLast }) {
   )
 })
 
+// A harness steering note (a chat.steering course-correction the server
+// injected mid-turn): bulb marker, muted like the headers, italic so it reads
+// as an aside rather than model prose.
+const SteeringStep = memo(function SteeringStep({ step, isLast }) {
+  return (
+    <div className={`timeline-item ${isLast ? "last" : ""}`}>
+      <div className="timeline-marker">
+        <Lightbulb size={18} className="timeline-icon steering-icon" />
+      </div>
+      <div className="timeline-content">
+        <div className="timeline-steering-content">{step.content}</div>
+      </div>
+    </div>
+  )
+})
+
 const ToolStep = memo(function ToolStep({ step, isLast }) {
   const Icon = toolIcon(step.toolName)
   return (
@@ -370,6 +393,7 @@ function headerLabel(steps) {
   if (steps.length === 0) return "Reasoning"
   const last = steps[steps.length - 1]
   if (last.type === "thinking") return reasoningPreview(last)
+  if (last.type === "steer") return "Course check"
   return toolLabel(last.toolName, last.toolInput, !last.isToolComplete)
 }
 
@@ -386,8 +410,8 @@ export function UnifiedThinkingBlock({ contentBlocks = [], isGroupComplete = fal
     () =>
       contentBlocks
         .map((s, i) =>
-          s.type === "text"
-            ? `${i}:x${s.content?.length || 0}`
+          s.type === "text" || s.type === "steer"
+            ? `${i}:${s.type}:${s.content?.length || 0}`
             : `${i}:${s.id || ""}:${s.toolName || ""}:${s.isComplete ? 1 : 0}:${s.error ? 1 : 0}`
         )
         .join("|"),
@@ -432,6 +456,9 @@ export function UnifiedThinkingBlock({ contentBlocks = [], isGroupComplete = fal
               const isLast = !isGroupComplete && i === mergedSteps.length - 1
               if (step.type === "thinking") {
                 return <ThinkingStep key={step.id} segments={step.segments} isLast={isLast} />
+              }
+              if (step.type === "steer") {
+                return <SteeringStep key={step.id} step={step} isLast={isLast} />
               }
               return <ToolStep key={step.id} step={step} isLast={isLast} />
             })}

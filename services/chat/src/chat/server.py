@@ -20,6 +20,7 @@ carrying Sparky's **typed chunks**, produced by consuming the LangGraph run's
     {"type": "think",  "content": "..."}          reasoning (Converse reasoning_content / GPT summary)
     {"type": "tool", "id": ..., "tool_name": ..., "tool_start": true,  "content": <args>}
     {"type": "tool", "id": ..., "tool_name": ..., "tool_start": false, "content": <result>, "error": bool}
+    {"type": "steer", "content": "..."}           a chat.steering reminder (tags stripped; UI-gated)
     {"type": "text",  "content": "..."}           assistant answer tokens
     {"type": "error", "error_code": ..., "message": ...}
     {"end": true, "token_stats": {...}, "checkpoint_id": "..."}
@@ -328,7 +329,14 @@ def process_stream_data(
     restore them here (without overwriting any the model did pass) so the emitted
     event — live and in stored history — names the real dataset.
     """
-    from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+    from langchain_core.messages import (
+        AIMessage,
+        AIMessageChunk,
+        HumanMessage,
+        ToolMessage,
+    )
+
+    from chat.steering import STEERING_MARKER, strip_reminder_tags
 
     if mode == "updates":
         if not isinstance(data, dict):
@@ -341,10 +349,24 @@ def process_stream_data(
         # resume with Command(resume={id: ...}); see ``_ask_human_chunk_from_state``).
         if "__interrupt__" in data:
             return None
+        out: list[dict[str, Any]] = []
+        # A SteeringMiddleware injection surfaces as ITS node's update carrying a
+        # marked HumanMessage. Emit it as a "steer" chunk (tags stripped) so the
+        # UI can show the nudge in the thinking timeline — display is gated
+        # client-side (VITE_CHAT_SHOW_STEERING); the model is steered regardless.
+        for update in data.values():
+            if not isinstance(update, dict):
+                continue
+            for msg in update.get("messages", []) or []:
+                if isinstance(msg, HumanMessage) and (
+                    (msg.additional_kwargs or {}).get(STEERING_MARKER)
+                ):
+                    out.append(
+                        {"type": "steer", "content": strip_reminder_tags(msg.content)}
+                    )
         node = data.get("model") or data.get("agent")
         if not isinstance(node, dict):
-            return None
-        out: list[dict[str, Any]] = []
+            return out or None
         for msg in node.get("messages", []) or []:
             if isinstance(msg, AIMessage):
                 for tc in msg.tool_calls or []:
@@ -598,6 +620,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         with_current_date,
     )
     from chat.sql import AthenaSQL, RedshiftDataSQL, make_sql_tool
+    from chat.steering import SteeringMiddleware, steering_enabled
     from chat.tools import build_consumption_tools, make_agent_tools
     from chat.web_search import build_web_search_engine, make_web_search_tool
 
@@ -761,7 +784,11 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # iteration instead of full-price input. No-ops (with a warning) on a
         # non-Bedrock model (a Mantle GPT catalog entry).
         # AskHumanMiddleware owns the human-in-the-loop interrupt for ask_human.
+        # SteeringMiddleware injects derailment <system-reminder>s (repetition /
+        # futility / silence — see chat.steering); env kill switch, default on.
         middleware = [BedrockPromptCachingMiddleware(), AskHumanMiddleware()]
+        if steering_enabled():
+            middleware.append(SteeringMiddleware())
         # Current date rides on the END of the prompt (day granularity, UTC) so
         # relative time references resolve; see graph.with_current_date.
         return build_graph(
@@ -860,8 +887,24 @@ def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
         # usage gauge works identically on history.
         return {"end": True, "token_stats": turn_stats} if turn_stats else {"end": True}
 
+    from chat.steering import STEERING_MARKER, strip_reminder_tags
+
     for msg in messages:
         if isinstance(msg, HumanMessage):
+            # A harness-injected steering reminder (chat.steering) is part of
+            # the MODEL's context, not the user's transcript — it must never
+            # open a phantom turn or render as a user bubble. It re-emerges as
+            # the same "steer" event the live stream emitted, so the thinking
+            # timeline survives a history reload.
+            if (getattr(msg, "additional_kwargs", None) or {}).get(STEERING_MARKER):
+                if current is not None:
+                    current["aiMessage"].append(
+                        {
+                            "type": "steer",
+                            "content": strip_reminder_tags(_text(msg.content)),
+                        }
+                    )
+                continue
             if current:
                 current["aiMessage"].append(_end_event())
                 turns.append(current)

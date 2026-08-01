@@ -4,6 +4,7 @@
 //   {type:"think",  content}                                    reasoning
 //   {type:"tool", id, tool_name, tool_start:true,  content}     tool call start (args)
 //   {type:"tool", id, tool_name, tool_start:false, content, error}  tool result
+//   {type:"steer", content}                                     harness steering note
 //   {type:"text",  content}                                     answer tokens
 //   {type:"error", error_code, message}                         a failure
 //   {end:true, token_stats, checkpoint_id}                      terminal marker

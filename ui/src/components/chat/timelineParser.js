@@ -28,6 +28,13 @@ export function buildTimelineSteps(contentSegments) {
         isToolComplete: segment.isComplete,
         toolError: segment.error,
       })
+    } else if (segment.type === "steer" && segment.content) {
+      // A harness steering note — its own timeline step (bulb marker).
+      steps.push({
+        id: `steer-${steps.length}`,
+        type: "steer",
+        content: segment.content,
+      })
     }
   }
   return steps

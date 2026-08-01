@@ -16,6 +16,8 @@ okf/<data_domain>/
     ├── references/<type>/<slug>.md   # type: Reference — canonical fact-typed
     │                                 #   folders: joins/ metrics/ enums/
     │                                 #   named_sets/ glossary/ known_issues/
+    │                                 #   recipes/ (mandatory query transforms,
+    │                                 #   authored only when a dataset needs one)
     │                                 #   (one doc per item; see okf-authoring skill)
     ├── external/<d>/<ds>/…           # type: Cross-Dataset Reference — one subtree
     │                                 #   per counterpart dataset, written ONLY by a
