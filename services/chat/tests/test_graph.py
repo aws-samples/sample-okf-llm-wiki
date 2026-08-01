@@ -34,6 +34,33 @@ def test_prompt_covers_the_load_bearing_instructions():
     assert "read-only" in p
 
 
+def test_prompt_teaches_result_skepticism_bounded():
+    # An implausible tool result is a bug in the QUERY until checked (fan-out,
+    # skipped dedup recipe, sentinel, non-additive sum) — but skepticism must be
+    # bounded and aimed at the query, never the data: fix once, re-run, then
+    # report with the anomaly named. No result-shopping toward a prior.
+    assert "<result_skepticism>" in SYSTEM_PROMPT
+    block = SYSTEM_PROMPT.split("<result_skepticism>")[1].split(
+        "</result_skepticism>"
+    )[0]
+    low = block.lower()
+    assert "fans out" in low
+    assert "references/recipes/" in block
+    assert "sentinel" in low
+    assert "fix the query once" in low
+    # the overcorrection guard: a verified surprising number is the answer
+    assert "never" in low and "expectation" in low
+
+
+def test_prompt_names_recipes_folder_conditionally():
+    # <wiki_structure> lists references/recipes/ so the agent knows the folder
+    # exists — but flagged as present only when a dataset needs one (most
+    # bundles have no recipe; the mention must not imply otherwise).
+    block = SYSTEM_PROMPT.split("<wiki_structure>")[1].split("</wiki_structure>")[0]
+    assert "`recipes/`" in block
+    assert "present only when" in block
+
+
 def test_prompt_groups_sources_into_one_tag_and_allows_urls():
     # The UI renders ONE badge per <cite> tag (paged when it holds several), so a
     # claim with two sources must be one tag — adjacent tags would litter the

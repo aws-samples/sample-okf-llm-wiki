@@ -37,8 +37,10 @@ own `index.md` listing and linking what's inside.
 types, join keys, coded values, units, caveats.
 - `references/` — cross-cutting facts: `joins/` (how tables connect, with \
 tested SQL), `metrics/` (official definitions and formulas), `named_sets/` \
-(canonical filters/lifecycles), `glossary/`, `known_issues/`, and \
-`usage_guardrails.md` (the dataset's do's and don'ts).
+(canonical filters/lifecycles), `glossary/`, `known_issues/`, `recipes/` \
+(mandatory query transforms, e.g. a dedup — apply verbatim; present only when \
+the dataset needs one), and `usage_guardrails.md` (the dataset's do's and \
+don'ts).
 - `external/<domain>/<dataset>/` — documented relationships to OTHER datasets \
 (shared keys, how to join across, semantic overlaps).
 """
@@ -53,6 +55,19 @@ units, and default filters — exactly the details naive SQL gets wrong. Trust \
 them over intuition.
 - Curator annotations and known-issue notes INSIDE a page correct or constrain \
 the text around them — they win over the surrounding prose.
+"""
+
+_SKEPTICISM = """\
+## If a result looks wrong
+- Treat an implausible query result (zero rows, an off-scale total, \
+duplicated rows) as a bug in YOUR query until checked. Usual causes: a \
+join that fans out (join docs state the cardinality), a skipped \
+mandatory transform (`references/recipes/`), a sentinel value aggregated as \
+real data (enum docs flag them), a non-additive measure summed across periods \
+(guardrails).
+- Fix once and re-run; if still odd, report the number WITH the anomaly named. \
+Once the mechanics check out, a surprising number is the answer — never re-run \
+variations until one matches your expectation.
 """
 
 _SHARED_TAIL = """\
@@ -95,7 +110,7 @@ metrics that use it, and those pages carry the caveats.
 )
 
 #: What the consumption MCP's ``read_me`` returns.
-MCP_PRIMER = f"{_STRUCTURE}\n{_TRAPS}\n{_MCP_NAV}"
+MCP_PRIMER = f"{_STRUCTURE}\n{_TRAPS}\n{_SKEPTICISM}\n{_MCP_NAV}"
 
 #: What the benchmark solver's ``read_me`` returns.
-SOLVER_PRIMER = f"{_STRUCTURE}\n{_TRAPS}\n{_SOLVER_NAV}"
+SOLVER_PRIMER = f"{_STRUCTURE}\n{_TRAPS}\n{_SKEPTICISM}\n{_SOLVER_NAV}"

@@ -38,6 +38,7 @@ permission failure — defense in depth, not the sole boundary.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -421,12 +422,28 @@ def make_sql_tool(
     query would hit a non-existent database if we defaulted to the dataset id.
     The Redshift engine is pinned to its mapping's database and ignores the
     default.
+
+    Every successful result additionally passes through the anomaly detector
+    (``chat.sql_anomalies``): findings are always logged, and — within a
+    per-turn budget — a ``<system-reminder>`` is appended after the result
+    payload so the model applies its ``<result_skepticism>`` procedure at the
+    moment the evidence is in front of it. The budget state lives in this
+    closure, which is per-turn because ``server.build_agent`` constructs the
+    tool fresh on every run.
     """
     from langchain_core.tools import StructuredTool
+
+    from chat import sql_anomalies
 
     default_db = None
     if dataset_scope:
         default_db = dataset_scope.get("glue_database") or dataset_scope.get("dataset")
+
+    # Per-turn injection budget: at most MAX_INJECTIONS_PER_TURN reminders, and
+    # a finding KIND that was already injected this turn never re-injects (the
+    # model has been told; repeating it is nagging).
+    injected_kinds: set[str] = set()
+    injection_count = 0
 
     def run_sql(sql: str) -> Any:
         # A failed query must come back to the model as a tool RESULT it can
@@ -435,13 +452,33 @@ def make_sql_tool(
         # as chat.tools._make_tool). Athena's own error text (COLUMN_NOT_FOUND:
         # line N:M ..., Insufficient Lake Formation permission(s) ...) is exactly
         # the feedback the model needs, so it passes through verbatim.
+        nonlocal injection_count
         try:
-            return engine.run(sql, default_database=default_db)
+            result = engine.run(sql, default_database=default_db)
         except ValueError as e:  # the read-only guard — concise, actionable
             return f"Error: {e}"
         except Exception as e:  # noqa: BLE001 - a tool error is feedback, not a crash
             log.warning("run_sql failed", exc_info=True)
             return f"Error: run_sql failed: {type(e).__name__}: {e}"
+        # Fail-open anomaly scan: a detector bug must never fail a successful
+        # query. Detection runs on EVERY result (the log feeds threshold
+        # calibration); injection respects the per-turn budget above.
+        try:
+            findings = sql_anomalies.detect(result)
+        except Exception:  # noqa: BLE001 - detection is advisory, never fatal
+            log.warning("sql anomaly detection failed", exc_info=True)
+            return result
+        if findings:
+            log.info(
+                "run_sql anomalies detected: %s",
+                sorted({f.kind for f in findings}),
+            )
+            novel = [f for f in findings if f.kind not in injected_kinds]
+            if novel and injection_count < sql_anomalies.MAX_INJECTIONS_PER_TURN:
+                injection_count += 1
+                injected_kinds.update(f.kind for f in novel)
+                return json.dumps(result) + "\n\n" + sql_anomalies.compose(novel)
+        return result
 
     return StructuredTool.from_function(
         func=run_sql,

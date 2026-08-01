@@ -151,6 +151,28 @@
   color: var(--unified-text-muted);
 }
 
+/* The reasoning prose renders through Markdown, whose .okf-prose applies
+   text-foreground (tuned for the ANSWER) — inside the timeline that read
+   darker than the muted headers. Scope it back so thinking text matches the
+   header color (Reasoning / tool labels), upright — the steering note below
+   is the italic one. */
+.timeline-thinking-content .okf-prose {
+  color: var(--unified-text-muted);
+}
+
+/* Steering notes (chat.steering course corrections): same muted tone as the
+   headers, italic so they read as a harness aside rather than model prose. */
+.timeline-steering-content {
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--unified-text-muted);
+  font-style: italic;
+}
+
+.timeline-icon.steering-icon {
+  color: var(--unified-thinking-icon-color);
+}
+
 .timeline-thinking-content p {
   margin: 0 0 8px 0;
 }

@@ -666,6 +666,63 @@ def test_read_history_folds_messages_into_turns():
     assert any(e.get("type") == "think" and e.get("content") for e in ai)
 
 
+def test_history_renders_steering_as_steer_events_not_user_turns():
+    # A steering <system-reminder> (chat.steering) is persisted as a
+    # HumanMessage in the checkpoint — it must NOT open a phantom turn or
+    # render as a user bubble on reload; it re-emerges as the same "steer"
+    # event the live stream emitted (tags stripped), in stream order, so the
+    # thinking timeline survives a history reload.
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from chat.steering import STEERING_MARKER
+
+    msgs = [
+        HumanMessage(content="real question"),
+        AIMessage(content="digging"),
+        HumanMessage(
+            content="<system-reminder>step back</system-reminder>",
+            additional_kwargs={STEERING_MARKER: "silence"},
+        ),
+        AIMessage(content="the answer"),
+    ]
+    turns = server._messages_to_turns(msgs)
+    assert len(turns) == 1  # the marker message opened no second turn
+    assert turns[0]["userMessage"] == "real question"
+    events = turns[0]["aiMessage"]
+    texts = [e["content"] for e in events if e.get("type") == "text"]
+    assert texts == ["digging", "the answer"]
+    # The reminder re-emerges as a steer event, between the two AI texts.
+    steers = [e for e in events if e.get("type") == "steer"]
+    assert [s["content"] for s in steers] == ["step back"]  # tags stripped
+    order = [e.get("type") for e in events if e.get("type") in ("text", "steer")]
+    assert order == ["text", "steer", "text"]
+
+
+def test_process_stream_updates_emits_steer_chunks():
+    # The SteeringMiddleware's injection surfaces as its node's update carrying
+    # a marked HumanMessage — the translator emits a "steer" chunk with the
+    # <system-reminder> envelope stripped. Unmarked human messages are ignored.
+    from langchain_core.messages import HumanMessage
+
+    from chat.steering import STEERING_MARKER
+
+    data = {
+        "SteeringMiddleware.before_model": {
+            "messages": [
+                HumanMessage(
+                    content="<system-reminder>re-read the docs</system-reminder>",
+                    additional_kwargs={STEERING_MARKER: "futility"},
+                )
+            ]
+        }
+    }
+    chunks = server.process_stream_data("updates", data)
+    assert chunks == [{"type": "steer", "content": "re-read the docs"}]
+
+    unmarked = {"node": {"messages": [HumanMessage(content="hello")]}}
+    assert server.process_stream_data("updates", unmarked) is None
+
+
 def test_read_history_empty_for_unknown_thread():
     from langgraph.checkpoint.memory import InMemorySaver
 

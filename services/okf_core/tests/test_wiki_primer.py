@@ -20,6 +20,17 @@ def test_both_primers_cover_structure_and_trap_locations():
         assert "not tracked" in primer
 
 
+def test_both_primers_teach_result_skepticism():
+    # An implausible query result is a bug in the query until checked (fan-out,
+    # skipped recipe, sentinel, non-additive sum) — and once the mechanics check
+    # out, a surprising number is the answer: no re-running toward a prior.
+    for primer in (wp.MCP_PRIMER, wp.SOLVER_PRIMER):
+        assert "If a result looks wrong" in primer
+        assert "fans out" in primer
+        assert "recipes/" in primer
+        assert "never re-run" in primer.lower()
+
+
 def test_each_primer_names_only_the_tools_its_surface_has():
     # MCP: backlinks + semantic search exist and are the underused moves.
     assert "get_backlinks" in wp.MCP_PRIMER
