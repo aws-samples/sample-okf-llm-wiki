@@ -367,24 +367,36 @@ the full question). If the raw question already stands alone, copy it verbatim
 and set "rewritten": false.
 
 transcript — sharp declarative prose, one fact per sentence, describing what
-the analyst DID. One short paragraph per successful executed query: tables
-touched, period/filter bounds, aggregation and grain, whether deduplication was
-applied, whether documented sentinel/placeholder values were excluded. Phrase
-facts with these exact terms where they apply: clarificationObtained,
-termDisambiguated, periodSpecified, periodWithinHorizon, queryExecuted,
-dedupApplied, sentinelExcluded, snapshotSummedOverTime,
-disjointMeasuresCombined, deprecatedObjectUsed, recipeApplied. When a POLICY
-VOCABULARY section is present, also bind facts to those exact names — write
-the term verbatim rather than paraphrasing its meaning; leave terms the chain
-does not evidence unmentioned. Give each bound term its OWN short declarative
-sentence ("dedupApplied is true.") — never bundle several terms into one
-sentence, and never phrase a term as a condition or a consequence of another
-sentence: compound phrasing is what makes the downstream reasoner unable to
-translate unambiguously. End each query
-paragraph with its measured result sentence given under MEASURED RESULT SHAPES
-— copy those numbers verbatim, never derive your own. Attest ONLY what the
-chain evidences; "not determinable" is a legal value — never fabricate a
-binding. Do not mention wiki pages read. Do not mention any final answer.
+the analyst DID. Structure: one short paragraph per successful executed query
+(AT MOST two sentences of mechanics — tables touched and the operation — plus
+its measured result sentence given under MEASURED RESULT SHAPES, numbers
+copied verbatim, never derived; a probe/validation query like a min/max or
+count sanity-check gets ONE mechanics sentence), then ONE final paragraph
+carrying THE TURN'S TERM BINDINGS. The downstream reasoner has a hard
+processing budget — every sentence beyond the bindings spends it.
+
+The bindings paragraph: phrase facts with these exact terms where they apply:
+clarificationObtained, termDisambiguated, periodSpecified,
+periodWithinHorizon, queryExecuted, dedupApplied, sentinelExcluded,
+snapshotSummedOverTime, disjointMeasuresCombined, deprecatedObjectUsed,
+recipeApplied. When a POLICY VOCABULARY section is present, also bind facts
+to those exact names — write the term verbatim rather than paraphrasing its
+meaning; leave terms the chain does not evidence unmentioned. Each bound term
+gets its OWN short declarative sentence, in EITHER polarity —
+"dedupApplied is true." / "dedupApplied is false." — never a prose negation
+("no deduplication was applied"): the reasoner cannot tell a prose negation
+from unbound narrative. Bind each term AT MOST ONCE for the WHOLE TURN: the
+claim set is evaluated as one conjunction, so binding a term true for one
+query and false for another is a formal self-contradiction that voids the
+check. When queries genuinely differ, bind the polarity that describes what
+the ANSWER rests on (any answer-bearing reliance on out-of-horizon data means
+"periodWithinHorizon is false"; dedup applied everywhere it mattered means
+"dedupApplied is true") and describe the per-query difference in the prose,
+without re-binding the term. Never bundle several terms into one sentence,
+and never phrase a term as a condition or a consequence of another sentence.
+Attest ONLY what the chain evidences; "not determinable" is a legal value —
+never fabricate a binding. Do not mention wiki pages read. Do not mention any
+final answer.
 
 assumptions — interpretive choices the chain evidences (a term read one way, a
 period assumed, a scope narrowed), one short sentence each. Empty list if none.

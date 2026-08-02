@@ -182,15 +182,37 @@ function Finding({ finding, dataDomain, dataset, onOpenDoc }) {
             What would make this wrong
           </AccordionTrigger>
           <AccordionContent className="text-xs break-words text-muted-foreground">
-            {finding.scenario}
+            {/* The scenario is a LIST of assignment statements — rendered one
+                per line (a raw array in JSX concatenates with no separator). */}
+            {(Array.isArray(finding.scenario)
+              ? finding.scenario
+              : [finding.scenario]
+            ).map((statement, i) => (
+              <p key={i} className="py-0.5">
+                {statement}
+              </p>
+            ))}
           </AccordionContent>
         </AccordionItem>
       </Accordion>
     )
   }
 
-  // Not checkable: the reasoner couldn't state this in the policy's terms, so it
-  // is neither supported nor contradicted.
+  // Not checkable — but the three subtypes mean different things, and the
+  // honest message differs: TOO_COMPLEX is a processing-budget overflow — the
+  // policy's size TIMES this turn's volume (long multi-query chains, large
+  // answers) — not a statement about the turn's phrasing.
+  if (finding?.type === "TOO_COMPLEX") {
+    return (
+      <p className="min-w-0 text-xs break-words text-muted-foreground">
+        The reasoner ran out of processing budget on this turn — the policy’s
+        rules and this turn’s volume (several queries, a long answer) together
+        exceed its limits. Focused single-query turns on this dataset remain
+        checkable; if this happens on simple turns too, the policy needs a
+        leaner rebuild.
+      </p>
+    )
+  }
   return (
     <p className="min-w-0 text-xs break-words text-muted-foreground">
       {claim

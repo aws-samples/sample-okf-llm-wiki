@@ -248,11 +248,12 @@ def test_prepass_input_lists_the_policy_vocabulary():
     turn = _sql_turn()
     vocab = [{"name": "lastDriverStandingsRowSelected", "description": "d" * 400}]
     text = pc.build_prepass_input([], turn, vocabulary=vocab)
-    assert "POLICY VOCABULARY" in text
+    assert "== POLICY VOCABULARY" in text
     assert "lastDriverStandingsRowSelected" in text
     assert "d" * pc._VOCAB_DESC_CHARS in text
     assert "d" * (pc._VOCAB_DESC_CHARS + 1) not in text
-    assert "POLICY VOCABULARY" not in pc.build_prepass_input([], turn)
+    # No vocabulary -> no SECTION (the contract prose still references one).
+    assert "== POLICY VOCABULARY" not in pc.build_prepass_input([], turn)
 
 
 def test_gather_policy_vocabulary_dedupes_and_drops_core_terms():
