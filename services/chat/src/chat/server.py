@@ -21,6 +21,7 @@ carrying Sparky's **typed chunks**, produced by consuming the LangGraph run's
     {"type": "tool", "id": ..., "tool_name": ..., "tool_start": true,  "content": <args>}
     {"type": "tool", "id": ..., "tool_name": ..., "tool_start": false, "content": <result>, "error": bool}
     {"type": "steer", "content": "..."}           a chat.steering reminder (tags stripped; UI-gated)
+    {"type": "policy", "content": "..."}          a mid-turn policy flag (split from a run_sql result, or a behavioural note)
     {"type": "text",  "content": "..."}           assistant answer tokens
     {"type": "error", "error_code": ..., "message": ...}
     {"end": true, "token_stats": {...}, "checkpoint_id": "..."}
@@ -266,6 +267,63 @@ def _build_resume_map(graph: Any, cfg: dict, answers: Any) -> dict[str, Any] | N
     return by_interrupt
 
 
+def _clarification_fold(
+    graph: Any, cfg: dict, answers: Any
+) -> tuple[str, list[dict[str, str]]]:
+    """``(turn's raw question, [{prompt, answer}])`` for the curated-question fold.
+
+    The ``answer_human`` request carries only ``{id, answer}`` records, so both
+    halves come from the checkpoint the graph paused on: the raw question is
+    the last genuine user message (scope preamble stripped, steering/policy
+    injections skipped), and the prompts come from the pending ask_human
+    interrupts' question sets, matched to the answers by id. Best-effort: on
+    any read failure the fold degrades to the answers alone.
+    """
+    raw_q = ""
+    prompts: dict[str, str] = {}
+    try:
+        from langchain_core.messages import HumanMessage
+
+        from chat.policy_check import POLICY_MARKER
+        from chat.steering import STEERING_MARKER
+
+        state = graph.get_state(cfg)
+        for msg in reversed((state.values or {}).get("messages", []) if state else []):
+            if not isinstance(msg, HumanMessage):
+                continue
+            kwargs = getattr(msg, "additional_kwargs", None) or {}
+            if kwargs.get(STEERING_MARKER) or kwargs.get(POLICY_MARKER):
+                continue
+            content = msg.content
+            text = content if isinstance(content, str) else ""
+            raw_q = strip_scope_prefix(text)
+            break
+        for intr in _pending_interrupts(graph, cfg):
+            value = getattr(intr, "value", None)
+            if isinstance(value, dict) and value.get("type") == "ask_human":
+                for q in value.get("questions") or []:
+                    if isinstance(q, dict) and q.get("id"):
+                        prompts[str(q["id"])] = str(q.get("prompt") or "")
+    except Exception:  # noqa: BLE001 - the fold is advisory context
+        pass
+    qa: list[dict[str, str]] = []
+    for a in answers if isinstance(answers, (list, tuple)) else []:
+        if not isinstance(a, dict):
+            continue
+        raw = a.get("answer")
+        if isinstance(raw, (list, tuple)):
+            answer = ", ".join(str(x).strip() for x in raw if str(x).strip())
+        else:
+            answer = str(raw or "").strip()
+        qa.append(
+            {
+                "prompt": prompts.get(str(a.get("id") or ""), str(a.get("id") or "")),
+                "answer": answer,
+            }
+        )
+    return raw_q, qa
+
+
 # --- stream chunk translation (the crux) -------------------------------------
 
 
@@ -354,13 +412,22 @@ def process_stream_data(
         # marked HumanMessage. Emit it as a "steer" chunk (tags stripped) so the
         # UI can show the nudge in the thinking timeline — display is gated
         # client-side (VITE_CHAT_SHOW_STEERING); the model is steered regardless.
+        # A BehaviouralPolicyMiddleware injection carries the POLICY marker
+        # instead and becomes a typed "policy" chunk (shield timeline step,
+        # never display-gated) — checked FIRST so it can't fall through.
+        from chat.policy_check import POLICY_MARKER, policy_display
+
         for update in data.values():
             if not isinstance(update, dict):
                 continue
             for msg in update.get("messages", []) or []:
-                if isinstance(msg, HumanMessage) and (
-                    (msg.additional_kwargs or {}).get(STEERING_MARKER)
-                ):
+                if not isinstance(msg, HumanMessage):
+                    continue
+                kwargs = msg.additional_kwargs or {}
+                if kwargs.get(POLICY_MARKER):
+                    body = msg.content if isinstance(msg.content, str) else ""
+                    out.append({"type": "policy", "content": policy_display(body)})
+                elif kwargs.get(STEERING_MARKER):
                     out.append(
                         {"type": "steer", "content": strip_reminder_tags(msg.content)}
                     )
@@ -393,13 +460,20 @@ def process_stream_data(
 
         # Tool RESULT: a completed ToolMessage flowing back from a tool node.
         if isinstance(chunk, ToolMessage):
+            from chat.policy_check import split_policy_reminder
+
             content = chunk.content
+            policy_flag = ""
             if isinstance(content, str) and content:
+                # A run_sql result may carry the query-time policy reminder —
+                # split it into its own typed chunk (shield timeline step,
+                # like the steering bulbs) so it isn't buried in the payload.
+                content, policy_flag = split_policy_reminder(content)
                 try:
                     content = json.loads(content)
                 except json.JSONDecodeError:
                     pass  # leave as raw string
-            return {
+            result = {
                 "type": "tool",
                 "id": chunk.tool_call_id,
                 "tool_name": chunk.name,
@@ -407,6 +481,9 @@ def process_stream_data(
                 "content": content,
                 "error": getattr(chunk, "status", None) == "error",
             }
+            if policy_flag:
+                return [result, {"type": "policy", "content": policy_flag}]
+            return result
 
         if not isinstance(chunk, AIMessageChunk):
             return None
@@ -596,7 +673,10 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     added only when the deploy flag is on AND the run opted in — see
     :func:`make_agent_tools_with_features`. Web search is deploy-gated only (no
     opt-in): it reads no source data, so it rides every run of a deployment that
-    has a gateway wired.
+    has a gateway wired. ``policy_checker`` (built by the caller via
+    ``policy_check.make_policy_checker`` — None when policy checks are off or
+    not opted in) arms the mid-turn policy tracks: computational on the SQL
+    tool, behavioural as a before_model middleware.
 
     Each optional tool contributes a prompt BLOCK; the run's system prompt is the
     base plus the blocks for the tools actually wired, so the agent is never told
@@ -711,6 +791,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         checkpointer: Any,
         features: set[str] | None = None,
         user_sub: str = "",
+        policy_checker: Any = None,
     ):
         chat_model = build_chat_model(chat_config, model, effort)
         agent_tools = make_agent_tools(tools_impl, dataset_scope=scope)
@@ -758,6 +839,19 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # Redshift scope on a deployment without Redshift enabled gets NO SQL
         # tool — running the dataset's queries through Athena would silently hit
         # the wrong backend/dialect.
+        # ``policy_checker`` (a policy_check.PolicyChecker, or None) is
+        # constructed by the CALLER (_produce_run_chunks) — it needs the
+        # thread id for the curated question's durability and, on an
+        # ask_human resume, the fold hook — and armed per its opted tracks:
+        # computational rides the run_sql race below; behavioural gets the
+        # before_model middleware. The checker is engine-agnostic (both SQL
+        # engines share make_sql_tool; a Redshift run is @-scoped by
+        # construction so its dataset resolves via the pinned scope).
+        sql_checker = (
+            policy_checker
+            if policy_checker is not None and policy_checker.wants("computational")
+            else None
+        )
         if features and "sql" in features:
             scoped = _sql_scope(scope)
             scoped_source = (scoped or {}).get("source") or {}
@@ -766,7 +860,11 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                 if engine is not None:
                     agent_tools = [
                         *agent_tools,
-                        make_sql_tool(engine, dataset_scope=scoped),
+                        make_sql_tool(
+                            engine,
+                            dataset_scope=scoped,
+                            policy_checker=sql_checker,
+                        ),
                     ]
                     blocks.append(SQL_REDSHIFT_BLOCK)
             else:
@@ -774,7 +872,11 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                 if engine is not None:
                     agent_tools = [
                         *agent_tools,
-                        make_sql_tool(engine, dataset_scope=scoped),
+                        make_sql_tool(
+                            engine,
+                            dataset_scope=scoped,
+                            policy_checker=sql_checker,
+                        ),
                     ]
                     blocks.append(SQL_BLOCK)
         # Bedrock prompt caching (Sparky's setup): the middleware passes cache
@@ -789,6 +891,13 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         middleware = [BedrockPromptCachingMiddleware(), AskHumanMiddleware()]
         if steering_enabled():
             middleware.append(SteeringMiddleware())
+        # The behavioural policy track: batched steps-so-far evaluation via a
+        # before_model hook (runs once after ALL parallel tool results — free
+        # batching); verdicts inject steering-style and surface as shield steps.
+        if policy_checker is not None and policy_checker.wants("behavioural"):
+            from chat.policy_check import BehaviouralPolicyMiddleware
+
+            middleware.append(BehaviouralPolicyMiddleware(policy_checker))
         # Current date rides on the END of the prompt (day granularity, UTC) so
         # relative time references resolve; see graph.with_current_date.
         return build_graph(
@@ -887,16 +996,25 @@ def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
         # usage gauge works identically on history.
         return {"end": True, "token_stats": turn_stats} if turn_stats else {"end": True}
 
+    from chat.policy_check import POLICY_MARKER, policy_display
     from chat.steering import STEERING_MARKER, strip_reminder_tags
 
     for msg in messages:
         if isinstance(msg, HumanMessage):
-            # A harness-injected steering reminder (chat.steering) is part of
-            # the MODEL's context, not the user's transcript — it must never
-            # open a phantom turn or render as a user bubble. It re-emerges as
-            # the same "steer" event the live stream emitted, so the thinking
-            # timeline survives a history reload.
-            if (getattr(msg, "additional_kwargs", None) or {}).get(STEERING_MARKER):
+            # A harness-injected steering reminder (chat.steering) or
+            # behavioural policy note (chat.policy_check) is part of the
+            # MODEL's context, not the user's transcript — it must never open
+            # a phantom turn or render as a user bubble. Each re-emerges as
+            # the same typed event the live stream emitted ("steer"/"policy"),
+            # so the thinking timeline survives a history reload.
+            marker_kwargs = getattr(msg, "additional_kwargs", None) or {}
+            if marker_kwargs.get(POLICY_MARKER):
+                if current is not None:
+                    current["aiMessage"].append(
+                        {"type": "policy", "content": policy_display(_text(msg.content))}
+                    )
+                continue
+            if marker_kwargs.get(STEERING_MARKER):
                 if current is not None:
                     current["aiMessage"].append(
                         {
@@ -944,16 +1062,28 @@ def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
                     }
                 )
         elif isinstance(msg, ToolMessage) and current is not None:
+            # Mirror the live stream: a query-time policy reminder embedded in
+            # a run_sql result re-emerges as its own "policy" event on reload.
+            from chat.policy_check import split_policy_reminder
+
+            content = msg.content
+            policy_flag = ""
+            if isinstance(content, str):
+                content, policy_flag = split_policy_reminder(content)
             current["aiMessage"].append(
                 {
                     "type": "tool",
                     "id": msg.tool_call_id,
                     "tool_name": msg.name,
                     "tool_start": False,
-                    "content": msg.content,
+                    "content": content,
                     "error": getattr(msg, "status", None) == "error",
                 }
             )
+            if policy_flag:
+                current["aiMessage"].append(
+                    {"type": "policy", "content": policy_flag}
+                )
     if current:
         current["aiMessage"].append(_end_event())
         turns.append(current)
@@ -1081,9 +1211,13 @@ async def _produce_run_chunks(
     """
     from langchain_core.messages import AIMessageChunk
 
-    from chat.sql import normalize_features
+    from chat.policy_check import make_policy_checker
+    from chat.sql import normalize_features, policy_tracks
 
     token_stats: dict[str, int] = {}
+    answer_parts: list[str] = []
+    ask_pending = False
+    checker = None
     cfg = {
         "configurable": {"thread_id": internal_id},
         "recursion_limit": RECURSION_LIMIT,
@@ -1099,6 +1233,19 @@ async def _produce_run_chunks(
         # server-recognized subset; the factory further gates each on its deploy
         # flag, so an unknown/forbidden feature string is simply ignored here.
         features = normalize_features(input_data.get("features"))
+        # The mid-turn policy checker (None unless the deploy master gate is on
+        # AND the run's Policy feature armed a track). Built HERE rather than in
+        # the factory because it needs the thread id (curated-question
+        # durability on the THREAD row) and, on an ask_human resume, the
+        # clarification fold below.
+        checker = make_policy_checker(
+            chat_config,
+            tracks=policy_tracks(features),
+            scope=scope,
+            question=prompt or "",
+            user_sub=user_sub,
+            thread_id=client_thread_id,
+        )
 
         # Best-effort conversation-index upsert (sidebar). Only on a fresh turn — a
         # RESUME must NOT touch the index: its (model, effort) are the defaults (the
@@ -1117,7 +1264,13 @@ async def _produce_run_chunks(
             )
 
         graph = build_agent(
-            model, effort, scope, checkpointer, features=features, user_sub=user_sub
+            model,
+            effort,
+            scope,
+            checkpointer,
+            features=features,
+            user_sub=user_sub,
+            policy_checker=checker,
         )
         on_graph(graph)
 
@@ -1138,6 +1291,15 @@ async def _produce_run_chunks(
             if resume_map is None:
                 yield {"end": True}
                 return
+            # Fold the answered clarification into the curated question BEFORE
+            # the resumed run's first query (design §13.3 — the v3 reversal:
+            # computational judges need the clarified intent; the ask-first
+            # evidence lives in the behavioural steps track). The resume
+            # request carries no prompt, so the turn's raw question and the
+            # asked prompts come from the checkpoint's pending state.
+            if checker is not None:
+                raw_q, qa = _clarification_fold(graph, cfg, resume_answers)
+                checker.fold_clarifications(raw_q, qa)
             graph_input: Any = Command(resume=resume_map)
         else:
             graph_input = {
@@ -1171,6 +1333,10 @@ async def _produce_run_chunks(
                     seen_text = True
                 elif chunk.get("type") in ("text", "think"):
                     seen_text = True
+                if chunk.get("type") == "text":
+                    # Accumulated for the policy checks' rolling context —
+                    # the NEXT turn's rewrite needs THIS turn's final answer.
+                    answer_parts.append(chunk.get("content") or "")
                 yield chunk
 
         # If the stream ended because the graph PAUSED on ask_human interrupt(s),
@@ -1181,6 +1347,7 @@ async def _produce_run_chunks(
         if graph is not None:
             ask = _ask_human_chunk_from_state(graph, cfg)
             if ask is not None:
+                ask_pending = True
                 yield ask
     except asyncio.CancelledError:
         # Explicit stop — let the live-stream runner's on_cancel do the checkpoint
@@ -1188,6 +1355,16 @@ async def _produce_run_chunks(
         raise
     except Exception as exc:  # noqa: BLE001 - surface ANY failure as an error chunk
         yield _error_chunk("agent_error", str(exc))
+
+    # The turn's final answer feeds the NEXT turn's curated-question rewrite
+    # (THREAD-row write, async + best-effort inside the checker). Skipped when
+    # the turn PAUSED on ask_human — the answer isn't final; the resumed
+    # continuation records the complete one.
+    if checker is not None and answer_parts and not ask_pending:
+        try:
+            checker.record_final_answer("".join(answer_parts))
+        except Exception:  # noqa: BLE001 - advisory context, never fatal
+            pass
 
     # Terminal end marker (always), with token stats + the checkpoint id.
     end_marker: dict[str, Any] = {"end": True}
@@ -1386,14 +1563,11 @@ def build_app(
     chat_config: Any = None,
     build_agent: Callable | None = None,
     index_writer: Callable | None = None,
-    policy_clients: dict[str, Any] | None = None,
 ):
     """Build the FastAPI app wired to live deps. Requires fastapi + the stack.
 
-    ``chat_config`` / ``build_agent`` / ``index_writer`` / ``policy_clients`` are
-    injectable for tests; in the container they default to env-resolved live
-    clients (``policy_clients`` lazily, on the first ``policy_check`` request —
-    most deployments run with the feature off and must build nothing for it).
+    ``chat_config`` / ``build_agent`` / ``index_writer`` are injectable for
+    tests; in the container they default to env-resolved live clients.
     """
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
@@ -1526,40 +1700,6 @@ def build_app(
         if req_type == "stop":
             try:
                 data = await stop_run(user_sub, client_thread_id)
-            except Exception as exc:  # noqa: BLE001
-                return JSONResponse(
-                    _error_chunk("internal_error", str(exc)), headers=CORS_HEADERS
-                )
-            return JSONResponse(data, headers=CORS_HEADERS)
-
-        # Post-turn advisory policy check (chat.policy_check). JSON envelope
-        # like stop / get_session_history — no SSE, no new chunk vocabulary.
-        # Master-switched: with the flag off the type isn't served at all, so
-        # the deployment behaves exactly as before the feature existed.
-        if req_type == "policy_check":
-            if not getattr(chat_config, "policy_check_enabled", False):
-                return JSONResponse(
-                    _error_chunk(
-                        "disabled", "policy check is not enabled on this deployment"
-                    ),
-                    headers=CORS_HEADERS,
-                )
-            nonlocal policy_clients
-            try:
-                from chat import policy_check as pc
-
-                if policy_clients is None:
-                    policy_clients = pc.build_policy_clients(chat_config)
-                data = pc.run_policy_check(
-                    input_data,
-                    user_sub=user_sub,
-                    client_thread_id=client_thread_id,
-                    internal_thread_id=internal_id,
-                    chat_config=chat_config,
-                    build_agent=build_agent,
-                    checkpointer=checkpointer,
-                    clients=policy_clients,
-                )
             except Exception as exc:  # noqa: BLE001
                 return JSONResponse(
                     _error_chunk("internal_error", str(exc)), headers=CORS_HEADERS

@@ -190,3 +190,75 @@ def test_build_chat_model_dispatches_claude_to_converse(monkeypatch):
         "type": "adaptive",
         "display": "summarized",
     }
+
+
+def test_policy_judge_model_low_effort_on_luna(monkeypatch):
+    # The user-directed evaluator pair: reasoning LOW on the GPT (Luna) path.
+    import sys
+    import types
+
+    from chat.config import DEFAULT_POLICY_JUDGE_EFFORT, build_policy_judge_model
+
+    assert DEFAULT_POLICY_JUDGE_EFFORT == "low"
+
+    captured: dict = {}
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    lo = types.ModuleType("langchain_openai")
+    lo.ChatOpenAI = _FakeOpenAI
+    monkeypatch.setitem(sys.modules, "langchain_openai", lo)
+
+    cfg = ChatConfig.from_env(_env())  # default judge model is Luna
+    build_policy_judge_model(cfg)
+    assert captured["model"] == "openai.gpt-5.6-luna"
+    assert captured["reasoning_effort"] == "low"
+
+
+def test_policy_judge_model_haiku_uses_a_thinking_budget(monkeypatch):
+    # ...and an 8000-token thinking BUDGET on a pre-adaptive Converse model
+    # (Haiku 4.5 rejects the adaptive/effort encoding), with max_tokens lifted
+    # above the budget (budget-encoded thinking counts inside the ceiling).
+    import sys
+    import types
+
+    from chat.config import (
+        POLICY_JUDGE_MAX_TOKENS,
+        POLICY_JUDGE_THINKING_BUDGET,
+        build_policy_judge_model,
+    )
+
+    assert POLICY_JUDGE_THINKING_BUDGET == 8000
+
+    captured: dict = {}
+
+    class _FakeConverse:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    law = types.ModuleType("langchain_aws")
+    law.ChatBedrockConverse = _FakeConverse
+    monkeypatch.setitem(sys.modules, "langchain_aws", law)
+
+    cfg = ChatConfig.from_env(
+        _env(OKF_CHAT_POLICY_CHECK_MODEL="us.anthropic.claude-haiku-4-5")
+    )
+    build_policy_judge_model(cfg)
+    assert captured["additional_model_request_fields"]["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 8000,
+    }
+    assert captured["max_tokens"] == POLICY_JUDGE_THINKING_BUDGET + POLICY_JUDGE_MAX_TOKENS
+
+    # An adaptive-capable Converse id keeps the effort encoding.
+    captured.clear()
+    cfg = ChatConfig.from_env(
+        _env(OKF_CHAT_POLICY_CHECK_MODEL="global.anthropic.claude-opus-5")
+    )
+    build_policy_judge_model(cfg)
+    assert captured["additional_model_request_fields"]["thinking"] == {"type": "adaptive"}
+    assert captured["additional_model_request_fields"]["output_config"] == {
+        "effort": "low"
+    }

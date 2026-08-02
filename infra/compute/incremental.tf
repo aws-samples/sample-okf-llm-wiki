@@ -10,10 +10,8 @@ resource "aws_sqs_queue" "incremental_dlq" {
 
 resource "aws_sqs_queue" "incremental" {
   name = "${var.name_prefix}-incremental"
-  # >= 6x the consuming Lambda's timeout (the reindex.tf invariant). The
-  # incremental_fn timeout rises to 120s when AR builds are on (snapshot
-  # restores run in-process), so the visibility window rises with it.
-  visibility_timeout_seconds = local.ar_build_enabled ? 720 : 360
+  # >= 6x the consuming Lambda's timeout (the reindex.tf invariant).
+  visibility_timeout_seconds = 360
   sqs_managed_sse_enabled    = true # SSE-SQS at rest (CKV_AWS_27)
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.incremental_dlq.arn
@@ -100,18 +98,16 @@ module "incremental_fn" {
   handler     = "incremental.handler.lambda_handler"
   source_dir  = "${local.build_root}/incremental"
   policy_json = data.aws_iam_policy_document.incremental.json
-  # 120s: a policy_rebuild event either restores a snapshot in-process (a few
-  # control-plane calls + S3 copies, seconds) or fire-and-forgets an authoring
-  # run to the harvest runtime (milliseconds) — no model calls happen here.
-  # The queue's visibility_timeout stays >= 6x this (the reindex.tf invariant).
-  timeout     = local.ar_build_enabled ? 120 : 60
+  # A policy_rebuild event makes deterministic decisions (fingerprint check,
+  # stall reaping) and at most fire-and-forgets an authoring run to the
+  # harvest runtime — no model calls, no Bedrock work here.
+  timeout     = 60
   memory_size = 512
   environment = merge(local.common_env, {
     OKF_HARVEST_RUNTIME_ARN = try(aws_bedrockagentcore_agent_runtime.harvest[0].agent_runtime_arn, "")
-    # AR rebuild authority knobs (inert while enable_policy_build is off).
-    # No model config: the authoring agent runs on the HARVEST runtime.
-    OKF_POLICY_BUILD_ENABLED     = tostring(local.ar_build_enabled)
-    OKF_POLICY_GUARDRAIL_PROFILE = local.ar_guardrail_profile
+    # Policy rebuild authority switch (inert while enable_policy_build is
+    # off). No model config: the authoring agent runs on the HARVEST runtime.
+    OKF_POLICY_BUILD_ENABLED = tostring(local.ar_build_enabled)
   })
   tags = var.tags
 }
@@ -140,11 +136,10 @@ module "reconcile_fn" {
   memory_size = 512
   environment = merge(local.common_env, {
     OKF_HARVEST_RUNTIME_ARN = try(aws_bedrockagentcore_agent_runtime.harvest[0].agent_runtime_arn, "")
-    # The nightly pass completes `building` AR workflows (snapshotting the
-    # result), restores moved-back states, and dispatches authoring runs to
-    # the harvest runtime (inert while enable_policy_build is off).
-    OKF_POLICY_BUILD_ENABLED     = tostring(local.ar_build_enabled)
-    OKF_POLICY_GUARDRAIL_PROFILE = local.ar_guardrail_profile
+    # The nightly pass reaps stalled authoring runs and dispatches
+    # re-authoring to the harvest runtime (inert while enable_policy_build
+    # is off).
+    OKF_POLICY_BUILD_ENABLED = tostring(local.ar_build_enabled)
   })
   tags = var.tags
 }

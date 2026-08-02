@@ -85,7 +85,6 @@ class Config:
         chat_threads_table: str = "okf-chat",
         chat_checkpoint_table: str = "okf-chat-checkpoints",
         events=None,
-        bedrock=None,
     ):
         self.bucket = bucket
         self.registry_table = registry_table
@@ -122,10 +121,6 @@ class Config:
         # accelerator is off (handlers treat it as a structural switch) — the
         # nightly reconcile remains the correctness path either way.
         self.events = events
-        # Bedrock CONTROL plane, used only by the dataset-deletion purge (the AR
-        # policy + guardrail must not outlive their dataset — the account's
-        # 100-policy quota makes leaks expensive). None skips the purge.
-        self.bedrock = bedrock
         # The allowed (model, effort) catalog the UI's picker offers; used to
         # VALIDATE a per-harvest model/effort selection before it reaches the
         # runtime + Bedrock. Defaults to okf_core's built-in catalog when the
@@ -193,7 +188,6 @@ class Config:
                 if os.environ.get("OKF_EVENT_BUS_NAME")
                 else None
             ),
-            bedrock=boto3.client("bedrock", region_name=region),
         )
 
 
@@ -399,7 +393,6 @@ def _r_delete_domain(cfg, params, body, query, caller):
         s3=cfg.s3,
         bundle_bucket=cfg.bucket,
         freshness_table=cfg.freshness_table,
-        bedrock=cfg.bedrock,
     )
 
 
@@ -1022,7 +1015,6 @@ def _r_set_reasoning_enrollment(cfg, params, body, query, caller):
     return 200, handlers.set_reasoning_enrollment(
         cfg.ddb,
         cfg.s3,
-        cfg.bedrock,
         cfg.events,
         registry_table=cfg.registry_table,
         bucket=cfg.bucket,

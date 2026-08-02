@@ -15,6 +15,7 @@ import {
   ClockFading,
   Code2,
   Lightbulb,
+  ShieldAlert,
   Table2,
 } from "lucide-react"
 import { memo, useCallback, useMemo, useState } from "react"
@@ -333,6 +334,22 @@ const SteeringStep = memo(function SteeringStep({ step, isLast }) {
   )
 })
 
+// A query-time policy flag (split out of a run_sql result server-side):
+// shield marker, same muted aside treatment as steering — the agent already
+// acted on it; this is the visible trace.
+const PolicyStep = memo(function PolicyStep({ step, isLast }) {
+  return (
+    <div className={`timeline-item ${isLast ? "last" : ""}`}>
+      <div className="timeline-marker">
+        <ShieldAlert size={18} className="timeline-icon steering-icon" />
+      </div>
+      <div className="timeline-content">
+        <div className="timeline-steering-content">{step.content}</div>
+      </div>
+    </div>
+  )
+})
+
 const ToolStep = memo(function ToolStep({ step, isLast }) {
   const Icon = toolIcon(step.toolName)
   return (
@@ -394,6 +411,7 @@ function headerLabel(steps) {
   const last = steps[steps.length - 1]
   if (last.type === "thinking") return reasoningPreview(last)
   if (last.type === "steer") return "Course check"
+  if (last.type === "policy") return "Policy flag"
   return toolLabel(last.toolName, last.toolInput, !last.isToolComplete)
 }
 
@@ -410,7 +428,7 @@ export function UnifiedThinkingBlock({ contentBlocks = [], isGroupComplete = fal
     () =>
       contentBlocks
         .map((s, i) =>
-          s.type === "text" || s.type === "steer"
+          s.type === "text" || s.type === "steer" || s.type === "policy"
             ? `${i}:${s.type}:${s.content?.length || 0}`
             : `${i}:${s.id || ""}:${s.toolName || ""}:${s.isComplete ? 1 : 0}:${s.error ? 1 : 0}`
         )
@@ -459,6 +477,9 @@ export function UnifiedThinkingBlock({ contentBlocks = [], isGroupComplete = fal
               }
               if (step.type === "steer") {
                 return <SteeringStep key={step.id} step={step} isLast={isLast} />
+              }
+              if (step.type === "policy") {
+                return <PolicyStep key={step.id} step={step} isLast={isLast} />
               }
               return <ToolStep key={step.id} step={step} isLast={isLast} />
             })}

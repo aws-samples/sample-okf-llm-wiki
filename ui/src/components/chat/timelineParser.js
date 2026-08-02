@@ -35,6 +35,13 @@ export function buildTimelineSteps(contentSegments) {
         type: "steer",
         content: segment.content,
       })
+    } else if (segment.type === "policy" && segment.content) {
+      // A query-time policy flag — its own timeline step (shield marker).
+      steps.push({
+        id: `policy-${steps.length}`,
+        type: "policy",
+        content: segment.content,
+      })
     }
   }
   return steps

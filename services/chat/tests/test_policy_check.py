@@ -1,19 +1,22 @@
-"""The post-turn AR policy check: anatomy, pre-pass, fingerprint gate, reports.
+"""Mid-turn policy checks (v3): tracks, curated question, gates, middleware.
 
-The load-bearing contracts, in test order: turn ordinals are index-identical to
-the server's history fold (the UI's ``turn_key`` addresses the right turn);
-eligibility spends nothing on turns without data claims (and never counts SQL
-inside thinking blocks); extraction is deterministic and strips the anomaly
-reminder; the pre-pass fails OPEN and its input is blind to the final answer;
-a stale policy NEVER renders a verdict (it flags the row and publishes the
-rebuild event instead); reports are idempotent per (thread, turn) and isolated
-per user. Bedrock-runtime and EventBridge are hand fakes; DynamoDB + S3 run on
-moto.
+The load-bearing contracts, in test order: the exploration gate and dataset
+resolution are pure and spend nothing; the computational track judges ONLY
+computational policies against the curated question + SQL, with dedup and a
+per-turn budget; the behavioural track batches over the steps-so-far, judges
+ONLY behavioural policies, injects marker messages, and never nags twice; the
+rolling curated question costs zero model calls on turn 1, folds ask_human
+answers on resume (the deliberate v3 reversal), and survives reload on the
+THREAD row; judges answer through ONE enforced tool and fail open as missing
+shards; a stale/pre-v3 document NEVER renders a verdict (it flags the row and
+publishes the rebuild event — the self-heal migration). EventBridge is a hand
+fake; DynamoDB + S3 run on moto.
 """
 
 from __future__ import annotations
 
 import json
+import threading
 from types import SimpleNamespace
 
 import boto3
@@ -23,6 +26,7 @@ from moto import mock_aws
 
 from chat import policy_check as pc
 from chat import server
+from chat.threads import read_policy_state, write_policy_state
 from okf_aws import ar_policy as ap
 
 REGION = "us-east-1"
@@ -65,355 +69,81 @@ _SQL_RESULT = json.dumps(
     {"columns": ["team", "pts"], "rows": [["A", 1]], "row_count": 1, "truncated": False}
 )
 
-
-def _sql_turn(question="avg points?", answer="Team A leads with 1 point."):
-    return [
-        _user(question, scoped=True),
-        _ai(tool_calls=[("run_sql", {"sql": "SELECT 1"}, "c1")], thinking="plan"),
-        _tool("run_sql", _SQL_RESULT, "c1"),
-        _ai(text=answer),
-    ]
+_ANALYTICAL_SQL = "SELECT SUM(points) FROM driverstandings"
 
 
-# --- turn anatomy ---------------------------------------------------------------
-
-
-def test_turn_slices_are_index_identical_to_the_history_fold():
-    from chat.steering import STEERING_MARKER
-
-    msgs = [
-        _user("q1"),
-        _ai(text="a1"),
-        _user("q2", scoped=True),
-        HumanMessage(content="<system-reminder>x</system-reminder>",
-                     additional_kwargs={STEERING_MARKER: "silence"}),
-        _ai(tool_calls=[("run_sql", {"sql": "SELECT 1"}, "c1")]),
-        _tool("run_sql", _SQL_RESULT, "c1"),
-        _ai(text="a2"),
-        _user("q3"),
-        _ai(text="a3"),
-    ]
-    slices = pc.turn_slices(msgs)
-    turns = server._messages_to_turns(msgs)
-    assert len(slices) == len(turns) == 3
-    for i, turn in enumerate(turns):
-        assert turn["id"] == f"turn_{i}"
-        assert server.strip_scope_prefix(pc._text(slices[i][0].content)) == (
-            turn["userMessage"]
-        )
-
-
-# --- eligibility ------------------------------------------------------------------
-
-
-def test_sql_turn_is_eligible():
-    flags = pc.eligibility(_sql_turn())
-    assert flags["turn_ran_sql"] and flags["transcript_eligible"]
-    assert flags["check_eligible"]
-
-
-def test_prose_only_turn_is_not_eligible():
-    turn = [_user("what is this dataset?"), _ai(text="It documents F1 races.")]
-    assert not pc.eligibility(turn)["check_eligible"]
-
-
-def test_answered_ask_human_makeses_the_transcript_eligible():
-    turn = [
-        _user("q"),
-        _ai(tool_calls=[("ask_human", {"questions": []}, "c1")]),
-        _tool("ask_human", json.dumps({"status": "answered", "answers": []}), "c1"),
-        _ai(text="ok"),
-    ]
-    flags = pc.eligibility(turn)
-    assert flags["turn_asked_human"] and flags["check_eligible"]
-
-
-def test_errored_ask_human_is_not_an_interaction():
-    turn = [
-        _user("q"),
-        _ai(tool_calls=[("ask_human", {"questions": "bad"}, "c1")]),
-        _tool("ask_human", json.dumps({"status": "error"}), "c1", status="error"),
-        _ai(text="ok"),
-    ]
-    assert not pc.eligibility(turn)["check_eligible"]
-
-
-def test_recommended_sql_in_the_answer_is_eligible_without_execution():
-    turn = [_user("q"), _ai(text="Run this:\n```sql\nSELECT 1\n```")]
-    flags = pc.eligibility(turn)
-    assert flags["answer_ships_sql"] and flags["check_eligible"]
-    assert not flags["transcript_eligible"]
-
-
-def test_sql_inside_a_thinking_block_is_not_an_answer_claim():
-    turn = [_user("q"), _ai(text="No data needed.", thinking="```sql\nSELECT 1\n```")]
-    assert not pc.eligibility(turn)["check_eligible"]
-
-
-def test_plain_fence_with_select_lead_is_the_best_effort_fallback():
-    assert pc.detect_fenced_sql("```\nSELECT a FROM t\n```")
-    assert not pc.detect_fenced_sql("```\nnot a query\n```")
-    assert pc.recommended_sql("```sql\nSELECT 1\n```") == ["SELECT 1"]
-
-
-# --- deterministic extraction -------------------------------------------------------
-
-
-def test_executed_queries_pairs_calls_with_measured_shapes():
-    (q,) = pc.executed_queries(_sql_turn())
-    assert q["sql"] == "SELECT 1"
-    assert q["row_count"] == 1 and q["truncated"] is False
-    assert q["columns"] == ["team", "pts"]
-
-
-def test_executed_queries_strips_the_appended_anomaly_reminder():
-    body = _SQL_RESULT + "\n\n<system-reminder>zero rows…</system-reminder>"
-    turn = [
-        _user("q"),
-        _ai(tool_calls=[("run_sql", {"sql": "SELECT 1"}, "c1")]),
-        _tool("run_sql", body, "c1"),
-    ]
-    (q,) = pc.executed_queries(turn)
-    assert q["row_count"] == 1
-
-
-def test_failed_queries_are_omitted():
-    turn = [
-        _user("q"),
-        _ai(tool_calls=[("run_sql", {"sql": "SELECT boom"}, "c1")]),
-        _tool("run_sql", "Error: COLUMN_NOT_FOUND", "c1", status="error"),
-    ]
-    assert pc.executed_queries(turn) == []
-
-
-def test_ask_human_qa_extraction():
-    answered = json.dumps(
-        {
-            "status": "answered",
-            "answers": [{"id": "a", "prompt": "Which season?", "answer": "2019"}],
-            "note": "calendar year please",
-        }
-    )
-    turn = [_user("q"), _ai(tool_calls=[("ask_human", {}, "c1")]),
-            _tool("ask_human", answered, "c1")]
-    qa = pc.ask_human_qa(turn)
-    assert {"prompt": "Which season?", "answer": "2019"} in qa
-    assert any("calendar year" in x["answer"] for x in qa)
-
-
-def test_datasets_touched_from_scope_args_and_search_results():
-    hits = json.dumps([{"path": "sales/orders/tables/orders", "title": "t"}])
-    turn = [
-        _user("q", scoped=True),  # bird/formula_1 via the scope preamble
-        _ai(tool_calls=[
-            ("read_page", {"concept_id": "x", "data_domain": "hr", "dataset": "people"}, "c1"),
-            ("semantic_search", {"query": "orders"}, "c2"),
-        ]),
-        _tool("read_page", "{}", "c1"),
-        _tool("semantic_search", hits, "c2"),
-    ]
-    assert pc.datasets_touched(turn) == [LABEL, "hr/people", "sales/orders"]
-
-
-def test_thread_fallback_uses_the_nearest_prior_turn():
-    slices = [_sql_turn(), [_user("and for 2019?"), _ai(text="…")]]
-    assert pc._thread_fallback(slices, 1) == [LABEL]
-
-
-# --- the pre-pass --------------------------------------------------------------------
-
-
-def test_prepass_input_is_blind_to_the_final_answer():
-    turn = _sql_turn(answer="THE-ANSWER-TEXT never leaks")
-    text = pc.build_prepass_input([], turn)
-    assert "THE-ANSWER-TEXT" not in text
-    assert "SELECT 1" in text  # tool calls present
-    assert "plan" in text  # thinking present (assumption material)
-    assert "Query 1 returned 1 rows" in text  # measured, told not derived
-
-
-def test_prepass_input_carries_prior_turn_text_for_the_rewrite():
-    prior = _sql_turn(question="points per team in 2019?", answer="A: 400")
-    turn = [_user("and for 2018?"), _ai(text="B")]
-    text = pc.build_prepass_input([prior], turn)
-    assert "points per team in 2019?" in text and "A: 400" in text
-    assert "and for 2018?" in text
-
-
-def test_prepass_input_lists_the_policy_vocabulary():
-    # Dataset-specific variables the build derived: the transcript must be
-    # able to NAME them (paraphrase is what breeds TRANSLATION_AMBIGUOUS —
-    # live-observed on formula_1). Descriptions are capped; no vocabulary,
-    # no section.
-    turn = _sql_turn()
-    vocab = [{"name": "lastDriverStandingsRowSelected", "description": "d" * 400}]
-    text = pc.build_prepass_input([], turn, vocabulary=vocab)
-    assert "== POLICY VOCABULARY" in text
-    assert "lastDriverStandingsRowSelected" in text
-    assert "d" * pc._VOCAB_DESC_CHARS in text
-    assert "d" * (pc._VOCAB_DESC_CHARS + 1) not in text
-    # No vocabulary -> no SECTION (the contract prose still references one).
-    assert "== POLICY VOCABULARY" not in pc.build_prepass_input([], turn)
-
-
-def test_gather_policy_vocabulary_dedupes_and_drops_core_terms():
-    import io
-
-    from okf_aws.ar_policy import vocabulary_key
-
-    class FakeS3:
-        def __init__(self, blobs):
-            self.blobs = blobs
-
-        def get_object(self, Bucket, Key):
-            if Key not in self.blobs:
-                raise KeyError(Key)
-            return {"Body": io.BytesIO(self.blobs[Key])}
-
-    doc = json.dumps(
-        [
-            # A core term re-derived by the build: already in the contract,
-            # listing it twice would only dilute the section.
-            {"name": "queryExecuted", "description": "core duplicate"},
-            {"name": "lastRowSelected", "description": "keep me"},
-        ]
-    ).encode()
-    s3 = FakeS3(
-        {
-            vocabulary_key("bird", "f1"): doc,
-            vocabulary_key("bird", "f2"): doc,  # same names: deduped across sets
-        }
-    )
-    out = pc.gather_policy_vocabulary(
-        s3, bucket="b", labels=["bird/f1", "bird/f2", "bird/never-built"]
-    )
-    assert out == [{"name": "lastRowSelected", "description": "keep me"}]
-
-
-_GOOD_PREPASS = json.dumps(
-    {
-        "standalone_question": "average points per team for 2019",
-        "rewritten": True,
-        "transcript": "One query executed. dedupApplied is not determinable.",
-        "assumptions": ["season read as calendar year"],
-    }
-)
+# --- scripted models -----------------------------------------------------------
 
 
 class FakeModel:
+    """Plain-text scripted model (the curated-question rewrite path)."""
+
     def __init__(self, replies):
         self.replies = list(replies)
-        self.calls: list = []
+        self.prompts: list[str] = []
 
     def invoke(self, messages):
-        self.calls.append(messages)
-        reply = self.replies.pop(0)
-        if isinstance(reply, Exception):
-            raise reply
-        return AIMessage(content=reply)
+        self.prompts.append(
+            messages[0][1] if isinstance(messages[0], tuple) else str(messages)
+        )
+        return AIMessage(content=self.replies.pop(0))
 
 
-def test_run_prepass_retries_once_then_parses():
-    model = FakeModel(["not json", _GOOD_PREPASS])
-    out = pc.run_prepass(model, "input")
-    assert out and out["rewritten"] is True
-    assert len(model.calls) == 2
-    assert "ONLY the JSON" in str(model.calls[1])
+class _RaisingModel:
+    def invoke(self, *a, **k):
+        raise AssertionError("this call must never happen")
 
 
-def test_run_prepass_fails_open():
-    assert pc.run_prepass(FakeModel(["nope", "still nope"]), "x") is None
-    assert pc.run_prepass(FakeModel([RuntimeError("model down")]), "x") is None
+class FakeToolModel:
+    """Scripted tool-calling model. Each script entry is (tool_name, args) or
+    None (a prose reply with no tool call). Thread-safe pop for the pool."""
 
+    def __init__(self, scripts):
+        self.scripts = list(scripts)
+        self.prompts: list[str] = []
+        self._lock = threading.Lock()
 
-def test_parse_prepass_accepts_a_fenced_object():
-    assert pc.parse_prepass(f"```json\n{_GOOD_PREPASS}\n```") is not None
-    assert pc.parse_prepass('{"rewritten": true}') is None  # missing question
+    def bind_tools(self, tools):
+        self.tools = tools
+        return self
 
-
-# --- verdicts -------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "types,expected",
-    [
-        (["INVALID"], "violation"),
-        (["IMPOSSIBLE", "SATISFIABLE"], "violation"),
-        (["SATISFIABLE", "VALID"], "consistent"),
-        # NO_TRANSLATIONS is per-content-unit noise (a chart sentence, a
-        # courtesy line) — it only decides the verdict when it is ALL there is
-        # (live-observed: one untranslatable paragraph next to real findings
-        # must not veto them).
-        (["NO_TRANSLATIONS", "SATISFIABLE"], "consistent"),
-        (["NO_TRANSLATIONS", "VALID"], "consistent"),
-        (["NO_TRANSLATIONS", "INVALID"], "violation"),
-        (["NO_TRANSLATIONS", "TRANSLATION_AMBIGUOUS"], "not_checkable"),
-        (["NO_TRANSLATIONS"], "not_checkable"),
-        (["TOO_COMPLEX", "VALID"], "not_checkable"),
-        ([], "consistent"),
-    ],
-)
-def test_dataset_verdict_worst_of(types, expected):
-    assert pc.dataset_verdict([{"type": t} for t in types]) == expected
-
-
-def test_render_findings_quotes_the_grounded_rule():
-    grounding = {
-        "RULE1": {"rule_text": "IF zeroRows THEN no figures",
-                  "rule_source_page": "references/usage_guardrails.md"}
-    }
-    (f,) = pc.render_findings(
-        [{"type": "INVALID", "claim": "c", "rule_ids": ["RULE1"], "scenario": [],
-          "confidence": 0.9}],
-        grounding,
-    )
-    assert f["rule_text"] == "IF zeroRows THEN no figures"
-    assert f["rule_source_page"] == "references/usage_guardrails.md"
-
-
-# --- the orchestrator ------------------------------------------------------------------
-
-
-class FakeBedrockRuntime:
-    def __init__(self, finding=None):
-        self.finding = finding
-        self.calls: list[dict] = []
-
-    def apply_guardrail(self, **kw):
-        self.calls.append(kw)
-        findings = [self.finding] if self.finding else []
-        return {
-            "usage": {"automatedReasoningPolicyUnits": 1},
-            "assessments": [{"automatedReasoningPolicy": {"findings": findings}}],
-        }
-
-
-_INVALID_FINDING = {
-    "invalid": {
-        "translation": {
-            "premises": [], "claims": [{"naturalLanguage": "states figures"}],
-            "untranslatedPremises": [], "untranslatedClaims": [], "confidence": 0.9,
-        },
-        "contradictingRules": [{"identifier": "RULE1", "policyVersionArn": "arn:p:1"}],
-    }
-}
+    def invoke(self, messages):
+        prompt = messages[0][1] if isinstance(messages[0], tuple) else str(messages)
+        with self._lock:
+            self.prompts.append(prompt)
+            script = self.scripts.pop(0) if self.scripts else None
+        if script is None:
+            return AIMessage(content="prose, no tool call")
+        name, args = script
+        return AIMessage(
+            content="",
+            tool_calls=[{"name": name, "args": args, "id": "t1", "type": "tool_call"}],
+        )
 
 
 class FakeEvents:
     def __init__(self):
         self.entries: list[dict] = []
 
-    def put_events(self, *, Entries):
+    def put_events(self, Entries):
         self.entries.extend(Entries)
         return {"FailedEntryCount": 0}
 
 
-class FakeGraph:
-    def __init__(self, messages):
-        self.messages = messages
+def _wait_until(predicate, timeout=10.0):
+    """Poll for an async side effect (the checker pool has 8 workers, so a
+    barrier submit no longer guarantees ordering)."""
+    import time
 
-    def get_state(self, cfg):
-        return SimpleNamespace(values={"messages": self.messages})
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+# --- fixtures -------------------------------------------------------------------
 
 
 @pytest.fixture()
@@ -441,30 +171,41 @@ def env(monkeypatch):
         yield {"ddb": ddb, "s3": s3}
 
 
-def _seed_usable_policy(env):
-    """A registry row whose stored fingerprint matches the live wiki."""
+_POLICY_DOC = """\
+policies:
+  - id: P001
+    type: computational
+    condition: figures are stated from a query
+    action: never state figures without the documented dedup
+    source: references/usage_guardrails.md
+  - id: P002
+    type: behavioural
+    condition: an ambiguous points term is answered without pinning a reading
+    action: ask for clarification first
+    source: references/usage_guardrails.md
+"""
+
+
+def _seed_usable_policy(env, dataset=DATASET, doc=None, glue_database=None):
+    """A registry row whose stored fingerprint matches the live wiki + a doc."""
     env["s3"].put_object(
         Bucket=BUCKET,
-        Key=f"okf/{DOMAIN}/{DATASET}/references/usage_guardrails.md",
+        Key=f"okf/{DOMAIN}/{dataset}/references/usage_guardrails.md",
         Body=b"the rules",
     )
-    fresh = ap.source_hash(env["s3"], BUCKET, DOMAIN, DATASET)
-    env["ddb"].put_item(
-        TableName=REGISTRY_TABLE,
-        Item={
-            **ap.registry_key(DOMAIN, DATASET),
-            ap.ATTR_ENROLLED: {"BOOL": True},
-            ap.ATTR_BUILD_STATUS: {"S": "ready"},
-            ap.ATTR_SOURCE_HASH: {"S": fresh},
-            "ar_guardrail_id": {"S": "g1"},
-            "ar_guardrail_version": {"S": "2"},
-            "ar_policy_version": {"S": "1"},
-        },
-    )
-    ap.put_grounding(
-        env["s3"], bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET,
-        grounding={"RULE1": {"rule_text": "IF zeroRows THEN no figures",
-                              "rule_source_page": "references/usage_guardrails.md"}},
+    fresh = ap.source_hash(env["s3"], BUCKET, DOMAIN, dataset)
+    item = {
+        **ap.registry_key(DOMAIN, dataset),
+        ap.ATTR_ENROLLED: {"BOOL": True},
+        ap.ATTR_BUILD_STATUS: {"S": "ready"},
+        ap.ATTR_SOURCE_HASH: {"S": fresh},
+    }
+    if glue_database:
+        item["glue_database"] = {"S": glue_database}
+    env["ddb"].put_item(TableName=REGISTRY_TABLE, Item=item)
+    ap.put_policy_doc(
+        env["s3"], bucket=BUCKET, data_domain=DOMAIN, dataset=dataset,
+        doc_text=doc if doc is not None else _POLICY_DOC,
     )
 
 
@@ -476,226 +217,825 @@ def _cfg():
         region=REGION,
         policy_check_model="fake-model",
         policy_check_enabled=True,
+        policy_shard_size=10,
+        policy_judge_effort="low",
+        policy_query_timeout_s=10,
+        policy_query_max_per_turn=3,
     )
 
 
-def _run(env, turn_key=0, messages=None, model=None, bedrock=None, events=None,
-         force=False, user="alice"):
-    messages = messages if messages is not None else _sql_turn()
-    clients = {
-        "ddb": env["ddb"],
-        "s3": env["s3"],
-        "bedrock_runtime": bedrock or FakeBedrockRuntime(_INVALID_FINDING),
-        "events": events or FakeEvents(),
-        "model": model or FakeModel([_GOOD_PREPASS, "The agent recommended a query that sums points."]),
-    }
-    return pc.run_policy_check(
-        {"turn_key": turn_key, "force": force},
-        user_sub=user,
-        client_thread_id="conv1",
-        internal_thread_id=f"{user}:conv1",
-        chat_config=_cfg(),
-        build_agent=lambda *a, **k: FakeGraph(messages),
-        checkpointer=object(),
-        clients=clients,
+def _checker(env, judge, *, cfg=None, events=None, domain=DOMAIN, dataset=DATASET,
+             tracks=("computational",), question="career points?",
+             user_sub="", thread_id="", rewrite_model=None):
+    return pc.PolicyChecker(
+        chat_config=cfg or _cfg(),
+        tracks=tracks,
+        data_domain=domain,
+        dataset=dataset,
+        question=question,
+        user_sub=user_sub,
+        thread_id=thread_id,
+        clients={"ddb": env["ddb"], "s3": env["s3"],
+                 "events": events or FakeEvents()},
+        judge_model=judge,
+        # Tests that never exercise the rewrite must never build a live model.
+        rewrite_model=rewrite_model or _RaisingModel(),
     )
 
 
-def test_complete_check_renders_a_grounded_violation(env):
-    _seed_usable_policy(env)
-    bedrock = FakeBedrockRuntime(_INVALID_FINDING)
-    out = _run(env, bedrock=bedrock)
-    assert out["status"] == "complete" and out["eligible"] is True
-    (ds,) = out["datasets"]
-    assert ds["verdict"] == "violation"
-    (finding,) = ds["findings"]
-    assert finding["rule_text"] == "IF zeroRows THEN no figures"
-    assert finding["rule_source_page"] == "references/usage_guardrails.md"
-    assert out["policy_versions_used"] == {LABEL: "1"}
-    # The speaker split on the wire: the question is a premise, the answer text
-    # and transcript are claims.
-    (call,) = bedrock.calls
-    quals = {b["text"]["text"]: b["text"]["qualifiers"] for b in call["content"]}
-    assert quals["average points per team for 2019"] == ["query"]
-    assert any(
-        q == ["guard_content"] and "Team A leads" in t for t, q in quals.items()
+_QUERY_VIOLATION_SCRIPT = [
+    ("report_violations", {"violations": ["P001"]}),
+]
+
+_CLEAN_SCRIPT = [("report_violations", {"violations": []})]
+
+
+# --- the exploration gate + dataset resolution (pure) ----------------------------
+
+
+def test_is_analytical_sql_gate():
+    analytical = [
+        "SELECT COUNT(*) FROM results",
+        "SELECT SUM(points) FROM driverstandings WHERE driverid = 1",
+        "SELECT a FROM t JOIN u ON t.id = u.id LIMIT 5",
+        "WITH x AS (SELECT raceid FROM races)\n"
+        "SELECT raceid, ROW_NUMBER() OVER (ORDER BY raceid) FROM x",
+        "select year, count(*) from races group by year",
+    ]
+    exploration = [
+        "SELECT * FROM results LIMIT 5",
+        "SELECT DISTINCT status FROM results LIMIT 20",
+        "SHOW TABLES",
+        "EXPLAIN SELECT 1",
+        "DESCRIBE results",
+        "SELECT table_name FROM information_schema.tables",
+        "",
+    ]
+    for sql in analytical:
+        assert pc.is_analytical_sql(sql), sql
+    for sql in exploration:
+        assert not pc.is_analytical_sql(sql), sql
+
+
+def test_extract_sql_schemas():
+    cases = [
+        # quoted two-part refs, deduped across FROM and JOIN
+        ('SELECT COUNT(*) FROM "formula_1"."results" res '
+         'JOIN "formula_1"."races" r ON res.raceid = r.raceid',
+         ["formula_1"]),
+        # catalog-qualified three-part ref → the middle part
+        ('SELECT COUNT(*) FROM "awsdatacatalog"."formula_1"."results"',
+         ["formula_1"]),
+        # unquoted refs, two schemas in first-use order
+        ("select count(*) from football.appearances "
+         "join formula_1.results on 1=1",
+         ["football", "formula_1"]),
+        # alias.column is NOT a schema (only FROM/JOIN position counts)
+        ('SELECT ds."points" FROM "formula_1"."driverstandings" ds', ["formula_1"]),
+        # CTE names are unqualified and never match
+        ('WITH poles AS (SELECT raceid FROM "formula_1"."qualifying") '
+         "SELECT COUNT(*) FROM poles",
+         ["formula_1"]),
+        # string literals and comments cannot fake a table reference
+        ("SELECT COUNT(*) FROM \"formula_1\".\"results\" "
+         "WHERE name = 'from fake.table'",
+         ["formula_1"]),
+        ("-- from ghost.tbl\nSELECT COUNT(*) FROM formula_1.results",
+         ["formula_1"]),
+        ("SELECT 1", []),
+    ]
+    for sql, expected in cases:
+        assert pc.extract_sql_schemas(sql) == expected, sql
+
+
+def test_analytical_sqls_matches_results_to_their_calls():
+    turn = [
+        _user("q"),
+        _ai(tool_calls=[
+            ("run_sql", {"sql": _ANALYTICAL_SQL}, "c1"),
+            ("run_sql", {"sql": "SELECT * FROM races LIMIT 5"}, "c2"),
+            ("run_sql", {"sql": "SELECT COUNT(*) FROM races"}, "c3"),
+        ]),
+        _tool("run_sql", _SQL_RESULT, "c1"),
+        _tool("run_sql", _SQL_RESULT, "c2"),  # exploration: never counts
+        _tool("run_sql", "Error: boom", "c3", status="error"),  # errored: ditto
+    ]
+    assert pc.analytical_sqls(turn) == [_ANALYTICAL_SQL]
+
+
+# --- the judge fleet -------------------------------------------------------------
+
+
+_POLICIES = [
+    {"id": "P001", "type": "computational", "condition": "figures from empty results",
+     "action": "never state figures", "source": "references/usage_guardrails.md"},
+    {"id": "P002", "type": "behavioural", "condition": "ambiguous points term",
+     "action": "ask first", "source": "references/usage_guardrails.md"},
+]
+
+
+def test_judge_shard_reads_the_enforced_tool_call():
+    # IDS ONLY: the judge tool contract carries no evidence/explanations —
+    # the reminder is built from the authored policy text, so judge prose
+    # never reaches the main agent's context (and output tokens stay tiny).
+    model = FakeToolModel([
+        ("report_violations", {"violations": ["P001", "  ", ""]}),
+    ])
+    out = pc.judge_shard(
+        model, shard_text="…", evidence="…", prompt=pc._QUERY_JUDGE_PROMPT
     )
-    assert call["guardrailIdentifier"] == "g1" and call["guardrailVersion"] == "2"
+    assert out == ["P001"]  # blanks dropped
 
 
-def test_reports_are_idempotent_and_force_reruns(env):
+def test_judge_shard_retries_once_then_fails_open():
+    # First reply has no tool call; the retry demands it and succeeds.
+    model = FakeToolModel([
+        None,
+        ("report_violations", {"violations": []}),
+    ])
+    assert pc.judge_shard(
+        model, shard_text="…", evidence="…", prompt=pc._QUERY_JUDGE_PROMPT
+    ) == []
+    assert len(model.prompts) == 2
+    assert "report_violations" in model.prompts[1]  # the demand rode along
+    # Two tool-less replies: the shard goes unjudged, never fabricated.
+    stubborn = FakeToolModel([None, None])
+    assert pc.judge_shard(
+        stubborn, shard_text="…", evidence="…", prompt=pc._QUERY_JUDGE_PROMPT
+    ) is None
+
+
+def test_judge_policies_drops_ids_outside_the_judged_set():
+    model = FakeToolModel([
+        ("report_violations", {"violations": ["P001", "P999", "P001"]}),
+    ])
+    flagged, failed, total = pc.judge_policies(
+        model, _POLICIES, "e", shard_size=10, prompt=pc._QUERY_JUDGE_PROMPT
+    )
+    assert flagged == ["P001"]  # ghost id dropped, duplicate collapsed
+    assert (failed, total) == (0, 1)
+
+
+def test_judge_policies_counts_failed_shards():
+    model = FakeToolModel([None, None])  # one shard, both attempts tool-less
+    flagged, failed, total = pc.judge_policies(
+        model, _POLICIES, "e", shard_size=10, prompt=pc._QUERY_JUDGE_PROMPT
+    )
+    assert flagged == [] and failed == 1 and total == 1
+
+
+def test_render_judged_findings_joins_the_authored_policy_text():
+    findings = pc.render_judged_findings(
+        ["P002"], {p["id"]: p for p in _POLICIES}
+    )
+    assert findings == [{
+        "policy_id": "P002",
+        "condition": "ambiguous points term", "action": "ask first",
+        "source": "references/usage_guardrails.md",
+    }]
+
+
+# --- the reminder + its UI split ---------------------------------------------------
+
+
+def test_split_policy_reminder_roundtrips_the_composed_block():
+    findings = [
+        {"policy_id": "P001",
+         "condition": "standings points are aggregated",
+         "action": "use the final checkpoint",
+         "source": "references/usage_guardrails.md"},
+    ]
+    reminder = pc.compose_policy_reminder(
+        findings, "bird/formula_1",
+        subject=pc._QUERY_SUBJECT, closing=pc._QUERY_CLOSING,
+    )
+    payload = '{"rows": [1]}'
+    clean, display = pc.split_policy_reminder(payload + "\n\n" + reminder)
+    assert clean == payload
+    # The finding line is AUTHORED policy text only — the ids-only judge
+    # contract means no judge prose can appear here.
+    assert display == (
+        "- [P001] When standings points are aggregated — the agent must "
+        "use the final checkpoint (source: references/usage_guardrails.md)"
+    )
+    # A cross-dataset result carries TWO blocks — both stripped, findings merged.
+    two = payload + "\n\n" + reminder + "\n\n" + pc.compose_policy_reminder(
+        [{"policy_id": "P101", "condition": "c", "action": "a",
+          "source": "s.md"}],
+        "bird/football",
+        subject=pc._QUERY_SUBJECT, closing=pc._QUERY_CLOSING,
+    )
+    clean2, display2 = pc.split_policy_reminder(two)
+    assert clean2 == payload
+    assert "- [P001]" in display2 and "- [P101]" in display2
+    # No reminder = untouched passthrough.
+    assert pc.split_policy_reminder(payload) == (payload, "")
+
+
+def test_policy_display_extracts_finding_lines_only():
+    findings = [
+        {"policy_id": "P002", "why": "computed on ambiguity.", "condition": "c",
+         "action": "ask first", "source": "s.md"},
+    ]
+    note = pc.compose_policy_reminder(
+        findings, LABEL, subject=pc._STEPS_SUBJECT, closing=pc._STEPS_CLOSING
+    )
+    assert "the steps you have taken so far this turn" in note
+    display = pc.policy_display(note)
+    assert display.startswith("- [P002]")
+    assert "own judgment" not in display and "Do not mention" not in display
+    assert pc.policy_display("no findings here") == "A documented policy was flagged."
+
+
+# --- the computational track --------------------------------------------------------
+
+
+def test_query_check_flags_and_judges_only_computational_policies(env):
     _seed_usable_policy(env)
-    first = _run(env)
-    model = FakeModel([])  # would raise on any call
-    again = _run(env, model=model)
-    assert again == first and model.calls == []
-    rerun = _run(env, force=True)
-    assert rerun["status"] == "complete"
+    judge = FakeToolModel(list(_QUERY_VIOLATION_SCRIPT))
+    checker = _checker(env, judge)
+    note = checker.submit(_ANALYTICAL_SQL).result(timeout=10)
+    assert note.startswith("<system-reminder>")
+    assert note.endswith("</system-reminder>")
+    assert "[P001]" in note
+    assert "never state figures without the documented dedup" in note
+    assert "results above are real" in note
+    # The flags ship unverified and say so — the agent is the verifier.
+    assert "false positives" in note and "your own judgment" in note
+    # Exactly ONE model round (the shard): no second verification pass.
+    assert len(judge.prompts) == 1
+    # The mid-turn framing, the question, and the SQL all reached the judge —
+    # and ONLY the computational subset did (the type split).
+    assert "IN PROGRESS" in judge.prompts[0]
+    assert "career points?" in judge.prompts[0]
+    assert _ANALYTICAL_SQL in judge.prompts[0]
+    assert "P001" in judge.prompts[0] and "P002" not in judge.prompts[0]
 
 
-def test_not_eligible_is_persisted_and_returned(env):
-    turn = [_user("hi"), _ai(text="hello!")]
-    out = _run(env, messages=turn)
-    assert out["status"] == "not_eligible" and out["eligible"] is False
-    stored = pc.read_report(env["ddb"], THREADS_TABLE, "alice", "conv1", 0)
-    assert stored and stored["status"] == "not_eligible"
-
-
-def test_stale_policy_never_renders_a_verdict(env):
+def test_query_check_clean_verdict_is_cached_by_normalized_sql(env):
     _seed_usable_policy(env)
-    # The wiki moves after the build: fingerprints no longer match.
+    judge = FakeToolModel(list(_CLEAN_SCRIPT))
+    checker = _checker(env, judge)
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    # Same query modulo whitespace: served from the cache, no second fleet.
+    reworded = "  SELECT   SUM(points)\n FROM driverstandings "
+    assert checker.submit(reworded).result(timeout=10) == ""
+    assert len(judge.prompts) == 1
+
+
+def test_query_check_skips_exploration_without_any_spend(env):
+    _seed_usable_policy(env)
+    judge = FakeToolModel([])
+    checker = _checker(env, judge)
+    assert checker.submit("SELECT * FROM results LIMIT 5").result(timeout=10) == ""
+    assert judge.prompts == []  # the gate never judged
+
+
+def test_query_check_honors_the_per_turn_budget(env):
+    _seed_usable_policy(env)
+    cfg = _cfg()
+    cfg.policy_query_max_per_turn = 1
+    judge = FakeToolModel(list(_CLEAN_SCRIPT))
+    checker = _checker(env, judge, cfg=cfg)
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    over = checker.submit(
+        "SELECT raceid, COUNT(*) FROM results GROUP BY raceid"
+    ).result(timeout=10)
+    assert over == ""
+    assert len(judge.prompts) == 1  # the second analytical query was over budget
+
+
+def test_query_check_stale_fingerprint_publishes_rebuild_and_skips(env):
+    _seed_usable_policy(env)
+    # The live wiki moves on after the seed → the stored fingerprint is stale.
     env["s3"].put_object(
         Bucket=BUCKET,
         Key=f"okf/{DOMAIN}/{DATASET}/references/usage_guardrails.md",
-        Body=b"the rules, amended",
+        Body=b"the rules, revised",
     )
-    bedrock, events = FakeBedrockRuntime(_INVALID_FINDING), FakeEvents()
-    out = _run(env, bedrock=bedrock, events=events)
-    (ds,) = out["datasets"]
-    assert ds["verdict"] == "stale" and ds["findings"] == []
-    assert bedrock.calls == []  # the hard gate: no AR call against a stale policy
-    (entry,) = events.entries
-    assert entry["DetailType"] == "policy_rebuild"
-    assert json.loads(entry["Detail"])["dataset"] == DATASET
-    row = env["ddb"].get_item(
-        TableName=REGISTRY_TABLE, Key=ap.registry_key(DOMAIN, DATASET)
-    )["Item"]
-    assert row[ap.ATTR_BUILD_STATUS]["S"] == "stale"
+    events = FakeEvents()
+    judge = FakeToolModel([])
+    checker = _checker(env, judge, events=events)
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    assert judge.prompts == []  # stale is never judged
+    assert len(events.entries) == 1
+    assert json.loads(events.entries[0]["Detail"])["data_domain"] == DOMAIN
 
 
-def test_building_and_absent_policies_report_their_states(env):
-    env["ddb"].put_item(
-        TableName=REGISTRY_TABLE,
-        Item={**ap.registry_key(DOMAIN, DATASET),
-              ap.ATTR_ENROLLED: {"BOOL": True},
-              ap.ATTR_BUILD_STATUS: {"S": "building"}},
-    )
-    out = _run(env)
-    (ds,) = out["datasets"]
-    assert ds["verdict"] == "building"
-
-    env["ddb"].delete_item(
-        TableName=REGISTRY_TABLE, Key=ap.registry_key(DOMAIN, DATASET)
-    )
-    out = _run(env, force=True)
-    (ds,) = out["datasets"]
-    assert ds["verdict"] == "not_enrolled"
-
-
-def test_unenrolled_dataset_reports_not_enrolled_and_is_never_checked(env):
-    # A mapping row with NO ar attrs (registered, never opted in): the sidebar
-    # gets the enrollment pointer, and neither bedrock nor events is touched.
-    env["ddb"].put_item(
-        TableName=REGISTRY_TABLE,
-        Item={**ap.registry_key(DOMAIN, DATASET), "data_domain": {"S": DOMAIN}},
-    )
-    bedrock, events = FakeBedrockRuntime(_INVALID_FINDING), FakeEvents()
-    out = _run(env, bedrock=bedrock, events=events)
-    (ds,) = out["datasets"]
-    assert ds["verdict"] == "not_enrolled" and ds["findings"] == []
-    assert bedrock.calls == [] and events.entries == []
+def test_pre_v3_document_without_types_self_heals(env):
+    # The migration path: an old document (no `type`) fails the parse → the
+    # check publishes the rebuild and stays silent, never judges half-blind.
+    _seed_usable_policy(env, doc="""\
+policies:
+  - id: P001
+    condition: figures are stated from a query
+    action: never state figures
+    source: references/usage_guardrails.md
+""")
+    events = FakeEvents()
+    judge = FakeToolModel([])
+    checker = _checker(env, judge, events=events)
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    assert judge.prompts == []
+    assert len(events.entries) == 1
 
 
-def test_enrolled_but_never_built_reports_no_policy(env):
-    env["ddb"].put_item(
-        TableName=REGISTRY_TABLE,
-        Item={**ap.registry_key(DOMAIN, DATASET),
-              ap.ATTR_ENROLLED: {"BOOL": True}},
-    )
-    out = _run(env)
-    (ds,) = out["datasets"]
-    assert ds["verdict"] == "no_policy"
+def test_query_check_not_enrolled_is_silent(env):
+    judge = FakeToolModel([])
+    checker = _checker(env, judge)
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    assert judge.prompts == []
 
 
-def test_prepass_failure_is_unavailable_and_not_persisted(env):
+# --- unscoped runs: dataset resolution from the SQL itself -------------------------
+
+
+def test_unscoped_checker_resolves_dataset_from_qualified_sql(env):
+    _seed_usable_policy(env)  # glue db falls back to the dataset id
+    judge = FakeToolModel(list(_QUERY_VIOLATION_SCRIPT))
+    checker = _checker(env, judge, domain="", dataset="")
+    note = checker.submit(
+        'SELECT SUM(points) FROM "formula_1"."driverstandings"'
+    ).result(timeout=10)
+    assert "[P001]" in note and "bird/formula_1" in note
+
+
+def test_unscoped_checker_uses_the_registry_glue_database(env):
+    # The mapping's Glue DB name differs from the dataset id — the row's
+    # glue_database attribute must win (same contract as scope enrichment).
+    _seed_usable_policy(env, glue_database="f1_glue")
+    judge = FakeToolModel(list(_QUERY_VIOLATION_SCRIPT))
+    checker = _checker(env, judge, domain="", dataset="")
+    note = checker.submit(
+        'SELECT SUM(points) FROM "f1_glue"."driverstandings"'
+    ).result(timeout=10)
+    assert "[P001]" in note and "bird/formula_1" in note
+
+
+def test_unscoped_checker_skips_unenrolled_schemas_for_free(env):
     _seed_usable_policy(env)
-    out = _run(env, model=FakeModel(["junk", "junk"]))
-    assert out["status"] == "unavailable"
-    assert pc.read_report(env["ddb"], THREADS_TABLE, "alice", "conv1", 0) is None
-    # A later click with a healthy model completes normally.
-    assert _run(env)["status"] == "complete"
+    judge = FakeToolModel([])
+    checker = _checker(env, judge, domain="", dataset="")
+    note = checker.submit(
+        'SELECT COUNT(*) FROM "other_db"."events" GROUP BY kind'
+    ).result(timeout=10)
+    assert note == ""
+    assert judge.prompts == []  # nothing enrolled to judge against
 
 
-def test_bad_and_out_of_range_turn_keys(env):
-    assert _run(env, turn_key="x")["error_code"] == "bad_request"
-    assert _run(env, turn_key=7)["error_code"] == "not_found"
-
-
-def test_in_flight_turn_reports_running(env, monkeypatch):
-    from chat import live_streams
-
-    monkeypatch.setattr(live_streams, "get", lambda key: SimpleNamespace(user_message="q"))
-    monkeypatch.setattr(live_streams, "is_active", lambda key: True)
-    out = _run(env, turn_key=0)
-    assert out == {"type": "policy_check", "turn_key": 0, "status": "running"}
-
-
-def test_reports_are_isolated_per_user(env):
+def test_unscoped_cross_dataset_join_judges_each_dataset(env):
     _seed_usable_policy(env)
-    _run(env, user="alice")
-    assert pc.read_report(env["ddb"], THREADS_TABLE, "bob", "conv1", 0) is None
+    _seed_usable_policy(env, dataset="football", doc="""\
+policies:
+  - id: P101
+    type: computational
+    condition: any aggregate over appearances
+    action: never sum appearances across seasons
+    source: references/usage_guardrails.md
+""")
+    judge = FakeToolModel([
+        ("report_violations", {"violations": ["P001"]}),
+        ("report_violations", {"violations": ["P101"]}),
+    ])
+    checker = _checker(env, judge, domain="", dataset="")
+    note = checker.submit(
+        'SELECT COUNT(*) FROM "formula_1"."results" r '
+        'JOIN "football"."appearances" a ON r.driverid = a.player_id'
+    ).result(timeout=10)
+    assert "[P001]" in note and "bird/formula_1" in note
+    assert "[P101]" in note and "bird/football" in note
+    assert len(judge.prompts) == 2  # one fleet per matched dataset
 
 
-# --- the server branch -------------------------------------------------------------
+# --- the rolling curated question ---------------------------------------------------
 
 
-def _post_policy_check(app, enabled_sub="alice"):
-    import jwt
-    from fastapi.testclient import TestClient
-
-    token = jwt.encode({"sub": enabled_sub}, "k" * 32, algorithm="HS256")
-    return TestClient(app).post(
-        "/invocations",
-        json={"input": {"type": "policy_check", "turn_key": 0}},
-        headers={
-            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": "conv1",
-            "Authorization": f"Bearer {token}",
-        },
+def test_turn_one_uses_the_raw_question_with_zero_model_calls(env):
+    _seed_usable_policy(env)
+    judge = FakeToolModel(list(_CLEAN_SCRIPT))
+    # user_sub/thread_id present, but the THREAD row has no prior state — a
+    # fresh thread OR the turn where policy was first enabled MID-conversation
+    # (identical by construction: no armed run ever wrote state). The RAISING
+    # rewrite model proves no rewrite call happens.
+    checker = _checker(env, judge, user_sub="alice", thread_id="conv1",
+                       question="career points?")
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    assert "career points?" in judge.prompts[0]
+    # The raw question is SEEDED as the curated question — without this write
+    # the next turn would find nothing to chain from and the rolling rewrite
+    # could never start.
+    state = read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
     )
+    assert state["curated_question"] == "career points?"
 
 
-def _stub_app(enabled: bool, monkeypatch=None):
-    class _Cfg:
-        checkpoint_table = "okf-chat-checkpoints"
-        threads_table = THREADS_TABLE
-        region = REGION
-        checkpoint_ttl_seconds = None
-        policy_check_enabled = enabled
-
-    def _fake_checkpointer(cfg):
-        return object()
-
-    import chat.server as srv
-
-    if monkeypatch:
-        monkeypatch.setattr(srv, "make_checkpointer", _fake_checkpointer)
-    return srv.build_app(
-        chat_config=_Cfg(),
-        build_agent=lambda *a, **k: FakeGraph([]),
-        index_writer=lambda **kw: None,
-        policy_clients={"ddb": None, "s3": None, "bedrock_runtime": None,
-                        "events": None, "model": None},
+def test_follow_up_turn_rewrites_and_persists_the_curated_question(env):
+    _seed_usable_policy(env)
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+        curated_question="average points per team for 2019",
+        last_answer="Team A led 2019 with 400 points.",
     )
+    rewrite = FakeModel([json.dumps({"question": "average points per team for 2018"})])
+    judge = FakeToolModel(list(_CLEAN_SCRIPT))
+    checker = _checker(env, judge, user_sub="alice", thread_id="conv1",
+                       question="and for 2018?", rewrite_model=rewrite)
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    # The rewrite saw all three pieces...
+    assert "average points per team for 2019" in rewrite.prompts[0]
+    assert "Team A led 2019" in rewrite.prompts[0]
+    assert "and for 2018?" in rewrite.prompts[0]
+    # ...the judge got the CURATED question, not the fragment...
+    assert "average points per team for 2018" in judge.prompts[0]
+    # ...and the curated question survived to the THREAD row (durability).
+    state = read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )
+    assert state["curated_question"] == "average points per team for 2018"
 
 
-def test_disabled_deployment_refuses_the_request_type(monkeypatch):
-    resp = _post_policy_check(_stub_app(False, monkeypatch))
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["type"] == "error" and body["error_code"] == "disabled"
+def test_the_chain_establishes_across_two_armed_turns(env):
+    # End-to-end over the THREAD row, no hand-seeded state: turn 1 seeds the
+    # raw question; turn 2 (a fresh checker, as the server builds per run)
+    # finds it plus the recorded answer and RUNS the rewrite.
+    _seed_usable_policy(env)
+    t1 = _checker(env, FakeToolModel(list(_CLEAN_SCRIPT)),
+                  user_sub="alice", thread_id="conv1",
+                  question="average points per team for 2019?")
+    assert t1.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    t1.record_final_answer("Team A led 2019 with 400 points.")
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["last_answer"])
+
+    rewrite = FakeModel([json.dumps({"question": "average points per team for 2018"})])
+    judge2 = FakeToolModel(list(_CLEAN_SCRIPT))
+    t2 = _checker(env, judge2, user_sub="alice", thread_id="conv1",
+                  question="and for 2018?", rewrite_model=rewrite)
+    assert t2.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    assert "average points per team for 2019?" in rewrite.prompts[0]
+    assert "Team A led 2019" in rewrite.prompts[0]
+    assert "average points per team for 2018" in judge2.prompts[0]
 
 
-def test_enabled_deployment_dispatches_to_the_handler(monkeypatch):
-    seen: list[dict] = []
+def test_answer_only_state_still_triggers_the_rewrite(env):
+    # The previous armed turn ran no SQL, so only its ANSWER was recorded (the
+    # curated-question seed happens on the first submitted query). The answer
+    # alone still carries the context — the rewrite must run, not fall back.
+    _seed_usable_policy(env)
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1", last_answer="Team A led 2019 with 400 points.",
+    )
+    rewrite = FakeModel([json.dumps({"question": "points for Team A in 2018"})])
+    judge = FakeToolModel(list(_CLEAN_SCRIPT))
+    checker = _checker(env, judge, user_sub="alice", thread_id="conv1",
+                       question="and for 2018?", rewrite_model=rewrite)
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    assert "Team A led 2019" in rewrite.prompts[0]
+    assert "points for Team A in 2018" in judge.prompts[0]
 
-    def _fake_run(input_data, **kw):
-        seen.append(input_data)
-        return {"type": "policy_check", "turn_key": 0, "status": "not_eligible"}
 
-    import chat.policy_check as pcmod
+def test_rewrite_failure_falls_back_to_the_raw_question(env):
+    _seed_usable_policy(env)
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1", curated_question="prior question",
+    )
+    judge = FakeToolModel(list(_CLEAN_SCRIPT))
+    broken = FakeModel(["not json at all"])
+    checker = _checker(env, judge, user_sub="alice", thread_id="conv1",
+                       question="and for 2018?", rewrite_model=broken)
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    assert "and for 2018?" in judge.prompts[0]  # raw question, fail-open
 
-    monkeypatch.setattr(pcmod, "run_policy_check", _fake_run)
-    resp = _post_policy_check(_stub_app(True, monkeypatch))
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "not_eligible"
-    assert seen == [{"type": "policy_check", "turn_key": 0}]
+
+def test_fold_clarifications_reruns_the_rewrite_with_the_qa(env):
+    # The v3 REVERSAL: an answered ask_human IS folded into the curated
+    # question (the ask-first evidence lives in the behavioural steps track).
+    _seed_usable_policy(env)
+    rewrite = FakeModel([json.dumps({"question": "championship points for Hamilton"})])
+    judge = FakeToolModel(list(_QUERY_VIOLATION_SCRIPT))
+    checker = _checker(env, judge, user_sub="alice", thread_id="conv1",
+                       question="", rewrite_model=rewrite)
+    checker.fold_clarifications(
+        "points for Hamilton?",
+        [{"prompt": "Which points?", "answer": "championship"}],
+    )
+    note = checker.submit(_ANALYTICAL_SQL).result(timeout=10)
+    assert "[P001]" in note
+    assert "Which points?" in rewrite.prompts[0]
+    assert "championship" in rewrite.prompts[0]
+    assert "points for Hamilton?" in rewrite.prompts[0]
+    assert "championship points for Hamilton" in judge.prompts[0]
+    # The folded question is durable too.
+    state = read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )
+    assert state["curated_question"] == "championship points for Hamilton"
+
+
+def test_build_curate_input_sections_are_conditional():
+    text = pc.build_curate_input(raw_question="points?")
+    assert "LATEST MESSAGE" in text
+    assert "PREVIOUS QUESTION" not in text and "CLARIFICATIONS" not in text
+    full = pc.build_curate_input(
+        prev_question="pq", prev_answer="pa", raw_question="rq",
+        qa=[{"prompt": "p", "answer": "a"}],
+    )
+    for fragment in ("PREVIOUS QUESTION", "ANSWER THE USER GOT", "LATEST MESSAGE",
+                     "CLARIFICATIONS"):
+        assert fragment in full
+
+
+def test_record_final_answer_persists_truncated(env):
+    judge = FakeToolModel([])
+    checker = _checker(env, judge, user_sub="alice", thread_id="conv1")
+    checker.record_final_answer("The answer. " * 400)  # > the 2k cap
+    def _state():
+        return read_policy_state(
+            env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+            thread_id="conv1",
+        )
+    assert _wait_until(lambda: _state()["last_answer"])
+    state = _state()
+    assert state["last_answer"].startswith("The answer.")
+    assert len(state["last_answer"]) == 2000
+
+
+def test_read_policy_state_is_empty_for_a_missing_row(env):
+    state = read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="nobody",
+        thread_id="ghost",
+    )
+    assert state == {"curated_question": "", "last_answer": ""}
+
+
+# --- the behavioural track ------------------------------------------------------
+
+
+def _behaviour_turn(sql=_ANALYTICAL_SQL):
+    return [
+        _user("points for Hamilton?", scoped=True),
+        _ai(tool_calls=[("run_sql", {"sql": sql}, "c1")],
+            thinking="private-deliberation"),
+        _tool("run_sql", _SQL_RESULT, "c1"),
+    ]
+
+
+_STEPS_VIOLATION_SCRIPT = [
+    ("report_violations", {"violations": ["P002"]}),
+]
+
+
+def test_behavioural_check_judges_the_steps_with_behavioural_policies(env):
+    _seed_usable_policy(env)
+    judge = FakeToolModel(list(_STEPS_VIOLATION_SCRIPT))
+    checker = _checker(env, judge, tracks=("behavioural",))
+    note = checker.submit_behavioural(_behaviour_turn()).result(timeout=10)
+    assert "[P002]" in note and "ask for clarification first" in note
+    assert "the steps you have taken so far this turn" in note
+    # ONLY the behavioural subset reached the judge; committed-conduct framing.
+    assert "P002" in judge.prompts[0] and "P001" not in judge.prompts[0]
+    assert "COMMITTED" in judge.prompts[0]
+    assert "SUM(points)" in judge.prompts[0]  # the steps carry the SQL verbatim
+    assert "private-deliberation" not in judge.prompts[0]  # thinking is never evidence
+
+
+def test_behavioural_check_never_nags_the_same_policy_twice(env):
+    _seed_usable_policy(env)
+    judge = FakeToolModel(list(_STEPS_VIOLATION_SCRIPT) * 2)
+    checker = _checker(env, judge, tracks=("behavioural",))
+    first = checker.submit_behavioural(_behaviour_turn()).result(timeout=10)
+    assert "[P002]" in first
+    # A later, larger window re-flags the same policy → suppressed.
+    window = _behaviour_turn() + [
+        _ai(tool_calls=[("run_sql", {"sql": "SELECT COUNT(*) FROM races"}, "c2")]),
+        _tool("run_sql", _SQL_RESULT, "c2"),
+    ]
+    assert checker.submit_behavioural(window).result(timeout=10) == ""
+
+
+def test_steps_evidence_includes_the_clarification_exchange():
+    qa = json.dumps(
+        {"status": "answered",
+         "answers": [{"prompt": "Which points?", "answer": "championship"}]}
+    )
+    turn = [
+        _user("points?"),
+        _ai(tool_calls=[("ask_human", {"q": "?"}, "c1")]),
+        _tool("ask_human", qa, "c1"),
+    ]
+    text = pc.build_steps_evidence(turn, question="points?")
+    assert "Which points?" in text and "championship" in text
+    assert "STEPS THE AGENT HAS TAKEN" in text
+
+
+def test_steps_evidence_excludes_injected_notes():
+    from chat.steering import STEERING_MARKER
+
+    turn = _behaviour_turn() + [
+        HumanMessage(content="<system-reminder>steer</system-reminder>",
+                     additional_kwargs={STEERING_MARKER: "silence"}),
+        HumanMessage(content="<system-reminder>policy</system-reminder>",
+                     additional_kwargs={pc.POLICY_MARKER: "behavioural"}),
+    ]
+    text = pc.build_steps_evidence(turn, question="q")
+    assert "steer" not in text and "policy</system-reminder>" not in text
+
+
+class _State(dict):
+    """A dict-based stand-in for the middleware's state (has .get)."""
+
+
+def test_middleware_kicks_once_batches_and_delivers_at_the_same_hook(env):
+    _seed_usable_policy(env)
+    judge = FakeToolModel(list(_STEPS_VIOLATION_SCRIPT))
+    checker = _checker(env, judge, tracks=("behavioural",))
+    mw = pc.BehaviouralPolicyMiddleware(checker)
+
+    # No analytical results yet → nothing kicked, nothing injected — but the
+    # first hook pre-warms the checker (cold-start off the eval's wait path).
+    opener = [_user("points for Hamilton?", scoped=True)]
+    assert mw.before_model(_State(messages=opener)) is None
+    assert mw._future is None
+    assert _wait_until(lambda: checker._warmed)
+
+    # TWO parallel analytical results arrive before this hook runs → ONE
+    # batched eval, and the hook WAITS for it: the verdict must inject before
+    # THIS model call (fire-and-forget would lose the race to a final answer
+    # and never deliver — the live-observed failure mode).
+    window = _behaviour_turn() + [
+        _ai(tool_calls=[("run_sql", {"sql": "SELECT AVG(points) FROM results"}, "c2")]),
+        _tool("run_sql", _SQL_RESULT, "c2"),
+    ]
+    out = mw.before_model(_State(messages=window))
+    (msg,) = out["messages"]
+    assert msg.additional_kwargs[pc.POLICY_MARKER] == "behavioural"
+    assert "[P002]" in msg.content
+    assert len(judge.prompts) == 1  # one batched eval covered both queries
+    assert mw._future is None  # consumed at delivery
+    # Nothing new since → the next hook neither re-kicks nor waits.
+    assert mw.before_model(_State(messages=window)) is None
+
+
+def test_middleware_async_hook_delivers_too(env):
+    import asyncio
+
+    _seed_usable_policy(env)
+    judge = FakeToolModel(list(_STEPS_VIOLATION_SCRIPT))
+    checker = _checker(env, judge, tracks=("behavioural",))
+    mw = pc.BehaviouralPolicyMiddleware(checker)
+
+    async def _drive():
+        opener = [_user("points for Hamilton?", scoped=True)]
+        assert await mw.abefore_model(_State(messages=opener)) is None  # baseline
+        return await mw.abefore_model(_State(messages=_behaviour_turn()))
+
+    out = asyncio.run(_drive())
+    (msg,) = out["messages"]
+    assert "[P002]" in msg.content
+
+
+def test_middleware_never_triggers_on_a_resume_without_new_queries(env):
+    # An ask_human RESUME rebuilds the middleware; its first hook sees the
+    # PRE-ASK analytical results in the window. Those were already evaluated
+    # by the run that issued them — the first hook BASELINES and must not
+    # kick (the trigger contract is NEW complex queries, never the resume
+    # itself). A genuinely new query after the resume still triggers.
+    _seed_usable_policy(env)
+    judge = FakeToolModel(list(_STEPS_VIOLATION_SCRIPT))
+    checker = _checker(env, judge, tracks=("behavioural",))
+    mw = pc.BehaviouralPolicyMiddleware(checker)
+
+    resumed = _behaviour_turn() + [
+        _ai(tool_calls=[("ask_human", {"q": "?"}, "c9")]),
+        _tool("ask_human", json.dumps({"status": "answered", "answers": []}), "c9"),
+    ]
+    assert mw.before_model(_State(messages=resumed)) is None  # baseline, no kick
+    assert mw._future is None
+    assert mw.before_model(_State(messages=resumed)) is None  # still nothing new
+    assert judge.prompts == []
+
+    fresh_query = resumed + [
+        _ai(tool_calls=[("run_sql", {"sql": "SELECT AVG(points) FROM results"}, "c2")]),
+        _tool("run_sql", _SQL_RESULT, "c2"),
+    ]
+    out = mw.before_model(_State(messages=fresh_query))
+    (msg,) = out["messages"]
+    assert "[P002]" in msg.content
+    assert len(judge.prompts) == 1
+
+
+def test_middleware_slow_verdict_defers_to_the_next_hook(env):
+    # The eval outlasts the wait budget: the hook gives up WITHOUT consuming
+    # the future (a later hook gets another window; a turn that ends first
+    # drops it — advisory), and the model call proceeds unblocked.
+    import threading
+
+    release = threading.Event()
+
+    class _SlowChecker:
+        wait_budget_s = 0.05
+
+        def prewarm(self):
+            pass
+
+        def submit_behavioural(self, messages):
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pool = ThreadPoolExecutor(max_workers=1)
+            return self._pool.submit(lambda: release.wait(5) and "")
+
+    mw = pc.BehaviouralPolicyMiddleware(_SlowChecker())
+    opener = [_user("q", scoped=True)]
+    assert mw.before_model(_State(messages=opener)) is None  # baseline
+    assert mw.before_model(_State(messages=_behaviour_turn())) is None
+    assert mw._future is not None  # kept for a later hook
+    release.set()
+
+
+def test_middleware_survives_a_failing_checker(env):
+    class _Boom:
+        def prewarm(self):
+            pass
+
+        def submit_behavioural(self, messages):
+            raise RuntimeError("boom")
+
+    mw = pc.BehaviouralPolicyMiddleware(_Boom())
+    opener = [_user("q", scoped=True)]
+    assert mw.before_model(_State(messages=opener)) is None  # baseline
+    assert mw.before_model(_State(messages=_behaviour_turn())) is None  # swallowed
+
+
+def test_policy_note_never_resets_the_steering_turn_slice():
+    # The injected note is a HumanMessage — steering's turn_slice must not
+    # treat it as a genuine user message (marker parity pinned here).
+    from chat import steering
+
+    assert pc.POLICY_MARKER in steering._INJECTED_MARKER_KEYS
+    note = HumanMessage(content="<system-reminder>n</system-reminder>",
+                        additional_kwargs={pc.POLICY_MARKER: "behavioural"})
+    window = steering.turn_slice([_user("q"), _ai(text="a"), note])
+    assert isinstance(window[0], HumanMessage) and window[0].content == "q"
+
+
+# --- checker construction + arming -------------------------------------------------
+
+
+def test_make_policy_checker_gates_on_deploy_flag_and_tracks():
+    cfg = _cfg()
+    on = pc.make_policy_checker(
+        cfg, tracks={"computational"}, scope={"data_domain": DOMAIN, "dataset": DATASET},
+        question="q", user_sub="alice", thread_id="conv1",
+    )
+    assert isinstance(on, pc.PolicyChecker)
+    assert on.wants("computational") and not on.wants("behavioural")
+    # No tracks → no checker, whatever the flag says.
+    assert pc.make_policy_checker(
+        cfg, tracks=set(), scope=None, question="q",
+        user_sub="alice", thread_id="conv1",
+    ) is None
+    # Deploy gate off → no checker, whatever the client sent.
+    cfg.policy_check_enabled = False
+    assert pc.make_policy_checker(
+        cfg, tracks={"computational", "behavioural"}, scope=None, question="q",
+        user_sub="alice", thread_id="conv1",
+    ) is None
+
+
+def test_should_wait_only_for_analytical_sql(env):
+    checker = _checker(env, FakeToolModel([]))
+    assert checker.should_wait(_ANALYTICAL_SQL)
+    assert not checker.should_wait("SELECT * FROM races LIMIT 5")
+
+
+def test_concurrent_checks_run_on_a_pool_and_respect_the_budget(env):
+    # The pool allows up to 8 concurrent fleet rounds (parallel tool-called
+    # queries + a behavioural eval must not serialize while their callers'
+    # wait budgets burn) — and the shared budget/dedup state stays correct
+    # under that concurrency: 3 distinct analytical queries at a cap of 2
+    # yield exactly 2 judged fleets, whatever the interleaving.
+    from chat.policy_check import _POOL_WORKERS
+
+    _seed_usable_policy(env)
+    cfg = _cfg()
+    cfg.policy_query_max_per_turn = 2
+    judge = FakeToolModel(list(_CLEAN_SCRIPT) * 3)
+    checker = _checker(env, judge, cfg=cfg)
+    assert checker._pool._max_workers == _POOL_WORKERS == 8
+    sqls = [
+        "SELECT SUM(points) FROM driverstandings",
+        "SELECT COUNT(*) FROM results GROUP BY raceid",
+        "SELECT AVG(points) FROM results",
+    ]
+    futures = [checker.submit(s) for s in sqls]
+    assert [f.result(timeout=15) for f in futures] == ["", "", ""]
+    assert len(judge.prompts) == 2  # the third was over budget, atomically

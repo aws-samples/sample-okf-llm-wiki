@@ -1,14 +1,14 @@
-// Reasoning — per-dataset Automated Reasoning enrollment + policy transparency.
+// Reasoning — per-dataset policy-check enrollment + policy transparency.
 //
-// Enrollment is OPT-IN (the account allows 100 policies total, so each one is a
-// deliberate spend): a dataset starts unenrolled, can only enroll once a wiki
-// exists (the policy is derived FROM the bundle), and unenrolling DELETES the
-// policy, its guardrail, and the derived artifacts — confirmed first, since a
-// re-enroll rebuilds from scratch. The rest of the page is transparency: which
-// wiki files feed the policy, the rules the reasoner actually enforces (each
-// quoting its source page), when the last build ran, and whether it still
-// matches the live wiki — with a manual Sync as the fail-safe when it doesn't.
-// Builds run async on the backend (minutes); the page polls while one is live.
+// Enrollment is OPT-IN: a dataset starts unenrolled, can only enroll once a
+// wiki exists (the policies are derived FROM the bundle), and unenrolling
+// DELETES the policy document and its derived artifacts — confirmed first,
+// since a re-enroll re-authors from scratch. The rest of the page is
+// transparency: which wiki files feed the document, the individual policies
+// the judge fleet enforces (each with a stable id and its source page), when
+// the last authoring ran, and whether it still matches the live wiki — with a
+// manual Sync as the fail-safe when it doesn't. Authoring runs async on the
+// backend (minutes); the page polls while one is live.
 
 import { useCallback, useEffect, useState } from "react"
 import {
@@ -19,7 +19,6 @@ import {
   ShieldOffIcon,
 } from "lucide-react"
 
-import { Markdown } from "@/components/chat/Markdown"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -60,25 +59,15 @@ const STATUS_CHIP = {
     variant: "outline",
     cls: "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
   },
-  degraded: { text: "Ready (reduced coverage)", variant: "secondary", cls: "" },
-  building: { text: "Building…", variant: "secondary", cls: "" },
-  stale: { text: "Rebuild pending", variant: "secondary", cls: "" },
-  failed: { text: "Build failed", variant: "destructive", cls: "" },
-  unsupported_region: {
-    text: "Unavailable in this region",
-    variant: "secondary",
-    cls: "",
-  },
+  building: { text: "Authoring…", variant: "secondary", cls: "" },
+  stale: { text: "Re-author pending", variant: "secondary", cls: "" },
+  failed: { text: "Authoring failed", variant: "destructive", cls: "" },
 }
 
 function fmtWhen(iso) {
   if (!iso) return ""
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
-}
-
-function pct(x) {
-  return `${Math.round((Number(x) || 0) * 100)}%`
 }
 
 export default function ReasoningView({ api, selection }) {
@@ -130,9 +119,7 @@ export default function ReasoningView({ api, selection }) {
   // building. Booleans (not `data`) as deps so polling doesn't reset the
   // give-up timer every refresh.
   const settled =
-    building ||
-    (data?.up_to_date === true &&
-      (data?.status === "ready" || data?.status === "degraded"))
+    building || (data?.up_to_date === true && data?.status === "ready")
   useEffect(() => {
     if (!building && !syncPending) return
     const id = setInterval(load, BUILD_POLL_MS)
@@ -210,12 +197,13 @@ export default function ReasoningView({ api, selection }) {
                 Automated reasoning
               </CardTitle>
               <CardDescription>
-                Checks chat answers about{" "}
+                Chat answers about{" "}
                 <span className="font-medium text-foreground">
                   {domain}/{dataset}
                 </span>{" "}
-                against rules derived from its wiki. Opt-in per dataset; the
-                policy rebuilds automatically when the wiki changes.
+                are judged by a model fleet against policies derived from its
+                wiki. Opt-in per dataset; the policy document re-authors
+                automatically when the wiki changes.
               </CardDescription>
             </div>
             {data?.enrolled ? (
@@ -373,16 +361,6 @@ export default function ReasoningView({ api, selection }) {
                   </Button>
                 </div>
               ) : null}
-              {data?.fidelity_coverage || data?.fidelity_accuracy ? (
-                <p className="text-muted-foreground">
-                  Policy fidelity: {pct(data.fidelity_coverage)} of the source
-                  material became rules, translated at{" "}
-                  {pct(data.fidelity_accuracy)} accuracy.
-                  {data?.status === "degraded"
-                    ? " Below the quality bar — checks still run, but coverage is reduced."
-                    : ""}
-                </p>
-              ) : null}
             </div>
           )}
         </CardContent>
@@ -419,11 +397,12 @@ export default function ReasoningView({ api, selection }) {
               <div className="space-y-1.5">
                 <CardTitle className="flex items-center gap-2 text-base">
                   <BookOpenTextIcon className="size-4 text-muted-foreground" />
-                  Rules{data?.rules?.length ? ` (${data.rules.length})` : ""}
+                  Policies
+                  {data?.policies?.length ? ` (${data.policies.length})` : ""}
                 </CardTitle>
                 <CardDescription>
-                  What the reasoner enforces, verbatim — each rule traces to
-                  the wiki page it came from.
+                  What the judges enforce — each policy is individually
+                  tracked by its id and traces to the wiki page it came from.
                 </CardDescription>
               </div>
               {/* The document exists once anything has been authored — i.e.
@@ -431,20 +410,39 @@ export default function ReasoningView({ api, selection }) {
               {data?.status ? (
                 <Button size="sm" variant="outline" onClick={openDoc}>
                   <FileTextIcon className="size-3.5" />
-                  View ar_rules.md
+                  View policies.yaml
                 </Button>
               ) : null}
             </div>
           </CardHeader>
           <CardContent>
-            {data?.rules?.length ? (
+            {data?.policies?.length ? (
               <ul className="space-y-2.5">
-                {data.rules.map((rule) => (
-                  <li key={rule.id} className="space-y-0.5 text-sm">
-                    <p className="border-l-2 border-border pl-2.5">{rule.text}</p>
-                    {rule.source_page ? (
+                {data.policies.map((policy) => (
+                  <li key={policy.id} className="space-y-0.5 text-sm">
+                    <p className="border-l-2 border-border pl-2.5">
+                      <span className="font-mono text-[11px] text-muted-foreground">
+                        {policy.id}
+                      </span>{" "}
+                      {/* The check track (v3 type split): computational runs
+                          against SQL queries, behavioural against the agent's
+                          steps. */}
+                      {policy.type ? (
+                        <Badge
+                          variant="outline"
+                          className="mr-1 px-1.5 py-0 align-middle text-[10px] font-normal text-muted-foreground capitalize"
+                        >
+                          {policy.type}
+                        </Badge>
+                      ) : null}
+                      When {policy.condition} —{" "}
+                      <span className="text-muted-foreground">
+                        the agent must {policy.action}.
+                      </span>
+                    </p>
+                    {policy.source ? (
                       <p className="pl-2.5 font-mono text-[11px] text-muted-foreground">
-                        {rule.source_page}
+                        {policy.source}
                       </p>
                     ) : null}
                   </li>
@@ -453,8 +451,8 @@ export default function ReasoningView({ api, selection }) {
             ) : (
               <p className="text-sm text-muted-foreground">
                 {building
-                  ? "The first build is running — rules appear here when it finishes."
-                  : "No rules yet."}
+                  ? "The first authoring run is in flight — policies appear here when it finishes."
+                  : "No policies yet."}
               </p>
             )}
           </CardContent>
@@ -472,10 +470,10 @@ export default function ReasoningView({ api, selection }) {
           <SheetHeader>
             <SheetTitle className="flex items-center gap-2 font-mono text-sm">
               <FileTextIcon className="size-4 text-muted-foreground" />
-              ar_rules.md
+              policies.yaml
             </SheetTitle>
             <SheetDescription>
-              The numbered rules document this policy is built from, authored
+              The policy document the judges evaluate turns against, authored
               from the wiki&apos;s reference docs — as of the last sync.
             </SheetDescription>
           </SheetHeader>
@@ -487,10 +485,12 @@ export default function ReasoningView({ api, selection }) {
                 <Spinner className="size-4" />
               </div>
             ) : doc.exists ? (
-              <Markdown>{doc.text}</Markdown>
+              <pre className="text-xs leading-relaxed break-words whitespace-pre-wrap text-muted-foreground">
+                {doc.text}
+              </pre>
             ) : (
               <p className="text-sm text-muted-foreground">
-                No rules document yet — the first build writes it.
+                No policy document yet — the first authoring run writes it.
               </p>
             )}
           </ScrollArea>

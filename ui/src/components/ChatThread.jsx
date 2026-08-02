@@ -52,18 +52,6 @@ function HistorySkeleton() {
 const FOOTER_NOTE =
   "The agent reads the wiki to answer. It can be wrong — verify against the source docs."
 
-// A turn addressed the way the SERVER addresses it: its ordinal in the rebuilt
-// history. A history-loaded turn carries that ordinal in its id (`turn_3`); a live
-// turn's id is `turn_<ts>_<rand>` and its ordinal is its position in the list.
-// Preferring the id keeps the ordinal correct after a send that failed before it
-// checkpointed — such a turn renders with no server counterpart and would
-// otherwise shift every later turn by one.
-const SERVER_TURN_ID = /^turn_(\d+)$/
-function serverTurnKey(id, index) {
-  const m = SERVER_TURN_ID.exec(String(id || ""))
-  return m ? Number(m[1]) : index
-}
-
 export function ChatThread({
   chatTurns,
   isStreaming,
@@ -85,8 +73,6 @@ export function ChatThread({
   datasetScope,
   onScopeChange,
   onOpenDoc,
-  policyTurn = null,
-  onPolicyCheck,
   composerLeftSlot,
   disabled,
 }) {
@@ -276,7 +262,6 @@ export function ChatThread({
                 bottom scroll-fade at rest, instead of ending right at the edge. */}
             {chatTurns.map((turn, i) => {
               const isLast = i === chatTurns.length - 1
-              const turnKey = serverTurnKey(turn.id, i)
               return (
                 <div
                   key={turn.id}
@@ -295,9 +280,6 @@ export function ChatThread({
                     datasetScope={datasetScope}
                     wikiSources={wikiSources}
                     onOpenDoc={onOpenDoc}
-                    turnKey={turnKey}
-                    policyOpen={policyTurn === turnKey}
-                    onPolicyCheck={onPolicyCheck}
                   />
                 </div>
               )

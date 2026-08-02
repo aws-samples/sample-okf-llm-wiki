@@ -476,23 +476,20 @@ variable "enable_policy_checks" {
   type        = bool
   default     = false
   description = <<-EOT
-    Master deploy switch for the Automated Reasoning policy check — a post-turn,
-    ADVISORY check of a chat turn's data claims against the dataset's documented
-    rules (Bedrock Guardrails Automated Reasoning checks). It never blocks,
-    gates, or feeds back into the model; it is a trust surface for the human.
+    Master deploy switch for the mid-turn policy checks — ADVISORY checks of a
+    chat run's SQL queries (computational policies) and steps (behavioural
+    policies) against the dataset's authored policy document, judged by a
+    map-reduce fleet of LLM judges (chat/policy_check.py). Flags ride back
+    into the model's own context as hedged system reminders — the model
+    decides the correction; nothing blocks or gates. Per-run opt-in sits
+    below this gate: the composer's Policy feature (requires the SQL tool).
 
-    When true: the chat runtime's role gains bedrock:ApplyGuardrail (scoped to
-    this account's guardrails + the cross-region guardrail-profile objects),
-    the registry stale-flag write, and events:PutEvents; the Control API gains
-    events:PutEvents + the delete-path purge actions; and the policy_rebuild
-    EventBridge rule is created onto the incremental queue. Policies and
-    guardrails themselves are RUNTIME-managed via boto3 (hashicorp/aws ~> 6.0
-    has no AR policy resource) — Terraform contributes IAM only, the same
-    posture as S3 Vectors.
-
-    Automatically inert in a region where AR checks don't exist (see
-    local.ar_supported_regions): the feature degrades to ABSENT, never to an
-    error. Costs ~1-2 cents per inspected turn, spent only on click.
+    When true: the chat runtime's role gains the registry stale-flag write and
+    events:PutEvents (the judges use the SAME model path as chat — no extra
+    Bedrock grants); the Control API gains events:PutEvents; and the
+    policy_rebuild EventBridge rule is created onto the incremental queue.
+    Works in EVERY region the chat model works in. Costs a handful of small
+    judge calls per opted-in analytical query / step batch.
   EOT
 }
 
@@ -500,47 +497,24 @@ variable "enable_policy_build" {
   type        = bool
   default     = false
   description = <<-EOT
-    Build/refresh AR policies from the wiki (requires var.enable_policy_checks).
-    Adds the policy/build/guardrail action set to the HARVEST runtime role (the
-    finalize hook: gather sources -> preprocess -> ensure policy -> start an
-    async INGEST_CONTENT build workflow, best-effort AFTER the commit marker)
-    and to the INCREMENTAL role (the rebuild authority: policy_rebuild events +
-    the nightly reconcile that finishes `building` workflows and hash-verifies
-    every AR-enabled dataset).
+    Author/refresh policy documents from the wiki (requires
+    var.enable_policy_checks). Turns on the HARVEST runtime's finalize hook
+    (gather sources -> run the policy-author agent -> persist policies.yaml ->
+    stamp ready, best-effort AFTER the commit marker) and the INCREMENTAL
+    rebuild authority (policy_rebuild events + the nightly reconcile that
+    reaps stalled authoring runs and hash-verifies every enrolled dataset).
+    No Bedrock control-plane resources are involved.
 
-    Separate from enable_policy_checks so a deployment can consume policies
-    built elsewhere, or turn checks on before the build pipeline is trusted.
-    100 AR policies per account (non-adjustable) bounds dataset coverage.
+    Separate from enable_policy_checks so a deployment can consume documents
+    authored elsewhere, or turn checks on before the authoring is trusted.
   EOT
 }
 
-variable "policy_guardrail_profile" {
-  type        = string
-  default     = ""
-  description = <<-EOT
-    Cross-region guardrail profile id the per-dataset guardrails carry. An
-    AR-policy-carrying guardrail REQUIRES one (omitting it is a
-    ValidationException), and the profile FAMILY must match the deployment
-    region — CreateGuardrail in an EU region with us.guardrail.v1:0 is a
-    ValidationException at build time (live-verified in eu-west-1). Empty
-    (the default) derives the right family from var.region:
-    eu-* -> eu.guardrail.v1:0, otherwise us.guardrail.v1:0 — see
-    local.ar_guardrail_profile. Set explicitly only to pin a specific
-    profile version; keep local.ar_profile_destinations consistent, or
-    ApplyGuardrail fails with AccessDenied at check time.
-  EOT
-}
 
 variable "chat_policy_check_model" {
   type        = string
   default     = "openai.gpt-5.6-luna"
-  description = "Pre-pass model for the policy check's transcript + question-rewrite extraction, run at the provider's minimal reasoning level — this is extraction, not reasoning, so a small fast id is right. An openai.* id is fully supported: chat_mantle_enabled derives the role's Mantle grants from this var too (gated on enable_policy_checks), so no extra wiring is needed to point it at GPT or back at a Converse id."
-}
-
-variable "chat_policy_check_eager" {
-  type        = bool
-  default     = false
-  description = "Run the policy check automatically post-turn instead of on-click (v2). Changes only WHEN the pipeline runs — the check itself is identical. Leave false until the false-INVALID rate on human-correct answers is measured at ~0."
+  description = "The policy checks' model id, serving BOTH the curated-question rewrite (minimal effort — extraction) and the judge fleets (reasoning ON but shallow: code-level OKF_CHAT_POLICY_JUDGE_EFFORT, default low on GPT; an 8000-token thinking budget on a pre-adaptive Converse id like Haiku 4.5). An openai.* id is fully supported: chat_mantle_enabled derives the role's Mantle grants from this var too (gated on enable_policy_checks)."
 }
 
 variable "policy_preprocess_model" {

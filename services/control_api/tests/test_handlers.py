@@ -435,88 +435,29 @@ def test_delete_domain_mapping_idempotent_when_nothing_exists(cfg):
         "purged_bundle_objects": 0,
         "purged_freshness_rows": 0,
         "purged_report_rows": 0,
-        "purged_ar_policy": False,
     }
 
 
-class _FakeArBedrock:
-    """Records AR deletions; optionally raises to prove best-effort posture."""
-
-    def __init__(self, raising=False):
-        self.raising = raising
-        self.deleted: list[tuple[str, str]] = []
-
-    def delete_guardrail(self, *, guardrailIdentifier):
-        if self.raising:
-            raise RuntimeError("bedrock down")
-        self.deleted.append(("guardrail", guardrailIdentifier))
-
-    def delete_automated_reasoning_policy(self, *, policyArn, force):
-        assert force is True
-        self.deleted.append(("policy", policyArn))
-
-
-def _seed_ar_dataset(cfg, dd="sport", ds="f1"):
+def _seed_policy_dataset(cfg, dd="sport", ds="f1"):
     handlers.upsert_domain_mapping(
         cfg.ddb, registry_table=REGISTRY, data_domain=dd, dataset=ds,
         glue_database="db",
     )
-    cfg.ddb.update_item(
-        TableName=REGISTRY,
-        Key={"pk": {"S": f"DOMAIN#{dd}"}, "sk": {"S": f"DATASET#{ds}"}},
-        UpdateExpression="SET ar_policy_arn = :p, ar_guardrail_id = :g",
-        ExpressionAttributeValues={
-            ":p": {"S": "arn:aws:bedrock:us-east-1:1:automated-reasoning-policy/p1"},
-            ":g": {"S": "g1"},
-        },
-    )
-    cfg.s3.put_object(Bucket=BUCKET, Key=f"policy/{dd}/{ds}/ar_rules.md", Body=b"1. x")
-    cfg.s3.put_object(Bucket=BUCKET, Key=f"policy/{dd}/{ds}/grounding.json", Body=b"{}")
+    cfg.s3.put_object(Bucket=BUCKET, Key=f"policy/{dd}/{ds}/policies.yaml", Body=b"policies: []")
+    cfg.s3.put_object(Bucket=BUCKET, Key=f"policy/{dd}/{ds}/sources_manifest.json", Body=b"{}")
 
 
-def test_delete_domain_mapping_purges_the_ar_policy(cfg):
-    """The policy + guardrail + policy/<d>/<ds>/ must not outlive the dataset —
-    a re-registered same-named dataset would inherit the old rules, and the
-    100-policy account quota makes leaks expensive. Guardrail deletes FIRST
-    (it references the policy version)."""
-    _seed_ar_dataset(cfg)
-    bedrock = _FakeArBedrock()
+def test_delete_domain_mapping_purges_the_policy_artifacts(cfg):
+    """policy/<d>/<ds>/ must not outlive the dataset — a re-registered
+    same-named dataset would inherit the old policy document."""
+    _seed_policy_dataset(cfg)
     res = handlers.delete_domain_mapping(
         cfg.ddb, registry_table=REGISTRY, data_domain="sport", dataset="f1",
-        s3=cfg.s3, bundle_bucket=BUCKET, freshness_table=FRESHNESS, bedrock=bedrock,
+        s3=cfg.s3, bundle_bucket=BUCKET, freshness_table=FRESHNESS,
     )
-    assert res["purged_ar_policy"] is True
-    assert bedrock.deleted == [
-        ("guardrail", "g1"),
-        ("policy", "arn:aws:bedrock:us-east-1:1:automated-reasoning-policy/p1"),
-    ]
+    assert res["deleted"] is True
     listed = cfg.s3.list_objects_v2(Bucket=BUCKET, Prefix="policy/sport/f1/")
     assert listed.get("KeyCount", 0) == 0
-
-
-def test_delete_domain_mapping_without_ar_attrs_touches_no_bedrock(cfg):
-    handlers.upsert_domain_mapping(
-        cfg.ddb, registry_table=REGISTRY, data_domain="plain", dataset="ds",
-        glue_database="db",
-    )
-    bedrock = _FakeArBedrock(raising=True)  # any call would raise
-    res = handlers.delete_domain_mapping(
-        cfg.ddb, registry_table=REGISTRY, data_domain="plain", dataset="ds",
-        bedrock=bedrock,
-    )
-    assert res["deleted"] is True and res["purged_ar_policy"] is False
-    assert bedrock.deleted == []
-
-
-def test_delete_domain_mapping_survives_a_bedrock_failure(cfg):
-    """A leaked policy beats a wedged deletion: Bedrock errors are swallowed."""
-    _seed_ar_dataset(cfg, dd="sport", ds="f2")
-    res = handlers.delete_domain_mapping(
-        cfg.ddb, registry_table=REGISTRY, data_domain="sport", dataset="f2",
-        s3=cfg.s3, bundle_bucket=BUCKET, freshness_table=FRESHNESS,
-        bedrock=_FakeArBedrock(raising=True),
-    )
-    assert res["deleted"] is True and res["purged_ar_policy"] is False
     assert handlers.list_domains(cfg.ddb, registry_table=REGISTRY) == []
 
 

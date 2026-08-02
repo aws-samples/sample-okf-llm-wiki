@@ -849,7 +849,6 @@ def delete_domain_mapping(
     s3=None,
     bundle_bucket: str | None = None,
     freshness_table: str | None = None,
-    bedrock=None,
 ) -> dict[str, Any]:
     """Delete a dataset and ALL state it owns. Idempotent throughout.
 
@@ -881,17 +880,6 @@ def delete_domain_mapping(
     """
     purged_objects = 0
     purged_freshness = 0
-
-    # 0. The Automated Reasoning policy + guardrail, read off the mapping row
-    #    BEFORE it goes. A re-registered same-named dataset must not inherit the
-    #    previous owner's policy, and the 100-policy account cap makes leaked
-    #    policies expensive. Best-effort (loud log): a Bedrock hiccup must not
-    #    leave the dataset half-deleted — the leak is operator-recoverable, a
-    #    wedged deletion is worse.
-    ar_purged = _purge_ar_policy(
-        ddb, bedrock, registry_table=registry_table,
-        data_domain=data_domain, dataset=dataset,
-    )
 
     # 1. Bundle + benchmark + AR policy artifacts (+ cascade to vectors via
     #    Object-Deleted events for the .md keys). policy/<d>/<ds>/ holds the
@@ -928,54 +916,7 @@ def delete_domain_mapping(
         "purged_bundle_objects": purged_objects,
         "purged_freshness_rows": purged_freshness,
         "purged_report_rows": purged_reports,
-        "purged_ar_policy": ar_purged,
     }
-
-
-def _purge_ar_policy(
-    ddb, bedrock, *, registry_table: str, data_domain: str, dataset: str
-) -> bool:
-    """Delete the dataset's AR guardrail then its policy. True when both are gone.
-
-    Guardrail first: it references the policy version, so deleting the policy
-    under it would raise ResourceInUse. Attempted only when the mapping row
-    actually carries AR identifiers (a never-built dataset makes no Bedrock
-    calls at all), and only with a ``bedrock`` client wired. Every failure is
-    logged and swallowed — see the caller's step-0 comment.
-    """
-    try:
-        row = (
-            ddb.get_item(
-                TableName=registry_table,
-                Key={
-                    "pk": {"S": f"DOMAIN#{data_domain}"},
-                    "sk": {"S": f"DATASET#{dataset}"},
-                },
-            ).get("Item")
-            or {}
-        )
-        policy_arn = ((row.get("ar_policy_arn") or {}).get("S")) or ""
-        guardrail_id = ((row.get("ar_guardrail_id") or {}).get("S")) or ""
-        if bedrock is None or not (policy_arn or guardrail_id):
-            return False
-        if guardrail_id:
-            bedrock.delete_guardrail(guardrailIdentifier=guardrail_id)
-        if policy_arn:
-            # force=True: versions/test artifacts go with the policy — nothing
-            # under a deleted dataset's policy is worth preserving.
-            bedrock.delete_automated_reasoning_policy(policyArn=policy_arn, force=True)
-        return True
-    except Exception:  # noqa: BLE001 - a leaked policy beats a wedged deletion
-        import logging
-
-        logging.getLogger("control_api").warning(
-            "AR policy purge failed for %s/%s (delete the policy/guardrail "
-            "manually to reclaim the account quota)",
-            data_domain,
-            dataset,
-            exc_info=True,
-        )
-        return False
 
 
 def _purge_s3_prefix(s3, *, bucket: str, prefix: str) -> int:
@@ -3346,11 +3287,11 @@ def get_reasoning_status(
     """Everything the Reasoning page renders, in one call.
 
     ``up_to_date`` is the user-facing face of the fingerprint gate: the stored
-    ``ar_source_hash`` (what the policy was built from) against a hash computed
-    from the LIVE wiki right now. ``sources`` is the live source-file set —
-    what a build started today would ingest — and ``rules`` is the built
-    policy's grounding map (empty until the first build completes), each rule
-    quoting the wiki page it came from.
+    ``ar_source_hash`` (what the document was authored from) against a hash
+    computed from the LIVE wiki right now. ``sources`` is the live source-file
+    set — what an authoring run started today would read — and ``policies``
+    is the authored document's entries (empty until the first authoring run
+    completes), each individually trackable by its stable id.
     """
     item = _reasoning_row(ddb, registry_table, data_domain, dataset)
     enrolled = ar_policy.is_enrolled(item)
@@ -3365,20 +3306,18 @@ def get_reasoning_status(
     if stored_hash:
         up_to_date = bool(fresh_hash) and fresh_hash == stored_hash
 
-    rules: list[dict[str, Any]] = []
+    policies: list[dict[str, Any]] = []
     if enrolled and status:
-        grounding = ar_policy.read_grounding(
+        from okf_core import policy_doc as pdoc
+
+        doc = ar_policy.read_policy_doc(
             s3, bucket=bucket, data_domain=data_domain, dataset=dataset
         )
-        rules = [
-            {
-                "id": rule_id,
-                "text": (entry or {}).get("rule_text") or "",
-                "source_page": (entry or {}).get("rule_source_page") or "",
-            }
-            for rule_id, entry in sorted(grounding.items())
-            if isinstance(entry, dict)
-        ]
+        if doc is not None:
+            try:
+                policies = pdoc.parse_policies(doc)
+            except pdoc.PolicyDocError:
+                policies = []  # a bad artifact reads as "no policies yet"
 
     return {
         "data_domain": data_domain,
@@ -3393,23 +3332,15 @@ def get_reasoning_status(
         "status": status,
         "built_at": _row_str(item, "ar_built_at"),
         "build_detail": _row_str(item, "ar_build_detail"),
-        "policy_version": _row_str(item, "ar_policy_version"),
-        "fidelity_coverage": float(
-            (item.get("ar_fidelity_coverage") or {}).get("N") or 0
-        ),
-        "fidelity_accuracy": float(
-            (item.get("ar_fidelity_accuracy") or {}).get("N") or 0
-        ),
         "up_to_date": up_to_date,
         "sources": [rel for rel, _content in sources],
-        "rules": rules,
+        "policies": policies,
     }
 
 
 def set_reasoning_enrollment(
     ddb,
     s3,
-    bedrock,
     events,
     *,
     registry_table: str,
@@ -3425,13 +3356,11 @@ def set_reasoning_enrollment(
     place in a 30s Lambda). Refused while no complete wiki exists: the policy
     is derived from the bundle, so there is nothing to derive from yet.
 
-    UNENROLL is DELETE semantics (operator decision): the guardrail, the
-    policy (reclaiming its slot under the account's 100-policy cap), the
-    ``policy/<d>/<ds>/`` artifacts, and every ``ar_*`` row attribute all go.
-    Strict, not best-effort — the user asked for a deletion, so a failed
-    Bedrock delete surfaces as an error to retry rather than silently leaking
-    a policy the row no longer knows about. Refused while a build is in
-    flight (the workflow must finish or fail before its policy can go).
+    UNENROLL is DELETE semantics (operator decision): the
+    ``policy/<d>/<ds>/`` artifacts and every ``ar_*`` row attribute all go
+    (v2: no Bedrock resources exist — the judge engine's only artifacts are
+    the S3 document + the row stamps). Refused while an authoring run is in
+    flight (it must finish or fail before its artifacts can go).
     """
     item = _reasoning_row(ddb, registry_table, data_domain, dataset)
     already = ar_policy.is_enrolled(item)
@@ -3459,18 +3388,6 @@ def set_reasoning_enrollment(
             409,
             "a policy build is in flight — wait for it to finish before unenrolling",
         )
-    policy_arn = _row_str(item, "ar_policy_arn")
-    guardrail_id = _row_str(item, "ar_guardrail_id")
-    try:
-        # Guardrail first: it references the policy version.
-        if bedrock is not None and guardrail_id:
-            bedrock.delete_guardrail(guardrailIdentifier=guardrail_id)
-        if bedrock is not None and policy_arn:
-            bedrock.delete_automated_reasoning_policy(policyArn=policy_arn, force=True)
-    except Exception as e:  # noqa: BLE001 - surface, don't leak silently
-        raise ApiError(
-            502, f"could not delete the reasoning policy ({type(e).__name__}) — try again"
-        ) from e
     _purge_s3_prefix(
         s3, bucket=bucket, prefix=ar_policy.policy_prefix(data_domain, dataset)
     )
@@ -3512,18 +3429,17 @@ def get_reasoning_document(
     data_domain: str,
     dataset: str,
 ) -> dict[str, Any]:
-    """The dataset's ``ar_rules.md`` — the document its policy is built from.
+    """The dataset's ``policies.yaml`` — the authored policy document.
 
     A separate endpoint (not a ``get_reasoning_status`` field) because the
-    status call is polled every few seconds during a build and this document
-    can be tens of kilobytes: it is fetched only when the user opens the
-    viewer. The live file is version-faithful by construction — authoring
-    rewrites it at build time and a snapshot restore rewrites it from the
-    restored era — so no version parameter exists. Absent (never authored,
-    or unenrolled) reads as ``exists: false`` rather than an error: the page
+    status call is polled every few seconds during authoring and this
+    document can be tens of kilobytes: it is fetched only when the user opens
+    the viewer. The live file is version-faithful by construction (authoring
+    rewrites it), so no version parameter exists. Absent (never authored, or
+    unenrolled) reads as ``exists: false`` rather than an error: the page
     decides how to render that.
     """
-    text = ar_policy.read_ar_rules(
+    text = ar_policy.read_policy_doc(
         s3, bucket=bucket, data_domain=data_domain, dataset=dataset
     )
     return {"exists": text is not None, "text": text or ""}

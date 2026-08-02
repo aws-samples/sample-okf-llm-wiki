@@ -706,19 +706,6 @@ def test_repromote_tolerates_a_rejected_event_entry(aws):
     assert _mapping_row(ddb)["ar_build_status"]["S"] == "stale"
 
 
-def test_repromote_flags_a_degraded_policy_stale_too(aws):
-    v1, _v2 = _write_history(aws["s3"])
-    ddb = aws["ddb"]
-    _seed_mapping(ddb, ar_build_status="degraded")
-    time.sleep(1.05)
-
-    out = _repromote(aws, v1, events=FakeEvents())
-
-    assert out["status"] == "complete"
-    # ``degraded`` still renders verdicts, so it must be invalidated like ready.
-    assert _mapping_row(ddb)["ar_build_status"]["S"] == "stale"
-
-
 def test_repromote_without_an_events_client_is_a_total_no_op(aws):
     v1, _v2 = _write_history(aws["s3"])
     ddb = aws["ddb"]

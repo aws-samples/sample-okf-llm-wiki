@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useState } from "react"
 
 import { newThreadId } from "@/lib/chatApi"
-import { loadFeatures, saveFeatures } from "@/lib/chatFeatures"
+import { loadFeatures, sanitizeFeatures, saveFeatures } from "@/lib/chatFeatures"
 import {
   CHAT_EFFORTS,
   CHAT_MODEL,
@@ -113,10 +113,12 @@ export function useChatController({ urlThreadId, onThreadChange }) {
     setConv((c) => ({ ...c, effort }))
   }, [])
 
-  // Optional features (e.g. SQL) toggle at any time too — resolved per-run, and
-  // persisted as the default for the next new chat.
+  // Optional features (e.g. SQL / Policy) toggle at any time too — resolved
+  // per-run, and persisted as the default for the next new chat. Sanitizing
+  // here (not just at load) keeps the policy→SQL dependency enforced however
+  // the change arrives: removing SQL drops the policy selection with it.
   const onFeaturesChange = useCallback((features) => {
-    const next = Array.isArray(features) ? features : []
+    const next = sanitizeFeatures(Array.isArray(features) ? features : [])
     saveFeatures(next)
     setConv((c) => ({ ...c, features: next }))
   }, [])

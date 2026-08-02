@@ -114,9 +114,6 @@ function ChatMessageImpl({
   datasetScope,
   wikiSources,
   onOpenDoc,
-  turnKey,
-  policyOpen = false,
-  onPolicyCheck,
 }) {
   const aiEvents = turn.aiMessage || []
   const isEnd = aiEvents.length > 0 && aiEvents[aiEvents.length - 1]?.end === true
@@ -204,13 +201,7 @@ function ChatMessageImpl({
             )
           })}
           {showActions ? (
-            <ResponseActions
-              text={answerText}
-              stats={tokenStats}
-              turnKey={turnKey}
-              policyOpen={policyOpen}
-              onPolicyCheck={onPolicyCheck}
-            />
+            <ResponseActions text={answerText} stats={tokenStats} />
           ) : null}
         </div>
       </div>

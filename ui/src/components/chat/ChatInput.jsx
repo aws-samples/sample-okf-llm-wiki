@@ -12,6 +12,7 @@ import {
   AtSignIcon,
   DatabaseIcon,
   PlusIcon,
+  ShieldCheckIcon,
   SlidersHorizontalIcon,
   SquareIcon,
   XIcon,
@@ -33,6 +34,9 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
@@ -42,7 +46,13 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover"
 import { Slider } from "@/components/ui/slider"
-import { AVAILABLE_FEATURES, featureById } from "@/lib/chatFeatures"
+import {
+  AVAILABLE_FEATURES,
+  featureById,
+  isPolicyId,
+  POLICY_AVAILABLE,
+  POLICY_OPTIONS,
+} from "@/lib/chatFeatures"
 import { cn } from "@/lib/utils"
 
 const MAX_HEIGHT = 200
@@ -127,12 +137,19 @@ function FeatureChip({ feature, onRemove }) {
   )
 }
 
-function AddFeatureMenu({ enabled, onToggle }) {
+function AddFeatureMenu({ enabled, onToggle, onPickPolicy }) {
   const [open, setOpen] = useState(false)
   const enabledSet = new Set(enabled)
-  // Nothing left to add once every available feature is enabled — hide the "+".
   const remaining = AVAILABLE_FEATURES.filter((f) => !enabledSet.has(f.id))
-  if (remaining.length === 0) return null
+  // The Policy field is offered while no policy option is active. Its hard
+  // dependency: it only ENABLES while the SQL feature is checked (the checks
+  // judge SQL conduct — nothing to check without the tool). The chip cascade
+  // (removing SQL removes Policy) lives in the feature sanitizer.
+  const sqlOn = enabledSet.has("sql")
+  const policyActive = enabled.some(isPolicyId)
+  const offerPolicy = POLICY_AVAILABLE && !policyActive
+  // Nothing left to add once everything available is enabled — hide the "+".
+  if (remaining.length === 0 && !offerPolicy) return null
 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
@@ -172,6 +189,43 @@ function AddFeatureMenu({ enabled, onToggle }) {
             </DropdownMenuItem>
           )
         })}
+        {offerPolicy ? (
+          <DropdownMenuSub>
+            {/* The trigger stays a ROW: the text stacks in an inner column so
+                the SubTrigger's built-in chevron keeps its place at the right,
+                vertically centered — a flex-col on the trigger itself would
+                wrap the chevron onto its own line below the description. */}
+            <DropdownMenuSubTrigger disabled={!sqlOn}>
+              <span className="flex flex-col gap-0.5">
+                <span className="flex items-center gap-2">
+                  <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
+                  Policy
+                </span>
+                <span className="pl-5.5 text-[11px] text-muted-foreground">
+                  {sqlOn
+                    ? "Flag documented-policy violations mid-turn"
+                    : "Requires the SQL capability"}
+                </span>
+              </span>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="w-64">
+              {POLICY_OPTIONS.map((o) => (
+                <DropdownMenuItem
+                  key={o.id}
+                  onSelect={() => onPickPolicy(o.id)}
+                  className="flex-col items-start gap-0.5"
+                >
+                  <span className="text-sm">{o.label}</span>
+                  {o.description ? (
+                    <span className="text-[11px] text-muted-foreground">
+                      {o.description}
+                    </span>
+                  ) : null}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        ) : null}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -287,8 +341,21 @@ export function ChatInput({
     },
     [enabledFeatures, onFeaturesChange]
   )
+  // Picking a policy option replaces any current one (mutually exclusive).
+  const pickPolicy = useCallback(
+    (id) =>
+      onFeaturesChange?.([...enabledFeatures.filter((f) => !isPolicyId(f)), id]),
+    [enabledFeatures, onFeaturesChange]
+  )
+  // Removing SQL also drops the policy selection (the controller's sanitizer
+  // enforces the same dependency; filtering here keeps the UI instant).
   const removeFeature = useCallback(
-    (id) => onFeaturesChange?.(enabledFeatures.filter((f) => f !== id)),
+    (id) =>
+      onFeaturesChange?.(
+        enabledFeatures.filter(
+          (f) => f !== id && !(id === "sql" && isPolicyId(f))
+        )
+      ),
     [enabledFeatures, onFeaturesChange]
   )
 
@@ -513,7 +580,11 @@ export function ChatInput({
 
       <div className="flex items-center gap-1">
         {onFeaturesChange ? (
-          <AddFeatureMenu enabled={enabledFeatures} onToggle={addFeature} />
+          <AddFeatureMenu
+            enabled={enabledFeatures}
+            onToggle={addFeature}
+            onPickPolicy={pickPolicy}
+          />
         ) : null}
         <EffortSetting
           effort={effort}

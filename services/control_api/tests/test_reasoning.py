@@ -1,11 +1,11 @@
 """The Reasoning page endpoints: enrollment (opt-in/delete), status, sync.
 
 The contracts pinned here: enrollment is refused without a complete wiki;
-enrolling publishes the first-build event but never builds in-process;
-unenrolling is STRICT delete semantics (guardrail -> policy -> artifacts ->
-attrs, surfacing a Bedrock failure instead of leaking a policy) and is refused
-mid-build; `up_to_date` is the fingerprint gate rendered for humans; and the
-manual sync is one event, nothing more.
+enrolling publishes the first-authoring event but never authors in-process;
+unenrolling is delete semantics (the ``policy/`` artifacts + every ``ar_*``
+attr — v2 has no Bedrock resources) and is refused mid-authoring;
+`up_to_date` is the fingerprint gate rendered for humans; and the manual sync
+is one event, nothing more.
 """
 
 from __future__ import annotations
@@ -29,20 +29,6 @@ class FakeEvents:
     def put_events(self, *, Entries):
         self.entries.extend(Entries)
         return {"FailedEntryCount": 1 if self.fail else 0}
-
-
-class FakeBedrock:
-    def __init__(self, raising=False):
-        self.raising = raising
-        self.deleted: list[tuple[str, str]] = []
-
-    def delete_guardrail(self, *, guardrailIdentifier):
-        if self.raising:
-            raise RuntimeError("bedrock down")
-        self.deleted.append(("guardrail", guardrailIdentifier))
-
-    def delete_automated_reasoning_policy(self, *, policyArn, force):
-        self.deleted.append(("policy", policyArn))
 
 
 def _seed(cfg, *, wiki=True, sources=True):
@@ -74,9 +60,9 @@ def _set(cfg, **attrs):
     )
 
 
-def _enroll(cfg, events=None, bedrock=None, enrolled=True):
+def _enroll(cfg, events=None, enrolled=True):
     return handlers.set_reasoning_enrollment(
-        cfg.ddb, cfg.s3, bedrock or FakeBedrock(), events,
+        cfg.ddb, cfg.s3, events,
         registry_table=REGISTRY, bucket=BUCKET,
         data_domain=DOMAIN, dataset=DATASET, enrolled=enrolled,
     )
@@ -138,33 +124,45 @@ def test_enroll_is_idempotent_and_requeues(cfg):
 # --- unenroll (delete semantics) ---------------------------------------------------
 
 
+_POLICY_DOC = """\
+policies:
+  - id: P001
+    type: behavioural
+    condition: figures from empty results
+    action: never state figures
+    source: references/usage_guardrails.md
+"""
+
+
 def _seed_built(cfg):
     _seed(cfg)
     _set(
         cfg,
         ar_enrolled={"BOOL": True},
         ar_build_status={"S": "ready"},
-        ar_policy_arn={"S": "arn:p1"},
-        ar_guardrail_id={"S": "g1"},
         ar_source_hash={"S": "h"},
     )
-    cfg.s3.put_object(Bucket=BUCKET, Key=f"policy/{DOMAIN}/{DATASET}/ar_rules.md", Body=b"1. x")
-    cfg.s3.put_object(Bucket=BUCKET, Key=f"policy/{DOMAIN}/{DATASET}/grounding.json", Body=b"{}")
+    ap.put_policy_doc(
+        cfg.s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET,
+        doc_text=_POLICY_DOC,
+    )
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key=f"policy/{DOMAIN}/{DATASET}/sources_manifest.json",
+        Body=b"{}",
+    )
 
 
 def test_unenroll_deletes_everything(cfg):
     _seed_built(cfg)
-    bedrock = FakeBedrock()
-    out = _enroll(cfg, events=FakeEvents(), bedrock=bedrock, enrolled=False)
+    out = _enroll(cfg, events=FakeEvents(), enrolled=False)
     assert out == {"enrolled": False, "deleted": True}
-    # Guardrail first (it references the policy version), then the policy.
-    assert bedrock.deleted == [("guardrail", "g1"), ("policy", "arn:p1")]
     listed = cfg.s3.list_objects_v2(Bucket=BUCKET, Prefix=f"policy/{DOMAIN}/{DATASET}/")
     assert listed.get("KeyCount", 0) == 0
     status = _status(cfg)
     # Delete semantics: indistinguishable from never-enrolled.
     assert status["enrolled"] is False and status["status"] == ""
-    assert status["up_to_date"] is None and status["rules"] == []
+    assert status["up_to_date"] is None and status["policies"] == []
 
 
 def test_unenroll_mid_build_is_refused(cfg):
@@ -173,15 +171,6 @@ def test_unenroll_mid_build_is_refused(cfg):
     with pytest.raises(handlers.ApiError) as e:
         _enroll(cfg, events=FakeEvents(), enrolled=False)
     assert e.value.status == 409 and "in flight" in e.value.message
-
-
-def test_unenroll_surfaces_a_bedrock_failure_instead_of_leaking(cfg):
-    _seed_built(cfg)
-    with pytest.raises(handlers.ApiError) as e:
-        _enroll(cfg, events=FakeEvents(), bedrock=FakeBedrock(raising=True), enrolled=False)
-    assert e.value.status == 502
-    # Nothing was cleared: the row still says enrolled+ready, so a retry works.
-    assert _status(cfg)["enrolled"] is True
 
 
 def test_unenroll_when_not_enrolled_is_a_no_op(cfg):
@@ -203,23 +192,22 @@ def test_status_lists_sources_and_flags_freshness(cfg):
         ar_build_status={"S": "ready"},
         ar_source_hash={"S": fresh},
         ar_built_at={"S": "2026-08-01T10:00:00+00:00"},
-        ar_fidelity_coverage={"N": "0.9"},
-        ar_fidelity_accuracy={"N": "0.95"},
     )
-    ap.put_grounding(
+    ap.put_policy_doc(
         cfg.s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET,
-        grounding={"RULE1": {"rule_text": "IF x THEN y",
-                              "rule_source_page": "references/usage_guardrails.md"}},
+        doc_text=_POLICY_DOC,
     )
     out = _status(cfg)
     assert out["enrolled"] is True and out["up_to_date"] is True
     assert out["sources"] == ["references/usage_guardrails.md"]
-    assert out["rules"] == [{
-        "id": "RULE1", "text": "IF x THEN y",
-        "source_page": "references/usage_guardrails.md",
+    # `type` rides through to the Reasoning page (the per-policy track badge).
+    assert out["policies"] == [{
+        "id": "P001", "type": "behavioural",
+        "condition": "figures from empty results",
+        "action": "never state figures",
+        "source": "references/usage_guardrails.md",
     }]
     assert out["built_at"] == "2026-08-01T10:00:00+00:00"
-    assert out["fidelity_coverage"] == 0.9
 
     # The wiki moves -> the same endpoint reports out-of-date (the manual-sync
     # fail-safe's trigger condition).
@@ -253,15 +241,15 @@ def test_sync_queues_one_rebuild(cfg):
     assert json.loads(entry["Detail"])["reason"] == "manual_sync"
 
 
-def test_document_returns_the_live_rules_doc(cfg):
-    # The viewer's endpoint: the off-mount ar_rules.md verbatim. Deliberately
-    # NOT part of get_reasoning_status (that call is polled during builds and
-    # this document can be tens of kilobytes).
+def test_document_returns_the_live_policy_doc(cfg):
+    # The viewer's endpoint: the off-mount policies.yaml verbatim. Deliberately
+    # NOT part of get_reasoning_status (that call is polled during authoring
+    # and this document can be tens of kilobytes).
     _seed_built(cfg)
     out = handlers.get_reasoning_document(
         cfg.s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET
     )
-    assert out == {"exists": True, "text": "1. x"}
+    assert out == {"exists": True, "text": _POLICY_DOC}
 
 
 def test_document_absent_reads_as_exists_false(cfg):

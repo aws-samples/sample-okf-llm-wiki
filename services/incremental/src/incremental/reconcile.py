@@ -52,7 +52,6 @@ def reconcile(
     freshness_table: str,
     harvest_runtime_arn: str,
     ddb_client=None,
-    bedrock=None,
 ) -> dict[str, Any]:
     """Scan all mapped datasets and enqueue incrementals for drifted tables.
 
@@ -66,8 +65,8 @@ def reconcile(
     after the table sweep: a drifted table just enqueued a re-harvest whose
     finalize will move the source fingerprint again, but the fingerprint gate
     makes running "too early" merely redundant, never wrong. Its summary rides
-    under ``"ar"``; a failure there never fails the sweep (``bedrock`` is its
-    test seam; authoring dispatches reuse ``agentcore`` + the runtime ARN).
+    under ``"ar"``; a failure there never fails the sweep (authoring
+    dispatches reuse ``agentcore`` + the runtime ARN).
     """
     reg = ddb.Table(registry_table)
     scanned_datasets = 0
@@ -137,7 +136,6 @@ def reconcile(
                 table=registry_table,
                 s3=s3,
                 bucket=bundle_bucket,
-                bedrock=bedrock,
                 agentcore=agentcore,
                 harvest_runtime_arn=harvest_runtime_arn,
             )
