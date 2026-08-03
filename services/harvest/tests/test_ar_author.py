@@ -270,3 +270,269 @@ def test_author_converse_client_gets_the_long_read_timeout(monkeypatch):
     assert captured["config"] is not None
     assert captured["config"].read_timeout >= 300
     assert captured["config"].retries["mode"] == "adaptive"
+
+
+# --- the extractor fleet (map side) ------------------------------------------
+
+
+def _rule(source="references/usage_guardrails.md", **over):
+    rule = {
+        "type": "computational",
+        "condition": "when a query aggregates the status column of any table",
+        "action": "always filter with status = 1 before counting",
+        "source": source,
+    }
+    rule.update(over)
+    return rule
+
+
+def test_validate_rules_schema_and_attribution():
+    allowed = {"references/enums/status.md"}
+    valid, errors = ar_author._validate_rules(
+        [
+            _rule(source="references/enums/status.md"),
+            _rule(source="references/enums/status.md", type="banana"),
+            _rule(source="references/ghost.md"),
+            _rule(source="references/enums/status.md", condition="x"),
+            "not-an-object",
+        ],
+        allowed,
+    )
+    assert len(valid) == 1
+    assert len(errors) == 4
+    assert any("banana" not in e and "type" in e for e in errors)
+    assert any("ghost" in e for e in errors)
+
+
+class _ScriptedExtractorModel:
+    """bind_tools/invoke double: records the forced tool choice, plays replies."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.tool_choices = []
+
+    def bind_tools(self, tools, tool_choice=None):
+        self.tool_choices.append((tuple(t.name for t in tools), tool_choice))
+        return self
+
+    def invoke(self, _messages):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(tool_calls=self.replies.pop(0))
+
+
+def test_forced_extract_retries_invalid_payloads_then_returns_valid():
+    allowed = {"references/enums/status.md"}
+    model = _ScriptedExtractorModel(
+        [
+            [{"id": "t1", "args": {"rules": [_rule(source="references/ghost.md")]}}],
+            [{"id": "t2", "args": {"rules": [_rule(source="references/enums/status.md")]}}],
+        ]
+    )
+    out = ar_author._forced_extract(model, "prompt", allowed)
+    assert [r["source"] for r in out] == ["references/enums/status.md"]
+    # The call is FORCED at the API layer — the guarantee, not a prompt hope.
+    assert model.tool_choices == [(("submit_rules",), "submit_rules")]
+
+
+def test_forced_extract_salvages_the_valid_subset_on_exhaustion():
+    allowed = {"references/enums/status.md"}
+    bad_and_good = {
+        "rules": [
+            _rule(source="references/enums/status.md"),
+            _rule(source="references/ghost.md"),
+        ]
+    }
+    model = _ScriptedExtractorModel(
+        [[{"id": f"t{i}", "args": bad_and_good}] for i in range(3)]
+    )
+    out = ar_author._forced_extract(model, "prompt", allowed)
+    assert [r["source"] for r in out] == ["references/enums/status.md"]
+
+
+def test_extract_candidates_unions_the_clusters(monkeypatch):
+    import re
+
+    class _EchoModel:
+        """Returns one rule per allowed page — thread-safe, prompt-derived."""
+
+        def bind_tools(self, tools, tool_choice=None):
+            return self
+
+        def invoke(self, messages):
+            from types import SimpleNamespace
+
+            match = re.search(r"one of: (.+?)\)\.", messages[0].content, re.S)
+            rels = [r.strip() for r in match.group(1).split(",")]
+            return SimpleNamespace(
+                tool_calls=[
+                    {"id": "t", "args": {"rules": [_rule(source=r) for r in rels]}}
+                ]
+            )
+
+    monkeypatch.setattr(ar_author, "_build_extractor_model", lambda: _EchoModel())
+    big = b"x" * 20_000
+    sources = [
+        ("references/usage_guardrails.md", big),
+        ("references/enums/status.md", big),
+        ("references/enums/bestellart.md", big),
+        ("references/metrics/stock_level.md", big),
+        ("references/known_issues/free_text_and_confidentiality.md", big),
+    ]
+    out = ar_author._extract_candidates(sources)
+    # Every source page produced a candidate — coverage is structural.
+    assert sorted({r["source"] for r in out}) == sorted(s[0] for s in sources)
+
+
+def test_extract_candidates_skips_fanout_below_two_clusters(monkeypatch):
+    monkeypatch.setattr(
+        ar_author, "_build_extractor_model",
+        lambda: (_ for _ in ()).throw(AssertionError("must not build a model")),
+    )
+    assert ar_author._extract_candidates(
+        [("references/enums/status.md", b"x" * 100)]
+    ) == []
+
+
+# --- synthesizer wiring (reduce side) ----------------------------------------
+
+
+def test_from_scratch_authoring_synthesizes_from_the_fleet(monkeypatch):
+    captured = {}
+
+    class _CapturingAgent:
+        def __init__(self, tools):
+            self.tools = {t.name: t for t in tools}
+
+        def invoke(self, payload, config=None):
+            captured["task"] = payload["messages"][0].content
+            self.tools["write_policies"].func(content=GOOD_DOC)
+            return {"messages": []}
+
+    monkeypatch.setattr(
+        "harvest.benchmark.react.make_react_agent",
+        lambda model, tools, prompt: _CapturingAgent(tools),
+    )
+    monkeypatch.setenv("OKF_POLICY_FANOUT", "true")
+    candidates = [_rule(source="references/usage_guardrails.md")]
+    out = ar_author.author_policy_doc(
+        sources=_SOURCES, model=object(), extract=lambda s: candidates
+    )
+    assert out == GOOD_DOC.strip()
+    assert "SYNTHESIZER" in captured["task"]
+    assert "always filter with status = 1" in captured["task"]
+
+
+def test_update_mode_never_fans_out(monkeypatch):
+    calls = []
+    monkeypatch.setenv("OKF_POLICY_FANOUT", "true")
+    monkeypatch.setattr(
+        "harvest.benchmark.react.make_react_agent",
+        lambda model, tools, prompt: _ScriptedAgent(tools, [GOOD_DOC]),
+    )
+    out = ar_author.author_policy_doc(
+        sources=_SOURCES,
+        prior_doc=GOOD_DOC,
+        prior_manifest=_manifest(_SOURCES),
+        model=object(),
+        extract=lambda s: calls.append(s) or [],
+    )
+    assert out == GOOD_DOC.strip()
+    assert calls == []  # increments go through the old path, untouched
+
+
+def test_extraction_failure_falls_back_to_single_pass(monkeypatch):
+    captured = {}
+
+    class _CapturingAgent:
+        def __init__(self, tools):
+            self.tools = {t.name: t for t in tools}
+
+        def invoke(self, payload, config=None):
+            captured["task"] = payload["messages"][0].content
+            self.tools["write_policies"].func(content=GOOD_DOC)
+            return {"messages": []}
+
+    monkeypatch.setattr(
+        "harvest.benchmark.react.make_react_agent",
+        lambda model, tools, prompt: _CapturingAgent(tools),
+    )
+    monkeypatch.setenv("OKF_POLICY_FANOUT", "true")
+
+    def _boom(_sources):
+        raise RuntimeError("fleet exploded")
+
+    out = ar_author.author_policy_doc(sources=_SOURCES, model=object(), extract=_boom)
+    assert out == GOOD_DOC.strip()
+    assert "from scratch" in captured["task"]  # the plain single-pass prompt
+
+
+def test_fanout_kill_switch(monkeypatch):
+    monkeypatch.setenv("OKF_POLICY_FANOUT", "false")
+    monkeypatch.setattr(
+        "harvest.benchmark.react.make_react_agent",
+        lambda model, tools, prompt: _ScriptedAgent(tools, [GOOD_DOC]),
+    )
+    out = ar_author.author_policy_doc(
+        sources=_SOURCES,
+        model=object(),
+        extract=lambda s: (_ for _ in ()).throw(AssertionError("must not extract")),
+    )
+    assert out == GOOD_DOC.strip()
+
+
+# --- the coverage nudge -------------------------------------------------------
+
+
+def test_coverage_nudge_names_uncited_sources_once_and_still_stages():
+    ctx = AuthorContext(
+        _SOURCES
+        + [
+            ("references/known_issues/never_cited.md", b"a decidable trap"),
+            ("references/enums/index.md", b"navigation only"),
+        ]
+    )
+    first = ctx.write_policies(GOOD_DOC)
+    # Staged AND nudged: the note can only improve the document, never block it.
+    assert first.startswith("Accepted: 2 policies staged.")
+    assert "never_cited.md" in first
+    assert "index.md" not in first  # navigation pages never trigger the nudge
+    assert ctx.staged  # the document stands even if the agent stops here
+    second = ctx.write_policies(GOOD_DOC)
+    assert second == "Accepted: 2 policies staged."  # once per run
+
+
+def test_coverage_nudge_stays_out_of_update_mode():
+    ctx = AuthorContext(
+        _SOURCES + [("references/known_issues/never_cited.md", b"x")],
+        prior_doc=GOOD_DOC,
+        prior_manifest=_manifest(_SOURCES),
+    )
+    assert ctx.write_policies(GOOD_DOC) == "Accepted: 2 policies staged."
+
+
+def test_validate_rules_coerces_common_malformed_shapes():
+    # Live failure: rules arrived as a JSON-encoded string (3 attempts
+    # straight); also cover the bare-object and dict-of-rules shapes.
+    import json
+
+    allowed = {"references/enums/status.md"}
+    good = _rule(source="references/enums/status.md")
+    for shape in (json.dumps([good]), good, {"0": good}):
+        valid, errors = ar_author._validate_rules(shape, allowed)
+        assert [r["source"] for r in valid] == ["references/enums/status.md"], shape
+        assert errors == []
+    valid, errors = ar_author._validate_rules("not json at all", allowed)
+    assert valid == [] and "list" in errors[0]
+
+
+
+def test_submit_rules_tool_advertises_the_full_item_schema():
+    # The dead-extractor fix: the toolSpec must carry the typed item shape
+    # (an untyped lambda advertised `rules: anything`, and the model
+    # stringified the list — live 2026-08-03).
+    tool = ar_author._submit_rules_tool()
+    schema = tool.args_schema.model_json_schema()
+    rule_schema = schema["$defs"]["ExtractedRule"]["properties"]
+    assert rule_schema["type"]["enum"] == ["computational", "behavioural"]
+    assert set(rule_schema) == {"type", "condition", "action", "source"}

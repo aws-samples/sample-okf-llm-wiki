@@ -229,6 +229,30 @@ with the **gather-time** fingerprint (a wiki that moves mid-authoring yields
 a stale-on-arrival document, never a mislabelled one). Authoring IS
 completion — there is no build workflow and no completion authority.
 
+**From-scratch runs are map-reduce** (first authoring + forced Sync — any run
+with no prior document). Measured 2026-08-03 (hifa): three single-pass
+from-scratch runs over identical sources each produced a DIFFERENT incomplete
+rule set — extraction recall is an attention problem, not a model-tier one.
+So: `harvest.ar_clusters` splits the sources into deterministic topic
+clusters (path + frontmatter-tag routing; ~8 files / ~25k tokens max, thin
+topics fold into a catch-all, the confidentiality/disclosure topic and the
+`usage_guardrails.md` contract stay ISOLATED however thin — isolation is the
+remedy for the pages single-pass kept dropping); a fleet of per-cluster
+extractors (classifier contract: thinking off / reasoning `"none"`, FORCED
+`submit_rules` tool call, schema + source-attribution validation with
+bounded retry, salvage-on-exhaustion) mines candidate rules in parallel;
+and the authoring agent becomes the SYNTHESIZER — it receives the candidate
+union, dedupes/merges/prunes (proportionality is its explicit job, backed by
+the `OKF_POLICY_MAX_RULES` cap), verifies doubtful candidates via
+`read_source`, and owns the single `write_policies` gate as before. The
+gate adds a one-shot **coverage nudge** on full-mode submissions: a valid
+document that leaves non-index sources uncited is staged AND answered with
+the uncited list — one extract-or-affirm round trip. Everything is
+fail-open (fleet failure → plain single-pass authoring); UPDATE runs never
+fan out (minimal diffs + stable ids are exactly right there). Code-level
+env: `OKF_POLICY_FANOUT` (default on; `false` kills the fleet),
+`OKF_POLICY_EXTRACT_CONCURRENCY` (default `4`).
+
 **The rebuild authority** (`incremental.ar_rebuild`, reached by
 `policy_rebuild` events and the nightly reconcile) makes only
 deterministic decisions: registration/bundle-ready/fingerprint checks,

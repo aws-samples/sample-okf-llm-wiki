@@ -126,6 +126,8 @@ class AuthorContext:
                 self.status[rel] = "unchanged"
         self.removed: list[str] = sorted(set(prior_files) - set(self.current))
         self.staged: str = ""
+        # The coverage nudge fires at most once per run (see write_policies).
+        self._nudged: bool = False
 
     @property
     def update_mode(self) -> bool:
@@ -176,8 +178,30 @@ class AuthorContext:
         if error:
             return f"Error: {error}"
         self.staged = text
-        count = len(policy_doc.parse_policies(text))
-        return f"Accepted: {count} policies staged."
+        policies = policy_doc.parse_policies(text)
+        accepted = f"Accepted: {len(policies)} policies staged."
+        # Coverage nudge (full mode, once): whole pages silently yielding no
+        # rule is the measured single-pass failure mode, so a valid submission
+        # that leaves sources uncited gets ONE extract-or-affirm round trip.
+        # The document is STAGED either way — the nudge can only improve it
+        # (last accepted submission wins), never block it. index pages are
+        # navigation, not assertions; they never trigger the nudge.
+        if not self.update_mode and not self._nudged:
+            cited = {p.get("source") for p in policies}
+            uncited = sorted(
+                rel
+                for rel in self.current
+                if not rel.endswith("index.md") and rel not in cited
+            )
+            if uncited:
+                self._nudged = True
+                return (
+                    f"{accepted} NOTE: these sources yielded no policy: "
+                    f"{', '.join(uncited)}. Re-read them and resubmit with any "
+                    "decidable rules they assert — or leave the staged "
+                    "document as is if they genuinely contain none."
+                )
+        return accepted
 
     def validate(self, content: str) -> str | None:
         """The submission gate; None when acceptable, else what to fix."""
@@ -236,8 +260,22 @@ class AuthorContext:
             ),
         ]
 
-    def task_prompt(self) -> str:
+    def task_prompt(self, candidates: list[dict] | None = None) -> str:
         if not self.update_mode:
+            if candidates:
+                return (
+                    "Author policies.yaml for this dataset. An extractor fleet "
+                    "has already mined every source page in parallel; its "
+                    "candidate rules are below with their source attributions. "
+                    "You are the SYNTHESIZER: dedupe and merge overlapping "
+                    "candidates (keep the most precise variant), drop anything "
+                    "not decidable or over-enumerated (proportionality is YOUR "
+                    "job — the fleet extracts maximally by design), verify any "
+                    "candidate you doubt with read_source(), and add any "
+                    "decidable rule the fleet missed. Then submit the FULL "
+                    "document via write_policies.\n\nCandidate rules:\n"
+                    + _render_candidates(candidates)
+                )
             return (
                 "Author policies.yaml for this dataset from scratch. Start with "
                 "list_sources(), read every source, then submit via "
@@ -262,14 +300,42 @@ def author_policy_doc(
     prior_manifest: dict[str, Any] | None = None,
     fetch_old: Callable[[str], bytes | None] | None = None,
     model: Any = None,
+    extract: Callable[[list[tuple[str, bytes]]], list[dict]] | None = None,
 ) -> str:
     """Run the authoring agent; returns the accepted document ("" on failure).
 
     Never raises: the caller (the build trigger) maps "" onto its existing
     ``no_rules`` failure stamp, and a recursion-limit exit returns whatever
     submission was accepted before the budget ran out.
+
+    **From-scratch runs are map-reduce** (first authoring + forced Sync — any
+    run with no ``prior_doc``): a fleet of per-cluster extractors mines
+    candidate rules in parallel (``harvest.ar_clusters`` owns the
+    deterministic clustering), and the authoring agent becomes the
+    SYNTHESIZER — it receives the candidate union, dedupes/merges/prunes it,
+    verifies doubtful candidates against the sources, and owns the one
+    ``write_policies`` gate as before. Measured motivation (2026-08-03):
+    three single-pass from-scratch runs over the same sources each produced a
+    different incomplete rule set — recall is an attention problem, and
+    per-cluster extraction makes coverage structural instead of lucky.
+    Extraction is fail-open: no candidates -> plain single-pass authoring.
+    UPDATE runs (``prior_doc`` present) never fan out — minimal diffs with
+    stable ids are exactly right there. ``extract`` is the injectable fleet
+    seam (tests); None -> the real fleet when fan-out is enabled.
     """
     from harvest.benchmark.react import is_recursion_limit, make_react_agent
+
+    candidates: list[dict] = []
+    if not prior_doc and _fanout_enabled():
+        try:
+            extract = extract or _extract_candidates
+            candidates = extract(sources) or []
+        except Exception:  # noqa: BLE001 - extraction must never fail authoring
+            log.warning(
+                "candidate extraction failed — authoring single-pass",
+                exc_info=True,
+            )
+            candidates = []
 
     ctx = AuthorContext(
         sources,
@@ -284,7 +350,7 @@ def author_policy_doc(
 
     try:
         agent.invoke(
-            {"messages": [HumanMessage(content=ctx.task_prompt())]},
+            {"messages": [HumanMessage(content=ctx.task_prompt(candidates))]},
             config={"recursion_limit": _RECURSION_LIMIT},
         )
     except Exception as e:  # noqa: BLE001 - staged-so-far is still a result
@@ -298,6 +364,15 @@ def author_policy_doc(
                 "submission (%s)", "present" if ctx.staged else "absent"
             )
     return ctx.staged
+
+
+def _fanout_enabled() -> bool:
+    """Kill switch for the extractor fleet (default ON). Read at call time."""
+    return os.environ.get("OKF_POLICY_FANOUT", "").lower() not in (
+        "false",
+        "0",
+        "no",
+    )
 
 
 def _build_author_model() -> Any:
@@ -341,3 +416,311 @@ def _build_author_model() -> Any:
         botocore_config=_bedrock_config(),
         thinking_budget=int(budget_raw) if budget_raw else None,
     )
+
+
+# --- the extractor fleet (map side of from-scratch authoring) -----------------
+
+#: A cluster's rules are a page of YAML at most; extraction is not authoring.
+_EXTRACT_MAX_TOKENS = 8000
+#: Forced-call attempts per cluster before the fleet fails that cluster open.
+_EXTRACT_ATTEMPTS = 3
+#: Concurrent extractors (env-tunable; the fleet is minutes-rare, so this only
+#: bounds Bedrock burst, not steady-state cost).
+_EXTRACT_CONCURRENCY_ENV = "OKF_POLICY_EXTRACT_CONCURRENCY"
+_DEFAULT_EXTRACT_CONCURRENCY = 4
+
+_EXTRACT_PROMPT = """\
+You are one extractor in a fleet distilling DECIDABLE guardrail rules from a \
+dataset's wiki. You received ONE topic cluster of pages (topic: {topic}); the \
+other clusters are handled by other extractors — mine YOURS exhaustively.
+
+A rule is DECIDABLE when an independent judge could check it against a SQL \
+query (`computational`) or against an agent's conduct and final answer \
+(`behavioural`). For each rule: `condition` = precisely when it applies, \
+`action` = what must (or must never) be done — carry the page's exact \
+columns, tables, values and predicates; never soften a specific into a \
+generality, and never invent a rule the pages do not assert. `source` = the \
+cluster page that asserts the rule (one of: {allowed}).
+
+{contract_block}Cluster pages:
+
+{pages}
+
+Submit EVERY rule in ONE submit_rules call."""
+
+_CONTRACT_BLOCK = """\
+The dataset's operating contract is attached for CONTEXT (interpreting your \
+pages); cite your own cluster's pages, not the contract:
+
+{contract}
+
+"""
+
+
+def _render_candidates(candidates: list[dict]) -> str:
+    lines = []
+    for c in candidates:
+        lines.append(
+            f"- type: {c.get('type')}\n"
+            f"  condition: {c.get('condition')}\n"
+            f"  action: {c.get('action')}\n"
+            f"  source: {c.get('source')}"
+        )
+    return "\n".join(lines)
+
+
+def _render_pages(files: list[tuple[str, bytes]]) -> str:
+    return "\n\n".join(
+        f"===== {rel}\n{content.decode('utf-8', errors='replace')}"
+        for rel, content in files
+    )
+
+
+def _build_extractor_model() -> Any:
+    """The extractor is a CLASSIFIER-contract client, not a reasoner.
+
+    Same model id as the author (``OKF_POLICY_PREPROCESS_MODEL``) but thinking
+    OFF + temperature 0 on Converse (which is exactly what makes the FORCED
+    ``submit_rules`` tool choice legal on Anthropic) and reasoning ``"none"``
+    on an openai.* id — the judge fleet's proven dual-family contract. The
+    deep judgment (dedupe, proportionality, verification) belongs to the
+    synthesizer, not here.
+    """
+    from okf_aws.model_factory import (
+        DEFAULT_MANTLE_REGION,
+        build_bedrock_converse,
+        build_mantle_openai,
+        is_openai_model,
+    )
+
+    from harvest.agent import _bedrock_config
+
+    model_id = os.environ.get("OKF_POLICY_PREPROCESS_MODEL", DEFAULT_AUTHOR_MODEL)
+    if is_openai_model(model_id):
+        return build_mantle_openai(
+            model_id,
+            "none",
+            _EXTRACT_MAX_TOKENS,
+            region=os.environ.get("OKF_HARVEST_MANTLE_REGION", DEFAULT_MANTLE_REGION),
+        )
+    return build_bedrock_converse(
+        model_id,
+        "none",  # unused: thinking is off
+        _EXTRACT_MAX_TOKENS,
+        region=os.environ.get("AWS_REGION", "us-east-1"),
+        botocore_config=_bedrock_config(),
+        thinking=False,
+        temperature=0,
+    )
+
+
+def _coerce_rules(rules: Any) -> Any:
+    """Recover the common malformed shapes before validating.
+
+    Live 2026-08-03 (fpl's measures cluster): a model returned ``rules`` as a
+    JSON-ENCODED STRING three attempts straight, salvaging nothing — 8 pages
+    fell back to the synthesizer's nudge. Also accepts a bare single rule
+    object and a dict-of-rules keyed by index; anything else passes through to
+    the validator's normal rejection.
+    """
+    if isinstance(rules, str):
+        import json
+
+        try:
+            rules = json.loads(rules)
+        except ValueError:
+            return rules
+    if isinstance(rules, dict):
+        if {"type", "condition", "action", "source"} <= set(rules):
+            return [rules]
+        values = list(rules.values())
+        if values and all(isinstance(v, dict) for v in values):
+            return values
+    return rules
+
+
+def _validate_rules(
+    rules: Any, allowed_sources: set[str]
+) -> tuple[list[dict], list[str]]:
+    """``(valid, errors)`` — schema + source-attribution checks per candidate."""
+    rules = _coerce_rules(rules)
+    if not isinstance(rules, list):
+        return [], ["`rules` must be a list of rule objects"]
+    valid: list[dict] = []
+    errors: list[str] = []
+    for i, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            errors.append(f"rules[{i}] is not an object")
+            continue
+        rtype = rule.get("type")
+        condition = (rule.get("condition") or "").strip()
+        action = (rule.get("action") or "").strip()
+        source = (rule.get("source") or "").strip()
+        problems = []
+        if rtype not in ("computational", "behavioural"):
+            problems.append("type must be computational|behavioural")
+        if len(condition) < 10:
+            problems.append("condition is missing or too vague")
+        if len(action) < 10:
+            problems.append("action is missing or too vague")
+        if source not in allowed_sources:
+            problems.append(
+                f"source {source!r} is not one of this cluster's pages"
+            )
+        if problems:
+            errors.append(f"rules[{i}]: " + "; ".join(problems))
+        else:
+            valid.append(
+                {
+                    "type": rtype,
+                    "condition": condition,
+                    "action": action,
+                    "source": source,
+                }
+            )
+    return valid, errors
+
+
+def _submit_rules_tool():
+    """The extraction tool, with a FULLY TYPED args schema.
+
+    The schema is the fix for the dead-extractor failure (live 2026-08-03,
+    fpl's measures cluster): built from an untyped lambda, the tool advertised
+    `rules` with no item structure, so the model had to infer the shape from
+    prose — and stringified the list three attempts straight. A typed pydantic
+    schema puts the exact object shape (and the type enum) in the toolSpec the
+    API renders, so the model is constrained instead of guessing;
+    ``_coerce_rules`` remains the belt-and-braces behind it.
+    """
+    from typing import Literal
+
+    from langchain_core.tools import StructuredTool
+    from pydantic import BaseModel, Field
+
+    class ExtractedRule(BaseModel):
+        """One decidable rule asserted by a cluster page."""
+
+        type: Literal["computational", "behavioural"]
+        condition: str = Field(description="Precisely when the rule applies")
+        action: str = Field(
+            description=(
+                "What must (or must never) be done — carry the page's exact "
+                "columns, tables, values and predicates"
+            )
+        )
+        source: str = Field(description="The cluster page that asserts the rule")
+
+    class SubmitRules(BaseModel):
+        """Submit every decidable rule extracted from the cluster."""
+
+        rules: list[ExtractedRule]
+
+    return StructuredTool.from_function(
+        func=lambda rules: "ok",
+        name="submit_rules",
+        description="Submit every decidable rule extracted from the cluster.",
+        args_schema=SubmitRules,
+    )
+
+
+def _forced_extract(model: Any, prompt: str, allowed_sources: set[str]) -> list[dict]:
+    """One cluster's extraction: forced submit_rules call + gate-retry.
+
+    The CALL is guaranteed by the API (forced tool choice); the PAYLOAD by the
+    validation round trip; the PIPELINE by salvage-on-exhaustion — the valid
+    subset of the final attempt still counts, and an empty result fails open
+    to the synthesizer (whose coverage nudge names the hole).
+    """
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    bound = model.bind_tools([_submit_rules_tool()], tool_choice="submit_rules")
+    messages: list[Any] = [HumanMessage(content=prompt)]
+    valid: list[dict] = []
+    for attempt in range(1, _EXTRACT_ATTEMPTS + 1):
+        reply = bound.invoke(messages)
+        calls = getattr(reply, "tool_calls", None) or []
+        if not calls:
+            # Unreachable under a working forced tool choice; belt-and-braces.
+            messages += [
+                reply,
+                HumanMessage(content="Reply ONLY with a submit_rules call."),
+            ]
+            continue
+        args = calls[0].get("args") or {}
+        valid, errors = _validate_rules(args.get("rules"), allowed_sources)
+        if not errors or attempt == _EXTRACT_ATTEMPTS:
+            if errors:
+                log.warning(
+                    "extractor exhausted retries; salvaging %d valid rules "
+                    "(dropped: %s)", len(valid), "; ".join(errors[:5]),
+                )
+            return valid
+        messages += [
+            reply,
+            ToolMessage(
+                content=(
+                    "Error: " + "; ".join(errors[:10]) + " — resubmit ONE "
+                    "submit_rules call shaped exactly like: {\"rules\": "
+                    "[{\"type\": \"computational\", \"condition\": \"…\", "
+                    "\"action\": \"…\", \"source\": \"<a cluster page>\"}]}"
+                ),
+                tool_call_id=calls[0].get("id") or "submit_rules",
+            ),
+        ]
+    return valid
+
+
+def _extract_candidates(sources: list[tuple[str, bytes]]) -> list[dict]:
+    """The fleet: cluster deterministically, extract in parallel, return the union.
+
+    Returns [] when fan-out isn't worthwhile (fewer than two clusters) — the
+    caller then authors single-pass exactly as before. Per-cluster failures
+    log and drop (fail-open); candidate order is cluster order, so the
+    synthesizer's input is as deterministic as the model output allows.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from harvest.ar_clusters import cluster_sources
+
+    clusters, shared = cluster_sources(sources)
+    if len(clusters) < 2:
+        return []
+    model = _build_extractor_model()
+    contract_text = _render_pages(shared) if shared else ""
+
+    def _one(cluster) -> list[dict]:
+        allowed = {rel for rel, _c in cluster.files}
+        contract_block = (
+            _CONTRACT_BLOCK.format(contract=contract_text)
+            if contract_text and not allowed.intersection({s[0] for s in shared})
+            else ""
+        )
+        prompt = _EXTRACT_PROMPT.format(
+            topic=cluster.topic,
+            allowed=", ".join(sorted(allowed)),
+            contract_block=contract_block,
+            pages=_render_pages(cluster.files),
+        )
+        try:
+            rules = _forced_extract(model, prompt, allowed)
+            log.info(
+                "extractor %s: %d rules from %d pages",
+                cluster.topic, len(rules), len(cluster.files),
+            )
+            return rules
+        except Exception:  # noqa: BLE001 - one cluster must not sink the fleet
+            log.warning("extractor %s failed (skipped)", cluster.topic, exc_info=True)
+            return []
+
+    workers = min(
+        int(os.environ.get(_EXTRACT_CONCURRENCY_ENV) or _DEFAULT_EXTRACT_CONCURRENCY),
+        len(clusters),
+    )
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_one, clusters))
+    candidates = [rule for cluster_rules in results for rule in cluster_rules]
+    log.info(
+        "extractor fleet: %d candidate rules from %d clusters",
+        len(candidates), len(clusters),
+    )
+    return candidates
