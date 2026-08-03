@@ -55,9 +55,18 @@ FIELD_DATASET = "dataset"
 #: only ever reaches logs: the consumer runs the same rebuild pipeline whatever
 #: the reason, so it is deliberately NOT part of :func:`parse_detail`'s result.
 FIELD_REASON = "reason"
+#: Optional force flag: the rebuild authority skips its rebuild-iff-changed
+#: short-circuit and re-authors even when the source fingerprint is current.
+#: Set ONLY by the manual Sync — the sources can be unchanged while the
+#: authoring itself moved on (a new model, effort, or prompt), and Sync is the
+#: operator's "author now". Automatic publishers (repromote, incremental)
+#: never force: for them fingerprint equality genuinely means nothing to do.
+FIELD_FORCE = "force"
 
 
-def build_detail(data_domain: str, dataset: str, *, reason: str = "") -> dict[str, Any]:
+def build_detail(
+    data_domain: str, dataset: str, *, reason: str = "", force: bool = False
+) -> dict[str, Any]:
     """The ``Detail`` payload (a dict — the caller JSON-encodes it).
 
     ``data_domain``/``dataset`` identify the dataset whose policy is suspect;
@@ -76,7 +85,18 @@ def build_detail(data_domain: str, dataset: str, *, reason: str = "") -> dict[st
     detail: dict[str, Any] = {FIELD_DATA_DOMAIN: domain, FIELD_DATASET: name}
     if (reason or "").strip():
         detail[FIELD_REASON] = reason.strip()
+    if force:
+        detail[FIELD_FORCE] = True
     return detail
+
+
+def is_forced(detail: Mapping[str, Any] | Any) -> bool:
+    """Whether a received detail carries the force flag (absent = False).
+
+    Tolerant by design (like :func:`parse_detail`'s treatment of extras): a
+    non-mapping or missing/falsy field simply reads as not forced.
+    """
+    return isinstance(detail, Mapping) and bool(detail.get(FIELD_FORCE))
 
 
 def parse_detail(detail: Mapping[str, Any] | Any) -> tuple[str, str]:

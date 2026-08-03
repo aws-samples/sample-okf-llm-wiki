@@ -205,8 +205,12 @@ def test_sync_queues_one_rebuild(cfg):
     assert out == {"queued": True}
     (entry,) = events.entries
     assert entry["DetailType"] == "policy_rebuild"
+    # `force` is what makes Sync "author now": without it the rebuild
+    # authority's fingerprint skip turned Sync on a ready dataset into a
+    # silent no-op (queued toast, nothing else — live 2026-08-03).
     assert json.loads(entry["Detail"]) == {
         "data_domain": DOMAIN, "dataset": DATASET, "reason": "manual_sync",
+        "force": True,
     }
 
 

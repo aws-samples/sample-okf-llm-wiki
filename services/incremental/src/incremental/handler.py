@@ -400,6 +400,7 @@ def _process_policy_rebuild(
     except ValueError:
         log.warning("Malformed policy_rebuild detail dropped: %s", detail)
         return
+    force = policy_rebuild.is_forced(detail)
     result = ar_rebuild.run_rebuild(
         data_domain,
         dataset,
@@ -409,5 +410,12 @@ def _process_policy_rebuild(
         bucket=bundle_bucket,
         agentcore=agentcore,
         harvest_runtime_arn=harvest_runtime_arn,
+        force=force,
     )
-    log.info("policy_rebuild %s/%s -> %s", data_domain, dataset, result)
+    log.info(
+        "policy_rebuild %s/%s%s -> %s",
+        data_domain,
+        dataset,
+        " (forced)" if force else "",
+        result,
+    )

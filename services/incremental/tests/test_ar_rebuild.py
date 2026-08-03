@@ -101,13 +101,14 @@ def _put_doc(s3):
     )
 
 
-def _run(aws, agentcore=None):
+def _run(aws, agentcore=None, force=False):
     return ar_rebuild.run_rebuild(
         DOMAIN, DATASET,
         ddb=_low(), table=REGISTRY_TABLE,
         s3=aws["s3"], bucket=BUNDLE_BUCKET,
         agentcore=agentcore if agentcore is not None else FakeAgentCore(),
         harvest_runtime_arn=RUNTIME_ARN,
+        force=force,
     )
 
 
@@ -192,6 +193,54 @@ def test_unchanged_fingerprint_with_a_live_document_skips(aws):
     )
     agentcore = FakeAgentCore()
     assert _run(aws, agentcore) == ar_rebuild.OUTCOME_UNCHANGED
+    assert agentcore.invocations == []
+
+
+def test_forced_rebuild_reauthors_an_unchanged_ready_dataset(aws):
+    # The manual Sync: sources identical, row ready, document live — force
+    # dispatches anyway (the authoring config may have moved on), and the
+    # payload carries the flag so the harvest-side skip is bypassed too.
+    seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
+    _seed_sources(aws["s3"])
+    seed_ready_bundle(aws["s3"], data_domain=DOMAIN, dataset=DATASET)
+    _put_doc(aws["s3"])
+    fresh = source_hash(aws["s3"], BUNDLE_BUCKET, DOMAIN, DATASET)
+    _set_ar_attrs(
+        aws["ddb"],
+        **{ATTR_BUILD_STATUS: BUILD_READY, ATTR_SOURCE_HASH: fresh},
+    )
+    agentcore = FakeAgentCore()
+    assert _run(aws, agentcore, force=True) == ar_rebuild.OUTCOME_INVOKED
+    (invocation,) = agentcore.invocations
+    assert json.loads(invocation["payload"]) == {
+        "mode": "ar_rules", "data_domain": DOMAIN, "dataset": DATASET,
+        "force": True,
+    }
+
+
+def test_forced_rebuild_still_respects_an_in_flight_build(aws):
+    # Force bypasses freshness, never the lease: a young building row wins.
+    seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
+    _seed_sources(aws["s3"])
+    _set_ar_attrs(
+        aws["ddb"],
+        **{
+            ATTR_BUILD_STATUS: BUILD_BUILDING,
+            "ar_build_started_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    agentcore = FakeAgentCore()
+    assert _run(aws, agentcore, force=True) == ar_rebuild.OUTCOME_IN_FLIGHT
+    assert agentcore.invocations == []
+
+
+def test_forced_rebuild_without_a_wiki_is_refused(aws):
+    # Force is "author now", not "author from nothing": no complete marker,
+    # no dispatch (same rule as the unforced path).
+    seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
+    _seed_sources(aws["s3"])
+    agentcore = FakeAgentCore()
+    assert _run(aws, agentcore, force=True) == ar_rebuild.OUTCOME_NO_WIKI
     assert agentcore.invocations == []
 
 

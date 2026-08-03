@@ -177,3 +177,19 @@ def test_policy_report_sk_prefix_requires_a_thread_id():
 def test_parse_policy_report_sk_rejects_non_report_keys(sk):
     with pytest.raises(ValueError):
         parse_policy_report_sk(sk)
+
+
+def test_build_detail_carries_force_only_when_set():
+    from okf_core.policy_rebuild import is_forced
+
+    # Omitted-when-false keeps the default payload at exactly the two
+    # identifying fields (existing consumers see no shape change).
+    assert "force" not in build_detail("d", "ds")
+    detail = build_detail("d", "ds", reason="manual_sync", force=True)
+    assert detail["force"] is True
+    # parse_detail ignores it (an extra, like reason)…
+    assert parse_detail(detail) == ("d", "ds")
+    # …and is_forced is the accessor, tolerant of absence and junk.
+    assert is_forced(detail) is True
+    assert is_forced({"data_domain": "d", "dataset": "ds"}) is False
+    assert is_forced("not-a-mapping") is False

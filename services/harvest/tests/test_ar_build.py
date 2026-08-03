@@ -102,13 +102,14 @@ def aws(monkeypatch):
         yield s3, ddb
 
 
-def _trigger(s3, ddb, *, author=None):
+def _trigger(s3, ddb, *, author=None, force=False):
     return ar_build.maybe_build_policy(
         data_domain=DOMAIN,
         dataset=DATASET,
         registry=(ddb, TABLE),
         s3=s3,
         author=author or FakeAuthor(),
+        force=force,
     )
 
 
@@ -174,6 +175,23 @@ def test_unchanged_fingerprint_skips_when_the_document_exists(aws):
     assert _trigger(s3, ddb, author=author) == ar_build.OUTCOME_AUTHORED
     assert _trigger(s3, ddb, author=author) == ar_build.OUTCOME_UNCHANGED
     assert len(author.calls) == 1  # the re-harvest cost zero model calls
+
+
+def test_forced_trigger_reauthors_at_an_unchanged_fingerprint(aws):
+    # The manual Sync's dispatch: same sources, ready row, live document —
+    # force re-authors anyway (the authoring model/effort/prompt may have
+    # changed, which the fingerprint cannot see).
+    s3, ddb = aws
+    author = FakeAuthor()
+    assert _trigger(s3, ddb, author=author) == ar_build.OUTCOME_AUTHORED
+    assert _trigger(s3, ddb, author=author, force=True) == ar_build.OUTCOME_AUTHORED
+    assert len(author.calls) == 2
+    assert _attr(ddb, ATTR_BUILD_STATUS) == "ready"
+    # From scratch, NOT update mode: the prior document is withheld on a
+    # forced run — fed back, update mode's "minimally edit" instruction would
+    # hand the old document straight back and defeat the re-roll.
+    assert author.calls[1]["prior_doc"] == ""
+    assert author.calls[1]["prior_manifest"] is None
 
 
 def test_ready_row_without_its_document_reauthors(aws):

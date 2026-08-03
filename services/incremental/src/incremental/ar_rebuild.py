@@ -93,11 +93,14 @@ def run_rebuild(
     bucket: str,
     agentcore: Any = None,
     harvest_runtime_arn: str = "",
+    force: bool = False,
 ) -> str:
     """Bring one dataset's policy document up to date. NEVER raises.
 
     ``ddb`` is the LOW-LEVEL DynamoDB client (the registry stamp helpers speak
-    typed attributes).
+    typed attributes). ``force`` (manual Sync) re-authors even when the source
+    fingerprint is current — the sources may be unchanged while the authoring
+    itself moved on (model/effort/prompt); the in-flight lease still wins.
     """
     if not rebuild_enabled():
         return OUTCOME_DISABLED
@@ -111,6 +114,7 @@ def run_rebuild(
             bucket=bucket,
             agentcore=agentcore,
             harvest_runtime_arn=harvest_runtime_arn,
+            force=force,
         )
     except Exception:  # noqa: BLE001 - a rebuild is advisory, never a Lambda error
         log.error(
@@ -132,6 +136,7 @@ def _run_rebuild(
     bucket: str,
     agentcore: Any,
     harvest_runtime_arn: str,
+    force: bool = False,
 ) -> str:
     # Registration first: a rebuild event for a dataset with no mapping row —
     # a late event, a duplicate that raced a dataset delete — must cost one
@@ -162,6 +167,17 @@ def _run_rebuild(
         s3, bucket=bucket, data_domain=data_domain, dataset=dataset
     )
     doc_ok = _doc_parses(doc)
+    # A forced rebuild (manual Sync) skips BOTH freshness short-circuits: the
+    # fingerprint only proves the SOURCES are unchanged, and force exists for
+    # exactly the case where the authoring itself moved on.
+    if force:
+        if not is_bundle_ready(s3, bucket, data_domain, dataset):
+            return OUTCOME_NO_WIKI
+        return _dispatch_authoring(
+            data_domain, dataset,
+            agentcore=agentcore, harvest_runtime_arn=harvest_runtime_arn,
+            force=True,
+        )
     if stored_hash == fresh_hash and status in USABLE_BUILD_STATUSES:
         # The artifact must actually exist AND parse for "unchanged" to hold —
         # a ready row without its document (a pre-v2 dataset, a lost write)
@@ -227,6 +243,7 @@ def _dispatch_authoring(
     *,
     agentcore: Any,
     harvest_runtime_arn: str,
+    force: bool = False,
 ) -> str:
     """Fire one ``mode="ar_rules"`` authoring run at the harvest runtime."""
     if agentcore is None or not harvest_runtime_arn:
@@ -245,17 +262,29 @@ def _dispatch_authoring(
     # PRE-DEPLOY code — which silently defeats the Reasoning page's
     # retry-after-a-fix flow. Dedup doesn't need the session: the runtime's
     # conditional `building` flip already collapses duplicate events.
+    payload: dict[str, Any] = {
+        "mode": "ar_rules",
+        "data_domain": data_domain,
+        "dataset": dataset,
+    }
+    if force:
+        # The harvest-side trigger has its OWN fingerprint skip; a forced run
+        # (manual Sync) must bypass that one too or the force dies at the hop.
+        payload["force"] = True
     agentcore.invoke_agent_runtime(
         agentRuntimeArn=harvest_runtime_arn,
         runtimeSessionId=runtime_session_id(
             data_domain, f"{dataset}--ar-rules", unique_token=uuid.uuid4().hex
         ),
         qualifier="DEFAULT",
-        payload=json.dumps(
-            {"mode": "ar_rules", "data_domain": data_domain, "dataset": dataset}
-        ).encode("utf-8"),
+        payload=json.dumps(payload).encode("utf-8"),
     )
-    log.info("policy authoring dispatched for %s/%s", data_domain, dataset)
+    log.info(
+        "policy authoring dispatched for %s/%s%s",
+        data_domain,
+        dataset,
+        " (forced)" if force else "",
+    )
     return OUTCOME_INVOKED
 
 

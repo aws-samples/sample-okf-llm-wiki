@@ -106,6 +106,7 @@ def maybe_build_policy(
     s3: Any = None,
     bucket: str = "",
     author: Any = None,
+    force: bool = False,
 ) -> str:
     """Bring the dataset's policy document up to date with the wiki. NEVER raises.
 
@@ -113,6 +114,10 @@ def maybe_build_policy(
     when the author ran and the row was stamped ready, one of the no-op
     outcomes otherwise, and ``OUTCOME_ERROR`` when a step failed (loudly
     logged, lease released).
+
+    ``force`` (a manual Sync's dispatch) re-authors even at an unchanged
+    source fingerprint — the sources may be identical while the authoring
+    itself moved on (model/effort/prompt). The building lease still wins.
 
     Every AWS seam is injectable (``registry`` as the ``(dynamodb client,
     table)`` tuple harvest uses everywhere, ``s3``, and ``author`` — the
@@ -131,6 +136,7 @@ def maybe_build_policy(
             s3=s3,
             bucket=bucket,
             author=author,
+            force=force,
         )
     except Exception:  # noqa: BLE001 - authoring must never fail a finished harvest
         log.error(
@@ -151,6 +157,7 @@ def _author_and_stamp(
     s3: Any,
     bucket: str,
     author: Any,
+    force: bool = False,
 ) -> str:
     """The authoring pipeline proper. Raises only into :func:`maybe_build_policy`."""
     registry = registry or build_registry_client()
@@ -193,7 +200,7 @@ def _author_and_stamp(
         )
         return OUTCOME_NO_SOURCES
 
-    if stored_hash == fresh_hash and status in _SKIP_STATUSES:
+    if not force and stored_hash == fresh_hash and status in _SKIP_STATUSES:
         # The document must exist AND PARSE for "unchanged" to hold — a ready
         # row without its artifact (a pre-v2 dataset, a lost write) or with a
         # schema-invalid one (a pre-v3, type-less document) re-authors. The
@@ -232,6 +239,7 @@ def _author_and_stamp(
         doc_text = _author_doc(
             author, s3=s3, bucket=bucket,
             data_domain=data_domain, dataset=dataset, sources=sources,
+            force=force,
         )
         if not doc_text.strip():
             log.error(
@@ -295,16 +303,27 @@ def _stored_doc_parses(
 
 def _author_doc(
     author: Any, *, s3: Any, bucket: str, data_domain: str, dataset: str,
-    sources: list[tuple[str, bytes]],
+    sources: list[tuple[str, bytes]], force: bool = False,
 ) -> str:
-    """Run the document author with the previous run's diff base wired in."""
+    """Run the document author with the previous run's diff base wired in.
+
+    A FORCED run (manual Sync) authors FROM SCRATCH: the prior document is
+    withheld, so the agent never sees update mode. Feeding it back would
+    defeat the operator's re-roll — with unchanged sources, update mode tells
+    the agent to "minimally edit" and it hands the old document straight
+    back, whatever model/effort/prompt improvements the force was meant to
+    exercise. Fresh ids are the accepted cost (id stability is an
+    update-mode courtesy, not a cross-version contract). Automatic rebuilds
+    keep update mode: their sources actually changed, and minimal diffs with
+    stable ids are exactly right there.
+    """
     from harvest.ar_author import author_policy_doc
 
     author = author or author_policy_doc
-    prior_doc = read_policy_doc(
+    prior_doc = "" if force else (read_policy_doc(
         s3, bucket=bucket, data_domain=data_domain, dataset=dataset
-    ) or ""
-    prior_manifest = read_sources_manifest(
+    ) or "")
+    prior_manifest = None if force else read_sources_manifest(
         s3, bucket=bucket, data_domain=data_domain, dataset=dataset
     )
     return author(

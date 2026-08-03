@@ -160,29 +160,27 @@ export default function ReasoningView({ api, selection }) {
 
   const building = data?.status === "building"
   const failed = data?.status === "failed"
-  // "Settled" ends the queued-sync window: either the build poll takes over
-  // (building) or the row already reached a usable, current policy — a fast
-  // snapshot restore can land between two polls without ever showing
-  // building. Booleans (not `data`) as deps so polling doesn't reset the
-  // give-up timer every refresh.
-  const settled =
-    building || (data?.up_to_date === true && data?.status === "ready")
   useEffect(() => {
     if (!building && !syncPending) return
     const id = setInterval(load, BUILD_POLL_MS)
     return () => clearInterval(id)
   }, [building, syncPending, load])
-  // Once the row settles, the queued window closes; if the dispatch was lost,
-  // give up after 90s and re-enable the manual buttons.
+  // The queued window ends when the build poll takes over — a forced Sync
+  // ALWAYS dispatches an authoring run, so `building` is the one expected
+  // next state (a ready+current row no longer counts as settled: that was
+  // the old rebuild-iff-changed semantics, and it closed the window the
+  // instant a re-sync of a current document was clicked — the page then sat
+  // frozen until a manual refresh). If the dispatch was lost, give up after
+  // 90s and re-enable the manual buttons.
   useEffect(() => {
     if (!syncPending) return
-    if (settled) {
+    if (building) {
       setSyncPending(false)
       return
     }
     const id = setTimeout(() => setSyncPending(false), 90_000)
     return () => clearTimeout(id)
-  }, [syncPending, settled])
+  }, [syncPending, building])
 
   const run = async (fn) => {
     setBusy(true)
@@ -306,25 +304,21 @@ export default function ReasoningView({ api, selection }) {
                 ) : null}
               </div>
               {/* Building: the page polls; authoring IS completion (v3 — no
-                  build workflow, no completion authority). A build that died
-                  leaves the row `building` until the rebuild authority's
-                  reaper: Sync (and every policy_rebuild event) is a NO-OP for
-                  a building row younger than the ~1h grace, then fails and
-                  re-dispatches it. Sync stays reachable here as that
-                  post-grace recovery — not as a completion trigger. */}
+                  build workflow, no completion authority). Sync is DISABLED
+                  while a build is in flight — it only runs from a settled row
+                  (ready or failed); the in-flight lease would refuse it
+                  anyway, and offering a dead button reads as broken. A build
+                  that dies is reaped automatically after about an hour (the
+                  rebuild authority's stall reaper / nightly reconcile), which
+                  flips the row to failed and re-enables the retry here. */}
               {building ? (
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-muted-foreground">
-                    A build is running — this page updates automatically. A
-                    build that dies is retried by Sync after about an hour;
-                    until then Sync leaves it undisturbed.
+                    A build is running — this page updates automatically. Sync
+                    re-enables when it settles; a build that dies is reaped
+                    after about an hour.
                   </span>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    disabled={busy || syncPending}
-                    onClick={sync}
-                  >
+                  <Button size="sm" variant="ghost" disabled>
                     <RefreshCwIcon className="size-3.5" />
                     Sync
                   </Button>
@@ -349,7 +343,11 @@ export default function ReasoningView({ api, selection }) {
                     disabled={busy || syncPending}
                     onClick={sync}
                   >
-                    <RefreshCwIcon className="size-3.5" />
+                    {busy ? (
+                      <Spinner className="size-3.5" />
+                    ) : (
+                      <RefreshCwIcon className="size-3.5" />
+                    )}
                     Sync now
                   </Button>
                 </div>
@@ -365,7 +363,11 @@ export default function ReasoningView({ api, selection }) {
                     disabled={busy || syncPending}
                     onClick={sync}
                   >
-                    <RefreshCwIcon className="size-3.5" />
+                    {busy ? (
+                      <Spinner className="size-3.5" />
+                    ) : (
+                      <RefreshCwIcon className="size-3.5" />
+                    )}
                     Sync
                   </Button>
                 </div>

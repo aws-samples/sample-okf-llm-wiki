@@ -28,7 +28,14 @@ def test_ar_rules_mode_validates_and_dispatches_to_the_build_trigger(monkeypatch
         lambda **kw: calls.append(kw) or "unchanged",
     )
     ep._dispatch({"mode": "ar_rules", "data_domain": "d", "dataset": "x"})
-    assert calls == [{"data_domain": "d", "dataset": "x"}]
+    assert calls == [{"data_domain": "d", "dataset": "x", "force": False}]
+
+    # A forced dispatch (manual Sync) carries the flag through to the trigger.
+    calls.clear()
+    ep._dispatch(
+        {"mode": "ar_rules", "data_domain": "d", "dataset": "x", "force": True}
+    )
+    assert calls == [{"data_domain": "d", "dataset": "x", "force": True}]
 
 
 def test_model_config_from_payload_absent_is_none():

@@ -429,23 +429,32 @@ the results/turn untouched.
 - `GET /reasoning/{domain}/{dataset}` — everything the Reasoning page renders:
   `wiki_ready`, status, `up_to_date` (the fingerprint gate for humans), the
   live source list, and the document's policies (id/condition/action/source).
-- `POST /reasoning/{domain}/{dataset}/sync` — one `policy_rebuild` event
-  (refused without a complete wiki). Doubles as the manual FIRST authoring
-  for a dataset predating the feature (there is no bulk backfill) and as the
-  fail-safe when an automatic trigger was missed. The rebuild authority's
-  iff-changed skip makes syncing a current document a clean no-op; a stalled
-  `building` row is reaped and re-dispatched, and a lost ready-stamp is
-  deterministically recovered.
+- `POST /reasoning/{domain}/{dataset}/sync` — one FORCED `policy_rebuild`
+  event (refused without a complete wiki). Sync is "author now": the event
+  carries `force: true`, which bypasses the rebuild-iff-changed skip at BOTH
+  hops (rebuild authority and harvest-side trigger) — a manual Sync's sources
+  may be unchanged while the authoring itself moved on (model/effort/prompt),
+  and without force a Sync on a ready dataset acknowledged "queued" then
+  silently did nothing (live 2026-08-03). A forced run also authors FROM
+  SCRATCH — the prior document is withheld (update mode's "minimally edit"
+  would hand it straight back); automatic rebuilds keep update mode (minimal
+  diffs, stable ids). Doubles as the manual FIRST
+  authoring for a dataset predating the feature (there is no bulk backfill).
+  The building lease still wins (an in-flight run is never preempted; the UI
+  disables Sync while a build is live), and a stalled `building` row is
+  reaped and re-dispatched.
 - `GET /reasoning/{domain}/{dataset}/document` — `{exists, text}`: the live
   `policies.yaml` verbatim (kept for raw API access; the UI page renders the
   parsed per-guardrail list from the status call instead).
 
 **The `policy_rebuild` event** (`okf_core.policy_rebuild`): custom source
 `okf.policy`, detail-type `policy_rebuild`, detail
-`{data_domain, dataset, reason?}`. Rides the SAME EventBridge → SQS →
+`{data_domain, dataset, reason?, force?}`. Rides the SAME EventBridge → SQS →
 incremental-handler path as the Glue events. Published by the Control API
-(manual sync / repromote) and the chat runtime (stale discovery).
-Duplicates are harmless: the runtime's conditional `building` flip collapses
+(manual sync / repromote) and the chat runtime (stale discovery). `force`
+(manual sync ONLY — omitted otherwise) makes the rebuild unconditional;
+automatic publishers never force, for them fingerprint equality genuinely
+means nothing to do. Duplicates are harmless: the runtime's conditional `building` flip collapses
 them. Events are a freshness ACCELERATOR; the fingerprint gate is
 correctness.
 

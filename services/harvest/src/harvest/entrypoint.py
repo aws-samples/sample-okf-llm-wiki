@@ -104,7 +104,13 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
     if mode == "ar_rules":
         from harvest.ar_build import maybe_build_policy
 
-        outcome = maybe_build_policy(data_domain=data_domain, dataset=dataset)
+        outcome = maybe_build_policy(
+            data_domain=data_domain,
+            dataset=dataset,
+            # A forced run (manual Sync) bypasses the fingerprint skip — the
+            # sources may be unchanged while the authoring config moved on.
+            force=bool(payload.get("force")),
+        )
         log.info("ar_rules run for %s/%s -> %s", data_domain, dataset, outcome)
         return
 

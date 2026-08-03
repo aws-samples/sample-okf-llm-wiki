@@ -3246,12 +3246,16 @@ def _row_str(item: dict[str, Any], name: str) -> str:
     return str((item.get(name) or {}).get("S") or "")
 
 
-def _publish_policy_rebuild(events, *, data_domain: str, dataset: str, reason: str) -> bool:
+def _publish_policy_rebuild(
+    events, *, data_domain: str, dataset: str, reason: str, force: bool = False
+) -> bool:
     """Publish one ``policy_rebuild`` event; True when accepted. Never raises.
 
     The rebuild authority's conditional ``building`` flip makes duplicates
     harmless, and the nightly reconcile makes a lost event a freshness delay,
     never a correctness problem — so publishing is always best-effort.
+    ``force`` bypasses the authority's rebuild-iff-changed skip (manual Sync
+    only — see ``okf_core.policy_rebuild.FIELD_FORCE``).
     """
     if events is None:
         return False
@@ -3262,7 +3266,9 @@ def _publish_policy_rebuild(events, *, data_domain: str, dataset: str, reason: s
                     "Source": policy_rebuild.EVENT_SOURCE,
                     "DetailType": policy_rebuild.DETAIL_TYPE_POLICY_REBUILD,
                     "Detail": json.dumps(
-                        policy_rebuild.build_detail(data_domain, dataset, reason=reason)
+                        policy_rebuild.build_detail(
+                            data_domain, dataset, reason=reason, force=force
+                        )
                     ),
                 }
             ]
@@ -3365,16 +3371,19 @@ def trigger_reasoning_sync(
     data_domain: str,
     dataset: str,
 ) -> dict[str, Any]:
-    """The Reasoning page's manual trigger: queue one rebuild now.
+    """The Reasoning page's manual trigger: author now, unconditionally.
 
     Doubles as the FIRST authoring for a pre-existing dataset (there is no
     bulk backfill by design — a dataset that predates the feature authors on
-    its first Sync, harvest, or repromote) and as the fail-safe when the wiki
-    moved and no automatic trigger caught it. Just the event — the rebuild
-    authority owns the pipeline, and its rebuild-iff-changed skip means
-    syncing an already-current policy is a clean no-op rather than a wasted
-    build. Refused while no complete wiki exists: the policy is derived from
-    the bundle, so there is nothing to author from yet.
+    its first Sync, harvest, or repromote) and as the operator's re-author
+    button. The event carries ``force``: the rebuild authority skips its
+    rebuild-iff-changed check, because a manual Sync's sources may be
+    unchanged while the AUTHORING moved on (a new model, effort, or prompt) —
+    without force, Sync on a ready dataset acknowledged "queued" and then
+    silently did nothing (live 2026-08-03). An in-flight build still wins
+    (the building lease is honored). Refused while no complete wiki exists:
+    the policy is derived from the bundle, so there is nothing to author
+    from yet.
     """
     _reasoning_row(ddb, registry_table, data_domain, dataset)  # 404 if unknown
     if events is None:
@@ -3382,7 +3391,11 @@ def trigger_reasoning_sync(
     if not is_bundle_ready(s3, bucket, data_domain, dataset):
         raise ApiError(409, "no wiki yet — run a harvest first")
     queued = _publish_policy_rebuild(
-        events, data_domain=data_domain, dataset=dataset, reason="manual_sync"
+        events,
+        data_domain=data_domain,
+        dataset=dataset,
+        reason="manual_sync",
+        force=True,
     )
     return {"queued": queued}
 

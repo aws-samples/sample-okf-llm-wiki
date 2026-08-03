@@ -298,8 +298,12 @@ function FilesPane({
       ) : null}
       {/* View header: dataset selector on the left, page-level actions pinned
           right on the same line — matching the Context Docs / Benchmark /
-          Harvest views. The per-doc breadcrumb still lives in the doc pane. */}
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+          Harvest views. The per-doc breadcrumb still lives in the doc pane.
+          mt-2.5 lines the picker's center up with the top strip's (~32px from
+          the inset top, the sidebar brand row's line): Browse is strip-less
+          (pt-2 region, h-7 picker → ~22px) so it needs the 10px the strip's
+          h-12/pt-4 geometry provides elsewhere. */}
+      <div className="mt-2.5 mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
         <div className="flex min-w-0 items-center">{picker}</div>
         <div className="flex shrink-0 items-center gap-2">
           {versionMode ? (
