@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm"
 import {
   AlertTriangleIcon,
   ChevronRightIcon,
+  CodeIcon,
   FileTextIcon,
   FolderIcon,
   FolderOpenIcon,
@@ -137,6 +138,13 @@ function FilesPane({
   useEffect(() => {
     setSelectedId(concept || null)
   }, [concept])
+
+  // Show the raw markdown (frontmatter + body) instead of the rendered doc.
+  // Reset to rendered whenever the selected doc changes.
+  const [rawView, setRawView] = useState(false)
+  useEffect(() => {
+    setRawView(false)
+  }, [selectedId])
 
   // Version-history pane state: null = normal doc view; {} opens it on the
   // default last-harvest diff; { to: "live" } opens it comparing the last good
@@ -408,61 +416,86 @@ function FilesPane({
               No file selected
             </CardTitle>
           )}
-          {/* Leave feedback about THIS page (concept) — a page-scoped note,
-              distinct from a text selection or the whole dataset. Lives here,
-              beside the doc's breadcrumb, since it's specific to this page. */}
+          {/* Per-doc actions, pinned right of the breadcrumb. Raw toggles the
+              rendered doc for its source markdown (frontmatter + body); the
+              PageAnnotator files feedback about THIS page (concept), distinct
+              from a text selection or the whole dataset. */}
           {!versionMode && selectedId && (
-            <PageAnnotator
-              api={api}
-              domain={domain}
-              dataset={dataset}
-              conceptId={selectedId}
-              onCreated={annotations.reload}
-            />
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                variant={rawView ? "secondary" : "outline"}
+                size="sm"
+                onClick={() => setRawView((v) => !v)}
+              >
+                <CodeIcon className="size-3.5" />
+                Raw
+              </Button>
+              <PageAnnotator
+                api={api}
+                domain={domain}
+                dataset={dataset}
+                conceptId={selectedId}
+                onCreated={annotations.reload}
+              />
+            </div>
           )}
           </div>
           <div className="h-px shrink-0 bg-gradient-to-r from-transparent via-border/60 to-transparent" />
           <div className="min-h-0 flex-1">
-            <ScrollArea className="okf-doc-scroll h-full">
-            <div className="min-w-0 p-5">
-              {versionMode ? (
-                <VersionDiffPane vh={vh} />
-              ) : loadingDoc ? (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Spinner />
-                  Loading…
+            {!versionMode && selectedId && rawView && content ? (
+              // Raw source: the whole file including YAML frontmatter, filling
+              // the entire content card (full width + height). Rendered OUTSIDE
+              // the padded markdown ScrollArea so CodeView owns its own scroll;
+              // no annotation wrapper — anchoring targets the rendered doc.
+              <div className="h-full min-w-0 p-5">
+                <CodeView
+                  code={content}
+                  language="markdown"
+                  className="okf-codeview-full okf-codeview-doc"
+                />
+              </div>
+            ) : (
+              <ScrollArea className="okf-doc-scroll h-full">
+                <div className="min-w-0 p-5">
+                  {versionMode ? (
+                    <VersionDiffPane vh={vh} />
+                  ) : loadingDoc ? (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Spinner />
+                      Loading…
+                    </div>
+                  ) : docError ? (
+                    <Alert variant="destructive">
+                      <AlertTitle>Failed to read file</AlertTitle>
+                      <AlertDescription>{docError}</AlertDescription>
+                    </Alert>
+                  ) : !selectedId ? (
+                    <p className="text-sm text-muted-foreground">
+                      Select a concept on the left to render its markdown.
+                    </p>
+                  ) : (
+                    // Wrap the rendered doc so a text selection surfaces the
+                    // "Annotate" popover; a saved note refreshes the sidebar list.
+                    <SelectionAnnotator
+                      api={api}
+                      domain={domain}
+                      dataset={dataset}
+                      conceptId={selectedId}
+                      onCreated={annotations.reload}
+                    >
+                      <ConceptDoc
+                        conceptId={selectedId}
+                        text={content}
+                        onNavigate={openConcept}
+                        domain={domain}
+                        dataset={dataset}
+                        onNavigateCross={onOpenCross}
+                      />
+                    </SelectionAnnotator>
+                  )}
                 </div>
-              ) : docError ? (
-                <Alert variant="destructive">
-                  <AlertTitle>Failed to read file</AlertTitle>
-                  <AlertDescription>{docError}</AlertDescription>
-                </Alert>
-              ) : !selectedId ? (
-                <p className="text-sm text-muted-foreground">
-                  Select a concept on the left to render its markdown.
-                </p>
-              ) : (
-                // Wrap the rendered doc so a text selection surfaces the
-                // "Annotate" popover; a saved note refreshes the sidebar list.
-                <SelectionAnnotator
-                  api={api}
-                  domain={domain}
-                  dataset={dataset}
-                  conceptId={selectedId}
-                  onCreated={annotations.reload}
-                >
-                  <ConceptDoc
-                    conceptId={selectedId}
-                    text={content}
-                    onNavigate={openConcept}
-                    domain={domain}
-                    dataset={dataset}
-                    onNavigateCross={onOpenCross}
-                  />
-                </SelectionAnnotator>
-              )}
-            </div>
-            </ScrollArea>
+              </ScrollArea>
+            )}
           </div>
         </div>
       </Card>

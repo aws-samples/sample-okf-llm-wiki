@@ -20,6 +20,20 @@
   width: 100%;
 }
 
+/* Doc "Raw" variant — fills the entire content card: full width AND full
+   height, with no inner scroll cap so long docs flow into the doc pane's own
+   ScrollArea (matching the rendered-markdown view) instead of a boxed 320px. */
+.okf-codeview.okf-codeview-doc {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.okf-codeview-doc .okf-codeview-scroll {
+  flex: 1;
+  max-height: none;
+}
+
 .okf-codeview-header {
   display: flex;
   align-items: center;

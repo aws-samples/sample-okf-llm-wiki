@@ -238,8 +238,8 @@ export function PageAnnotator({ api, domain, dataset, conceptId, onCreated }) {
           setOpen(true)
         }}
       >
-        <FileTextIcon className="size-3.5" />
-        Annotate Page
+        <MessageSquarePlusIcon className="size-3.5" />
+        Annotate
       </Button>
       <Dialog
         open={open}
