@@ -44,7 +44,7 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu"
-import { Skeleton } from "@/components/ui/skeleton"
+import { Spinner } from "@/components/ui/spinner"
 
 // Arrowhead marker. Color is set explicitly because RF11 markers don't inherit
 // the edge stroke; --muted-foreground stays legible on light and dark.
@@ -438,7 +438,12 @@ function GraphPane({ api, domain, dataset, onOpenConcept }) {
       <Card className="min-h-0 flex-1 gap-0 py-0">
         <GraphHeader graph={null} focusId={null} onClearFocus={() => {}} />
         <CardContent className="min-h-0 flex-1 p-0">
-          <Skeleton className="size-full" />
+          {/* Match the loaded canvas: plain surface, square corners (no
+              rounding/grey tint), with a centered spinner so loading reads as
+              in-progress rather than an empty grey panel. */}
+          <div className="flex size-full items-center justify-center">
+            <Spinner className="size-6 text-muted-foreground" />
+          </div>
         </CardContent>
       </Card>
     )
