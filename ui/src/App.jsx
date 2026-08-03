@@ -613,6 +613,11 @@ function Console({ auth, api }) {
   // (#/benchmark/<d>/<ds>/<report_id> opens the report detail page). Report ids
   // are single segments, so the generic parse carries them in route.concept.
   const routeReportId = section === "benchmark" ? route.concept : null
+  // The Harvest section reuses the trailing segment as an INTENT sentinel:
+  // #/harvest/<d>/<ds>/annotations deep-links straight into the "Apply
+  // annotations" picker (the Browse annotations panel links here). Same
+  // route.concept reuse as the benchmark report id above.
+  const routeHarvestIntent = section === "harvest" ? route.concept : null
 
   const setSelectionKey = useCallback(
     (key) => push({ section, selectionKey: key, concept: null }),
@@ -662,6 +667,20 @@ function Console({ auth, api }) {
         concept: conceptId,
       }),
     [push]
+  )
+
+  // Jump from Browse's annotations panel to the Harvest view's "Apply
+  // annotations" picker: switch section AND carry the `annotations` intent
+  // sentinel in the concept slot so HarvestView auto-opens the picker on
+  // arrival (Back returns to Browse).
+  const openHarvestAnnotations = useCallback(
+    () =>
+      push({
+        section: "harvest",
+        selectionKey,
+        concept: "annotations",
+      }),
+    [push, selectionKey]
   )
 
   // Browse reports the concept it opened so the URL stays in sync (and Back
@@ -937,6 +956,7 @@ function Console({ auth, api }) {
                     concept={routeConcept}
                     onConceptChange={onBrowseConcept}
                     onOpenCross={openCrossConcept}
+                    onApplyAnnotations={openHarvestAnnotations}
                   />
                 </div>
               ) : section === "graph" ? (
@@ -1001,6 +1021,7 @@ function Console({ auth, api }) {
                       api={api}
                       selection={selection}
                       datasets={datasets}
+                      autoOpenAnnotations={routeHarvestIntent === "annotations"}
                     />
                   )}
                   {section === "credentials" && (
