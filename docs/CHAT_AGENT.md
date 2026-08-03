@@ -738,6 +738,15 @@ paused; `loadHistory` restores it, so a page refresh re-renders the QA form and 
 user can still answer later. No new env, no infra change; server-side pure
 `langchain_core` + `langgraph`.
 
+**Answered result in the transcript.** Once the user submits, the `ask_human` step
+lands in the reasoning timeline like any other tool. The form never echoes the
+selection into the chat, so the tool's result — `{status:"answered", answers:[{id,
+prompt, answer}]}` — is where the chosen answer becomes visible: `wikiTools.js`
+parses it into a `qa` view (question→answer pairs) and `UnifiedThinkingBlock`
+renders each pair (muted prompt, emphasized answer) in a card, default-EXPANDED
+(like `web_search`) so the user's selection reads inline without opening the step.
+A malformed/noop result falls back to the raw JSON so nothing is hidden.
+
 ## 14e. Public web search (`web_search`) — BUILT
 
 Lets the agent put internal numbers in **external context**: is a decline unusual

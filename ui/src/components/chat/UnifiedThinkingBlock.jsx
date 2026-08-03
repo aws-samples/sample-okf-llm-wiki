@@ -156,6 +156,23 @@ function ToolResultDetail({ view, rawContent }) {
       </div>
     )
   }
+
+  // ask_human: the questions the agent asked paired with the user's answers. The
+  // form doesn't echo the selection into the transcript, so this IS where the
+  // chosen answer becomes visible — question as a muted label, answer emphasized.
+  if (view.kind === "qa") {
+    if (!view.pairs.length) return null
+    return (
+      <div className="tool-result-qa">
+        {view.pairs.map((p, i) => (
+          <div key={i} className="tool-result-qa-item">
+            <div className="tool-result-qa-prompt">{p.prompt}</div>
+            <div className="tool-result-qa-answer">{p.answer}</div>
+          </div>
+        ))}
+      </div>
+    )
+  }
   if (view.kind === "raw") {
     const txt = coerceToolText(rawContent)
     if (!txt) return null
@@ -207,11 +224,13 @@ function SqlResultTabs({ sql, resultNode }) {
 // chevron when there's detail. (The tool's icon lives on the timeline marker,
 // not in the header.)
 function ToolResultIndicator({ toolName, input, content, isComplete, error }) {
-  // web_search opens EXPANDED: the sources are the substance of that step (which
-  // pages the answer's external claims rest on), not a detail to drill into —
-  // same call ChatGPT/Claude make with their search cards. Everything else stays
-  // collapsed so the timeline reads as a list of steps.
-  const [expanded, setExpanded] = useState(toolName === "web_search")
+  // web_search and ask_human open EXPANDED: for web_search the sources are the
+  // substance of the step; for ask_human the user's answers ARE the point (the
+  // form never echoes the selection into the transcript, so it must show inline).
+  // Everything else stays collapsed so the timeline reads as a list of steps.
+  const [expanded, setExpanded] = useState(
+    toolName === "web_search" || toolName === "ask_human"
+  )
 
   const view = useMemo(
     () => (isComplete && !error ? parseToolResult(toolName, content) : null),
@@ -238,6 +257,7 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error }) {
     ((view && view.kind === "table" && view.rows?.length) ||
       (view && view.kind === "sources" && view.items?.length) ||
       (view && view.kind === "chips" && view.items?.length) ||
+      (view && view.kind === "qa" && view.pairs?.length) ||
       (view && view.kind === "raw" && content != null) ||
       Boolean(sqlQuery) ||
       error)

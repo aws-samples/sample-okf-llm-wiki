@@ -149,7 +149,12 @@ function statusVariant(status) {
 // Start a harvest for the selected dataset and poll its status every ~4s.
 // `datasets` is the registered-mapping list (threaded from App) — the candidate
 // pool for the cross-dataset target picker.
-export default function HarvestView({ api, selection, datasets = [] }) {
+export default function HarvestView({
+  api,
+  selection,
+  datasets = [],
+  autoOpenAnnotations = false,
+}) {
   const [status, setStatus] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -694,6 +699,20 @@ export default function HarvestView({ api, selection, datasets = [] }) {
       setAnnoLoading(false)
     }
   }
+  // Deep-link arrival (#/harvest/<d>/<ds>/annotations, from Browse's
+  // annotations panel): auto-open the picker ONCE the selection is ready. The
+  // ref latch means it fires a single time per mount — not again if the picker
+  // is closed and re-rendered.
+  const autoOpenedRef = useRef(false)
+  useEffect(() => {
+    if (autoOpenAnnotations && hasSelection && !autoOpenedRef.current) {
+      autoOpenedRef.current = true
+      openAnnotationPicker()
+    }
+    // openAnnotationPicker is a fresh closure each render; the latch (not deps)
+    // guards against re-firing, so intentionally omit it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoOpenAnnotations, hasSelection])
   // Switching scope re-seeds the selection to "all in that scope" — the common
   // case; unticking is the exception.
   const changeAnnoScope = (scope) => {

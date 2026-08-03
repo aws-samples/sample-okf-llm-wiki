@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   CheckCircle2Icon,
+  FileTextIcon,
   MessageSquarePlusIcon,
+  PlayIcon,
   Trash2Icon,
   XCircleIcon,
 } from "lucide-react"
@@ -18,6 +20,14 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import {
   Popover,
   PopoverAnchor,
@@ -189,6 +199,94 @@ export function SelectionAnnotator({
   )
 }
 
+// A header button that files feedback about the WHOLE current page (concept),
+// not a text selection and not the whole dataset. It creates an annotation with
+// the real `conceptId` but no anchor (empty quote/prefix/suffix), so it sits
+// between the selection-anchored notes (which carry a quote) and the
+// `_dataset` general notes. Opens a modal composer rather than a rect-pinned
+// popover, since there's no selection to anchor to.
+export function PageAnnotator({ api, domain, dataset, conceptId, onCreated }) {
+  const [open, setOpen] = useState(false)
+  const [note, setNote] = useState("")
+  const [saving, setSaving] = useState(false)
+
+  const submit = useCallback(async () => {
+    const text = note.trim()
+    if (!text) return
+    setSaving(true)
+    try {
+      await api.createAnnotation(domain, dataset, conceptId, text, {})
+      toast.success("Page annotation added")
+      setOpen(false)
+      setNote("")
+      onCreated?.()
+    } catch (e) {
+      toast.error(`Could not save annotation: ${e.message || e}`)
+    } finally {
+      setSaving(false)
+    }
+  }, [api, domain, dataset, conceptId, note, onCreated])
+
+  return (
+    <>
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={!conceptId}
+        onClick={() => {
+          setNote("")
+          setOpen(true)
+        }}
+      >
+        <MessageSquarePlusIcon className="size-3.5" />
+        Annotate
+      </Button>
+      <Dialog
+        open={open}
+        onOpenChange={(o) => {
+          setOpen(o)
+          if (!o) setNote("")
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <FileTextIcon className="size-4" />
+              Annotate this page
+            </DialogTitle>
+            <DialogDescription>
+              Feedback about this whole page. Applies to{" "}
+              <span className="font-mono text-xs">{conceptId}</span>, not a
+              selection or the whole dataset.
+            </DialogDescription>
+          </DialogHeader>
+          <Textarea
+            autoFocus
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="What's wrong or missing on this page? The harvester will verify it against the data."
+            className="min-h-[120px] text-sm"
+          />
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setOpen(false)}
+              disabled={saving}
+            >
+              Cancel
+            </Button>
+            <Button size="sm" onClick={submit} disabled={saving || !note.trim()}>
+              {saving ? <Spinner /> : null}
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
 function OutcomeBadge({ status, outcome }) {
   if (status !== "resolved") {
     const label = status === "in_review" ? "In review" : "Open"
@@ -228,6 +326,13 @@ function AnnotationCard({ ann, onOpenConcept, onDelete, deleting }) {
           {ann.submitted_via === "agent" && (
             <Badge variant="outline" className="text-[10px]">
               agent
+            </Badge>
+          )}
+          {/* Whole-page feedback: a real concept but no text selection to
+              anchor to (vs a selection note, which carries a quote). */}
+          {ann.concept_id !== "_dataset" && !ann.quote && (
+            <Badge variant="outline" className="text-[10px]">
+              page
             </Badge>
           )}
         </span>
@@ -300,6 +405,7 @@ export function AnnotationSidebar({
   error,
   reload,
   onOpenConcept,
+  onApplyAnnotations,
 }) {
   const [deletingId, setDeletingId] = useState(null)
 
@@ -423,6 +529,26 @@ export function AnnotationSidebar({
           </Button>
         </div>
       </div>
+      {/* Kick off an annotation-mode re-harvest for this dataset. Rather than
+          running it here (fire-and-forget, no progress), this jumps to the
+          Harvest view's "Apply annotations" picker — where the operator can
+          pick a scope + subset and watch the run's live progress. Enabled only
+          when there are open notes to apply. */}
+      {onApplyAnnotations && (
+        <Button
+          className="w-full"
+          disabled={openItems.length === 0}
+          onClick={onApplyAnnotations}
+        >
+          <PlayIcon className="size-4" />
+          Apply annotations
+          {openItems.length > 0 && (
+            <Badge variant="secondary" className="ml-1">
+              {openItems.length}
+            </Badge>
+          )}
+        </Button>
+      )}
       <TabsList className="w-full">
         <TabsTrigger value="open" className="flex-1">
           Open

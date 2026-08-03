@@ -21,6 +21,7 @@ import {
   GlobeIcon,
   Link2Icon,
   ListTreeIcon,
+  MessageCircleQuestionIcon,
   ScanSearchIcon,
   SearchIcon,
   TerminalIcon,
@@ -46,6 +47,8 @@ const ICONS = {
   // web_search = the one tool that reads OUTSIDE the org (globe, deliberately
   // distinct from the wiki's own search glyphs)
   web_search: GlobeIcon,
+  // ask_human = a pause to ask the user clarifying questions (question glyph)
+  ask_human: MessageCircleQuestionIcon,
   // render_chart is lifted into its own inline chart block and never appears in
   // the timeline (see buildMessageBlocks) — but keep an icon + label so an edge
   // case (e.g. a raw tool listing) doesn't fall through to raw.
@@ -126,6 +129,12 @@ export function toolLabel(toolName, args, running) {
       const verb = running ? "Searching the web" : "Web search"
       return `${verb} ${quoted}`.trim()
     }
+    case "ask_human": {
+      // args.questions is the list the model asked; count them for the label.
+      const n = Array.isArray(a.questions) ? a.questions.length : 0
+      const suffix = n ? ` · ${plural(n, "question")}` : ""
+      return running ? "Asking you" : `Asked you${suffix}`
+    }
     default: {
       const name = prettyName(toolName)
       return running ? `Running ${name}` : name
@@ -164,6 +173,9 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many || one + "s"}`
 //   sources — { items:[{url,title,host,publishedDate}] } — web_search: favicon +
 //             title + host rows, each a link out
 //   chips   — compact monospace pills (list_directory entries)
+//   qa      — { pairs:[{prompt,answer}] } — ask_human: the questions the agent
+//             asked paired with what the user answered (so the selection is
+//             visible in the transcript instead of buried in raw JSON)
 //   none    — summary only, no expandable body (read_page / index dir)
 //   raw     — JSON fallback for anything unrecognized
 export function parseToolResult(toolName, rawContent) {
@@ -331,6 +343,25 @@ export function parseToolResult(toolName, rawContent) {
           publishedDate: s(r.published_date),
         })),
       }
+    }
+    case "ask_human": {
+      // { status, answers:[{id,prompt,answer}], note } on resume, or
+      // { status:"error", error } if the model's question set was malformed.
+      // Surface the question→answer pairs so the user's selection reads inline
+      // (rather than being buried in the raw JSON tool result).
+      if (content && typeof content === "object" && content.status === "answered") {
+        const answers = Array.isArray(content.answers) ? content.answers : []
+        return {
+          summary: plural(answers.length, "answer"),
+          kind: "qa",
+          pairs: answers.map((x) => ({
+            prompt: s(x.prompt),
+            answer: s(x.answer),
+          })),
+        }
+      }
+      // Malformed / noop / anything unexpected → raw so nothing is hidden.
+      return { summary: "", kind: "raw", raw: content }
     }
     default:
       return { summary: "", kind: "raw", raw: content }

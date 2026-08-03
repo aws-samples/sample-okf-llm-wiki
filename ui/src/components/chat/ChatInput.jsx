@@ -34,6 +34,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -137,8 +138,16 @@ function FeatureChip({ feature, onRemove }) {
   )
 }
 
-function AddFeatureMenu({ enabled, onToggle, onPickPolicy }) {
+// `canScope` adds a "Scope to a dataset" entry (an explicit, discoverable
+// alternative to typing "@" — see ChatInput). Picking it fires `onScope`, which
+// opens the same dataset picker the "@" mention does.
+function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) {
   const [open, setOpen] = useState(false)
+  // Set when the "Scope to a dataset" item is chosen, so onCloseAutoFocus knows
+  // to skip Radix's focus-restore to the "+" trigger — that restore lands
+  // OUTSIDE the dataset popover onScope just opened and would dismiss it
+  // instantly. onScope focuses the picker itself, so no focus is lost.
+  const scopeSelectedRef = useRef(false)
   const enabledSet = new Set(enabled)
   const remaining = AVAILABLE_FEATURES.filter((f) => !enabledSet.has(f.id))
   // The Policy field is offered while no policy option is active. Its hard
@@ -148,8 +157,9 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy }) {
   const sqlOn = enabledSet.has("sql")
   const policyActive = enabled.some(isPolicyId)
   const offerPolicy = POLICY_AVAILABLE && !policyActive
-  // Nothing left to add once everything available is enabled — hide the "+".
-  if (remaining.length === 0 && !offerPolicy) return null
+  // Hide the "+" only when there's genuinely nothing to offer — no remaining
+  // features, no policy field, AND no dataset to scope to.
+  if (remaining.length === 0 && !offerPolicy && !canScope) return null
 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
@@ -165,66 +175,105 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy }) {
           <PlusIcon className="size-4" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" side="top" className="w-60">
-        <DropdownMenuLabel className="text-xs text-muted-foreground">
-          Add a capability
-        </DropdownMenuLabel>
-        {remaining.map((f) => {
-          const Icon = f.icon
-          return (
+      <DropdownMenuContent
+        align="start"
+        side="top"
+        className="w-60"
+        onCloseAutoFocus={(e) => {
+          if (scopeSelectedRef.current) {
+            scopeSelectedRef.current = false
+            e.preventDefault()
+          }
+        }}
+      >
+        {canScope ? (
+          <>
+            <DropdownMenuLabel className="text-xs text-muted-foreground">
+              Scope
+            </DropdownMenuLabel>
             <DropdownMenuItem
-              key={f.id}
-              onSelect={() => onToggle(f.id)}
+              onSelect={() => {
+                scopeSelectedRef.current = true
+                onScope()
+              }}
               className="flex-col items-start gap-0.5"
             >
               <span className="flex items-center gap-2">
-                {Icon ? <Icon className="size-3.5 text-muted-foreground" /> : null}
-                {f.menuLabel || f.label}
+                <AtSignIcon className="size-3.5 text-muted-foreground" />
+                Scope to a dataset
               </span>
-              {f.description ? (
-                <span className="pl-5.5 text-[11px] text-muted-foreground">
-                  {f.description}
-                </span>
-              ) : null}
+              <span className="pl-5.5 text-[11px] text-muted-foreground">
+                Focus the wiki on one dataset (or type “@”).
+              </span>
             </DropdownMenuItem>
-          )
-        })}
-        {offerPolicy ? (
-          <DropdownMenuSub>
-            {/* The trigger stays a ROW: the text stacks in an inner column so
-                the SubTrigger's built-in chevron keeps its place at the right,
-                vertically centered — a flex-col on the trigger itself would
-                wrap the chevron onto its own line below the description. */}
-            <DropdownMenuSubTrigger disabled={!sqlOn}>
-              <span className="flex flex-col gap-0.5">
-                <span className="flex items-center gap-2">
-                  <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
-                  Guardrails
-                </span>
-                <span className="pl-5.5 text-[11px] text-muted-foreground">
-                  {sqlOn
-                    ? "Flag documented-guardrail violations mid-turn"
-                    : "Requires the SQL capability"}
-                </span>
-              </span>
-            </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent className="w-64">
-              {POLICY_OPTIONS.map((o) => (
+          </>
+        ) : null}
+        {remaining.length > 0 || offerPolicy ? (
+          <>
+            {canScope ? <DropdownMenuSeparator /> : null}
+            <DropdownMenuLabel className="text-xs text-muted-foreground">
+              Add a capability
+            </DropdownMenuLabel>
+            {remaining.map((f) => {
+              const Icon = f.icon
+              return (
                 <DropdownMenuItem
-                  key={o.id}
-                  onSelect={() => onPickPolicy(o.id)}
+                  key={f.id}
+                  onSelect={() => onToggle(f.id)}
                   className="flex-col items-start gap-0.5"
                 >
-                  <span className="text-sm">{o.label}</span>
-                  {o.description ? (
-                    <span className="text-[11px] text-muted-foreground">
-                      {o.description}
+                  <span className="flex items-center gap-2">
+                    {Icon ? (
+                      <Icon className="size-3.5 text-muted-foreground" />
+                    ) : null}
+                    {f.menuLabel || f.label}
+                  </span>
+                  {f.description ? (
+                    <span className="pl-5.5 text-[11px] text-muted-foreground">
+                      {f.description}
                     </span>
                   ) : null}
                 </DropdownMenuItem>
-              ))}
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
+              )
+            })}
+            {offerPolicy ? (
+              <DropdownMenuSub>
+                {/* The trigger stays a ROW: the text stacks in an inner column so
+                    the SubTrigger's built-in chevron keeps its place at the right,
+                    vertically centered — a flex-col on the trigger itself would
+                    wrap the chevron onto its own line below the description. */}
+                <DropdownMenuSubTrigger disabled={!sqlOn}>
+                  <span className="flex flex-col gap-0.5">
+                    <span className="flex items-center gap-2">
+                      <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
+                      Guardrails
+                    </span>
+                    <span className="pl-5.5 text-[11px] text-muted-foreground">
+                      {sqlOn
+                        ? "Flag documented-guardrail violations mid-turn"
+                        : "Requires the SQL capability"}
+                    </span>
+                  </span>
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="w-64">
+                  {POLICY_OPTIONS.map((o) => (
+                    <DropdownMenuItem
+                      key={o.id}
+                      onSelect={() => onPickPolicy(o.id)}
+                      className="flex-col items-start gap-0.5"
+                    >
+                      <span className="text-sm">{o.label}</span>
+                      {o.description ? (
+                        <span className="text-[11px] text-muted-foreground">
+                          {o.description}
+                        </span>
+                      ) : null}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            ) : null}
+          </>
         ) : null}
       </DropdownMenuContent>
     </DropdownMenu>
@@ -308,7 +357,7 @@ export function ChatInput({
   onPrepare,
   isStreaming = false,
   disabled = false,
-  placeholder = "Ask about the wiki…",
+  placeholder = "Ask about the wiki. Use @ to pin questions to a particular dataset",
   leftSlot = null,
   autoFocus = true,
   effort,
@@ -406,6 +455,22 @@ export function ChatInput({
     },
     [onScopeChange, text, mentionQuery]
   )
+
+  // Open the dataset picker from the "+" menu instead of an "@" keystroke. There
+  // is no "@" fragment to strip on pick, so leave mentionAtRef at -1 (pickDataset
+  // skips the strip when it's negative). Stamp the open time: the "+" dropdown's
+  // teardown (focus restore + outside-pointer detection) fires just after this
+  // and the picker popover reads it as an outside interaction — the onOpenChange
+  // guard below ignores any dismiss within a short grace window so the picker
+  // doesn't flicker shut. (Same pattern as App.jsx's CollapsedNavTrigger.)
+  const scopeOpenedAt = useRef(0)
+  const openScopePicker = useCallback(() => {
+    if (!canMention) return
+    mentionAtRef.current = -1
+    setMentionQuery("")
+    scopeOpenedAt.current = performance.now()
+    setMentionOpen(true)
+  }, [canMention])
 
   // Dismiss the picker WITHOUT choosing: strip the "@" (and any query typed after
   // it in the textarea) that triggered it, close, and refocus the composer. Fired
@@ -547,6 +612,12 @@ export function ChatInput({
         open={mentionOpen && canMention}
         onOpenChange={(o) => {
           if (!o) {
+            // Ignore the transient dismiss that fires right after opening from
+            // the "+" menu: the dropdown's teardown (focus restore + outside-
+            // pointer detection) reads as an outside interaction and would close
+            // the picker within a few hundred ms. A short grace window after a
+            // programmatic open swallows it; real dismisses arrive later.
+            if (performance.now() - scopeOpenedAt.current < 500) return
             setMentionOpen(false)
             mentionAtRef.current = -1
           }
@@ -579,11 +650,13 @@ export function ChatInput({
       </Popover>
 
       <div className="flex items-center gap-1">
-        {onFeaturesChange ? (
+        {onFeaturesChange || canMention ? (
           <AddFeatureMenu
             enabled={enabledFeatures}
             onToggle={addFeature}
             onPickPolicy={pickPolicy}
+            canScope={canMention}
+            onScope={openScopePicker}
           />
         ) : null}
         <EffortSetting

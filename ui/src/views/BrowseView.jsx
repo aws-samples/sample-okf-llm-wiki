@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm"
 import {
   AlertTriangleIcon,
   ChevronRightIcon,
+  CodeIcon,
   FileTextIcon,
   FolderIcon,
   FolderOpenIcon,
@@ -56,6 +57,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import {
   AnnotationSidebar,
+  PageAnnotator,
   SelectionAnnotator,
   useAnnotations,
 } from "@/views/AnnotationSidebar.jsx"
@@ -78,6 +80,7 @@ export default function BrowseView({
   concept,
   onConceptChange,
   onOpenCross,
+  onApplyAnnotations,
   picker,
 }) {
   const domain = selection?.data_domain
@@ -105,6 +108,7 @@ export default function BrowseView({
       concept={concept}
       onConceptChange={onConceptChange}
       onOpenCross={onOpenCross}
+      onApplyAnnotations={onApplyAnnotations}
     />
   )
 }
@@ -116,6 +120,7 @@ function FilesPane({
   concept,
   onConceptChange,
   onOpenCross,
+  onApplyAnnotations,
   picker,
 }) {
   const [files, setFiles] = useState([])
@@ -133,6 +138,13 @@ function FilesPane({
   useEffect(() => {
     setSelectedId(concept || null)
   }, [concept])
+
+  // Show the raw markdown (frontmatter + body) instead of the rendered doc.
+  // Reset to rendered whenever the selected doc changes.
+  const [rawView, setRawView] = useState(false)
+  useEffect(() => {
+    setRawView(false)
+  }, [selectedId])
 
   // Version-history pane state: null = normal doc view; {} opens it on the
   // default last-harvest diff; { to: "live" } opens it comparing the last good
@@ -284,12 +296,57 @@ function FilesPane({
           </AlertDescription>
         </Alert>
       ) : null}
+      {/* View header: dataset selector on the left, page-level actions pinned
+          right on the same line — matching the Context Docs / Benchmark /
+          Harvest views. The per-doc breadcrumb still lives in the doc pane. */}
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex min-w-0 items-center">{picker}</div>
+        <div className="flex shrink-0 items-center gap-2">
+          {versionMode ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setVersionMode(null)}
+            >
+              <XIcon className="size-3.5" />
+              Close
+            </Button>
+          ) : (
+            <>
+              {/* Compare/restore published bundle versions. */}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setVersionMode({})}
+              >
+                <HistoryIcon className="size-3.5" />
+                History
+              </Button>
+              {/* Open the annotations panel. The badge shows how many of the
+                  caller's notes are still open (unresolved) for this dataset. */}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setAnnotationsOpen(true)}
+              >
+                <MessageSquareTextIcon className="size-3.5" />
+                Annotations
+                {openCount > 0 && (
+                  <Badge variant="secondary" className="ml-1">
+                    {openCount}
+                  </Badge>
+                )}
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
       <Card className="grid min-h-0 flex-1 grid-cols-1 gap-0 overflow-hidden py-0 md:grid-rows-1 md:grid-cols-[minmax(240px,320px)_1fr]">
         <div className="flex min-h-0 flex-col border-b bg-muted/40 max-md:h-[40vh] md:border-r md:border-b-0">
           {/* Equal-height header rows (h-12) in BOTH panes + the same fade
               hairline below, so the two separators sit on one level. */}
           <div className="flex h-12 shrink-0 items-center justify-between gap-2 px-4">
-            {picker ?? <CardTitle className="text-sm">Concepts</CardTitle>}
+            <CardTitle className="text-sm">Concepts</CardTitle>
             <span className="shrink-0 text-xs text-muted-foreground">
               {versionMode
                 ? `${vh.files.length} changed`
@@ -359,88 +416,86 @@ function FilesPane({
               No file selected
             </CardTitle>
           )}
-          <div className="flex shrink-0 items-center gap-2">
-            {versionMode ? (
+          {/* Per-doc actions, pinned right of the breadcrumb. Raw toggles the
+              rendered doc for its source markdown (frontmatter + body); the
+              PageAnnotator files feedback about THIS page (concept), distinct
+              from a text selection or the whole dataset. */}
+          {!versionMode && selectedId && (
+            <div className="flex shrink-0 items-center gap-2">
               <Button
-                variant="outline"
+                variant={rawView ? "secondary" : "outline"}
                 size="sm"
-                onClick={() => setVersionMode(null)}
+                onClick={() => setRawView((v) => !v)}
               >
-                <XIcon className="size-3.5" />
-                Close
+                <CodeIcon className="size-3.5" />
+                Raw
               </Button>
-            ) : (
-              <>
-                {/* Compare/restore published bundle versions. */}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setVersionMode({})}
-                >
-                  <HistoryIcon className="size-3.5" />
-                  History
-                </Button>
-                {/* Open the annotations panel. The badge shows how many of the
-                    caller's notes are still open (unresolved) for this dataset. */}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setAnnotationsOpen(true)}
-                >
-                  <MessageSquareTextIcon className="size-3.5" />
-                  Annotations
-                  {openCount > 0 && (
-                    <Badge variant="secondary" className="ml-1">
-                      {openCount}
-                    </Badge>
-                  )}
-                </Button>
-              </>
-            )}
-          </div>
+              <PageAnnotator
+                api={api}
+                domain={domain}
+                dataset={dataset}
+                conceptId={selectedId}
+                onCreated={annotations.reload}
+              />
+            </div>
+          )}
           </div>
           <div className="h-px shrink-0 bg-gradient-to-r from-transparent via-border/60 to-transparent" />
           <div className="min-h-0 flex-1">
-            <ScrollArea className="okf-doc-scroll h-full">
-            <div className="min-w-0 p-5">
-              {versionMode ? (
-                <VersionDiffPane vh={vh} />
-              ) : loadingDoc ? (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Spinner />
-                  Loading…
+            {!versionMode && selectedId && rawView && content ? (
+              // Raw source: the whole file including YAML frontmatter, filling
+              // the entire content card (full width + height). Rendered OUTSIDE
+              // the padded markdown ScrollArea so CodeView owns its own scroll;
+              // no annotation wrapper — anchoring targets the rendered doc.
+              <div className="h-full min-w-0 p-5">
+                <CodeView
+                  code={content}
+                  language="markdown"
+                  className="okf-codeview-full okf-codeview-doc"
+                />
+              </div>
+            ) : (
+              <ScrollArea className="okf-doc-scroll h-full">
+                <div className="min-w-0 p-5">
+                  {versionMode ? (
+                    <VersionDiffPane vh={vh} />
+                  ) : loadingDoc ? (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Spinner />
+                      Loading…
+                    </div>
+                  ) : docError ? (
+                    <Alert variant="destructive">
+                      <AlertTitle>Failed to read file</AlertTitle>
+                      <AlertDescription>{docError}</AlertDescription>
+                    </Alert>
+                  ) : !selectedId ? (
+                    <p className="text-sm text-muted-foreground">
+                      Select a concept on the left to render its markdown.
+                    </p>
+                  ) : (
+                    // Wrap the rendered doc so a text selection surfaces the
+                    // "Annotate" popover; a saved note refreshes the sidebar list.
+                    <SelectionAnnotator
+                      api={api}
+                      domain={domain}
+                      dataset={dataset}
+                      conceptId={selectedId}
+                      onCreated={annotations.reload}
+                    >
+                      <ConceptDoc
+                        conceptId={selectedId}
+                        text={content}
+                        onNavigate={openConcept}
+                        domain={domain}
+                        dataset={dataset}
+                        onNavigateCross={onOpenCross}
+                      />
+                    </SelectionAnnotator>
+                  )}
                 </div>
-              ) : docError ? (
-                <Alert variant="destructive">
-                  <AlertTitle>Failed to read file</AlertTitle>
-                  <AlertDescription>{docError}</AlertDescription>
-                </Alert>
-              ) : !selectedId ? (
-                <p className="text-sm text-muted-foreground">
-                  Select a concept on the left to render its markdown.
-                </p>
-              ) : (
-                // Wrap the rendered doc so a text selection surfaces the
-                // "Annotate" popover; a saved note refreshes the sidebar list.
-                <SelectionAnnotator
-                  api={api}
-                  domain={domain}
-                  dataset={dataset}
-                  conceptId={selectedId}
-                  onCreated={annotations.reload}
-                >
-                  <ConceptDoc
-                    conceptId={selectedId}
-                    text={content}
-                    onNavigate={openConcept}
-                    domain={domain}
-                    dataset={dataset}
-                    onNavigateCross={onOpenCross}
-                  />
-                </SelectionAnnotator>
-              )}
-            </div>
-            </ScrollArea>
+              </ScrollArea>
+            )}
           </div>
         </div>
       </Card>
@@ -471,6 +526,7 @@ function FilesPane({
               error={annotations.error}
               reload={annotations.reload}
               onOpenConcept={openConceptFromSidebar}
+              onApplyAnnotations={onApplyAnnotations}
             />
           </div>
         </SheetContent>

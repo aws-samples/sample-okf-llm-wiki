@@ -387,3 +387,42 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ask_human results: the questions the agent asked paired with the user's
+   answers. The form never echoes the selection into the transcript, so this is
+   where the chosen answer becomes visible — the prompt reads as a muted label
+   and the answer stands out as the primary text below it. Same --card slab and
+   border as the source list so it reads as one card, one pair per row. */
+.tool-result-qa {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  max-width: 640px;
+  border-radius: 10px;
+  background-color: var(--card);
+  border: 1px solid var(--unified-border-color);
+  padding: 4px;
+}
+
+.tool-result-qa-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 7px;
+}
+
+.tool-result-qa-prompt {
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--unified-text-secondary);
+}
+
+.tool-result-qa-answer {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--unified-text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
