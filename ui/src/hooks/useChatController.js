@@ -14,6 +14,7 @@ import {
   loadEffort,
   saveEffort,
 } from "@/lib/chatModels"
+import { clearLastThread, loadLastThread, saveLastThread } from "@/lib/lastChat"
 
 function newConversation() {
   return {
@@ -27,11 +28,24 @@ function newConversation() {
   }
 }
 
-export function useChatController({ urlThreadId, onThreadChange }) {
+export function useChatController({
+  urlThreadId,
+  onThreadChange,
+  active = true,
+  userSub,
+}) {
+  // The thread to open on FIRST mount: an explicit #/chat/<id> deep link wins;
+  // otherwise fall back to this user's last conversation (localStorage) so
+  // returning to Chat after a reload — even one that landed on another section —
+  // reopens where they left off. Computed once (initializer), so a later
+  // localStorage change doesn't yank the live conversation.
+  const [initialThreadId] = useState(
+    () => urlThreadId || loadLastThread(userSub)
+  )
   const [conv, setConv] = useState(() =>
-    urlThreadId
+    initialThreadId
       ? {
-          threadId: urlThreadId,
+          threadId: initialThreadId,
           model: CHAT_MODEL,
           effort: loadEffort(),
           features: loadFeatures(),
@@ -39,23 +53,36 @@ export function useChatController({ urlThreadId, onThreadChange }) {
         }
       : newConversation()
   )
-  // Opened from a link/history (needs a load) vs freshly minted (starts empty).
-  const [resumed, setResumed] = useState(Boolean(urlThreadId))
+  // Opened from a link/history/last-session (needs a load) vs freshly minted.
+  const [resumed, setResumed] = useState(Boolean(initialThreadId))
   // Initiated (first turn sent, or resumed) — gates the URL binding.
-  const [started, setStarted] = useState(Boolean(urlThreadId))
+  const [started, setStarted] = useState(Boolean(initialThreadId))
   const [historyOpen, setHistoryOpen] = useState(false)
   // Bumped to re-fetch the history list (after a turn writes/renames a row).
   const [historyReloadKey, setHistoryReloadKey] = useState(0)
 
-  // Bind the URL (#/chat/<threadId>) ONLY once the conversation is initiated. A
-  // fresh, untouched chat has no server session yet, so it must not stamp a
-  // thread id into the URL. Once `started`, keep it in sync (replace() upstream).
+  // Bind the URL (#/chat/<threadId>) ONLY once the conversation is initiated AND
+  // chat is the active section. A fresh, untouched chat has no server session
+  // yet, so it must not stamp a thread id into the URL. The `active` guard is
+  // what makes chat→browse→chat work: when you leave chat, `urlThreadId` goes
+  // null but the in-memory conversation persists — without the guard this effect
+  // would fire onThreadChange and shove #/chat/<id> back into the URL, bouncing
+  // you off the section you navigated to. While away, the thread lives in memory
+  // (and localStorage); on return, active flips true and re-binds the URL.
   useEffect(() => {
-    if (!started) return
+    if (!started || !active) return
     if (onThreadChange && conv.threadId !== urlThreadId) {
       onThreadChange(conv.threadId)
     }
-  }, [started, conv.threadId, urlThreadId, onThreadChange])
+  }, [started, active, conv.threadId, urlThreadId, onThreadChange])
+
+  // Persist the started conversation as this user's "last chat" so returning to
+  // Chat (even after a full page reload that landed on another section, where
+  // the URL carries no thread) reopens it. Only once started — an untouched new
+  // chat has no server session worth remembering.
+  useEffect(() => {
+    if (started && conv.threadId) saveLastThread(userSub, conv.threadId)
+  }, [started, conv.threadId, userSub])
 
   // First turn landed: lock the conversation as started (binds the URL, locks the
   // model). We do NOT refresh the history list here — at turn-OPEN the server's
@@ -64,6 +91,13 @@ export function useChatController({ urlThreadId, onThreadChange }) {
   // (onTurnComplete), by which point the row is written.
   const onStarted = useCallback(() => {
     setStarted(true)
+    // Also mark it resumable: once a turn has landed the conversation is
+    // persisted server-side, so if the chat page later UNMOUNTS (navigating to
+    // another section) and remounts on return, it should reload history rather
+    // than show a blank transcript. resumed is only read by the mount effect
+    // (empty deps), so flipping it now doesn't disturb the live, already-mounted
+    // conversation — it only governs the next mount.
+    setResumed(true)
   }, [])
 
   // A turn finished streaming: the index row is committed, so refresh the sidebar
@@ -77,10 +111,14 @@ export function useChatController({ urlThreadId, onThreadChange }) {
     setConv(newConversation())
     setResumed(false)
     setStarted(false)
+    // Forget the persisted last chat too — a fresh, unsent chat has no server
+    // session, so a reload now should land on a blank chat, not reopen the one
+    // we just left. The persist effect re-saves once this chat's first turn lands.
+    clearLastThread(userSub)
     // Drop the previous chat's id from the URL — a fresh chat isn't bound until
     // its first turn (the started-gated effect re-binds then).
     onThreadChange?.(null)
-  }, [onThreadChange])
+  }, [onThreadChange, userSub])
 
   const resumeThread = useCallback((t) => {
     setConv({
