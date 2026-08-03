@@ -241,3 +241,32 @@ def test_author_never_raises(monkeypatch):
 
 def test_doc_cap_constant_is_generous_but_real():
     assert MAX_DOC_CHARS == 50_000
+
+
+def test_author_converse_client_gets_the_long_read_timeout(monkeypatch):
+    # The regression that failed bird/european_football live (2026-08-03): a
+    # Converse-backed author reasons for minutes before the first response
+    # byte, so the client must carry harvest's botocore config (600s read
+    # timeout + adaptive retries), not botocore's 60s default — which is what
+    # an omitted `config` silently gives.
+    import sys
+    import types
+
+    captured: dict = {}
+
+    class _FakeConverse:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    law = types.ModuleType("langchain_aws")
+    law.ChatBedrockConverse = _FakeConverse
+    monkeypatch.setitem(sys.modules, "langchain_aws", law)
+    monkeypatch.setenv(
+        "OKF_POLICY_PREPROCESS_MODEL", "global.anthropic.claude-sonnet-5"
+    )
+
+    ar_author._build_author_model()
+
+    assert captured["config"] is not None
+    assert captured["config"].read_timeout >= 300
+    assert captured["config"].retries["mode"] == "adaptive"

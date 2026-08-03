@@ -37,7 +37,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Select,
   SelectContent,
@@ -465,15 +464,19 @@ export default function ReasoningView({ api, selection }) {
               date.
             </DialogDescription>
           </DialogHeader>
-          <ScrollArea className="max-h-80">
+          {/* Plain scroll div, NOT ScrollArea: Radix's viewport wraps children
+              in a display:table div that grows to fit long unbreakable paths,
+              so truncation never engages and the list bleeds past the dialog.
+              break-all keeps the full path readable within the width. */}
+          <div className="okf-thin-scroll max-h-80 min-w-0 overflow-y-auto">
             <ul className="space-y-1 pr-3 font-mono text-xs text-muted-foreground">
               {(data?.sources || []).map((path) => (
-                <li key={path} className="truncate">
+                <li key={path} className="break-all">
                   {path}
                 </li>
               ))}
             </ul>
-          </ScrollArea>
+          </div>
         </DialogContent>
       </Dialog>
     </>

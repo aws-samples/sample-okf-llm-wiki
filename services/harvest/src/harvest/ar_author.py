@@ -306,6 +306,13 @@ def _build_author_model() -> Any:
     ``OKF_POLICY_AUTHOR_THINKING_BUDGET`` selects the pre-adaptive budget
     encoding for models that need it (Haiku 4.5: 48000 is a sensible value);
     adaptive effort otherwise. GPT ids take the effort ladder directly.
+
+    The Converse client MUST get the harvest runtime's botocore config: a
+    high-effort authoring turn reasons for minutes before the first response
+    byte, and botocore's default 60s read timeout kills it with
+    ReadTimeoutError (live 2026-08-03: every Converse-backed authoring run
+    for bird/european_football timed out and the dataset marked failed —
+    the GPT/Mantle path never hit this because it doesn't ride botocore).
     """
     from okf_aws.model_factory import (
         DEFAULT_MANTLE_REGION,
@@ -313,6 +320,8 @@ def _build_author_model() -> Any:
         build_mantle_openai,
         is_openai_model,
     )
+
+    from harvest.agent import _bedrock_config
 
     model_id = os.environ.get("OKF_POLICY_PREPROCESS_MODEL", DEFAULT_AUTHOR_MODEL)
     effort = os.environ.get("OKF_POLICY_AUTHOR_EFFORT", DEFAULT_AUTHOR_EFFORT)
@@ -329,5 +338,6 @@ def _build_author_model() -> Any:
         effort,
         _AUTHOR_MAX_TOKENS,
         region=os.environ.get("AWS_REGION", "us-east-1"),
+        botocore_config=_bedrock_config(),
         thinking_budget=int(budget_raw) if budget_raw else None,
     )
