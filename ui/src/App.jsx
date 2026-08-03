@@ -91,44 +91,82 @@ import GraphView from "@/views/GraphView.jsx"
 
 // The console sections, in sidebar order. `needsSelection` gates the
 // dataset-scoped views so the breadcrumb can hint when nothing is picked.
+// `group` splits the nav into the top-level primary actions (the everyday
+// entrypoints — Chat first, since it's where you land on login) and the
+// "Manage" group below (dataset setup / operations).
 const NAV = [
-  { key: "domains", label: "Domains", icon: GlobeIcon, needsSelection: false },
+  // Chat spans the whole wiki (the "@" picker narrows it), so it needs no
+  // pre-selected dataset. It's the primary action — first, and the default
+  // landing section on login.
+  {
+    key: "chat",
+    label: "Chat",
+    icon: MessagesSquareIcon,
+    needsSelection: false,
+    group: "primary",
+  },
+  {
+    key: "browse",
+    label: "Browse",
+    icon: BoxesIcon,
+    needsSelection: true,
+    group: "primary",
+  },
+  {
+    key: "graph",
+    label: "Graph",
+    icon: NetworkIcon,
+    needsSelection: true,
+    group: "primary",
+  },
+  {
+    key: "domains",
+    label: "Domains",
+    icon: GlobeIcon,
+    needsSelection: false,
+    group: "manage",
+  },
   {
     key: "mappings",
     label: "Datasets",
     icon: DatabaseIcon,
     needsSelection: false,
+    group: "manage",
   },
   {
     key: "context",
     label: "Context Docs",
     icon: FileTextIcon,
     needsSelection: true,
+    group: "manage",
   },
-  { key: "harvest", label: "Harvest", icon: PlayIcon, needsSelection: true },
+  {
+    key: "harvest",
+    label: "Harvest",
+    icon: PlayIcon,
+    needsSelection: true,
+    group: "manage",
+  },
   {
     key: "benchmark",
     label: "Benchmark",
     icon: GaugeIcon,
     needsSelection: true,
-  },
-  { key: "browse", label: "Browse", icon: BoxesIcon, needsSelection: true },
-  { key: "graph", label: "Graph", icon: NetworkIcon, needsSelection: true },
-  // Chat spans the whole wiki (the "@" picker narrows it), so it needs no
-  // pre-selected dataset.
-  {
-    key: "chat",
-    label: "Chat",
-    icon: MessagesSquareIcon,
-    needsSelection: false,
+    group: "manage",
   },
   {
     key: "credentials",
     label: "Credentials",
     icon: KeyRoundIcon,
     needsSelection: false,
+    group: "manage",
   },
 ]
+
+// The two sidebar groups, in render order. Primary sits at the top with no
+// label (the everyday actions); Manage is labelled below it.
+const PRIMARY_NAV = NAV.filter((n) => n.group === "primary")
+const MANAGE_NAV = NAV.filter((n) => n.group === "manage")
 
 function LoginScreen({ onSignIn }) {
   return (
@@ -361,9 +399,10 @@ function CollapsedNavTrigger({
         onFocusOutside={(e) => e.preventDefault()}
         className="w-56 border-sidebar-border bg-sidebar p-2 text-sidebar-foreground"
       >
-        <SidebarGroupLabel>Manage</SidebarGroupLabel>
+        {/* Primary actions up top (Chat / Browse / Graph), no label — then the
+            labelled Manage group below, mirroring the expanded sidebar. */}
         <SidebarMenu>
-          {NAV.map((item) =>
+          {PRIMARY_NAV.map((item) =>
             item.key === "chat" && chatCtrl ? (
               // The REAL ChatNav (submenu included). Clicks deliberately do
               // NOT close the popover — it lives while hovered (leave to close),
@@ -388,6 +427,20 @@ function CollapsedNavTrigger({
               </SidebarMenuItem>
             )
           )}
+        </SidebarMenu>
+        <SidebarGroupLabel>Manage</SidebarGroupLabel>
+        <SidebarMenu>
+          {MANAGE_NAV.map((item) => (
+            <SidebarMenuItem key={item.key}>
+              <SidebarMenuButton
+                isActive={section === item.key}
+                onClick={() => onNavigate?.(item.key)}
+              >
+                <item.icon />
+                <span>{item.label}</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ))}
         </SidebarMenu>
         <RecentDatasetsMenu
           recents={recents}
@@ -605,7 +658,9 @@ function Console({ auth, api }) {
   // so browser back/forward navigate the app. See lib/route.js.
   const { route, push, replace } = useRouter()
 
-  const section = SECTION_KEYS.has(route.section) ? route.section : "domains"
+  // Chat is the primary entrypoint, so it's where you land on login (an
+  // empty/unknown hash falls back here).
+  const section = SECTION_KEYS.has(route.section) ? route.section : "chat"
   const selectionKey = route.selectionKey
   // Browse's currently-open concept comes from the URL (Browse pushes updates).
   const routeConcept = section === "browse" ? route.concept : null
@@ -802,11 +857,13 @@ function Console({ auth, api }) {
           <SidebarBrand />
         </SidebarHeader>
         <SidebarContent>
+          {/* Primary actions (Chat / Browse / Graph) sit at the top, unlabelled
+              — Chat is the everyday entrypoint. Dataset setup / operations live
+              in the labelled Manage group below. */}
           <SidebarGroup>
-            <SidebarGroupLabel>Manage</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
-                {NAV.map((item) =>
+                {PRIMARY_NAV.map((item) =>
                   item.key === "chat" ? (
                     <ChatNav
                       key={item.key}
@@ -828,6 +885,25 @@ function Console({ auth, api }) {
                     </SidebarMenuItem>
                   )
                 )}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+          <SidebarGroup>
+            <SidebarGroupLabel>Manage</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {MANAGE_NAV.map((item) => (
+                  <SidebarMenuItem key={item.key}>
+                    <SidebarMenuButton
+                      isActive={section === item.key}
+                      tooltip={item.label}
+                      onClick={() => navigate(item.key)}
+                    >
+                      <item.icon />
+                      <span>{item.label}</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))}
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
