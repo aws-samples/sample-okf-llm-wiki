@@ -216,23 +216,18 @@ export function makeApi(token) {
     repromoteStatus: (domain, dataset) =>
       request(token, "GET", `/bundle/${domain}/${dataset}/repromote`),
 
-    // Reasoning (Automated Reasoning policy) enrollment — the Reasoning page.
-    // Enrollment is per-dataset opt-in; enrolling queues the first policy
-    // build (minutes, async), unenrolling DELETES the policy + its artifacts
-    // (the page confirms first), and sync queues a manual rebuild — the
-    // fail-safe when the wiki moved and the automatic trigger was missed.
+    // Guardrails (policy checks) — the Guardrails page (internal name
+    // "reasoning"). Always-on per dataset: guardrails author automatically
+    // when the wiki changes (harvest, increment, restore); sync queues a
+    // manual (re)build — the first authoring for datasets predating the
+    // feature, and the fail-safe when the wiki moved and the automatic
+    // trigger was missed. (The GET /reasoning/{d}/{ds}/document endpoint
+    // still exists server-side for raw policies.yaml access; the page no
+    // longer embeds a viewer.)
     getReasoning: (domain, dataset) =>
       request(token, "GET", `/reasoning/${domain}/${dataset}`),
-    setReasoningEnrollment: (domain, dataset, enrolled) =>
-      request(token, "PUT", `/reasoning/${domain}/${dataset}/enrollment`, {
-        enrolled,
-      }),
     triggerReasoningSync: (domain, dataset) =>
       request(token, "POST", `/reasoning/${domain}/${dataset}/sync`),
-    // The ar_rules.md the policy is built from (the Reasoning page's document
-    // viewer). Fetched on open, never with the polled status call.
-    getReasoningDocument: (domain, dataset) =>
-      request(token, "GET", `/reasoning/${domain}/${dataset}/document`),
 
     // Annotations (user-scoped feedback on concept docs). All calls are scoped
     // server-side to the caller's Cognito sub — you only ever see/act on your

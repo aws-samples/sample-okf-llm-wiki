@@ -192,14 +192,13 @@ def test_build_chat_model_dispatches_claude_to_converse(monkeypatch):
     }
 
 
-def test_policy_judge_model_low_effort_on_luna(monkeypatch):
-    # The user-directed evaluator pair: reasoning LOW on the GPT (Luna) path.
+def test_policy_judge_model_openai_runs_reasoning_none(monkeypatch):
+    # The classifier contract on the OpenAI path too: a GPT judge (Terra)
+    # runs with reasoning "none" — no ladder, no knob.
     import sys
     import types
 
-    from chat.config import DEFAULT_POLICY_JUDGE_EFFORT, build_policy_judge_model
-
-    assert DEFAULT_POLICY_JUDGE_EFFORT == "low"
+    from chat.config import build_policy_judge_model
 
     captured: dict = {}
 
@@ -211,26 +210,25 @@ def test_policy_judge_model_low_effort_on_luna(monkeypatch):
     lo.ChatOpenAI = _FakeOpenAI
     monkeypatch.setitem(sys.modules, "langchain_openai", lo)
 
-    cfg = ChatConfig.from_env(_env())  # default judge model is Luna
+    cfg = ChatConfig.from_env(
+        _env(OKF_CHAT_POLICY_CHECK_MODEL="openai.gpt-5.6-terra")
+    )
     build_policy_judge_model(cfg)
-    assert captured["model"] == "openai.gpt-5.6-luna"
-    assert captured["reasoning_effort"] == "low"
+    assert captured["model"] == "openai.gpt-5.6-terra"
+    assert captured["reasoning_effort"] == "none"
 
 
-def test_policy_judge_model_haiku_uses_a_thinking_budget(monkeypatch):
-    # ...and an 8000-token thinking BUDGET on a pre-adaptive Converse model
-    # (Haiku 4.5 rejects the adaptive/effort encoding), with max_tokens lifted
-    # above the budget (budget-encoded thinking counts inside the ceiling).
+def test_policy_judge_model_converse_runs_classifier_mode(monkeypatch):
+    # A Converse (Anthropic) judge is a CLASSIFIER: thinking OFF, temperature
+    # 0, single forward pass — whatever the generation (pre-adaptive Haiku and
+    # adaptive Sonnet/Opus alike). Live 2026-08-03: thinking judges spent
+    # 40-50s per shard and sometimes exhausted into prose with no tool call;
+    # thinking-off is also what makes the FORCED report_violations tool
+    # choice legal on Anthropic models.
     import sys
     import types
 
-    from chat.config import (
-        POLICY_JUDGE_MAX_TOKENS,
-        POLICY_JUDGE_THINKING_BUDGET,
-        build_policy_judge_model,
-    )
-
-    assert POLICY_JUDGE_THINKING_BUDGET == 8000
+    from chat.config import POLICY_JUDGE_MAX_TOKENS, build_policy_judge_model
 
     captured: dict = {}
 
@@ -242,23 +240,17 @@ def test_policy_judge_model_haiku_uses_a_thinking_budget(monkeypatch):
     law.ChatBedrockConverse = _FakeConverse
     monkeypatch.setitem(sys.modules, "langchain_aws", law)
 
-    cfg = ChatConfig.from_env(
-        _env(OKF_CHAT_POLICY_CHECK_MODEL="us.anthropic.claude-haiku-4-5")
-    )
-    build_policy_judge_model(cfg)
-    assert captured["additional_model_request_fields"]["thinking"] == {
-        "type": "enabled",
-        "budget_tokens": 8000,
-    }
-    assert captured["max_tokens"] == POLICY_JUDGE_THINKING_BUDGET + POLICY_JUDGE_MAX_TOKENS
-
-    # An adaptive-capable Converse id keeps the effort encoding.
-    captured.clear()
-    cfg = ChatConfig.from_env(
-        _env(OKF_CHAT_POLICY_CHECK_MODEL="global.anthropic.claude-opus-5")
-    )
-    build_policy_judge_model(cfg)
-    assert captured["additional_model_request_fields"]["thinking"] == {"type": "adaptive"}
-    assert captured["additional_model_request_fields"]["output_config"] == {
-        "effort": "low"
-    }
+    for model_id in (
+        "us.anthropic.claude-haiku-4-5",
+        "global.anthropic.claude-sonnet-4-6",
+        "global.anthropic.claude-sonnet-5",  # the default
+    ):
+        captured.clear()
+        cfg = ChatConfig.from_env(_env(OKF_CHAT_POLICY_CHECK_MODEL=model_id))
+        build_policy_judge_model(cfg)
+        thinking = (captured.get("additional_model_request_fields") or {}).get(
+            "thinking"
+        )
+        assert thinking is None, model_id  # no thinking of either encoding
+        assert captured["temperature"] == 0
+        assert captured["max_tokens"] == POLICY_JUDGE_MAX_TOKENS

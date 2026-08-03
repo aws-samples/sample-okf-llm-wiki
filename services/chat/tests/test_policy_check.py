@@ -103,8 +103,9 @@ class FakeToolModel:
         self.prompts: list[str] = []
         self._lock = threading.Lock()
 
-    def bind_tools(self, tools):
+    def bind_tools(self, tools, tool_choice=None):
         self.tools = tools
+        self.tool_choice = tool_choice
         return self
 
     def invoke(self, messages):
@@ -144,6 +145,16 @@ def _wait_until(predicate, timeout=10.0):
 
 
 # --- fixtures -------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _fresh_source_hash_cache():
+    # The freshness fingerprint has a module-level TTL cache (amortizes the
+    # S3 corpus walk across turns in one container); tests re-stub the same
+    # (bucket, domain, dataset) with different content, so isolate them.
+    pc._source_hash_cache.clear()
+    yield
+    pc._source_hash_cache.clear()
 
 
 @pytest.fixture()
@@ -196,7 +207,6 @@ def _seed_usable_policy(env, dataset=DATASET, doc=None, glue_database=None):
     fresh = ap.source_hash(env["s3"], BUCKET, DOMAIN, dataset)
     item = {
         **ap.registry_key(DOMAIN, dataset),
-        ap.ATTR_ENROLLED: {"BOOL": True},
         ap.ATTR_BUILD_STATUS: {"S": "ready"},
         ap.ATTR_SOURCE_HASH: {"S": fresh},
     }
@@ -218,7 +228,6 @@ def _cfg():
         policy_check_model="fake-model",
         policy_check_enabled=True,
         policy_shard_size=10,
-        policy_judge_effort="low",
         policy_query_timeout_s=10,
         policy_query_max_per_turn=3,
     )
@@ -470,6 +479,9 @@ def test_query_check_flags_and_judges_only_computational_policies(env):
     assert "career points?" in judge.prompts[0]
     assert _ANALYTICAL_SQL in judge.prompts[0]
     assert "P001" in judge.prompts[0] and "P002" not in judge.prompts[0]
+    # A Converse (non-OpenAI) judge is a classifier: the verdict tool is
+    # FORCED, so a no-tool-call reply is structurally unreachable.
+    assert judge.tool_choice == "report_violations"
 
 
 def test_query_check_clean_verdict_is_cached_by_normalized_sql(env):
@@ -540,11 +552,16 @@ policies:
     assert len(events.entries) == 1
 
 
-def test_query_check_not_enrolled_is_silent(env):
+def test_query_check_never_authored_is_silent(env):
+    # No policy state on the row at all (a dataset predating the feature):
+    # the check stays silent AND publishes nothing — it is a consumer of
+    # policy state, never a backfill trigger.
+    events = FakeEvents()
     judge = FakeToolModel([])
-    checker = _checker(env, judge)
+    checker = _checker(env, judge, events=events)
     assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
     assert judge.prompts == []
+    assert events.entries == []
 
 
 # --- unscoped runs: dataset resolution from the SQL itself -------------------------
@@ -572,7 +589,7 @@ def test_unscoped_checker_uses_the_registry_glue_database(env):
     assert "[P001]" in note and "bird/formula_1" in note
 
 
-def test_unscoped_checker_skips_unenrolled_schemas_for_free(env):
+def test_unscoped_checker_skips_policy_less_schemas_for_free(env):
     _seed_usable_policy(env)
     judge = FakeToolModel([])
     checker = _checker(env, judge, domain="", dataset="")
@@ -580,7 +597,7 @@ def test_unscoped_checker_skips_unenrolled_schemas_for_free(env):
         'SELECT COUNT(*) FROM "other_db"."events" GROUP BY kind'
     ).result(timeout=10)
     assert note == ""
-    assert judge.prompts == []  # nothing enrolled to judge against
+    assert judge.prompts == []  # no policy state to judge against
 
 
 def test_unscoped_cross_dataset_join_judges_each_dataset(env):
@@ -643,6 +660,14 @@ def test_follow_up_turn_rewrites_and_persists_the_curated_question(env):
     judge = FakeToolModel(list(_CLEAN_SCRIPT))
     checker = _checker(env, judge, user_sub="alice", thread_id="conv1",
                        question="and for 2018?", rewrite_model=rewrite)
+    # Production sequencing: the server prewarms at run start, so the rewrite
+    # normally lands well before the first analytical query — model that here
+    # (evaluators never WAIT for it; _curated_now takes it iff it landed).
+    checker.prewarm()
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["curated_question"] == "average points per team for 2018")
     assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
     # The rewrite saw all three pieces...
     assert "average points per team for 2019" in rewrite.prompts[0]
@@ -668,15 +693,24 @@ def test_the_chain_establishes_across_two_armed_turns(env):
                   question="average points per team for 2019?")
     assert t1.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
     t1.record_final_answer("Team A led 2019 with 400 points.")
-    assert _wait_until(lambda: read_policy_state(
-        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
-        thread_id="conv1",
-    )["last_answer"])
+    # Both halves of the chain persist asynchronously (curation is a pool
+    # piece now) — wait for both before the next turn reads them.
+    assert _wait_until(lambda: (lambda s: s["last_answer"] and s["curated_question"])(
+        read_policy_state(
+            env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+            thread_id="conv1",
+        )
+    ))
 
     rewrite = FakeModel([json.dumps({"question": "average points per team for 2018"})])
     judge2 = FakeToolModel(list(_CLEAN_SCRIPT))
     t2 = _checker(env, judge2, user_sub="alice", thread_id="conv1",
                   question="and for 2018?", rewrite_model=rewrite)
+    t2.prewarm()
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["curated_question"] == "average points per team for 2018")
     assert t2.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
     assert "average points per team for 2019?" in rewrite.prompts[0]
     assert "Team A led 2019" in rewrite.prompts[0]
@@ -696,6 +730,11 @@ def test_answer_only_state_still_triggers_the_rewrite(env):
     judge = FakeToolModel(list(_CLEAN_SCRIPT))
     checker = _checker(env, judge, user_sub="alice", thread_id="conv1",
                        question="and for 2018?", rewrite_model=rewrite)
+    checker.prewarm()
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["curated_question"] == "points for Team A in 2018")
     assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
     assert "Team A led 2019" in rewrite.prompts[0]
     assert "points for Team A in 2018" in judge.prompts[0]
@@ -727,6 +766,13 @@ def test_fold_clarifications_reruns_the_rewrite_with_the_qa(env):
         "points for Hamilton?",
         [{"prompt": "Which points?", "answer": "championship"}],
     )
+    # The server prewarms AFTER the fold (the resume path), so the folded
+    # rewrite has landed by the time the resumed run's first query checks.
+    checker.prewarm()
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["curated_question"] == "championship points for Hamilton")
     note = checker.submit(_ANALYTICAL_SQL).result(timeout=10)
     assert "[P001]" in note
     assert "Which points?" in rewrite.prompts[0]
@@ -990,7 +1036,7 @@ def test_policy_note_never_resets_the_steering_turn_slice():
 # --- checker construction + arming -------------------------------------------------
 
 
-def test_make_policy_checker_gates_on_deploy_flag_and_tracks():
+def test_make_policy_checker_gates_on_deploy_flag_only():
     cfg = _cfg()
     on = pc.make_policy_checker(
         cfg, tracks={"computational"}, scope={"data_domain": DOMAIN, "dataset": DATASET},
@@ -998,11 +1044,15 @@ def test_make_policy_checker_gates_on_deploy_flag_and_tracks():
     )
     assert isinstance(on, pc.PolicyChecker)
     assert on.wants("computational") and not on.wants("behavioural")
-    # No tracks → no checker, whatever the flag says.
-    assert pc.make_policy_checker(
+    # No tracks → still a checker (curation-only: the rolling chain must not
+    # go stale on unarmed turns), but it judges NOTHING — wants() is False
+    # for both tracks, so neither the SQL tool nor the middleware wires in.
+    unarmed = pc.make_policy_checker(
         cfg, tracks=set(), scope=None, question="q",
         user_sub="alice", thread_id="conv1",
-    ) is None
+    )
+    assert isinstance(unarmed, pc.PolicyChecker)
+    assert not unarmed.wants("computational") and not unarmed.wants("behavioural")
     # Deploy gate off → no checker, whatever the client sent.
     cfg.policy_check_enabled = False
     assert pc.make_policy_checker(
@@ -1039,3 +1089,237 @@ def test_concurrent_checks_run_on_a_pool_and_respect_the_budget(env):
     futures = [checker.submit(s) for s in sqls]
     assert [f.result(timeout=15) for f in futures] == ["", "", ""]
     assert len(judge.prompts) == 2  # the third was over budget, atomically
+
+
+# --- regressions from the policy-commit review ------------------------------------
+
+
+def test_is_analytical_sql_sees_through_comments_and_set_ops():
+    # A leading comment must not disguise an analytical query as exploration:
+    # the engine strips comments too, so the query RUNS fine either way — the
+    # only casualty of a raw-text head check would be the (opted-in) checks.
+    assert pc.is_analytical_sql("-- career points\nSELECT SUM(points) FROM t")
+    assert pc.is_analytical_sql("/* probe */ SELECT a FROM t JOIN u ON 1=1")
+    # Set differences compute answers exactly like UNION does.
+    assert pc.is_analytical_sql("SELECT a FROM t EXCEPT SELECT a FROM u")
+    assert pc.is_analytical_sql("SELECT a FROM t INTERSECT SELECT a FROM u")
+    # Comment-prefixed exploration is still exploration.
+    assert not pc.is_analytical_sql("-- peek\nSELECT * FROM t LIMIT 5")
+
+
+def test_extract_sql_schemas_walks_comma_joins():
+    cases = [
+        # old-style comma join, bare and aliased
+        ("SELECT SUM(r.points) FROM formula_1.results r, football.teams t "
+         "WHERE r.id = t.id",
+         ["formula_1", "football"]),
+        ('SELECT COUNT(*) FROM "formula_1"."results" AS r, "football"."teams" AS t',
+         ["formula_1", "football"]),
+        ("SELECT COUNT(*) FROM formula_1.results, formula_1.races",
+         ["formula_1"]),
+        # a SELECT-list comma is NOT a FROM continuation: alias.col stays out
+        ("SELECT a.b, c.d FROM formula_1.results", ["formula_1"]),
+    ]
+    for sql, expected in cases:
+        assert pc.extract_sql_schemas(sql) == expected, sql
+
+
+def test_judge_policies_validates_ids_per_shard():
+    # With 2+ shards, a judge hallucinating an id from ANOTHER shard (whose
+    # own judge said clean) must be dropped: an id is only accepted from the
+    # judge that was actually shown that policy.
+    class _ShardAwareJudge:
+        def __init__(self):
+            self.prompts: list[str] = []
+            self._lock = threading.Lock()
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            prompt = messages[0][1]
+            with self._lock:
+                self.prompts.append(prompt)
+            # The P001 shard's judge "flags" P002 — an id it was never shown.
+            flags = ["P002"] if "id: P001" in prompt else []
+            return AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "report_violations",
+                    "args": {"violations": flags},
+                    "id": "t1", "type": "tool_call",
+                }],
+            )
+
+    flagged, failed, total = pc.judge_policies(
+        _ShardAwareJudge(), _POLICIES, "e", shard_size=1,
+        prompt=pc._QUERY_JUDGE_PROMPT,
+    )
+    assert flagged == [] and failed == 0 and total == 2
+
+
+def test_ask_human_qa_excludes_the_harness_note():
+    # The ask_human payload's "note" is ALWAYS a fixed harness instruction
+    # (chat.ask_human_middleware), never user speech — echoing it into the
+    # evidence would attribute harness text to the user.
+    payload = json.dumps({
+        "status": "answered",
+        "answers": [{"id": "q1", "prompt": "Which points?", "answer": "career"}],
+        "note": "The user answered your clarifying questions (above). Use these "
+                "answers to continue; do not ask them again.",
+    })
+    qa = pc.ask_human_qa([_tool("ask_human", payload)])
+    assert qa == [{"prompt": "Which points?", "answer": "career"}]
+
+
+def test_rewrite_failure_never_clobbers_the_stored_chain(env):
+    # A transient rewrite failure falls back for THIS turn but must not
+    # PERSIST the raw fragment over the previous good curated question —
+    # that would poison every later turn's rewrite, not just this one.
+    _seed_usable_policy(env)
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1", curated_question="prior question",
+    )
+    judge = FakeToolModel(list(_CLEAN_SCRIPT))
+    broken = FakeModel(["not json at all"])
+    checker = _checker(env, judge, user_sub="alice", thread_id="conv1",
+                       question="and for 2018?", rewrite_model=broken)
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    state = read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )
+    assert state["curated_question"] == "prior question"
+
+
+def test_close_releases_the_pool_and_later_work_fails_open(env):
+    checker = _checker(env, FakeToolModel([]), user_sub="alice", thread_id="c1")
+    checker.close()
+    checker.close()  # idempotent
+    # New submits are refused (run_sql wraps submit and fails open there)…
+    with pytest.raises(RuntimeError):
+        checker.submit(_ANALYTICAL_SQL)
+    # …and the teardown-side helpers swallow it themselves.
+    checker.record_final_answer("the answer")  # must not raise
+    checker.prewarm()  # must not raise
+
+
+def test_identical_parallel_queries_share_one_fleet_and_budget(env):
+    # Two identical (mod whitespace) queries racing the _notes cache must
+    # share ONE fleet round and ONE budget unit — the non-owner waits on the
+    # owner's in-flight verdict instead of re-judging.
+    _seed_usable_policy(env)
+    gate = threading.Event()
+
+    class _BlockingJudge(FakeToolModel):
+        def invoke(self, messages):
+            gate.wait(10)
+            return super().invoke(messages)
+
+    judge = _BlockingJudge(list(_CLEAN_SCRIPT) * 2)
+    checker = _checker(env, judge)
+    f1 = checker.submit(_ANALYTICAL_SQL)
+    f2 = checker.submit("  SELECT   SUM(points)  FROM   driverstandings  ")
+    gate.set()
+    assert f1.result(timeout=15) == "" and f2.result(timeout=15) == ""
+    assert len(judge.prompts) == 1  # one fleet, not two
+    assert checker._checks == 1  # one budget unit
+
+
+def test_evaluators_never_wait_for_the_rewrite(env):
+    # The fleet fires the moment it is triggered: a mid-flight rewrite must
+    # not delay the verdict — the judges get the RAW question instead
+    # (_curated_now), and the rewrite still lands in the background to
+    # advance the durable chain for the NEXT turn.
+    _seed_usable_policy(env)
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1", curated_question="prior question",
+        last_answer="prior answer",
+    )
+    release = threading.Event()
+
+    class _BlockedRewrite:
+        def invoke(self, *a, **k):
+            release.wait(10)
+            return AIMessage(content=json.dumps({"question": "rewritten q"}))
+
+    judge = FakeToolModel(list(_CLEAN_SCRIPT))
+    checker = _checker(env, judge, user_sub="alice", thread_id="conv1",
+                       question="and for 2018?", rewrite_model=_BlockedRewrite())
+    try:
+        checker.prewarm()
+        # Verdict arrives while the rewrite is still blocked...
+        assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+        # ...judged against the RAW question, not the stale stored one.
+        assert "and for 2018?" in judge.prompts[0]
+        assert "prior question" not in judge.prompts[0]
+    finally:
+        release.set()
+    # The background rewrite still advances the durable chain.
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["curated_question"] == "rewritten q")
+
+
+def test_unarmed_checker_still_maintains_the_curated_chain(env):
+    # Policy not armed this turn: the checker exists purely as the chain's
+    # keeper — prewarm runs the (turn-1) curation and persists it, so a later
+    # ARMED turn chains from real state instead of starting over.
+    checker = pc.PolicyChecker(
+        chat_config=_cfg(), tracks=frozenset(),
+        data_domain="", dataset="",
+        question="average points per team for 2019?",
+        user_sub="alice", thread_id="conv1",
+        clients={"ddb": env["ddb"], "s3": env["s3"], "events": FakeEvents()},
+        judge_model=FakeToolModel([]),
+        rewrite_model=_RaisingModel(),  # turn 1 must cost zero model calls
+    )
+    checker.prewarm()
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["curated_question"] == "average points per team for 2019?")
+    checker.record_final_answer("Team A led 2019 with 400 points.")
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["last_answer"])
+    checker.close()
+
+
+def test_slow_rewrite_never_blocks_unrelated_checker_state(env):
+    # The curated-question rewrite is a network call; while it is mid-flight
+    # the SHARED lock must be free — the old lock-across-model-call stalled
+    # every other checker operation (including the server's teardown-time
+    # client lookup, i.e. the event loop) behind it.
+    import time
+
+    _seed_usable_policy(env)
+    started, release = threading.Event(), threading.Event()
+
+    class _SlowRewrite:
+        def invoke(self, *a, **k):
+            started.set()
+            release.wait(10)
+            return AIMessage(content=json.dumps({"question": "q"}))
+
+    # Prior state forces the rewrite path (turn-1 raw-question shortcut off).
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1", curated_question="prior question",
+    )
+    checker = _checker(env, FakeToolModel([]), user_sub="alice",
+                       thread_id="conv1", question="and for 2018?",
+                       rewrite_model=_SlowRewrite())
+    try:
+        checker.prewarm()
+        assert started.wait(10)
+        t0 = time.monotonic()
+        checker._boto("ddb")  # shared-lock user: must not wait on the rewrite
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        release.set()
+    checker.close()

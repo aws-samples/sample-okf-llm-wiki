@@ -199,11 +199,11 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy }) {
               <span className="flex flex-col gap-0.5">
                 <span className="flex items-center gap-2">
                   <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
-                  Policy
+                  Guardrails
                 </span>
                 <span className="pl-5.5 text-[11px] text-muted-foreground">
                   {sqlOn
-                    ? "Flag documented-policy violations mid-turn"
+                    ? "Flag documented-guardrail violations mid-turn"
                     : "Requires the SQL capability"}
                 </span>
               </span>

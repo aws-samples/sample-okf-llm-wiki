@@ -1010,25 +1010,13 @@ def _r_get_reasoning(cfg, params, body, query, caller):
     )
 
 
-def _r_set_reasoning_enrollment(cfg, params, body, query, caller):
-    enrolled = bool((body or {}).get("enrolled"))
-    return 200, handlers.set_reasoning_enrollment(
+def _r_reasoning_sync(cfg, params, body, query, caller):
+    return 200, handlers.trigger_reasoning_sync(
         cfg.ddb,
         cfg.s3,
         cfg.events,
         registry_table=cfg.registry_table,
         bucket=cfg.bucket,
-        data_domain=params["domain"],
-        dataset=params["dataset"],
-        enrolled=enrolled,
-    )
-
-
-def _r_reasoning_sync(cfg, params, body, query, caller):
-    return 200, handlers.trigger_reasoning_sync(
-        cfg.ddb,
-        cfg.events,
-        registry_table=cfg.registry_table,
         data_domain=params["domain"],
         dataset=params["dataset"],
     )
@@ -1129,9 +1117,10 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("GET", "/bundle/{domain}/{dataset}/diff", _r_bundle_diff),
     ("POST", "/bundle/{domain}/{dataset}/repromote", _r_repromote_bundle),
     ("GET", "/bundle/{domain}/{dataset}/repromote", _r_repromote_status),
-    # Reasoning (AR policy) enrollment — the UI's Reasoning page.
+    # Reasoning (AR policy) status + manual sync — the UI's Reasoning page.
+    # Always-on per dataset: no enrollment route; Sync is also the manual
+    # first-authoring trigger for datasets predating the feature.
     ("GET", "/reasoning/{domain}/{dataset}", _r_get_reasoning),
-    ("PUT", "/reasoning/{domain}/{dataset}/enrollment", _r_set_reasoning_enrollment),
     ("POST", "/reasoning/{domain}/{dataset}/sync", _r_reasoning_sync),
     ("GET", "/reasoning/{domain}/{dataset}/document", _r_reasoning_document),
     ("GET", "/bundle/{domain}/{dataset}", _r_list_bundle),

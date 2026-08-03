@@ -40,12 +40,13 @@ from okf_core import policy_doc
 
 log = logging.getLogger("harvest.ar_author")
 
-#: An openai.* value needs the harvest role's Mantle grants (derived from
+#: Sonnet 5 with high-effort reasoning. An openai.* value is still supported
+#: (needs the harvest role's Mantle grants, derived from
 #: var.policy_preprocess_model).
-DEFAULT_AUTHOR_MODEL = "openai.gpt-5.6-luna"
-#: Full reasoning: policy distillation is judgment work, and this path runs
-#: rarely (per source change) and off every hot path — depth is free here.
-DEFAULT_AUTHOR_EFFORT = "xhigh"
+DEFAULT_AUTHOR_MODEL = "global.anthropic.claude-sonnet-5"
+#: Reasoning at HIGH: policy distillation is judgment work, and this path runs
+#: rarely (per source change) and off every hot path.
+DEFAULT_AUTHOR_EFFORT = "high"
 #: Ceiling leaves room for reasoning + a full policy document (the document
 #: itself is capped at MAX_DOC_CHARS ≈ 13k tokens).
 _AUTHOR_MAX_TOKENS = 64000

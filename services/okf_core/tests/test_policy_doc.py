@@ -87,9 +87,57 @@ def test_shard_policies_preserves_order_and_covers_everything():
         pd.shard_policies(entries, size=0)
 
 
+def test_shard_policies_groups_by_source_and_never_straddles():
+    # Policies from ONE wiki page must land in ONE judge's shard (shared
+    # vocabulary/context), whatever their document order; a group moves to a
+    # fresh shard rather than straddling a boundary, and only a group larger
+    # than the cap itself splits.
+    def _p(i, source):
+        return {"id": f"P{i:03}", "type": "computational",
+                "condition": "c", "action": "a", "source": source}
+
+    entries = [_p(1, "references/a.md"), _p(2, "references/b.md"),
+               _p(3, "references/a.md"), _p(4, "references/b.md"),
+               _p(5, "references/a.md"), _p(6, "references/c.md")]
+    shards = pd.shard_policies(entries, size=3)
+    assert [[p["id"] for p in s] for s in shards] == [
+        ["P001", "P003", "P005"],  # a.md's three, together
+        ["P002", "P004", "P006"],  # b.md whole + c.md riding along
+    ]
+    assert all(len(s) <= 3 for s in shards)
+    # An oversized single-source group still splits at the cap.
+    big = [_p(i, "references/a.md") for i in range(1, 6)]
+    assert [len(s) for s in pd.shard_policies(big, size=2)] == [2, 2, 1]
+
+
 def test_render_policies_for_judge_is_verbatim():
     entries = pd.parse_policies(GOOD)
     text = pd.render_policies_for_judge(entries[:1])
     assert "id: P001" in text
     assert "action: ask for clarification" in text
     assert "source: references/usage_guardrails.md" in text
+
+
+def test_parse_collapses_internal_whitespace_to_one_line():
+    # YAML block scalars legally carry embedded newlines; every consumer (the
+    # judge shard rendering, the reminder lines, the UI's line-oriented
+    # display slice) treats a field as ONE line — so single-line is enforced
+    # at parse time, the format's source of truth.
+    doc = (
+        "policies:\n"
+        "  - id: P001\n"
+        "    type: behavioural\n"
+        "    condition: |\n"
+        "      a points request could mean\n"
+        "      two readings\n"
+        "    action: >-\n"
+        "      ask   for\tclarification\n"
+        "      before answering\n"
+        "    source: references/x.md\n"
+    )
+    entry = pd.parse_policies(doc)[0]
+    assert entry["condition"] == "a points request could mean two readings"
+    assert entry["action"] == "ask for clarification before answering"
+    # One rendered line per field — a multi-line field would corrupt the
+    # judge's shard text and truncate the UI's display slice.
+    assert len(pd.render_policies_for_judge([entry]).splitlines()) == 4

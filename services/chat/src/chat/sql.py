@@ -402,6 +402,24 @@ _RUN_SQL_DESC_REDSHIFT = (
 )
 
 
+def _cancel_policy_check(future: Any) -> None:
+    """Best-effort cancel of a racing policy check whose query FAILED.
+
+    A query the engine rejected never produces results the model can act on,
+    so its verdict is worthless — and letting the queued check run anyway
+    would burn one of the turn's few judged-query budget units (and a fleet's
+    tokens) on SQL that never executed, starving the eventual successful
+    query. cancel() only stops a check that hasn't started; one already
+    mid-fleet keeps its (legitimately spent) budget unit.
+    """
+    if future is None:
+        return
+    try:
+        future.cancel()
+    except Exception:  # noqa: BLE001 - advisory, never fatal
+        pass
+
+
 def _await_policy_note(future: Any, checker: Any) -> str:
     """Resolve the soft policy verdict within the residual wait budget.
 
@@ -500,9 +518,11 @@ def make_sql_tool(
         try:
             result = engine.run(sql, default_database=default_db)
         except ValueError as e:  # the read-only guard — concise, actionable
+            _cancel_policy_check(policy_future)
             return f"Error: {e}"
         except Exception as e:  # noqa: BLE001 - a tool error is feedback, not a crash
             log.warning("run_sql failed", exc_info=True)
+            _cancel_policy_check(policy_future)
             return f"Error: run_sql failed: {type(e).__name__}: {e}"
         reminders: list[str] = []
         # Fail-open anomaly scan: a detector bug must never fail a successful

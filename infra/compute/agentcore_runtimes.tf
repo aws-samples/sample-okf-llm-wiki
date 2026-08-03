@@ -97,7 +97,7 @@ resource "aws_bedrockagentcore_agent_runtime" "harvest" {
     OKF_POLICY_BUILD_ENABLED = tostring(local.ar_build_enabled)
     # Model for the policies.yaml AUTHORING AGENT (harvest.ar_author — full
     # reasoning; rules distillation is judgment work). Effort/thinking-budget
-    # knobs are code-level env (OKF_POLICY_AUTHOR_EFFORT, default xhigh;
+    # knobs are code-level env (OKF_POLICY_AUTHOR_EFFORT, default high;
     # OKF_POLICY_AUTHOR_THINKING_BUDGET for pre-adaptive models like Haiku 4.5).
     OKF_POLICY_PREPROCESS_MODEL = var.policy_preprocess_model
 
@@ -303,11 +303,11 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     # Off: no checker is ever constructed, whatever the client sends.
     OKF_CHAT_POLICY_CHECK_ENABLED = tostring(local.ar_enabled)
     # One model id serves the curated-question rewrite (minimal effort) AND
-    # the judge fleets (reasoning ON but shallow — effort via code-level
-    # OKF_CHAT_POLICY_JUDGE_EFFORT, default low on GPT; an 8000-token thinking
-    # budget on a pre-adaptive Converse id like Haiku 4.5).
+    # the judge fleets (CLASSIFIER-style on every family: thinking off +
+    # temperature 0 on a Converse id, reasoning "none" on an openai.* id,
+    # with a forced report_violations tool call).
     # chat_mantle_enabled derives the Mantle grants from this var, so an
-    # openai.* value (the default) or a Converse id both just work.
+    # openai.* value or a Converse id (the default) both just work.
     OKF_CHAT_POLICY_CHECK_MODEL = var.chat_policy_check_model
 
     OTEL_RESOURCE_ATTRIBUTES = "service.name=${var.name_prefix}_chat"

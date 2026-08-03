@@ -3,10 +3,11 @@
 //
 // Two kinds of entry:
 // - flat features (SQL) — one menu row, one chip, one id.
-// - the POLICY field — a submenu with three mutually-exclusive options
-//   (Computational / Behavioural / Strict = both), each its own feature id
-//   (`policy:*`). It REQUIRES the SQL feature: the menu disables it while SQL
-//   is off, and removing the SQL chip also removes the policy chip. The server
+// - the GUARDRAILS field (internal ids still `policy:*` — the server
+//   contract) — a submenu with three mutually-exclusive options
+//   (Computational / Behavioural / Strict = both), each its own feature id.
+//   It REQUIRES the SQL feature: the menu disables it while SQL is off, and
+//   removing the SQL chip also removes the guardrails chip. The server
 //   enforces the same dependency independently (normalize_features drops
 //   orphaned policy:* values), so this is UX gating, not a security boundary.
 //
@@ -51,14 +52,15 @@ export const POLICY_OPTIONS = [
   {
     id: "policy:computational",
     label: "Computational",
-    description: "Judge each analytical SQL query against the dataset's policies",
+    description:
+      "Judge each analytical SQL query against the dataset's guardrails",
     icon: ShieldCheckIcon,
     available: POLICY_AVAILABLE,
   },
   {
     id: "policy:behavioural",
     label: "Behavioural",
-    description: "Judge the steps the agent takes against the dataset's policies",
+    description: "Judge the steps the agent takes against the dataset's guardrails",
     icon: ShieldCheckIcon,
     available: POLICY_AVAILABLE,
   },

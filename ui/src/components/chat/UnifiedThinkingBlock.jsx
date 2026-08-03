@@ -334,17 +334,70 @@ const SteeringStep = memo(function SteeringStep({ step, isLast }) {
   )
 })
 
-// A query-time policy flag (split out of a run_sql result server-side):
-// shield marker, same muted aside treatment as steering — the agent already
-// acted on it; this is the visible trace.
+// A query-time guardrail flag (split out of a run_sql result server-side):
+// shield marker; the agent already acted on it — this is the visible trace.
+// The server's display slice is one line per flagged guardrail, in the
+// authored-policy shape ("- [P001] When <condition> — the agent must
+// <action> (source: <page>)"); parse it back into fields so the flag reads
+// as a card, not a wall of text. Any line that doesn't parse (older
+// history, a format drift) falls back to the raw italic aside.
+const GUARDRAIL_LINE_RE =
+  /^- \[([^\]]+)\] When (.+?) — the agent must (.+?)(?:\s*\(source: ([^)]+)\))?$/
+
+function parseGuardrailFlags(content) {
+  const lines = (content || "").split("\n").filter((l) => l.trim())
+  const flags = []
+  for (const line of lines) {
+    const m = GUARDRAIL_LINE_RE.exec(line.trim())
+    if (!m) return null // one odd line -> render the whole thing raw
+    flags.push({ id: m[1], condition: m[2], action: m[3], source: m[4] || "" })
+  }
+  return flags.length ? flags : null
+}
+
 const PolicyStep = memo(function PolicyStep({ step, isLast }) {
+  const flags = parseGuardrailFlags(step.content)
   return (
     <div className={`timeline-item ${isLast ? "last" : ""}`}>
       <div className="timeline-marker">
         <ShieldAlert size={18} className="timeline-icon steering-icon" />
       </div>
       <div className="timeline-content">
-        <div className="timeline-steering-content">{step.content}</div>
+        {flags ? (
+          <div className="flex flex-col gap-1.5 py-0.5">
+            {flags.map((f, i) => (
+              <div
+                key={`${f.id}-${i}`}
+                className="rounded-md border border-border/60 bg-muted/30 px-2.5 py-2 text-[13px] leading-snug"
+              >
+                <div className="mb-1 flex items-center gap-2">
+                  <span className="font-mono text-[11px] text-muted-foreground">
+                    {f.id}
+                  </span>
+                  {f.source ? (
+                    <span className="truncate font-mono text-[11px] text-muted-foreground/70">
+                      {f.source}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="text-foreground">
+                  <span className="font-medium text-cyan-600 dark:text-cyan-400">
+                    Condition:
+                  </span>{" "}
+                  {f.condition}
+                </div>
+                <div className="text-foreground">
+                  <span className="font-medium text-cyan-600 dark:text-cyan-400">
+                    Action:
+                  </span>{" "}
+                  {f.action}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="timeline-steering-content">{step.content}</div>
+        )}
       </div>
     </div>
   )
@@ -411,7 +464,7 @@ function headerLabel(steps) {
   const last = steps[steps.length - 1]
   if (last.type === "thinking") return reasoningPreview(last)
   if (last.type === "steer") return "Course check"
-  if (last.type === "policy") return "Policy flag"
+  if (last.type === "policy") return "Guardrail flag"
   return toolLabel(last.toolName, last.toolInput, !last.isToolComplete)
 }
 

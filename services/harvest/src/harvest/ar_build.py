@@ -19,11 +19,14 @@ Load-bearing properties (unchanged from v1):
 
 * **Byte-identical when off.** With ``OKF_POLICY_BUILD_ENABLED`` unset nothing
   here reads S3, DynamoDB, or the environment beyond that one flag.
-* **Enrollment is per-dataset opt-in** (``ar_enrolled`` on the mapping row).
-  An unenrolled dataset costs one GetItem per harvest and nothing else.
-* **Re-author iff the sources changed** (or the document is missing — the
-  self-heal for datasets enrolled before v2). Most harvests cost one GetItem
-  plus one S3 walk.
+* **Always on per dataset** (the ``ar_enrolled`` opt-in is retired): every
+  committed harvest — full, incremental, annotation — brings the policy
+  document along with it. This finalize hook is exactly why a pre-existing
+  dataset needs no backfill sweep: its first wiki change authors the first
+  document.
+* **Re-author iff the sources changed** (or the document is missing — a
+  dataset's first harvest under this feature, or one predating v2). An
+  unchanged harvest costs one GetItem plus one S3 walk.
 * **The flip to ``building`` is the serialization point** with no stale escape
   hatch: once this function owns the lease, EVERY exit stamps a terminal
   status — a row abandoned at ``building`` can never re-author (the reconcile
@@ -73,7 +76,7 @@ REASON_NO_RULES = "no_rules"
 # reason authoring did or did not run.
 OUTCOME_DISABLED = "disabled"
 OUTCOME_UNCONFIGURED = "unconfigured"
-OUTCOME_NOT_ENROLLED = "not_enrolled"
+OUTCOME_UNREGISTERED = "unregistered"
 OUTCOME_NO_SOURCES = "no_sources"
 OUTCOME_UNCHANGED = "unchanged"
 OUTCOME_LOCKED = "locked"
@@ -116,7 +119,7 @@ def maybe_build_policy(
     document-authoring callable, defaulting to the :mod:`harvest.ar_author`
     agent) so the offline tests never construct a client. Unset seams are
     built from the environment on first use, i.e. only once the flag,
-    enrollment and fingerprint checks have all decided work is warranted.
+    registration and fingerprint checks have all decided work is warranted.
     """
     if not build_enabled():
         return OUTCOME_DISABLED
@@ -160,14 +163,14 @@ def _author_and_stamp(
         return OUTCOME_UNCONFIGURED
     ddb, table = registry
 
-    # Enrollment is the user's per-dataset opt-in (the Reasoning page), checked
-    # FIRST — before any S3 walk — so a harvest of an unenrolled dataset costs
-    # exactly one GetItem and writes nothing.
-    enrolled, status, stored_hash = _read_build_state(
+    # Registration first — before any S3 walk — so authoring can never
+    # resurrect state for a dataset whose mapping row is gone (a delete that
+    # raced the finalize hook costs exactly one GetItem and writes nothing).
+    registered, status, stored_hash = _read_build_state(
         ddb, table, data_domain=data_domain, dataset=dataset
     )
-    if not enrolled:
-        return OUTCOME_NOT_ENROLLED
+    if not registered:
+        return OUTCOME_UNREGISTERED
 
     bucket = bucket or os.environ.get("OKF_BUNDLE_BUCKET", "")
     if not bucket:
@@ -191,11 +194,18 @@ def _author_and_stamp(
         return OUTCOME_NO_SOURCES
 
     if stored_hash == fresh_hash and status in _SKIP_STATUSES:
-        # The document must actually exist for "unchanged" to hold — a ready
-        # row without its artifact (a pre-v2 dataset, a lost write) re-authors.
-        if status == BUILD_BUILDING or read_policy_doc(
+        # The document must exist AND PARSE for "unchanged" to hold — a ready
+        # row without its artifact (a pre-v2 dataset, a lost write) or with a
+        # schema-invalid one (a pre-v3, type-less document) re-authors. The
+        # dispatchers that route re-author runs here (the chat check gate,
+        # the rebuild authority) both gate on parseability, so an
+        # existence-only skip would ping-pong an invalid document between
+        # "rebuild!" and "unchanged" forever — the documented migration
+        # ("a pre-split document fails the parse … and re-authors") ends
+        # HERE, and only a parse check closes the loop.
+        if status == BUILD_BUILDING or _stored_doc_parses(
             s3, bucket=bucket, data_domain=data_domain, dataset=dataset
-        ) is not None:
+        ):
             log.info(
                 "policy document for %s/%s already %s at this source "
                 "fingerprint — skipping",
@@ -265,6 +275,24 @@ def _author_and_stamp(
     return OUTCOME_AUTHORED
 
 
+def _stored_doc_parses(
+    s3: Any, *, bucket: str, data_domain: str, dataset: str
+) -> bool:
+    """Whether the persisted policies.yaml exists and passes the schema check."""
+    from okf_core import policy_doc as pdoc
+
+    doc = read_policy_doc(
+        s3, bucket=bucket, data_domain=data_domain, dataset=dataset
+    )
+    if doc is None:
+        return False
+    try:
+        pdoc.parse_policies(doc)
+    except pdoc.PolicyDocError:
+        return False
+    return True
+
+
 def _author_doc(
     author: Any, *, s3: Any, bucket: str, data_domain: str, dataset: str,
     sources: list[tuple[str, bytes]],
@@ -293,21 +321,19 @@ def _author_doc(
 def _read_build_state(
     ddb: Any, table: str, *, data_domain: str, dataset: str
 ) -> tuple[bool, str, str]:
-    """``(enrolled, ar_build_status, ar_source_hash)``.
+    """``(registered, ar_build_status, ar_source_hash)``.
 
-    ``(False, "", "")`` when the row is absent. The enrollment gate and the
-    iff-changed skip are the whole reason harvest reads this row (its other
-    registry writes are blind UpdateItems), so the runtime role needs GetItem
-    on the registry table as well as UpdateItem.
+    ``(False, "", "")`` when the mapping row is absent. The registration gate
+    and the iff-changed skip are the whole reason harvest reads this row (its
+    other registry writes are blind UpdateItems), so the runtime role needs
+    GetItem on the registry table as well as UpdateItem.
     """
-    from okf_aws.ar_policy import is_enrolled
-
     item = (
         ddb.get_item(TableName=table, Key=registry_key(data_domain, dataset)).get("Item")
         or {}
     )
     return (
-        is_enrolled(item),
+        bool(item),
         ((item.get(ATTR_BUILD_STATUS) or {}).get("S")) or "",
         ((item.get(ATTR_SOURCE_HASH) or {}).get("S")) or "",
     )

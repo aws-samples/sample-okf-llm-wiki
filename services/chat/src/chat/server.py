@@ -1217,6 +1217,7 @@ async def _produce_run_chunks(
     token_stats: dict[str, int] = {}
     answer_parts: list[str] = []
     ask_pending = False
+    cancelled = False
     checker = None
     cfg = {
         "configurable": {"thread_id": internal_id},
@@ -1233,11 +1234,13 @@ async def _produce_run_chunks(
         # server-recognized subset; the factory further gates each on its deploy
         # flag, so an unknown/forbidden feature string is simply ignored here.
         features = normalize_features(input_data.get("features"))
-        # The mid-turn policy checker (None unless the deploy master gate is on
-        # AND the run's Policy feature armed a track). Built HERE rather than in
-        # the factory because it needs the thread id (curated-question
-        # durability on the THREAD row) and, on an ask_human resume, the
-        # clarification fold below.
+        # The mid-turn policy checker (None only when the deploy master gate
+        # is off). Built for EVERY gated run — an unarmed run's checker just
+        # maintains the rolling curated-question chain (prewarm below + the
+        # final-answer record at stream end); wants() gates all judging.
+        # Built HERE rather than in the factory because it needs the thread
+        # id (curated-question durability on the THREAD row) and, on an
+        # ask_human resume, the clarification fold below.
         checker = make_policy_checker(
             chat_config,
             tracks=policy_tracks(features),
@@ -1308,6 +1311,15 @@ async def _produce_run_chunks(
                 ]
             }
 
+        # Kick the policy cold start NOW, in parallel — most importantly the
+        # curated-question rewrite, which runs on EVERY gated run (armed or
+        # not: the rolling chain must not go stale on unarmed turns) and
+        # which nothing downstream ever waits on — evaluators take it only
+        # if it has landed, else the raw question. Placed AFTER the
+        # clarification fold above so a resume's rewrite includes the Q&A.
+        if checker is not None:
+            checker.prewarm()
+
         seen_text = False
         async for mode, data in graph.astream(
             graph_input,
@@ -1351,20 +1363,30 @@ async def _produce_run_chunks(
                 yield ask
     except asyncio.CancelledError:
         # Explicit stop — let the live-stream runner's on_cancel do the checkpoint
-        # repair + cancelled end marker; just propagate.
+        # repair + cancelled end marker; just propagate (the finally still
+        # releases the checker).
+        cancelled = True
         raise
     except Exception as exc:  # noqa: BLE001 - surface ANY failure as an error chunk
         yield _error_chunk("agent_error", str(exc))
-
-    # The turn's final answer feeds the NEXT turn's curated-question rewrite
-    # (THREAD-row write, async + best-effort inside the checker). Skipped when
-    # the turn PAUSED on ask_human — the answer isn't final; the resumed
-    # continuation records the complete one.
-    if checker is not None and answer_parts and not ask_pending:
-        try:
-            checker.record_final_answer("".join(answer_parts))
-        except Exception:  # noqa: BLE001 - advisory context, never fatal
-            pass
+    finally:
+        # Checker teardown runs on EVERY exit path — normal end, the early
+        # clean-end return, agent error, cancel, and a dropped consumer.
+        if checker is not None:
+            # The turn's final answer feeds the NEXT turn's curated-question
+            # rewrite (THREAD-row write, submitted async + best-effort inside
+            # the checker — never blocks teardown). Skipped when the turn
+            # PAUSED on ask_human (the answer isn't final; the resumed
+            # continuation records the complete one) and on cancel.
+            if not cancelled and answer_parts and not ask_pending:
+                try:
+                    checker.record_final_answer("".join(answer_parts))
+                except Exception:  # noqa: BLE001 - advisory, never fatal
+                    pass
+            # Release the worker pool: without this, the checker retained by
+            # the live-stream registry (via the graph) keeps 8 idle threads
+            # + its clients alive per conversation for the container's life.
+            checker.close()
 
     # Terminal end marker (always), with token stats + the checkpoint id.
     end_marker: dict[str, Any] = {"end": True}

@@ -32,6 +32,7 @@ and stub the SDKs.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # --- Bedrock Converse (Claude / Anthropic) ----------------------------------
@@ -40,6 +41,34 @@ from typing import Any
 # VERBATIM. Bedrock is the authority on which values a given model accepts (it
 # varies per model — e.g. Opus 4.8 supports "xhigh"), so we keep NO client-side
 # allow-list that could reject a valid value.
+
+
+# Claude version extractor for the adaptive-thinking capability gate. Both id
+# shapes are covered: family-first (``claude-haiku-4-5-20251001``,
+# ``claude-opus-4-8-…``) and version-first (``claude-3-5-sonnet-20241022``).
+_CLAUDE_VERSION_RE = re.compile(r"claude-(?:[a-z]+-)?(\d+)[.-](\d+)")
+
+# Adaptive thinking (``thinking.type=adaptive`` + ``output_config.effort``)
+# arrived with the Claude 4.6 generation.
+_ADAPTIVE_SINCE = (4, 6)
+
+
+def converse_supports_adaptive(model: str) -> bool:
+    """Whether a Converse (Anthropic) id accepts the ADAPTIVE thinking shape.
+
+    Pre-adaptive generations (< 4.6 — Haiku 4.5, Sonnet 4.5, every 3.x) take
+    a token budget (``thinking.type=enabled`` + ``budget_tokens``) and REJECT
+    the adaptive form with a ``ValidationException`` — a caller that guesses
+    the encoding by family-name substring silently mis-encodes every other
+    pre-adaptive id. This predicate is the single owner of that generation
+    knowledge; callers pick ``thinking_budget`` vs effort off it. Unknown /
+    unparseable ids default to adaptive (current generations are the common
+    case, and a wrong guess there fails loudly at invoke time either way).
+    """
+    m = _CLAUDE_VERSION_RE.search(model)
+    if not m:
+        return True
+    return (int(m.group(1)), int(m.group(2))) >= _ADAPTIVE_SINCE
 
 
 def thinking_fields(effort: str, *, summarize: bool = False) -> dict[str, Any]:
@@ -144,14 +173,18 @@ DEFAULT_MANTLE_REGION = "us-east-2"
 # downgrades the model.
 #
 # "none"/"minimal" are the deliberate exception to that fallthrough: they mean
-# "this call is extraction, not reasoning" (a transcript pass, a rewrite), and
+# "this call is extraction/classification, not reasoning" (a transcript pass,
+# a rewrite, a policy judge), and
 # letting them reach the xhigh default would silently bill a max-reasoning run
-# for a job that wanted none. Both land on "low" — NOT on a literal floor
-# name, because the floor's NAME varies by model generation: older GPT-5.x
-# ids accept "minimal" but not "none", while gpt-5.6-luna accepts "none" and
-# 400s on "minimal" (LIVE-VERIFIED 2026-08-01: `'minimal' is not supported
-# ... Supported values are: 'none', 'low', 'medium', 'high', 'xhigh'`).
-# "low" is the lowest value accepted across the whole Mantle fleet.
+# for a job that wanted none. "none" passes VERBATIM: the whole GPT-5.6
+# Mantle fleet accepts it (LIVE-VERIFIED 2026-08-01 on gpt-5.6-luna:
+# `'minimal' is not supported ... Supported values are: 'none', 'low',
+# 'medium', 'high', 'xhigh'`), and the policy classifiers (judge + rewrite)
+# depend on a genuine no-reasoning pass — an older GPT-5.x id that rejects
+# the name fails loudly at invoke, which is the codebase's standing posture
+# (Bedrock/the catalog are the authority, no client-side allow-list).
+# "minimal" still floors to "low": Luna 400s on that name, so it has no
+# fleet-safe verbatim meaning.
 FLOOR_GPT_REASONING_EFFORT = "low"
 GPT_EFFORT_MAP = {
     "max": "max",
@@ -160,7 +193,7 @@ GPT_EFFORT_MAP = {
     "medium": "medium",
     "low": "low",
     "minimal": FLOOR_GPT_REASONING_EFFORT,
-    "none": FLOOR_GPT_REASONING_EFFORT,
+    "none": "none",
 }
 DEFAULT_GPT_REASONING_EFFORT = "xhigh"
 

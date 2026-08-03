@@ -503,6 +503,7 @@ class _StubChecker:
         fut = Future()
         if self._resolve:
             fut.set_result(self._note)
+        self.last_future = fut
         return fut
 
 
@@ -536,6 +537,34 @@ def test_policy_submit_failure_is_fail_open():
         _StubEngine(), policy_checker=_StubChecker(raise_on_submit=True)
     )
     assert isinstance(tool.func("SELECT SUM(x) FROM t"), dict)
+
+
+def test_engine_failure_cancels_the_pending_check():
+    # A query the engine rejected has no results the model can act on, so its
+    # racing check is cancelled — a still-queued fleet must not burn one of
+    # the turn's few judged-query budget units on SQL that never executed.
+    class _FailingEngine(_StubEngine):
+        def run(self, sql, *, default_database=None):
+            raise RuntimeError("SYNTAX_ERROR: line 1:8")
+
+    checker = _StubChecker(resolve=False)  # still queued → cancellable
+    tool = make_sql_tool(_FailingEngine(), policy_checker=checker)
+    out = tool.func("SELECT SUM(x) FROM t")
+    assert isinstance(out, str) and out.startswith("Error:")
+    assert checker.submitted == ["SELECT SUM(x) FROM t"]
+    assert checker.last_future.cancelled()
+
+
+def test_read_only_guard_failure_cancels_the_pending_check():
+    class _GuardedEngine(_StubEngine):
+        def run(self, sql, *, default_database=None):
+            raise ValueError("read-only: DELETE is not allowed")
+
+    checker = _StubChecker(resolve=False)
+    tool = make_sql_tool(_GuardedEngine(), policy_checker=checker)
+    out = tool.func("DELETE FROM t")
+    assert isinstance(out, str) and out.startswith("Error:")
+    assert checker.last_future.cancelled()
 
 
 def test_exploration_queries_never_wait_on_the_verdict():

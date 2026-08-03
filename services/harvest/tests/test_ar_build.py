@@ -12,6 +12,7 @@ import pytest
 from moto import mock_aws
 
 from harvest import ar_build
+from okf_aws import ar_policy
 from okf_aws.ar_policy import (
     ATTR_BUILD_STATUS,
     ATTR_PENDING_SOURCE_HASH,
@@ -89,14 +90,13 @@ def aws(monkeypatch):
             BillingMode="PAY_PER_REQUEST",
         )
         # The mapping row exists from dataset registration; every stamp is
-        # conditioned on it. Enrolled: reasoning is per-dataset OPT-IN.
+        # conditioned on it (authoring is always-on — no per-dataset opt-in).
         ddb.put_item(
             TableName=TABLE,
             Item={
                 **registry_key(DOMAIN, DATASET),
                 "data_domain": {"S": DOMAIN},
                 "dataset": {"S": DATASET},
-                "ar_enrolled": {"BOOL": True},
             },
         )
         yield s3, ddb
@@ -138,24 +138,22 @@ def test_disabled_flag_is_a_pure_no_op(monkeypatch):
 # --- gates ---------------------------------------------------------------------
 
 
-def test_unenrolled_dataset_costs_one_get_item(aws):
+def test_unregistered_dataset_costs_one_get_item(aws):
+    # The mapping row is gone (a dataset delete raced the finalize hook):
+    # authoring must not resurrect state — one GetItem, no S3 touch.
     s3, ddb = aws
-    ddb.update_item(
-        TableName=TABLE,
-        Key=registry_key(DOMAIN, DATASET),
-        UpdateExpression="REMOVE ar_enrolled",
-    )
+    ddb.delete_item(TableName=TABLE, Key=registry_key(DOMAIN, DATASET))
 
     class BrokenS3:
         def __getattr__(self, name):
-            raise AssertionError("an unenrolled dataset must never touch S3")
+            raise AssertionError("an unregistered dataset must never touch S3")
 
     author = FakeAuthor()
     out = ar_build.maybe_build_policy(
         data_domain=DOMAIN, dataset=DATASET,
         registry=(ddb, TABLE), s3=BrokenS3(), author=author,
     )
-    assert out == ar_build.OUTCOME_NOT_ENROLLED
+    assert out == ar_build.OUTCOME_UNREGISTERED
     assert author.calls == []
 
 
@@ -192,6 +190,29 @@ def test_ready_row_without_its_document_reauthors(aws):
     ) == GOOD_DOC.strip() or read_policy_doc(
         s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET
     )
+
+
+def test_ready_row_with_an_invalid_document_reauthors(aws):
+    # THE v3 migration path's last hop: the dispatchers (chat's check gate,
+    # the rebuild authority) treat a present-but-unparseable policies.yaml
+    # (e.g. a pre-split, type-less document) as needing re-authoring — if the
+    # skip gate here checked mere existence, the dataset would ping-pong
+    # between "rebuild!" and "unchanged" forever and never re-author.
+    s3, ddb = aws
+    assert _trigger(s3, ddb) == ar_build.OUTCOME_AUTHORED
+    ar_policy.put_policy_doc(
+        s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET,
+        doc_text=(
+            "policies:\n"
+            "  - id: P001\n"  # no `type`: pre-v3 shape, fails the parse
+            "    condition: c\n"
+            "    action: a\n"
+            "    source: references/usage_guardrails.md\n"
+        ),
+    )
+    author = FakeAuthor()
+    assert _trigger(s3, ddb, author=author) == ar_build.OUTCOME_AUTHORED
+    assert len(author.calls) == 1  # re-authored despite the matching fingerprint
 
 
 def test_building_row_locks_out_a_second_run(aws):

@@ -124,25 +124,48 @@ def test_disabled_flag_is_a_no_op(monkeypatch):
     )
 
 
-def test_unenrolled_dataset_costs_one_get_item(aws):
-    seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
-
+def test_unregistered_dataset_costs_one_get_item(aws):
+    # No mapping row at all (a late event, a duplicate that raced a dataset
+    # delete): one GetItem, no S3 touch, nothing dispatched or written.
     class BrokenS3:
         def __getattr__(self, name):
-            raise AssertionError("an unenrolled dataset must never touch S3")
+            raise AssertionError("an unregistered dataset must never touch S3")
 
     out = ar_rebuild.run_rebuild(
         DOMAIN, DATASET,
         ddb=_low(), table=REGISTRY_TABLE, s3=BrokenS3(), bucket=BUNDLE_BUCKET,
         agentcore=FakeAgentCore(), harvest_runtime_arn=RUNTIME_ARN,
     )
-    assert out == ar_rebuild.OUTCOME_NOT_ENROLLED
+    assert out == ar_rebuild.OUTCOME_UNREGISTERED
+
+
+def test_never_authored_dataset_dispatches_a_first_authoring(aws):
+    # THE manual-Sync backfill path: a registered dataset with a committed
+    # wiki but no policy state at all (predates the feature) must author on
+    # its first policy_rebuild event — always-on has no enrollment gate.
+    seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
+    _seed_sources(aws["s3"])
+    seed_ready_bundle(aws["s3"], data_domain=DOMAIN, dataset=DATASET)
+    agentcore = FakeAgentCore()
+    assert _run(aws, agentcore) == ar_rebuild.OUTCOME_INVOKED
+    assert len(agentcore.invocations) == 1
+
+
+def test_uncommitted_bundle_defers_to_the_finalize_hook(aws):
+    # Source files exist but no complete marker (a first harvest mid-write):
+    # dispatching would race the run — its own finalize hook authors at
+    # commit, so the event is a clean no-op.
+    seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
+    _seed_sources(aws["s3"])
+    agentcore = FakeAgentCore()
+    assert _run(aws, agentcore) == ar_rebuild.OUTCOME_NO_WIKI
+    assert agentcore.invocations == []
 
 
 def test_changed_fingerprint_dispatches_with_a_fresh_session_each_time(aws):
     seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
-    _set_ar_attrs(aws["ddb"], ar_enrolled=True)
     _seed_sources(aws["s3"])
+    seed_ready_bundle(aws["s3"], data_domain=DOMAIN, dataset=DATASET)
     agentcore = FakeAgentCore()
     assert _run(aws, agentcore) == ar_rebuild.OUTCOME_INVOKED
     assert _run(aws, agentcore) == ar_rebuild.OUTCOME_INVOKED
@@ -165,7 +188,6 @@ def test_unchanged_fingerprint_with_a_live_document_skips(aws):
     fresh = source_hash(aws["s3"], BUNDLE_BUCKET, DOMAIN, DATASET)
     _set_ar_attrs(
         aws["ddb"],
-        ar_enrolled=True,
         **{ATTR_BUILD_STATUS: BUILD_READY, ATTR_SOURCE_HASH: fresh},
     )
     agentcore = FakeAgentCore()
@@ -178,10 +200,10 @@ def test_missing_document_reauthors_even_at_a_matching_hash(aws):
     # write) must dispatch, not skip as unchanged.
     seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
     _seed_sources(aws["s3"])
+    seed_ready_bundle(aws["s3"], data_domain=DOMAIN, dataset=DATASET)
     fresh = source_hash(aws["s3"], BUNDLE_BUCKET, DOMAIN, DATASET)
     _set_ar_attrs(
         aws["ddb"],
-        ar_enrolled=True,
         **{ATTR_BUILD_STATUS: BUILD_READY, ATTR_SOURCE_HASH: fresh},
     )
     agentcore = FakeAgentCore()
@@ -193,7 +215,6 @@ def test_young_building_row_is_in_flight(aws):
     seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
     _set_ar_attrs(
         aws["ddb"],
-        ar_enrolled=True,
         **{
             ATTR_BUILD_STATUS: BUILD_BUILDING,
             "ar_build_started_at": datetime.now(timezone.utc).isoformat(),
@@ -211,10 +232,10 @@ def test_stalled_building_row_is_reaped_then_redispatched(aws):
     # the SAME call dispatches a fresh authoring run.
     seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
     _seed_sources(aws["s3"])
+    seed_ready_bundle(aws["s3"], data_domain=DOMAIN, dataset=DATASET)
     stale = datetime.now(timezone.utc) - timedelta(hours=2)
     _set_ar_attrs(
         aws["ddb"],
-        ar_enrolled=True,
         **{
             ATTR_BUILD_STATUS: BUILD_BUILDING,
             "ar_build_started_at": stale.isoformat(),
@@ -235,7 +256,7 @@ def test_current_artifact_with_a_lost_stamp_recovers_without_authoring(aws):
 
     seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
     _seed_sources(aws["s3"])
-    _set_ar_attrs(aws["ddb"], ar_enrolled=True, **{ATTR_BUILD_STATUS: "failed"})
+    _set_ar_attrs(aws["ddb"], **{ATTR_BUILD_STATUS: "failed"})
     from okf_aws.ar_policy import gather_sources
 
     persist_author_state(
@@ -262,9 +283,10 @@ def test_pre_v3_document_reauthors_despite_matching_fingerprint(aws):
 
     seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
     _seed_sources(aws["s3"])
+    seed_ready_bundle(aws["s3"], data_domain=DOMAIN, dataset=DATASET)
     fresh = source_hash(aws["s3"], BUNDLE_BUCKET, DOMAIN, DATASET)
     _set_ar_attrs(
-        aws["ddb"], ar_enrolled=True,
+        aws["ddb"],
         **{ATTR_BUILD_STATUS: "ready", ATTR_SOURCE_HASH: fresh},
     )
     persist_author_state(
@@ -280,8 +302,8 @@ def test_pre_v3_document_reauthors_despite_matching_fingerprint(aws):
 
 def test_no_runtime_configured_is_an_error_not_a_crash(aws):
     seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
-    _set_ar_attrs(aws["ddb"], ar_enrolled=True)
     _seed_sources(aws["s3"])
+    seed_ready_bundle(aws["s3"], data_domain=DOMAIN, dataset=DATASET)
     out = ar_rebuild.run_rebuild(
         DOMAIN, DATASET,
         ddb=_low(), table=REGISTRY_TABLE, s3=aws["s3"], bucket=BUNDLE_BUCKET,
@@ -302,7 +324,7 @@ def _reconcile(aws, agentcore=None):
     )
 
 
-def _seed_enrolled_ready(aws, *, stored_hash=None, status=BUILD_READY):
+def _seed_policy_ready(aws, *, stored_hash=None, status=BUILD_READY):
     seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
     _seed_sources(aws["s3"])
     seed_ready_bundle(aws["s3"], data_domain=DOMAIN, dataset=DATASET)
@@ -310,7 +332,6 @@ def _seed_enrolled_ready(aws, *, stored_hash=None, status=BUILD_READY):
     fresh = source_hash(aws["s3"], BUNDLE_BUCKET, DOMAIN, DATASET)
     _set_ar_attrs(
         aws["ddb"],
-        ar_enrolled=True,
         **{
             ATTR_BUILD_STATUS: status,
             ATTR_SOURCE_HASH: stored_hash or fresh,
@@ -318,8 +339,11 @@ def _seed_enrolled_ready(aws, *, stored_hash=None, status=BUILD_READY):
     )
 
 
-def test_reconcile_skips_current_and_unenrolled_datasets(aws):
-    _seed_enrolled_ready(aws)
+def test_reconcile_skips_current_and_never_authored_datasets(aws):
+    # hr/people has a registered row but no ar_build_status: the nightly pass
+    # must NOT backfill it (its first document is a Sync/harvest/repromote
+    # decision, never a silent fleet-wide sweep) — it isn't even counted.
+    _seed_policy_ready(aws)
     seed_mapping(aws["ddb"], data_domain="hr", dataset="people", glue_database="db2")
     summary = _reconcile(aws)
     assert summary == {
@@ -329,7 +353,7 @@ def test_reconcile_skips_current_and_unenrolled_datasets(aws):
 
 
 def test_reconcile_dispatches_moved_stale_and_docless_datasets(aws):
-    _seed_enrolled_ready(aws, stored_hash="stale-fingerprint")
+    _seed_policy_ready(aws, stored_hash="stale-fingerprint")
     agentcore = FakeAgentCore()
     summary = _reconcile(aws, agentcore)
     assert summary["rebuilt"] == 1
@@ -338,13 +362,13 @@ def test_reconcile_dispatches_moved_stale_and_docless_datasets(aws):
 
 
 def test_reconcile_flags_stale_status_even_at_matching_hash(aws):
-    _seed_enrolled_ready(aws, status=BUILD_STALE)
+    _seed_policy_ready(aws, status=BUILD_STALE)
     summary = _reconcile(aws)
     assert summary["rebuilt"] == 1
 
 
 def test_reconcile_reauthors_when_the_document_is_missing(aws):
-    _seed_enrolled_ready(aws)
+    _seed_policy_ready(aws)
     aws["s3"].delete_object(
         Bucket=BUNDLE_BUCKET, Key=policy_doc_key(DOMAIN, DATASET)
     )
@@ -353,7 +377,7 @@ def test_reconcile_reauthors_when_the_document_is_missing(aws):
 
 
 def test_reconcile_reaps_abandoned_building_rows(aws):
-    _seed_enrolled_ready(aws)
+    _seed_policy_ready(aws)
     stale = datetime.now(timezone.utc) - timedelta(hours=2)
     _set_ar_attrs(
         aws["ddb"],
@@ -370,7 +394,7 @@ def test_reconcile_reaps_abandoned_building_rows(aws):
 
 
 def test_reconcile_leaves_young_building_rows_alone(aws):
-    _seed_enrolled_ready(aws)
+    _seed_policy_ready(aws)
     _set_ar_attrs(
         aws["ddb"],
         **{
@@ -382,9 +406,11 @@ def test_reconcile_leaves_young_building_rows_alone(aws):
     assert summary["in_flight"] == 1 and summary["rebuilt"] == 0
 
 
-def test_reconcile_never_backfills_an_unready_bundle(aws):
+def test_reconcile_never_dispatches_over_an_unready_bundle(aws):
+    # Lifecycle begun (a failed first build) but the bundle lost its commit
+    # marker (a re-harvest mid-write): the sweep must not race the run.
     seed_mapping(aws["ddb"], data_domain=DOMAIN, dataset=DATASET, glue_database="db")
-    _set_ar_attrs(aws["ddb"], ar_enrolled=True)
+    _set_ar_attrs(aws["ddb"], **{ATTR_BUILD_STATUS: "failed"})
     _seed_sources(aws["s3"])  # sources exist but no commit marker
     summary = _reconcile(aws)
     assert summary["skipped"] == 1 and summary["rebuilt"] == 0

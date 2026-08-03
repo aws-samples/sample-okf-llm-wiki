@@ -205,9 +205,19 @@ author gate refuses dead pages). Count backstop `OKF_POLICY_MAX_RULES`
 **Migration is the self-heal**: a pre-split document (no `type`) fails the
 parse, which flags the row stale and re-authors it — no code path needed.
 
-**Authoring lifecycle.** Enrollment is per-dataset OPT-IN (`ar_enrolled` on
-the mapping row, set from the Reasoning page). Authoring runs on the harvest
-runtime — at harvest finalize (best-effort, AFTER the commit marker) and on
+**Authoring lifecycle.** ALWAYS ON per dataset (the v1-era `ar_enrolled`
+opt-in is retired; the only switch left is the deploy-wide
+`OKF_POLICY_BUILD_ENABLED`). The triggers, not a flag, bound the work: the
+harvest finalize hook authors on every committed bundle change (full,
+incremental, annotation), `policy_rebuild` events cover the rest (the
+Reasoning page's manual Sync, the repromote accelerator — which also
+first-authors a dataset restored to a version without a document — and the
+chat check's stale discovery), and the nightly reconcile re-verifies ONLY
+datasets whose lifecycle has begun (`ar_build_status` present). A dataset
+predating the feature is therefore never bulk-backfilled: its first document
+comes from a manual Sync, its next harvest/increment, or a repromote.
+Authoring runs on the harvest runtime — at harvest finalize (best-effort,
+AFTER the commit marker) and on
 `mode="ar_rules"` dispatches — as a small ReAct agent with full reasoning
 (`harvest.ar_author`): it reads the sources (with per-file unified diffs
 against the previous authoring's copies), then submits through a validating
@@ -220,9 +230,9 @@ a stale-on-arrival document, never a mislabelled one). Authoring IS
 completion — there is no build workflow and no completion authority.
 
 **The rebuild authority** (`incremental.ar_rebuild`, reached by
-`policy_rebuild` events and the opt-in nightly reconcile) makes only
-deterministic decisions: enrollment/fingerprint checks, re-dispatch on
-change/missing document, **reaping** rows stalled at `building` past a 1h
+`policy_rebuild` events and the nightly reconcile) makes only
+deterministic decisions: registration/bundle-ready/fingerprint checks,
+re-dispatch on change/missing document, **reaping** rows stalled at `building` past a 1h
 grace period, and a **deterministic recovery** — when the persisted document's
 sources manifest fingerprint matches the live wiki but the ready stamp was
 lost, it re-stamps instead of re-authoring. Dispatches always mint a FRESH
@@ -248,18 +258,19 @@ policy/<data_domain>/<dataset>/
                            #   policies.yaml (stable ids), not a rewrite
 ```
 
-All derived and rebuildable from the bundle; deleting a dataset (or
-unenrolling) purges the prefix.
+All derived and rebuildable from the bundle; deleting a dataset purges the
+prefix.
 
 **Per-dataset state lives on the registry `DATASET#` row** (`pk =
 "DOMAIN#<data_domain>"`, `sk = "DATASET#<dataset>"` — the mapping row), as
-flat scalars: `{ar_enrolled, ar_build_status, ar_source_hash,
-ar_pending_source_hash, ar_build_started_at, ar_built_at, ar_build_detail}`.
-Statuses: `building` (the lease) / `ready` / `failed` / `stale`. The exact
-attr set is `okf_aws.ar_policy.AR_ROW_ATTRS` (which also lists retired
-v1-era attrs so unenrolling a legacy row cleans it completely) — unenrollment
-REMOVEs exactly this set, so "not enrolled" and "never enrolled" are
-indistinguishable.
+flat scalars: `{ar_build_status, ar_source_hash, ar_pending_source_hash,
+ar_build_started_at, ar_built_at, ar_build_detail}`.
+Statuses: `building` (the lease) / `ready` / `failed` / `stale`. An absent
+`ar_build_status` means the lifecycle has never begun — the reconcile skips
+such rows (no bulk backfill) and the chat check's dataset discovery ignores
+them. Retired attrs (`ar_enrolled`, the v1 Bedrock AR set) may linger on
+rows written by older deploys; nothing reads them, and dataset deletion
+removes the row itself.
 
 **The document is a DERIVED artifact of the bundle, exactly like the vector
 index.** S3 markdown is the only truth; a document authored from anything but
@@ -292,10 +303,15 @@ REMOVED; the shield timeline steps are the only policy surface):
   parallel tool-called queries, a behavioural eval alongside — must not
   serialize while their callers' wait budgets burn). Fleet mechanics are
   shared: policies shard ≤
-  `OKF_CHAT_POLICY_SHARD_SIZE` (default 10) per mini-judge; judges run with
-  shallow reasoning (`OKF_CHAT_POLICY_JUDGE_EFFORT`, default `low`; an
-  8000-token thinking budget on a pre-adaptive Converse id like Haiku 4.5)
-  and answer through exactly ONE enforced tool, `report_violations`, whose
+  `OKF_CHAT_POLICY_SHARD_SIZE` (default 10) per mini-judge, packed by
+  SOURCE page (`shard_policies` keeps one wiki page's policies in one
+  judge's shard — shared vocabulary/context; a group never straddles a
+  boundary, so grouping can cost an extra shard); judges are CLASSIFIERS on
+  EVERY family — thinking OFF + temperature 0 on a Converse (Anthropic) id,
+  reasoning `"none"` on an openai.* id — with a FORCED `report_violations`
+  tool choice (legal on Anthropic exactly because thinking is off), single
+  fast pass. They answer
+  through exactly ONE tool, `report_violations`, whose
   contract is **violated policy IDS ONLY** — no evidence, no explanations
   (saves judge output tokens, and the reminder the main agent reads is built
   from the AUTHORED policy text — condition/action/source — so judge prose
@@ -308,12 +324,18 @@ REMOVED; the shield timeline steps are the only policy surface):
 
 **The rolling curated question** (both tracks judge against it): turn 1 is
 the raw question at zero model cost — but it is still PERSISTED as the
-curated question (the seed the next turn chains from; the same path covers
-enabling policy MID-conversation, which starts a fresh chain at that turn
-rather than re-reading history). A later turn runs ONE minimal-effort
+curated question (the seed the next turn chains from). Curation runs on
+EVERY gated turn, armed or not (the checker is built whenever the deploy
+gate is on; an unarmed run's checker exists solely as the chain's keeper),
+so enabling Policy mid-conversation chains from real state instead of
+starting over. A later turn runs ONE minimal-effort
 rewrite — (previous curated question, previous final answer, current raw
-question) → curated question — kicked on the turn's first submitted query so
-it races the query's own execution; a previous ANSWER alone (an armed turn
+question) → curated question — kicked ASYNC at run start (the server's
+`prewarm()`, right after any clarification fold) so it races the model's
+own thinking and the queries; **evaluators never wait on it** — a verdict
+fired before the rewrite lands judges against the raw question, and the
+rewrite still persists in the background for the next turn. A previous
+ANSWER alone (an armed turn
 that ran no SQL never seeded the question) still triggers the rewrite. An answered `ask_human` clarification IS
 folded in, inline within the turn (the resume rebuilds the agent; the server
 hands the checkpoint's raw question + the Q&A to the fresh checker, which
@@ -333,18 +355,24 @@ raw-question (turn-1) semantics.
   database, so the model must schema-qualify every table — the checker reads
   the schemas in FROM/JOIN position (`extract_sql_schemas`; aliases, CTE
   names, string literals, and comments can't match) and resolves them
-  against the enrolled datasets' Glue map (`glue_database` attr, dataset id
-  fallback — same contract as scope enrichment; one filtered registry scan,
-  cached per turn). A cross-dataset join is judged against each matched
-  dataset; a query touching only un-enrolled data is skipped for free.
+  against the policy-bearing datasets' Glue map (`ar_build_status` present;
+  `glue_database` attr, dataset id fallback — same contract as scope
+  enrichment; one filtered registry scan, cached per turn). A cross-dataset
+  join is judged against each matched dataset; a query touching only
+  policy-less data is skipped for free.
 - **Race, don't block**: `run_sql` submits the check before dispatching the
   query (the judges spend the query's own execution time), then waits at most
   `OKF_CHAT_POLICY_QUERY_TIMEOUT_S` (default 60) AFTER the results are back —
   but ONLY for analytical queries (`should_wait`); exploration probes submit
-  without waiting, and the turn's FIRST query warms the cold start (judge
-  model, curated-question rewrite, freshness gate, enrolled-dataset map) in
-  the worker so the first analytical verdict isn't spent on setup. A verdict
-  that isn't ready in time is dropped — advisory, never a bottleneck.
+  without waiting. The cold start is PREWARMED at run start (the server
+  calls `checker.prewarm()` right after the clarification fold): each piece
+  — judge-model build, the curated-question rewrite, the freshness gate /
+  policy-dataset map — is its own parallel pool task behind its own
+  once-guard, and **nothing ever waits on the rewrite**: evaluators fire
+  the moment they are triggered and take the curated question only if it
+  has already landed, else the turn's raw question (`_curated_now`). A
+  verdict that isn't ready in time is dropped — advisory, never a
+  bottleneck.
 - **Exploration is free**: a deterministic structural gate
   (`is_analytical_sql`) judges only queries that compute something the
   policies govern (aggregates, windows, joins, unions). Row peeks, DISTINCT
@@ -381,9 +409,10 @@ invalidation, never a user bubble on reload), surfacing as the same typed
 `policy` chunk / shield step. The wait is the delivery guarantee: the model
 step right after an analytical batch is usually the one that writes the
 FINAL answer, so a fire-and-forget eval loses that race and its verdict
-never reaches the model at all (observed live 2026-08-02). The middleware's
-FIRST hook pre-warms the checker (model build, curated rewrite, gates), so
-the wait is normally just the fleet. A verdict slower than the budget rolls
+never reaches the model at all (observed live 2026-08-02). The checker is
+prewarmed at run start (see "Race, don't block" above; the middleware's
+first hook remains a second, idempotent caller), so the wait is normally
+just the fleet. A verdict slower than the budget rolls
 to the next hook, or drops at turn end (advisory, logged). One eval in
 flight at a time; a policy flagged once this turn is never re-flagged (no
 nagging).
@@ -398,27 +427,24 @@ the results/turn untouched.
 **Control API routes** (Cognito-authed, same Lambda):
 
 - `GET /reasoning/{domain}/{dataset}` — everything the Reasoning page renders:
-  enrollment, status, `up_to_date` (the fingerprint gate for humans), the
+  `wiki_ready`, status, `up_to_date` (the fingerprint gate for humans), the
   live source list, and the document's policies (id/condition/action/source).
-- `PUT /reasoning/{domain}/{dataset}/enrollment` `{enrolled}` — **enroll**
-  (flag + one `policy_rebuild` event; refused without a complete wiki) or
-  **unenroll** (delete semantics: the `policy/` prefix + every `ar_*` attr;
-  refused while an authoring run is in flight — `building ⇒ enrolled` always
-  holds).
-- `POST /reasoning/{domain}/{dataset}/sync` — the manual fail-safe: one
-  `policy_rebuild` event. The rebuild authority's iff-changed skip makes
-  syncing a current document a clean no-op; a stalled `building` row is
-  reaped and re-dispatched, and a lost ready-stamp is deterministically
-  recovered.
+- `POST /reasoning/{domain}/{dataset}/sync` — one `policy_rebuild` event
+  (refused without a complete wiki). Doubles as the manual FIRST authoring
+  for a dataset predating the feature (there is no bulk backfill) and as the
+  fail-safe when an automatic trigger was missed. The rebuild authority's
+  iff-changed skip makes syncing a current document a clean no-op; a stalled
+  `building` row is reaped and re-dispatched, and a lost ready-stamp is
+  deterministically recovered.
 - `GET /reasoning/{domain}/{dataset}/document` — `{exists, text}`: the live
-  `policies.yaml` for the page's viewer (a separate endpoint because the
-  status call is polled during authoring).
+  `policies.yaml` verbatim (kept for raw API access; the UI page renders the
+  parsed per-guardrail list from the status call instead).
 
 **The `policy_rebuild` event** (`okf_core.policy_rebuild`): custom source
 `okf.policy`, detail-type `policy_rebuild`, detail
 `{data_domain, dataset, reason?}`. Rides the SAME EventBridge → SQS →
 incremental-handler path as the Glue events. Published by the Control API
-(enroll / manual sync / repromote) and the chat runtime (stale discovery).
+(manual sync / repromote) and the chat runtime (stale discovery).
 Duplicates are harmless: the runtime's conditional `building` flip collapses
 them. Events are a freshness ACCELERATOR; the fingerprint gate is
 correctness.
@@ -461,13 +487,14 @@ attrs `{data_domain, dataset, source, glue_database, created_at}` plus optional
 dataset-guidance attrs `{guidance, guidance_updated_at, guidance_applied_version}`
 (shared authoring instructions; see `okf_core.guidance` + the harvest payload's
 `dataset_guidance` above) plus the optional **policy-check** attrs
-(`ar_policy_arn`, `ar_policy_version`, `ar_guardrail_id`, `ar_guardrail_version`,
-`ar_build_workflow_id`, `ar_build_status`, `ar_built_at`, `ar_bundle_version`,
-`ar_source_hash`, `ar_pending_source_hash`, `ar_fidelity_coverage`,
-`ar_fidelity_accuracy` — the build state and lease described under "Automated
-checks (LLM-judge engine)" above). Requires a
-pre-existing `META` row for the same `pk` (enforced by `assert_domain_declared`
-in the upsert adapter).
+(`ar_build_status`, `ar_source_hash`, `ar_pending_source_hash`,
+`ar_build_started_at`, `ar_built_at`, `ar_build_detail` — the build state and
+lease described under "Policy checks (LLM-judge engine)" above; retired
+attrs like `ar_enrolled` or the v1-era `ar_policy_arn`/`ar_guardrail_id` may
+linger on legacy rows — nothing reads them, and deleting the dataset deletes
+the row).
+Requires a pre-existing `META` row for the same `pk` (enforced by
+`assert_domain_declared` in the upsert adapter).
 
 A legacy `recursive_improvement` map may still sit on old `DATASET#` rows; it is
 **dead** — the in-harvest recursive-improvement loop is retired (harvests never
@@ -1210,8 +1237,8 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_WEB_SEARCH_TOOL_NAME` | the gateway-side tool name, `<target-name>___WebSearch` (AgentCore prefixes every tool with its target's name, joined by THREE underscores). Set by Terraform to save a round trip; empty → the runtime discovers it via `tools/list` and caches it |
 | `OKF_WEB_SEARCH_MAX_RESULTS` | default results per search when the agent doesn't pick a count via the tool's `max_results` arg (default `10`; 1–25). There is no date parameter — the connector ranks by relevance and the agent steers time through the query text, reading each result's `publishedDate` |
 | `OKF_CHAT_POLICY_CHECK_ENABLED` | (chat runtime) `"true"` → the mid-turn policy checks may be armed per run via `features: ["sql", "policy:*"]` (default `false`). Unset → no checker is ever constructed, whatever the client sends — the master gate above the per-run opt-in, set from `var.enable_policy_checks` |
-| `OKF_CHAT_POLICY_CHECK_MODEL` | (chat runtime) the policy checks' model id, serving BOTH the curated-question rewrite (minimal effort — extraction) and the JUDGE fleets (reasoning ON but shallow). Default `openai.gpt-5.6-luna`, from `var.chat_policy_check_model` — which also drives the chat role's Mantle grants, so an openai.* value needs no extra wiring. Code-level companions (env-read, not Terraform-plumbed): `OKF_CHAT_POLICY_JUDGE_EFFORT` (default `low`; a pre-adaptive Converse id like Haiku 4.5 instead gets a fixed 8000-token thinking budget), `OKF_CHAT_POLICY_SHARD_SIZE` (default `10` — policies per mini-judge), `OKF_CHAT_POLICY_QUERY_TIMEOUT_S` (default `60` — residual wait after the query returns) and `OKF_CHAT_POLICY_QUERY_MAX_PER_TURN` (default `3` — judged analytical queries per turn). Deploy-time only — deliberately NOT validated against `OKF_CHAT_MODEL_CATALOG`, which is the trust boundary for CLIENT-supplied models |
-| `OKF_POLICY_PREPROCESS_MODEL` | (harvest runtime) model id for the `policies.yaml` AUTHORING AGENT (`harvest.ar_author` — full reasoning; policy distillation is judgment work). Default `openai.gpt-5.6-luna`, from `var.policy_preprocess_model`, which also drives the harvest role's Mantle grants. Code-level companions (env-read, not Terraform-plumbed): `OKF_POLICY_AUTHOR_EFFORT` (default `xhigh`), `OKF_POLICY_AUTHOR_THINKING_BUDGET` (pre-adaptive models like Haiku 4.5 — e.g. `48000`), and `OKF_POLICY_MAX_RULES` (default `60` — the author gate's policy-count BACKSTOP against enumeration pathology; the prompt's proportionality guidance, not this cap, is what sizes a document to its dataset). The incremental Lambda runs NO models: authoring dispatches to the runtime |
+| `OKF_CHAT_POLICY_CHECK_MODEL` | (chat runtime) the policy checks' model id, serving BOTH the curated-question rewrite (no reasoning pass — extraction) and the JUDGE fleets. Default `global.anthropic.claude-sonnet-5` — judges run classifier-style on every family (thinking off + temperature 0 on Anthropic, reasoning `"none"` on openai.* ids like `openai.gpt-5.6-terra`, forced `report_violations` either way); from `var.chat_policy_check_model`, which also drives the chat role's Mantle grants, so an openai.* value needs no extra wiring. Code-level companions (env-read, not Terraform-plumbed): `OKF_CHAT_POLICY_SHARD_SIZE` (default `10` — policies per mini-judge), `OKF_CHAT_POLICY_QUERY_TIMEOUT_S` (default `60` — residual wait after the query returns) and `OKF_CHAT_POLICY_QUERY_MAX_PER_TURN` (default `3` — judged analytical queries per turn). Deploy-time only — deliberately NOT validated against `OKF_CHAT_MODEL_CATALOG`, which is the trust boundary for CLIENT-supplied models |
+| `OKF_POLICY_PREPROCESS_MODEL` | (harvest runtime) model id for the `policies.yaml` AUTHORING AGENT (`harvest.ar_author` — full reasoning; policy distillation is judgment work). Default `global.anthropic.claude-sonnet-5`, from `var.policy_preprocess_model`, which also drives the harvest role's Mantle grants. Code-level companions (env-read, not Terraform-plumbed): `OKF_POLICY_AUTHOR_EFFORT` (default `high`), `OKF_POLICY_AUTHOR_THINKING_BUDGET` (pre-adaptive models like Haiku 4.5 — e.g. `48000`), and `OKF_POLICY_MAX_RULES` (default `60` — the author gate's policy-count BACKSTOP against enumeration pathology; the prompt's proportionality guidance, not this cap, is what sizes a document to its dataset). The incremental Lambda runs NO models: authoring dispatches to the runtime |
 | `VITE_CHAT_POLICY_CHECK` | (UI, from `ui_env`) shows the composer's Policy feature (the "+" menu field with Computational / Behavioural / Strict) and the Reasoning sidebar page. Defaults ON — only the literal `"false"` hides them (an unset var must not silently drop the affordance). A DISPLAY gate only, same pattern as `VITE_CHAT_SQL_ENABLED`; the server-side `OKF_CHAT_POLICY_CHECK_ENABLED` + feature normalization are the real boundary |
 
 ## HTTP and auth

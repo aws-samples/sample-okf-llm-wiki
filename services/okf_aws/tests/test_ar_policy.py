@@ -241,24 +241,22 @@ def test_flag_stale_only_moves_usable_rows(aws):
     assert not ap.flag_stale(ddb, TABLE, data_domain=DOMAIN, dataset=DATASET)
 
 
-def test_enrollment_round_trip_and_full_cleanup(aws):
+def test_lifecycle_begun_reads_the_build_status(aws):
+    # The single "has this dataset started the policy lifecycle?" reader: the
+    # nightly reconcile's no-backfill skip and the chat check's dataset
+    # discovery both key off exactly this shape.
     _, ddb = aws
-    assert not ap.is_enrolled(_row(ddb))
-    ap.set_enrolled(ddb, TABLE, data_domain=DOMAIN, dataset=DATASET)
-    assert ap.is_enrolled(_row(ddb))
+    assert not ap.lifecycle_begun(None)
+    assert not ap.lifecycle_begun({})
+    assert not ap.lifecycle_begun(_row(ddb))  # registered, never authored
     ap.try_flip_building(
         ddb, TABLE, data_domain=DOMAIN, dataset=DATASET, pending_hash="h"
     )
+    assert ap.lifecycle_begun(_row(ddb))
     ap.stamp_ready(ddb, TABLE, data_domain=DOMAIN, dataset=DATASET, fingerprint="h")
-    # Every attribute the feature stamps must be in the cleanup set — a stamp
-    # outside AR_ROW_ATTRS would survive unenrollment as a zombie.
-    stamped = {k for k in _row(ddb) if k.startswith("ar_")}
-    assert stamped <= set(ap.AR_ROW_ATTRS)
-    ap.clear_ar_attrs(ddb, TABLE, data_domain=DOMAIN, dataset=DATASET)
-    row = _row(ddb)
-    assert not any(k.startswith("ar_") for k in row)
-    assert row.get("data_domain")  # the mapping row itself survives
-    assert not ap.is_enrolled(row)
+    assert ap.lifecycle_begun(_row(ddb))
+    ap.stamp_build_failed(ddb, TABLE, data_domain=DOMAIN, dataset=DATASET, reason="r")
+    assert ap.lifecycle_begun(_row(ddb))  # failed still counts: it retries
 
 
 def test_author_prompt_speaks_yaml_and_id_stability():

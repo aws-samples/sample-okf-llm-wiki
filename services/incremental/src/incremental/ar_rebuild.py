@@ -3,7 +3,7 @@
 The harvest finalize hook can only act while a harvest is running — this module
 is the other half of the policy-document lifecycle, reached by
 ``policy_rebuild`` events (EventBridge -> the same SQS queue as the Glue
-events; published by the Control API's repromote/enroll/sync paths and by the
+events; published by the Control API's repromote/sync paths and by the
 chat runtime's stale discovery) and by the nightly reconcile.
 
 The Lambda itself makes only DETERMINISTIC decisions; the authoring agent
@@ -18,9 +18,15 @@ on the harvest runtime:
   died mid-authoring) is stamped ``failed`` so the fingerprint check can
   re-dispatch it; a young ``building`` row is left alone.
 
-Everything is gated on ``OKF_POLICY_BUILD_ENABLED`` (default off) and on the
-per-dataset ``ar_enrolled`` opt-in, with per-dataset try/except so one broken
-dataset never blocks the rest.
+Everything is gated on ``OKF_POLICY_BUILD_ENABLED`` (default off); there is no
+per-dataset opt-in — the policy document is an always-on derived artifact.
+What keeps that from turning into a deploy-time fleet-wide backfill is the
+TRIGGER set, not a flag: events only arrive for datasets someone acted on (a
+manual Sync, a repromote, the chat check's stale discovery), and the nightly
+reconcile re-verifies only datasets whose policy lifecycle has BEGUN
+(``ar_build_status`` present) — a pre-existing dataset authors its first
+document on its first Sync/harvest/repromote, never spontaneously. Per-dataset
+try/except so one broken dataset never blocks the rest.
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ from okf_aws.ar_policy import (
     USABLE_BUILD_STATUSES,
     gather_sources,
     hash_sources,
-    is_enrolled,
+    lifecycle_begun,
     read_policy_doc,
     read_sources_manifest,
     registry_key,
@@ -58,7 +64,8 @@ _ABANDONED_AFTER = timedelta(hours=1)
 
 # run_rebuild outcomes — grep-compatible with the harvest trigger's vocabulary.
 OUTCOME_DISABLED = "disabled"
-OUTCOME_NOT_ENROLLED = "not_enrolled"
+OUTCOME_UNREGISTERED = "unregistered"
+OUTCOME_NO_WIKI = "no_wiki"
 OUTCOME_NO_SOURCES = "no_sources"
 OUTCOME_UNCHANGED = "unchanged"
 OUTCOME_RECOVERED = "recovered"  # artifact was current; only the stamp was lost
@@ -126,12 +133,12 @@ def _run_rebuild(
     agentcore: Any,
     harvest_runtime_arn: str,
 ) -> str:
-    # Enrollment first (the per-dataset opt-in from the Reasoning page): a
-    # rebuild event for an unenrolled dataset — a late event, a duplicate that
-    # raced an unenroll — must cost one GetItem and change nothing.
+    # Registration first: a rebuild event for a dataset with no mapping row —
+    # a late event, a duplicate that raced a dataset delete — must cost one
+    # GetItem and change nothing.
     item = _read_row(ddb, table, data_domain=data_domain, dataset=dataset)
-    if not is_enrolled(item):
-        return OUTCOME_NOT_ENROLLED
+    if not item:
+        return OUTCOME_UNREGISTERED
     status = _s(item, ATTR_BUILD_STATUS)
     stored_hash = _s(item, ATTR_SOURCE_HASH)
 
@@ -180,6 +187,14 @@ def _run_rebuild(
         )
         log.info("policy document recovered for %s/%s", data_domain, dataset)
         return OUTCOME_RECOVERED
+
+    # Only bundles a full harvest has committed get policies. This is also
+    # what a first-authoring event (a manual Sync on a never-authored
+    # dataset, a repromote) rides through — no lifecycle gate here — while an
+    # event landing mid-(re)harvest defers to the finalize hook, which
+    # authors at commit anyway.
+    if not is_bundle_ready(s3, bucket, data_domain, dataset):
+        return OUTCOME_NO_WIKI
 
     return _dispatch_authoring(
         data_domain, dataset,
@@ -253,14 +268,17 @@ def reconcile_policies(
     agentcore: Any = None,
     harvest_runtime_arn: str = "",
 ) -> dict[str, Any]:
-    """The nightly pass: reap stalls, then hash-verify every enrolled dataset.
+    """The nightly pass: reap stalls, then hash-verify every policy-bearing dataset.
 
-    Walks every ENROLLED ``DATASET#`` registry row (ALL sources, not just Glue
-    — a Redshift-backed dataset gets a policy too; unenrolled datasets are the
-    steady state and aren't even counted). Per-dataset errors are counted and
-    logged, never propagated: one broken dataset must not block the rest.
-    Returns ``{datasets, rebuilt, recovered, in_flight, reaped, skipped,
-    errors}``.
+    Walks every ``DATASET#`` registry row whose policy lifecycle has BEGUN
+    (``ar_build_status`` present; ALL sources, not just Glue — a
+    Redshift-backed dataset gets a policy too). Never-authored datasets are
+    deliberately not backfilled — their first document comes from a manual
+    Sync, the next harvest/increment's finalize hook, or a repromote; this
+    sweep only keeps already-authored documents honest. Per-dataset errors
+    are counted and logged, never propagated: one broken dataset must not
+    block the rest. Returns ``{datasets, rebuilt, recovered, in_flight,
+    reaped, skipped, errors}``.
     """
     summary = {
         "datasets": 0,
@@ -276,8 +294,8 @@ def reconcile_policies(
         dataset = _s(item, "dataset")
         if not data_domain or not dataset:
             continue
-        if not is_enrolled(item):
-            continue
+        if not lifecycle_begun(item):
+            continue  # never authored: no silent backfill
         summary["datasets"] += 1
         try:
             status = _s(item, ATTR_BUILD_STATUS)
@@ -302,8 +320,8 @@ def reconcile_policies(
             )
             # Parse gate mirrors run_rebuild: a schema-invalid document (a
             # pre-v3 one without `type` fields) counts as missing, so the
-            # nightly sweep migrates every enrolled dataset to the current
-            # format without anyone clicking anything.
+            # nightly sweep migrates every policy-bearing dataset to the
+            # current format without anyone clicking anything.
             doc_ok = _doc_parses(doc)
             if (
                 status in USABLE_BUILD_STATUSES
@@ -323,8 +341,8 @@ def reconcile_policies(
                 )
                 summary["recovered"] += 1
                 continue
-            # Only bundles a full harvest has committed get policies — the
-            # backfill path must not race a first harvest mid-author.
+            # Only bundles a full harvest has committed get policies — never
+            # race a (re)harvest mid-write; its finalize hook re-authors.
             if not is_bundle_ready(s3, bucket, data_domain, dataset):
                 summary["skipped"] += 1
                 continue

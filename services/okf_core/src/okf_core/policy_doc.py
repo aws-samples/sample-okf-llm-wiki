@@ -106,7 +106,12 @@ def parse_policies(text: str | bytes) -> list[dict[str, str]]:
                     f"{where} is missing a non-empty `{field}` "
                     f"(required fields: {', '.join(_REQUIRED)})"
                 )
-            entry[field] = value.strip()
+            # Collapse ALL internal whitespace (YAML block scalars legally
+            # carry embedded newlines): every consumer — the judge shard
+            # rendering, the reminder lines, the UI's line-oriented display
+            # slice — treats a field as ONE line, so single-line is enforced
+            # here, at the format's source of truth, not per consumer.
+            entry[field] = " ".join(value.split())
         if not POLICY_ID_RE.fullmatch(entry["id"]):
             raise PolicyDocError(
                 f"{where} id {entry['id']!r} must match P<number> (e.g. P001)"
@@ -181,10 +186,39 @@ def policies_of_type(
 def shard_policies(
     policies: list[dict[str, str]], size: int = DEFAULT_SHARD_SIZE
 ) -> list[list[dict[str, str]]]:
-    """Split entries into judge-sized shards, order-preserving."""
+    """Split entries into judge-sized shards, keeping same-``source`` groups whole.
+
+    Policies distilled from ONE wiki page share vocabulary and context (the
+    same enum, the same recipe, the same known issue), so a judge reasons
+    over them as a coherent set — a plain positional slice can scatter one
+    page's policies across shards, wasting exactly that coherence. Shards
+    are therefore packed from whole source-groups: groups keep the
+    document's first-appearance order (stable within a group), a group
+    moves to a fresh shard rather than straddling a boundary, and only a
+    group larger than ``size`` itself is split. Packing whole groups can
+    yield MORE shards than a positional ceil(n/size) slice — deliberate:
+    an extra shard is one more parallel judge call; a fragmented source
+    group is a judgment-quality loss on every call.
+    """
     if size < 1:
         raise ValueError("shard size must be >= 1")
-    return [policies[i : i + size] for i in range(0, len(policies), size)]
+    groups: dict[str, list[dict[str, str]]] = {}
+    for policy in policies:
+        groups.setdefault(str(policy.get("source") or ""), []).append(policy)
+    shards: list[list[dict[str, str]]] = []
+    current: list[dict[str, str]] = []
+    for group in groups.values():
+        # An oversized group is pre-chunked to the cap; each chunk then
+        # places like a normal block (its siblings land in adjacent shards).
+        for i in range(0, len(group), size):
+            block = group[i : i + size]
+            if current and len(current) + len(block) > size:
+                shards.append(current)
+                current = []
+            current.extend(block)
+    if current:
+        shards.append(current)
+    return shards
 
 
 def render_policies_for_judge(policies: list[dict[str, str]]) -> str:

@@ -502,7 +502,8 @@ variable "enable_policy_build" {
     (gather sources -> run the policy-author agent -> persist policies.yaml ->
     stamp ready, best-effort AFTER the commit marker) and the INCREMENTAL
     rebuild authority (policy_rebuild events + the nightly reconcile that
-    reaps stalled authoring runs and hash-verifies every enrolled dataset).
+    reaps stalled authoring runs and hash-verifies every policy-bearing
+    dataset; never-authored datasets are not backfilled).
     No Bedrock control-plane resources are involved.
 
     Separate from enable_policy_checks so a deployment can consume documents
@@ -513,14 +514,18 @@ variable "enable_policy_build" {
 
 variable "chat_policy_check_model" {
   type        = string
-  default     = "openai.gpt-5.6-luna"
-  description = "The policy checks' model id, serving BOTH the curated-question rewrite (minimal effort — extraction) and the judge fleets (reasoning ON but shallow: code-level OKF_CHAT_POLICY_JUDGE_EFFORT, default low on GPT; an 8000-token thinking budget on a pre-adaptive Converse id like Haiku 4.5). An openai.* id is fully supported: chat_mantle_enabled derives the role's Mantle grants from this var too (gated on enable_policy_checks)."
+  # Sonnet 5, no reasoning: both consumers run classifier-style anyway, and a
+  # Claude 5 head gives better verdicts than a small model at the same
+  # single-pass latency. "openai.gpt-5.6-terra" (reasoning "none") remains a
+  # tested alternative.
+  default     = "global.anthropic.claude-sonnet-5"
+  description = "The policy checks' model id, serving BOTH the curated-question rewrite (minimal effort — extraction) and the judge fleets. Judges run CLASSIFIER-style on every family — thinking off + temperature 0 on a Converse (Anthropic) id, reasoning \"none\" on an openai.* id (e.g. openai.gpt-5.6-terra) — with a FORCED report_violations tool call: fast single-pass verdicts. An openai.* value is fully supported: chat_mantle_enabled derives the role's Mantle grants from this var too (gated on enable_policy_checks)."
 }
 
 variable "policy_preprocess_model" {
   type        = string
-  default     = "openai.gpt-5.6-luna"
-  description = "Model for the ar_rules.md authoring agent (harvest.ar_author), run with FULL reasoning — turning wiki prose into decidable rules is judgment work, and it runs only when policy sources actually change. Runs exclusively on the harvest runtime (mode=\"ar_rules\"); harvest_mantle_enabled derives the Mantle grants from this var (gated on enable_policy_build). Kept separate from chat_policy_check_model — different services, different env namespaces."
+  default     = "global.anthropic.claude-sonnet-5"
+  description = "Model for the ar_rules.md authoring agent (harvest.ar_author), run with FULL reasoning (effort high — OKF_POLICY_AUTHOR_EFFORT) — turning wiki prose into decidable rules is judgment work, and it runs only when policy sources actually change. Runs exclusively on the harvest runtime (mode=\"ar_rules\"); harvest_mantle_enabled derives the Mantle grants from this var (gated on enable_policy_build). Kept separate from chat_policy_check_model — different services, different env namespaces."
 }
 
 variable "tags" {

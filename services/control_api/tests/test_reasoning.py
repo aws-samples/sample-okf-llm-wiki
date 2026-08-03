@@ -1,11 +1,11 @@
-"""The Reasoning page endpoints: enrollment (opt-in/delete), status, sync.
+"""The Reasoning page endpoints: status, manual sync, the document viewer.
 
-The contracts pinned here: enrollment is refused without a complete wiki;
-enrolling publishes the first-authoring event but never authors in-process;
-unenrolling is delete semantics (the ``policy/`` artifacts + every ``ar_*``
-attr — v2 has no Bedrock resources) and is refused mid-authoring;
-`up_to_date` is the fingerprint gate rendered for humans; and the manual sync
-is one event, nothing more.
+The contracts pinned here: policy checks are ALWAYS ON per dataset (no
+enrollment routes — the retired opt-in has no successor), sync is refused
+without a complete wiki but is otherwise available from EVERY state —
+including "never authored", where it is the manual first-authoring trigger
+(there is no bulk backfill by design); `up_to_date` is the fingerprint gate
+rendered for humans; and the manual sync is one event, nothing more.
 """
 
 from __future__ import annotations
@@ -60,14 +60,6 @@ def _set(cfg, **attrs):
     )
 
 
-def _enroll(cfg, events=None, enrolled=True):
-    return handlers.set_reasoning_enrollment(
-        cfg.ddb, cfg.s3, events,
-        registry_table=REGISTRY, bucket=BUCKET,
-        data_domain=DOMAIN, dataset=DATASET, enrolled=enrolled,
-    )
-
-
 def _status(cfg):
     return handlers.get_reasoning_status(
         cfg.ddb, cfg.s3, registry_table=REGISTRY, bucket=BUCKET,
@@ -75,53 +67,12 @@ def _status(cfg):
     )
 
 
-# --- enroll ---------------------------------------------------------------------
-
-
-def test_enroll_sets_the_flag_and_queues_the_first_build(cfg):
-    _seed(cfg)
-    events = FakeEvents()
-    out = _enroll(cfg, events=events)
-    assert out == {"enrolled": True, "queued": True}
-    (entry,) = events.entries
-    assert entry["DetailType"] == "policy_rebuild"
-    assert json.loads(entry["Detail"]) == {
-        "data_domain": DOMAIN, "dataset": DATASET, "reason": "enroll",
-    }
-    assert _status(cfg)["enrolled"] is True
-
-
-def test_enroll_without_a_wiki_is_refused(cfg):
-    # The fail-safe rule: the policy is derived FROM the wiki, so a dataset
-    # that was never harvested has nothing to enroll.
-    _seed(cfg, wiki=False)
-    with pytest.raises(handlers.ApiError) as e:
-        _enroll(cfg, events=FakeEvents())
-    assert e.value.status == 409 and "harvest" in e.value.message
-
-
-def test_enroll_when_the_feature_is_off_is_refused(cfg):
-    _seed(cfg)
-    with pytest.raises(handlers.ApiError) as e:
-        _enroll(cfg, events=None)
-    assert e.value.status == 409
-
-
-def test_enroll_unknown_dataset_is_404(cfg):
-    with pytest.raises(handlers.ApiError) as e:
-        _enroll(cfg, events=FakeEvents())
-    assert e.value.status == 404
-
-
-def test_enroll_is_idempotent_and_requeues(cfg):
-    _seed(cfg)
-    _enroll(cfg, events=FakeEvents())
-    events = FakeEvents()
-    out = _enroll(cfg, events=events)
-    assert out["enrolled"] is True and len(events.entries) == 1
-
-
-# --- unenroll (delete semantics) ---------------------------------------------------
+def _sync(cfg, events=None):
+    return handlers.trigger_reasoning_sync(
+        cfg.ddb, cfg.s3, events,
+        registry_table=REGISTRY, bucket=BUCKET,
+        data_domain=DOMAIN, dataset=DATASET,
+    )
 
 
 _POLICY_DOC = """\
@@ -138,7 +89,6 @@ def _seed_built(cfg):
     _seed(cfg)
     _set(
         cfg,
-        ar_enrolled={"BOOL": True},
         ar_build_status={"S": "ready"},
         ar_source_hash={"S": "h"},
     )
@@ -153,33 +103,6 @@ def _seed_built(cfg):
     )
 
 
-def test_unenroll_deletes_everything(cfg):
-    _seed_built(cfg)
-    out = _enroll(cfg, events=FakeEvents(), enrolled=False)
-    assert out == {"enrolled": False, "deleted": True}
-    listed = cfg.s3.list_objects_v2(Bucket=BUCKET, Prefix=f"policy/{DOMAIN}/{DATASET}/")
-    assert listed.get("KeyCount", 0) == 0
-    status = _status(cfg)
-    # Delete semantics: indistinguishable from never-enrolled.
-    assert status["enrolled"] is False and status["status"] == ""
-    assert status["up_to_date"] is None and status["policies"] == []
-
-
-def test_unenroll_mid_build_is_refused(cfg):
-    _seed(cfg)
-    _set(cfg, ar_enrolled={"BOOL": True}, ar_build_status={"S": "building"})
-    with pytest.raises(handlers.ApiError) as e:
-        _enroll(cfg, events=FakeEvents(), enrolled=False)
-    assert e.value.status == 409 and "in flight" in e.value.message
-
-
-def test_unenroll_when_not_enrolled_is_a_no_op(cfg):
-    _seed(cfg)
-    assert _enroll(cfg, events=FakeEvents(), enrolled=False) == {
-        "enrolled": False, "deleted": False,
-    }
-
-
 # --- status --------------------------------------------------------------------
 
 
@@ -188,7 +111,6 @@ def test_status_lists_sources_and_flags_freshness(cfg):
     fresh = ap.source_hash(cfg.s3, BUCKET, DOMAIN, DATASET)
     _set(
         cfg,
-        ar_enrolled={"BOOL": True},
         ar_build_status={"S": "ready"},
         ar_source_hash={"S": fresh},
         ar_built_at={"S": "2026-08-01T10:00:00+00:00"},
@@ -198,7 +120,7 @@ def test_status_lists_sources_and_flags_freshness(cfg):
         doc_text=_POLICY_DOC,
     )
     out = _status(cfg)
-    assert out["enrolled"] is True and out["up_to_date"] is True
+    assert out["wiki_ready"] is True and out["up_to_date"] is True
     assert out["sources"] == ["references/usage_guardrails.md"]
     # `type` rides through to the Reasoning page (the per-policy track badge).
     assert out["policies"] == [{
@@ -222,8 +144,55 @@ def test_status_lists_sources_and_flags_freshness(cfg):
 def test_status_of_an_unharvested_dataset_explains_why(cfg):
     _seed(cfg, wiki=False, sources=False)
     out = _status(cfg)
-    assert out["can_enroll"] is False and "harvest" in out["reason"]
+    assert out["wiki_ready"] is False and "harvest" in out["reason"]
     assert out["has_sources"] is False and out["up_to_date"] is None
+
+
+def test_status_of_a_never_authored_dataset_reads_as_no_policies_yet(cfg):
+    # Always-on but never authored (a dataset predating the feature): the
+    # page renders the manual first-authoring CTA off exactly this shape.
+    _seed(cfg)
+    out = _status(cfg)
+    assert out["wiki_ready"] is True and out["status"] == ""
+    assert out["up_to_date"] is None and out["policies"] == []
+    assert out["has_sources"] is True
+
+
+def test_status_unknown_dataset_is_404(cfg):
+    with pytest.raises(handlers.ApiError) as e:
+        _status(cfg)
+    assert e.value.status == 404
+
+
+def test_status_while_building_lists_sources_without_downloading_them(cfg):
+    # The UI polls every few seconds during a build; freshness is moot then
+    # (the page shows the build state) and the corpus must NOT be downloaded
+    # per poll — the source LIST alone feeds the response.
+    _seed(cfg)
+    _set(
+        cfg,
+        ar_build_status={"S": "building"},
+        ar_source_hash={"S": "stale-or-not-does-not-matter"},
+    )
+
+    real_get = cfg.s3.get_object
+
+    def _counting_get(**kwargs):
+        key = kwargs.get("Key", "")
+        assert not key.endswith("usage_guardrails.md"), (
+            "a building-status poll must not download source bodies"
+        )
+        return real_get(**kwargs)
+
+    cfg.s3.get_object = _counting_get
+    try:
+        out = _status(cfg)
+    finally:
+        cfg.s3.get_object = real_get
+    assert out["status"] == "building"
+    assert out["up_to_date"] is None  # moot mid-build, never a stale verdict
+    assert out["sources"] == ["references/usage_guardrails.md"]
+    assert out["has_sources"] is True
 
 
 # --- sync ----------------------------------------------------------------------
@@ -232,13 +201,63 @@ def test_status_of_an_unharvested_dataset_explains_why(cfg):
 def test_sync_queues_one_rebuild(cfg):
     _seed_built(cfg)
     events = FakeEvents()
-    out = handlers.trigger_reasoning_sync(
-        cfg.ddb, events, registry_table=REGISTRY,
-        data_domain=DOMAIN, dataset=DATASET,
-    )
+    out = _sync(cfg, events=events)
     assert out == {"queued": True}
     (entry,) = events.entries
-    assert json.loads(entry["Detail"])["reason"] == "manual_sync"
+    assert entry["DetailType"] == "policy_rebuild"
+    assert json.loads(entry["Detail"]) == {
+        "data_domain": DOMAIN, "dataset": DATASET, "reason": "manual_sync",
+    }
+
+
+def test_sync_is_the_manual_first_authoring_for_a_never_authored_dataset(cfg):
+    # A dataset predating the feature has a wiki but no policy state; there is
+    # no bulk backfill, so THIS is how its first document gets authored.
+    _seed(cfg)
+    events = FakeEvents()
+    assert _sync(cfg, events=events) == {"queued": True}
+    assert len(events.entries) == 1
+
+
+def test_sync_is_allowed_from_a_failed_build(cfg):
+    # The Reasoning page's "Retry build": a failed row (transient service
+    # error, a bad build input) must stay retryable — sync gates ONLY on the
+    # wiki existing, never on build status. Without this, a failed first
+    # build strands the dataset.
+    _seed(cfg)
+    _set(
+        cfg,
+        ar_build_status={"S": "failed"},
+        ar_build_detail={"S": "ValidationException: type not defined"},
+    )
+    events = FakeEvents()
+    assert _sync(cfg, events=events) == {"queued": True}
+    assert len(events.entries) == 1
+
+
+def test_sync_without_a_wiki_is_refused(cfg):
+    # The policy is derived FROM the wiki: a dataset that was never harvested
+    # has nothing to author from yet.
+    _seed(cfg, wiki=False)
+    with pytest.raises(handlers.ApiError) as e:
+        _sync(cfg, events=FakeEvents())
+    assert e.value.status == 409 and "harvest" in e.value.message
+
+
+def test_sync_when_the_feature_is_off_is_refused(cfg):
+    _seed(cfg)
+    with pytest.raises(handlers.ApiError) as e:
+        _sync(cfg, events=None)
+    assert e.value.status == 409
+
+
+def test_sync_unknown_dataset_is_404(cfg):
+    with pytest.raises(handlers.ApiError) as e:
+        _sync(cfg, events=FakeEvents())
+    assert e.value.status == 404
+
+
+# --- the document viewer ---------------------------------------------------------
 
 
 def test_document_returns_the_live_policy_doc(cfg):
@@ -258,34 +277,3 @@ def test_document_absent_reads_as_exists_false(cfg):
         cfg.s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET
     )
     assert out == {"exists": False, "text": ""}
-
-
-def test_sync_is_allowed_from_a_failed_build(cfg):
-    # The Reasoning page's "Retry build": a failed row (transient service
-    # error, a bad build input) must stay retryable — sync gates ONLY on
-    # enrollment, never on build status. Without this, a failed first build
-    # strands the dataset (enrolled, so re-enroll is unavailable too).
-    _seed(cfg)
-    _set(
-        cfg,
-        ar_enrolled={"BOOL": True},
-        ar_build_status={"S": "failed"},
-        ar_build_detail={"S": "ValidationException: type not defined"},
-    )
-    events = FakeEvents()
-    out = handlers.trigger_reasoning_sync(
-        cfg.ddb, events, registry_table=REGISTRY,
-        data_domain=DOMAIN, dataset=DATASET,
-    )
-    assert out == {"queued": True}
-    assert len(events.entries) == 1
-
-
-def test_sync_requires_enrollment(cfg):
-    _seed(cfg)
-    with pytest.raises(handlers.ApiError) as e:
-        handlers.trigger_reasoning_sync(
-            cfg.ddb, FakeEvents(), registry_table=REGISTRY,
-            data_domain=DOMAIN, dataset=DATASET,
-        )
-    assert e.value.status == 409

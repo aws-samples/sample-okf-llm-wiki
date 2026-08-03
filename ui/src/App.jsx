@@ -115,14 +115,16 @@ const NAV = [
     icon: GaugeIcon,
     needsSelection: true,
   },
-  // Reasoning: per-dataset Automated Reasoning enrollment + the built policy.
+  // Guardrails: per-dataset policy-check status + the authored guardrails.
   // Shown whenever the deploy exposes policy checks (same display gate as the
-  // chat toggle); the Control API is the real boundary.
+  // chat toggle); the Control API is the real boundary. The key doubles as
+  // the URL section (#/guardrails/<d>/<ds>); parseHash aliases the legacy
+  // "reasoning" section so old links keep working.
   ...(POLICY_CHECK_ENABLED
     ? [
         {
-          key: "reasoning",
-          label: "Reasoning",
+          key: "guardrails",
+          label: "Guardrails",
           icon: ShieldCheckIcon,
           needsSelection: true,
         },
@@ -998,6 +1000,13 @@ function Console({ auth, api }) {
                     }
                   />
                 </div>
+              ) : section === "guardrails" ? (
+                // Guardrails: same full-height-column pattern as Benchmark —
+                // only the guardrail list scrolls; the card header and build
+                // status stay fixed however long the list grows.
+                <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col p-1">
+                  <ReasoningView api={api} selection={selection} />
+                </div>
               ) : (
                 // p-1 gives the cards' ring/shadow room so the vertical scroll
                 // container doesn't clip them — including the first card's top edge,
@@ -1018,9 +1027,6 @@ function Console({ auth, api }) {
                       selection={selection}
                       datasets={datasets}
                     />
-                  )}
-                  {section === "reasoning" && (
-                    <ReasoningView api={api} selection={selection} />
                   )}
                   {section === "credentials" && (
                     <CredentialsView api={api} email={email} />

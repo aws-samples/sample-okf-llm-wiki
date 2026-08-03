@@ -24,8 +24,12 @@ History note: v1 of this feature compiled the document into a Bedrock
 Automated Reasoning (SMT) policy — hence the legacy ``ar_`` prefixes on the
 module name, the registry attributes, and the ``mode="ar_rules"`` dispatch,
 all kept to avoid a data migration. The AR engine was removed in favor of the
-judge fleet (2026-08-02, see the design doc's v2 pivot); ``AR_ROW_ATTRS``
-still lists the v1-era attributes so unenrolling legacy rows cleans them up.
+judge fleet (2026-08-02, see the design doc's v2 pivot), and the per-dataset
+``ar_enrolled`` opt-in was retired with it (2026-08-03): policy documents are
+an always-on derived artifact now, and the only feature switch left is the
+deploy-wide ``OKF_POLICY_BUILD_ENABLED`` flag. Retired attributes
+(``ar_enrolled``, the v1 Bedrock set) may linger on rows written by older
+deploys; nothing reads them, and deleting the dataset deletes the row.
 """
 
 from __future__ import annotations
@@ -76,35 +80,14 @@ ATTR_SOURCE_HASH = "ar_source_hash"
 #: a document that is stale on arrival, not one that claims to describe the
 #: new state.
 ATTR_PENDING_SOURCE_HASH = "ar_pending_source_hash"
-#: Per-dataset OPT-IN (BOOL). Enrollment is the user's switch under the
-#: deploy-wide flag: nothing authors, rebuilds, or renders verdicts for a
-#: dataset that is not enrolled. Set/cleared by the Control API's Reasoning
-#: endpoints; read by every authoring path and the chat check.
-ATTR_ENROLLED = "ar_enrolled"
 
-#: Every attribute the feature has EVER stamped onto the mapping row —
-#: including retired v1 (Bedrock AR) attributes, so unenrolling a legacy row
-#: cleans it completely. Unenrollment REMOVEs exactly this set: "not enrolled"
-#: and "never enrolled" are indistinguishable on the row — one state, no
-#: zombies.
-AR_ROW_ATTRS: tuple[str, ...] = (
-    ATTR_ENROLLED,
-    ATTR_BUILD_STATUS,
-    ATTR_SOURCE_HASH,
-    ATTR_PENDING_SOURCE_HASH,
-    "ar_build_started_at",
-    "ar_built_at",
-    "ar_build_detail",
-    # v1-era (Bedrock AR) attributes, kept for legacy-row cleanup only.
-    "ar_build_workflow_id",
-    "ar_policy_arn",
-    "ar_policy_version",
-    "ar_guardrail_id",
-    "ar_guardrail_version",
-    "ar_bundle_version",
-    "ar_fidelity_coverage",
-    "ar_fidelity_accuracy",
-)
+#: The live attribute set: {ATTR_BUILD_STATUS, ATTR_SOURCE_HASH,
+#: ATTR_PENDING_SOURCE_HASH, ar_build_started_at, ar_built_at,
+#: ar_build_detail}. A dataset with none of these has never begun the policy
+#: lifecycle — the nightly reconcile deliberately skips such rows (no silent
+#: fleet-wide backfill); the first document comes from a manual Sync, the next
+#: harvest/increment, or a repromote. Retired attributes (``ar_enrolled``,
+#: the v1 Bedrock AR set) may linger on legacy rows; nothing reads them.
 
 _DETAIL_MAX = 512
 
@@ -254,19 +237,8 @@ def read_source_copy(
 # -- source gathering ------------------------------------------------------------
 
 
-def gather_sources(
-    s3, bucket: str, data_domain: str, dataset: str
-) -> list[tuple[str, bytes]]:
-    """The dataset's policy source files as sorted ``(relative key, bytes)``.
-
-    One paginated ``list_objects_v2`` over the whole dataset prefix (tens of
-    objects) plus a GET per selected file — cheaper than six prefix listings.
-    Read from S3, not from the harvest mount, so the fingerprint describes what
-    an S3-reading rebuilder (incremental) or verifier (chat) will see, and so
-    the same function works in a Lambda with no mount.
-    """
-    prefix = bundle_prefix(data_domain, dataset)
-    pairs: list[tuple[str, bytes]] = []
+def _iter_source_keys(s3, bucket: str, prefix: str):
+    """Yield ``(rel_path, full_key)`` for every policy-source object (LIST only)."""
     token: str | None = None
     while True:
         kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
@@ -280,13 +252,41 @@ def gather_sources(
             # excludes external/<domain>/<dataset>/references/... for free.
             if not rel or rel.endswith("/") or not is_ar_source(rel):
                 continue
-            body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-            pairs.append((rel, body if isinstance(body, bytes) else str(body).encode()))
+            yield rel, key
         if not resp.get("IsTruncated"):
-            break
+            return
         token = resp.get("NextContinuationToken")
         if not token:
-            break
+            return
+
+
+def list_source_paths(s3, bucket: str, data_domain: str, dataset: str) -> list[str]:
+    """The dataset's policy-source rel paths, sorted — LIST only, no body GETs.
+
+    For callers that need the file SET but not a fingerprint (e.g. a status
+    poll while a build is running): a fraction of :func:`gather_sources`'s
+    cost, which downloads every body.
+    """
+    prefix = bundle_prefix(data_domain, dataset)
+    return sorted(rel for rel, _key in _iter_source_keys(s3, bucket, prefix))
+
+
+def gather_sources(
+    s3, bucket: str, data_domain: str, dataset: str
+) -> list[tuple[str, bytes]]:
+    """The dataset's policy source files as sorted ``(relative key, bytes)``.
+
+    One paginated ``list_objects_v2`` over the whole dataset prefix (tens of
+    objects) plus a GET per selected file — cheaper than six prefix listings.
+    Read from S3, not from the harvest mount, so the fingerprint describes what
+    an S3-reading rebuilder (incremental) or verifier (chat) will see, and so
+    the same function works in a Lambda with no mount.
+    """
+    prefix = bundle_prefix(data_domain, dataset)
+    pairs: list[tuple[str, bytes]] = []
+    for rel, key in _iter_source_keys(s3, bucket, prefix):
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        pairs.append((rel, body if isinstance(body, bytes) else str(body).encode()))
     return sorted(pairs, key=lambda pair: pair[0])
 
 
@@ -582,46 +582,12 @@ def flag_stale(ddb, table: str, *, data_domain: str, dataset: str) -> bool:
         raise
 
 
-def is_enrolled(item: dict[str, Any] | None) -> bool:
-    """True when a raw (typed-attribute) mapping row is enrolled in reasoning.
+def lifecycle_begun(item: dict[str, Any] | None) -> bool:
+    """True when a raw (typed-attribute) mapping row has policy build state.
 
-    The single reader every gate uses — authoring trigger, rebuild authority,
-    and the chat check — so "enrolled" can never mean different things on
-    different paths. An absent row, absent attr, or non-BOOL value is NOT
-    enrolled.
+    The single reader every "has this dataset started the policy lifecycle?"
+    gate uses (the chat check's dataset discovery, the nightly reconcile's
+    no-backfill skip), so it can never mean different things on different
+    paths. An absent row or absent ``ar_build_status`` has NOT begun.
     """
-    return bool(((item or {}).get(ATTR_ENROLLED) or {}).get("BOOL"))
-
-
-def set_enrolled(ddb, table: str, *, data_domain: str, dataset: str) -> None:
-    """Opt the dataset into reasoning. Conditional on the mapping row existing.
-
-    Only the flag: the first authoring run is triggered separately (a
-    ``policy_rebuild`` event to the rebuild authority), so enrollment itself
-    is instant.
-    """
-    _set_attrs(
-        ddb,
-        table,
-        data_domain=data_domain,
-        dataset=dataset,
-        attrs={ATTR_ENROLLED: True},
-    )
-
-
-def clear_ar_attrs(ddb, table: str, *, data_domain: str, dataset: str) -> None:
-    """Unenrollment's row half: REMOVE every policy attribute (delete semantics).
-
-    Leaves the row exactly as if the dataset had never been enrolled — no
-    paused/zombie third state to reason about. The caller owns the other half
-    (the ``policy/`` prefix purge) and the ordering. No condition beyond row
-    existence: clearing attrs off a row that lacks them is an idempotent no-op.
-    """
-    names = {f"#r{i}": attr for i, attr in enumerate(AR_ROW_ATTRS)}
-    ddb.update_item(
-        TableName=table,
-        Key=registry_key(data_domain, dataset),
-        UpdateExpression="REMOVE " + ", ".join(names),
-        ExpressionAttributeNames=names,
-        ConditionExpression="attribute_exists(pk)",
-    )
+    return bool(((item or {}).get(ATTR_BUILD_STATUS) or {}).get("S"))

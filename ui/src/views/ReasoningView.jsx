@@ -1,22 +1,24 @@
-// Reasoning — per-dataset policy-check enrollment + policy transparency.
+// Guardrails — per-dataset policy-check status + the authored guardrails.
 //
-// Enrollment is OPT-IN: a dataset starts unenrolled, can only enroll once a
-// wiki exists (the policies are derived FROM the bundle), and unenrolling
-// DELETES the policy document and its derived artifacts — confirmed first,
-// since a re-enroll re-authors from scratch. The rest of the page is
-// transparency: which wiki files feed the document, the individual policies
-// the judge fleet enforces (each with a stable id and its source page), when
-// the last authoring ran, and whether it still matches the live wiki — with a
-// manual Sync as the fail-safe when it doesn't. Authoring runs async on the
-// backend (minutes); the page polls while one is live.
+// Guardrail checks are ALWAYS ON per dataset (no enrollment): once a wiki
+// exists (the guardrails are derived FROM the bundle), the document authors
+// automatically on every wiki change — a harvest, an increment, a restore.
+// A dataset that predates the feature is deliberately not backfilled in
+// bulk; its first document comes from the Generate button here or its next
+// wiki change. The rest of the page is transparency, in ONE card: build
+// state and freshness (with manual Sync as the fail-safe), the source files
+// behind a modal, and each guardrail as its own sub-card (id, track badge,
+// Condition/Action, source page). Authoring runs async on the backend
+// (minutes); the page polls while one is live.
+//
+// (File and internal ids keep the historical "reasoning"/"policy" names —
+// only the user-visible copy says Guardrails.)
 
 import { useCallback, useEffect, useState } from "react"
 import {
-  BookOpenTextIcon,
   FileTextIcon,
   RefreshCwIcon,
   ShieldCheckIcon,
-  ShieldOffIcon,
 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
@@ -32,18 +34,17 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet"
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 
@@ -70,6 +71,58 @@ function fmtWhen(iso) {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
 }
 
+// The check track (v3 type split): computational runs against SQL queries,
+// behavioural against the agent's steps. Distinct tints so the two tracks
+// read apart at a glance (sky vs violet — both survive light and dark).
+const TYPE_BADGE = {
+  computational:
+    "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-400",
+  behavioural:
+    "border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-400",
+}
+
+// One authored guardrail as its own sub-card: id + track badge + source on
+// the top line, then the two authored fields verbatim (cyan labels, full
+// foreground text — the guardrail text is the payload, not an aside).
+function GuardrailItem({ policy }) {
+  return (
+    <li className="space-y-1 rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-mono text-[11px] text-muted-foreground">
+          {policy.id}
+        </span>
+        {policy.type ? (
+          <Badge
+            variant="outline"
+            className={`px-1.5 py-0 text-[10px] font-normal capitalize ${
+              TYPE_BADGE[policy.type] || "text-muted-foreground"
+            }`}
+          >
+            {policy.type}
+          </Badge>
+        ) : null}
+        {policy.source ? (
+          <span className="ml-auto truncate font-mono text-[11px] text-muted-foreground/70">
+            {policy.source}
+          </span>
+        ) : null}
+      </div>
+      <p className="text-foreground">
+        <span className="font-medium text-cyan-600 dark:text-cyan-400">
+          Condition:
+        </span>{" "}
+        {policy.condition}
+      </p>
+      <p className="text-foreground">
+        <span className="font-medium text-cyan-600 dark:text-cyan-400">
+          Action:
+        </span>{" "}
+        {policy.action}
+      </p>
+    </li>
+  )
+}
+
 export default function ReasoningView({ api, selection }) {
   const domain = selection?.data_domain
   const dataset = selection?.dataset
@@ -77,17 +130,14 @@ export default function ReasoningView({ api, selection }) {
 
   const [data, setData] = useState(null) // null until first load
   const [error, setError] = useState(null)
-  const [busy, setBusy] = useState(false) // an enroll/unenroll/sync in flight
-  const [confirmOpen, setConfirmOpen] = useState(false)
-  // The ar_rules.md viewer: fetched on first open (the doc can be tens of
-  // kilobytes — never with the polled status call), cached per dataset.
-  const [docOpen, setDocOpen] = useState(false)
-  const [doc, setDoc] = useState(null) // {exists, text} once fetched
-  const [docError, setDocError] = useState(null)
-  // A queued sync/enroll reaches the pipeline asynchronously: the row still
-  // reads failed/ready/"" for a few seconds until the build flips it to
-  // building. Poll through that window so the page catches the transition
-  // (and a fast snapshot restore, which can complete between two polls).
+  const [busy, setBusy] = useState(false) // a sync in flight
+  const [sourcesOpen, setSourcesOpen] = useState(false)
+  // The list's track filter: "all" | "behavioural" | "computational".
+  const [typeFilter, setTypeFilter] = useState("all")
+  // A queued sync reaches the pipeline asynchronously: the row still reads
+  // failed/ready/"" for a few seconds until the build flips it to building.
+  // Poll through that window so the page catches the transition (and a fast
+  // snapshot restore, which can complete between two polls).
   const [syncPending, setSyncPending] = useState(false)
 
   const load = useCallback(async () => {
@@ -104,10 +154,8 @@ export default function ReasoningView({ api, selection }) {
   useEffect(() => {
     setData(null)
     setError(null)
-    setConfirmOpen(false)
-    setDoc(null)
-    setDocOpen(false)
-    setDocError(null)
+    setSourcesOpen(false)
+    setTypeFilter("all")
     load()
   }, [load])
 
@@ -149,30 +197,11 @@ export default function ReasoningView({ api, selection }) {
       load()
     }
   }
-  const enroll = () =>
-    run(async () => {
-      await api.setReasoningEnrollment(domain, dataset, true)
-      setSyncPending(true) // the first build is queued; poll it into view
-    })
-  const unenroll = () => {
-    setConfirmOpen(false)
-    run(() => api.setReasoningEnrollment(domain, dataset, false))
-  }
   const sync = () =>
     run(async () => {
       await api.triggerReasoningSync(domain, dataset)
       setSyncPending(true)
     })
-  const openDoc = async () => {
-    setDocOpen(true)
-    if (doc) return // cached for this dataset
-    try {
-      setDoc(await api.getReasoningDocument(domain, dataset))
-      setDocError(null)
-    } catch (e) {
-      setDocError(e.message || String(e))
-    }
-  }
 
   if (!hasSelection) return null
   if (!data && !error) {
@@ -185,61 +214,78 @@ export default function ReasoningView({ api, selection }) {
   }
 
   const chip = STATUS_CHIP[data?.status]
+  const shownPolicies = (data?.policies || []).filter(
+    (p) => typeFilter === "all" || p.type === typeFilter
+  )
 
   return (
-    <div className="space-y-3">
-      <Card>
-        <CardHeader>
+    <>
+      {/* Cap the card at the view column's height (natural height below it)
+          and let ONLY the guardrail list scroll: header + build status stay
+          put, so the min-h-0 shrink chain runs Card → CardContent → list —
+          the Benchmark page's pattern. */}
+      <Card className="max-h-full min-h-0">
+        <CardHeader className="shrink-0 border-b">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1.5">
               <CardTitle className="flex items-center gap-2">
                 <ShieldCheckIcon className="size-4 text-primary" />
-                Automated reasoning
+                Guardrails
               </CardTitle>
               <CardDescription>
                 Chat answers about{" "}
                 <span className="font-medium text-foreground">
                   {domain}/{dataset}
                 </span>{" "}
-                are judged by a model fleet against policies derived from its
-                wiki. Opt-in per dataset; the policy document re-authors
-                automatically when the wiki changes.
+                are judged by a model fleet against guardrails derived from
+                its wiki. They re-author automatically when the wiki changes.
               </CardDescription>
             </div>
-            {data?.enrolled ? (
+            {data?.wiki_ready && data?.sources?.length ? (
               <Button
+                size="sm"
                 variant="outline"
-                disabled={busy || building}
-                onClick={() => setConfirmOpen(true)}
+                onClick={() => setSourcesOpen(true)}
               >
-                {busy ? <Spinner className="size-3.5" /> : <ShieldOffIcon className="size-3.5" />}
-                Unenroll
+                <FileTextIcon className="size-3.5" />
+                Source files
               </Button>
-            ) : (
-              <Button disabled={busy || !data?.can_enroll} onClick={enroll}>
-                {busy ? <Spinner className="size-3.5" /> : <ShieldCheckIcon className="size-3.5" />}
-                Enroll dataset
-              </Button>
-            )}
+            ) : null}
           </div>
         </CardHeader>
-        <CardContent className="space-y-3">
+        <CardContent className="flex min-h-0 flex-col gap-4">
           {error ? (
             <p className="text-sm text-destructive">{error}</p>
           ) : null}
-          {!data?.enrolled ? (
+          {!data?.wiki_ready ? (
             <p className="text-sm text-muted-foreground">
-              {data?.can_enroll
-                ? "Not enrolled. Enrolling builds the first policy from this wiki's reference docs (takes a few minutes)."
-                : data?.reason ||
-                  "This dataset can't be enrolled yet — run a harvest first."}
-              {data?.can_enroll && !data?.has_sources
-                ? " Note: this wiki has no policy-source files (usage guardrails, enums, metrics, recipes, known issues) yet, so a build would produce no rules."
-                : ""}
+              {data?.reason || "No wiki yet — run a harvest first."}
             </p>
-          ) : (
+          ) : !data?.status && !syncPending ? (
+            /* Never authored (a dataset predating the feature): there is no
+               bulk backfill by design — the first document comes from this
+               button, the next harvest/increment, or a restore. */
             <div className="space-y-2 text-sm">
-              <div className="flex flex-wrap items-center gap-2">
+              <p className="text-muted-foreground">
+                No guardrails yet. They author automatically on the next wiki
+                change (a harvest, an annotation, a restore) — or generate
+                them now (takes a few minutes).
+                {!data?.has_sources
+                  ? " Note: this wiki has no guardrail-source files (usage guardrails, enums, metrics, recipes, known issues) yet, so a build would produce no rules."
+                  : ""}
+              </p>
+              <Button disabled={busy} onClick={sync}>
+                {busy ? (
+                  <Spinner className="size-3.5" />
+                ) : (
+                  <ShieldCheckIcon className="size-3.5" />
+                )}
+                Generate guardrails
+              </Button>
+            </div>
+          ) : (
+            <div className="flex min-h-0 flex-col gap-2 text-sm">
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
                 {chip ? (
                   <Badge variant={chip.variant} className={chip.cls}>
                     {building ? <Spinner className="size-3" /> : null}
@@ -260,18 +306,19 @@ export default function ReasoningView({ api, selection }) {
                   </span>
                 ) : null}
               </div>
-              {/* Building: the page polls, but the row only flips when a
-                  completion authority stamps it — and if the runtime's
-                  in-session completion was interrupted, nothing else fires
-                  automatically (the nightly reconcile is opt-in). Sync IS the
-                  manual completion trigger (the rebuild authority checks
-                  building rows for a finished workflow first), so it must be
-                  reachable here — a building row without it can strand. */}
+              {/* Building: the page polls; authoring IS completion (v3 — no
+                  build workflow, no completion authority). A build that died
+                  leaves the row `building` until the rebuild authority's
+                  reaper: Sync (and every policy_rebuild event) is a NO-OP for
+                  a building row younger than the ~1h grace, then fails and
+                  re-dispatches it. Sync stays reachable here as that
+                  post-grace recovery — not as a completion trigger. */}
               {building ? (
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-muted-foreground">
-                    A build is running — this page updates automatically. If it
-                    looks stuck, Sync checks the build and completes it.
+                    A build is running — this page updates automatically. A
+                    build that dies is retried by Sync after about an hour;
+                    until then Sync leaves it undisturbed.
                   </span>
                   <Button
                     size="sm"
@@ -285,17 +332,17 @@ export default function ReasoningView({ api, selection }) {
                 </div>
               ) : null}
               {/* The freshness line IS the fingerprint gate, for humans: a
-                  policy built from anything but the current wiki never renders
-                  a verdict, so "out of date" means checks are paused until the
-                  rebuild lands. Sync is the fail-safe when no automatic
-                  trigger caught the change. A failed row owns its own retry
-                  line below instead — checks are off there whatever the hash
-                  says, so a freshness verdict would mislead. */}
+                  guardrail set built from anything but the current wiki never
+                  renders a verdict, so "out of date" means checks are paused
+                  until the rebuild lands. Sync is the fail-safe when no
+                  automatic trigger caught the change. A failed row owns its
+                  own retry line below instead — checks are off there whatever
+                  the hash says, so a freshness verdict would mislead. */}
               {data?.up_to_date === false && !building && !failed ? (
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-amber-700 dark:text-amber-400">
-                    Out of date — the wiki changed since this policy was built.
-                    Checks are paused until it rebuilds.
+                    Out of date — the wiki changed since these guardrails were
+                    built. Checks are paused until they rebuild.
                   </span>
                   <Button
                     size="sm"
@@ -324,11 +371,10 @@ export default function ReasoningView({ api, selection }) {
                   </Button>
                 </div>
               ) : null}
-              {/* A failed build must never strand the dataset: enrollment
-                  can't be re-run (the dataset IS enrolled) and the failure may
-                  be a transient service error, so the retry lives here. The
-                  rebuild authority retries a failed row even when the wiki is
-                  unchanged (its unchanged-skip excludes `failed`). */}
+              {/* A failed build must never strand the dataset — the failure
+                  may be a transient service error, so the retry lives here.
+                  The rebuild authority retries a failed row even when the
+                  wiki is unchanged (its unchanged-skip excludes `failed`). */}
               {failed && !building ? (
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-muted-foreground">
@@ -347,181 +393,89 @@ export default function ReasoningView({ api, selection }) {
                   </Button>
                 </div>
               ) : null}
-              {/* No build stamp at all (status ""): the first build was queued
-                  by enroll but nothing has flipped the row yet. If the queued
-                  window lapses (a lost event), Sync is the recovery. */}
-              {!chip && !building && !syncPending ? (
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-muted-foreground">
-                    Waiting for the first build to start.
-                  </span>
-                  <Button size="sm" variant="ghost" disabled={busy} onClick={sync}>
-                    <RefreshCwIcon className="size-3.5" />
-                    Sync
-                  </Button>
+
+              {/* The authored guardrails, in the same card — one sub-card per
+                  entry, individually tracked by its stable id. The LIST is
+                  the page's only scroll region (okf-thin-scroll: the app's
+                  transparent-track scrollbar), so status stays visible. */}
+              <div className="flex min-h-0 flex-col pt-2">
+                <div className="flex shrink-0 items-center justify-between gap-2 pb-2">
+                  <p className="text-sm font-medium text-muted-foreground">
+                    Guardrails
+                    {shownPolicies.length
+                      ? ` (${shownPolicies.length}${
+                          typeFilter === "all"
+                            ? ""
+                            : ` of ${data.policies.length}`
+                        })`
+                      : ""}
+                  </p>
+                  {data?.policies?.length ? (
+                    <Select value={typeFilter} onValueChange={setTypeFilter}>
+                      <SelectTrigger
+                        size="sm"
+                        className="text-xs"
+                        aria-label="Filter guardrails by track"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent align="end">
+                        <SelectItem value="all">Show all</SelectItem>
+                        <SelectItem value="behavioural">Behavioural</SelectItem>
+                        <SelectItem value="computational">
+                          Computational
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  ) : null}
                 </div>
-              ) : null}
+                {shownPolicies.length ? (
+                  <ul className="okf-thin-scroll min-h-0 space-y-2 overflow-y-auto pr-1">
+                    {shownPolicies.map((policy) => (
+                      <GuardrailItem key={policy.id} policy={policy} />
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    {building
+                      ? "The first authoring run is in flight — guardrails appear here when it finishes."
+                      : data?.policies?.length
+                        ? `No ${typeFilter} guardrails.`
+                        : "No guardrails yet."}
+                  </p>
+                )}
+              </div>
             </div>
           )}
         </CardContent>
       </Card>
 
-      {data?.enrolled && data?.sources?.length ? (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-base">
+      {/* The source-file list, on demand instead of inline — it is context,
+          not status, and can be dozens of paths. */}
+      <Dialog open={sourcesOpen} onOpenChange={setSourcesOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
               <FileTextIcon className="size-4 text-muted-foreground" />
               Source files
-            </CardTitle>
-            <CardDescription>
-              The wiki pages the policy is inferred from. Editing any of these
-              (or a harvest changing them) makes the policy out of date.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <ul className="space-y-1 font-mono text-xs text-muted-foreground">
-              {data.sources.map((path) => (
+            </DialogTitle>
+            <DialogDescription>
+              The wiki pages the guardrails are inferred from. Editing any of
+              these (or a harvest changing them) makes the guardrails out of
+              date.
+            </DialogDescription>
+          </DialogHeader>
+          <ScrollArea className="max-h-80">
+            <ul className="space-y-1 pr-3 font-mono text-xs text-muted-foreground">
+              {(data?.sources || []).map((path) => (
                 <li key={path} className="truncate">
                   {path}
                 </li>
               ))}
             </ul>
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {data?.enrolled ? (
-        <Card>
-          <CardHeader>
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div className="space-y-1.5">
-                <CardTitle className="flex items-center gap-2 text-base">
-                  <BookOpenTextIcon className="size-4 text-muted-foreground" />
-                  Policies
-                  {data?.policies?.length ? ` (${data.policies.length})` : ""}
-                </CardTitle>
-                <CardDescription>
-                  What the judges enforce — each policy is individually
-                  tracked by its id and traces to the wiki page it came from.
-                </CardDescription>
-              </div>
-              {/* The document exists once anything has been authored — i.e.
-                  any build state at all, including building/failed. */}
-              {data?.status ? (
-                <Button size="sm" variant="outline" onClick={openDoc}>
-                  <FileTextIcon className="size-3.5" />
-                  View policies.yaml
-                </Button>
-              ) : null}
-            </div>
-          </CardHeader>
-          <CardContent>
-            {data?.policies?.length ? (
-              <ul className="space-y-2.5">
-                {data.policies.map((policy) => (
-                  <li key={policy.id} className="space-y-0.5 text-sm">
-                    <p className="border-l-2 border-border pl-2.5">
-                      <span className="font-mono text-[11px] text-muted-foreground">
-                        {policy.id}
-                      </span>{" "}
-                      {/* The check track (v3 type split): computational runs
-                          against SQL queries, behavioural against the agent's
-                          steps. */}
-                      {policy.type ? (
-                        <Badge
-                          variant="outline"
-                          className="mr-1 px-1.5 py-0 align-middle text-[10px] font-normal text-muted-foreground capitalize"
-                        >
-                          {policy.type}
-                        </Badge>
-                      ) : null}
-                      When {policy.condition} —{" "}
-                      <span className="text-muted-foreground">
-                        the agent must {policy.action}.
-                      </span>
-                    </p>
-                    {policy.source ? (
-                      <p className="pl-2.5 font-mono text-[11px] text-muted-foreground">
-                        {policy.source}
-                      </p>
-                    ) : null}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                {building
-                  ? "The first authoring run is in flight — policies appear here when it finishes."
-                  : "No policies yet."}
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {/* The ar_rules.md viewer — the document the policy is built from,
-          rendered in a right sheet (the app's side-panel idiom; the chat's
-          DocPeek is welded into ChatPanel's layout and reads bundle pages,
-          which this off-mount document is not). Version-faithful by
-          construction: authoring rewrites the file at build time and a
-          restore rewrites it from the restored era. */}
-      <Sheet open={docOpen} onOpenChange={setDocOpen}>
-        <SheetContent side="right" className="flex w-full flex-col gap-0 sm:max-w-xl">
-          <SheetHeader>
-            <SheetTitle className="flex items-center gap-2 font-mono text-sm">
-              <FileTextIcon className="size-4 text-muted-foreground" />
-              policies.yaml
-            </SheetTitle>
-            <SheetDescription>
-              The policy document the judges evaluate turns against, authored
-              from the wiki&apos;s reference docs — as of the last sync.
-            </SheetDescription>
-          </SheetHeader>
-          <ScrollArea className="min-h-0 flex-1 px-4 pb-4">
-            {docError ? (
-              <p className="text-sm text-destructive">{docError}</p>
-            ) : doc === null ? (
-              <div className="flex justify-center py-8">
-                <Spinner className="size-4" />
-              </div>
-            ) : doc.exists ? (
-              <pre className="text-xs leading-relaxed break-words whitespace-pre-wrap text-muted-foreground">
-                {doc.text}
-              </pre>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No policy document yet — the first authoring run writes it.
-              </p>
-            )}
           </ScrollArea>
-        </SheetContent>
-      </Sheet>
-
-      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Unenroll from reasoning?</DialogTitle>
-            <DialogDescription>
-              This deletes the dataset&apos;s reasoning policy, its guardrail,
-              and the derived rule artifacts. Chat answers about{" "}
-              <span className="font-medium text-foreground">
-                {domain}/{dataset}
-              </span>{" "}
-              will no longer be checkable. Re-enrolling rebuilds everything
-              from the wiki (a few minutes).
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirmOpen(false)}>
-              Cancel
-            </Button>
-            <Button variant="destructive" onClick={unenroll}>
-              <ShieldOffIcon className="size-3.5" />
-              Unenroll and delete
-            </Button>
-          </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </>
   )
 }

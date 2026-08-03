@@ -57,35 +57,34 @@ DEFAULT_BEDROCK_MAX_ATTEMPTS = 5
 DEFAULT_MANTLE_REGION = "us-east-2"
 
 # The policy check's pre-pass (chat/policy_check.py) is EXTRACTION — rewrite the
-# question, narrate the chain — so it runs on the cheapest capable id rather than
-# the conversation's own model. Deploy-time only: unlike the per-run chat model
-# this never comes from a client, so it deliberately bypasses the catalog trust
-# boundary (`resolve_model_effort`). An openai.* default means the chat role's
-# Mantle grants must be on — infra derives that from var.chat_policy_check_model
-# (see agentcore_iam.tf chat_mantle_enabled).
-DEFAULT_POLICY_CHECK_MODEL = "openai.gpt-5.6-luna"
+# question, narrate the chain — so it runs with no reasoning pass rather than
+# on the conversation's own model. Deploy-time only: unlike the per-run chat
+# model this never comes from a client, so it deliberately bypasses the catalog
+# trust boundary (`resolve_model_effort`). Sonnet 5, no reasoning — mirrors
+# var.chat_policy_check_model's default. An openai.* value means the chat
+# role's Mantle grants must be on — infra derives that from the same var (see
+# agentcore_iam.tf chat_mantle_enabled).
+DEFAULT_POLICY_CHECK_MODEL = "global.anthropic.claude-sonnet-5"
 
 # The rewrite emits one small JSON object; a few thousand tokens is the whole
 # budget.
 POLICY_CHECK_MAX_TOKENS = 4000
 
 # Effort for the QUESTION-REWRITE call (extraction, not reasoning). Meaningless
-# with reasoning off on Converse; on Mantle it maps to "low" via GPT_EFFORT_MAP
-# (the floor's NAME varies by model generation — gpt-5.6-luna rejects
-# "minimal", older ids reject "none"; "low" is the lowest fleet-wide value).
+# with reasoning off on Converse; on Mantle "none" passes VERBATIM (the whole
+# GPT-5.6 fleet accepts it — a genuine no-reasoning pass).
 POLICY_CHECK_EFFORT = "none"
 
 # The JUDGE calls are judgment work — reasoning ON, but at the LOW end of the
 # ladder: the judges run inside a live query's verdict window, and live tuning
-# (2026-08-02) showed medium-effort rounds regularly blowing past it. "low" is
-# the GPT (Luna) knob; a pre-adaptive Converse model (Haiku 4.5) has no effort
-# ladder and takes a thinking token BUDGET instead — 8000 (user-directed pair:
-# Low on Luna, 8000 on Haiku). Env-tunable per deployment.
-DEFAULT_POLICY_JUDGE_EFFORT = "low"
+# (2026-08-02) showed medium-effort rounds regularly blowing past it. The
+# judges run CLASSIFIER-style on EVERY model family — thinking off on a
+# Converse (Anthropic) id, reasoning "none" on an OpenAI (GPT 5.6) id — with
+# a FORCED report_violations tool choice (see build_policy_judge_model —
+# live 2026-08-03, reasoning judges spent 40-50s per shard and sometimes
+# exhausted into prose with no tool call). No effort knob remains: shallow
+# is not a tuning choice, it is the judge's contract.
 POLICY_JUDGE_MAX_TOKENS = 8000
-# The budget-encoding path only: thinking tokens count INSIDE max_tokens there,
-# so the ceiling is budget + answer room (POLICY_JUDGE_MAX_TOKENS).
-POLICY_JUDGE_THINKING_BUDGET = 8000
 
 # Judges lose precision when a single rubric grows long; ≤ this many policies
 # per mini-judge (okf_core.policy_doc.DEFAULT_SHARD_SIZE is the format's own
@@ -187,7 +186,6 @@ class ChatConfig:
     # absent, exactly like OKF_CHAT_SQL_ENABLED above the SQL opt-in.
     policy_check_enabled: bool = False
     policy_check_model: str = DEFAULT_POLICY_CHECK_MODEL
-    policy_judge_effort: str = DEFAULT_POLICY_JUDGE_EFFORT
     policy_shard_size: int = DEFAULT_POLICY_SHARD_SIZE
     policy_query_timeout_s: int = DEFAULT_POLICY_QUERY_TIMEOUT_S
     policy_query_max_per_turn: int = DEFAULT_POLICY_QUERY_MAX_PER_TURN
@@ -244,9 +242,6 @@ class ChatConfig:
             in ("true", "1", "yes"),
             policy_check_model=env.get(
                 "OKF_CHAT_POLICY_CHECK_MODEL", DEFAULT_POLICY_CHECK_MODEL
-            ),
-            policy_judge_effort=env.get(
-                "OKF_CHAT_POLICY_JUDGE_EFFORT", DEFAULT_POLICY_JUDGE_EFFORT
             ),
             policy_shard_size=_int_env(
                 "OKF_CHAT_POLICY_SHARD_SIZE", DEFAULT_POLICY_SHARD_SIZE, env
@@ -332,11 +327,9 @@ def build_policy_check_model(cfg: ChatConfig):
     The rewrite resolves cross-turn anaphora — extraction, not reasoning — so
     determinism matters more than depth. On Converse, thinking is turned OFF
     (not merely dialed down — Converse rejects a caller-set temperature while
-    thinking is on) and temperature pinned to 0. On the GPT path the lever is
-    the effort FLOOR (``"none"`` maps to ``"low"`` — the lowest fleet-wide
-    value; the literal floor names are model-generation-specific and 400):
-    GPT-5.x reasoning models reject a non-default temperature outright, so
-    none is sent.
+    thinking is on) and temperature pinned to 0. On the GPT path reasoning is
+    ``"none"`` (verbatim — the GPT-5.6 fleet accepts it): GPT-5.x reasoning
+    models reject a non-default temperature outright, so none is sent.
 
     Not a plain :func:`build_chat_model` call with a small model: that one always
     configures adaptive thinking (the conversation wants it) and validates
@@ -369,20 +362,19 @@ def build_policy_check_model(cfg: ChatConfig):
 
 
 def build_policy_judge_model(cfg: ChatConfig):
-    """Build the judge client: reasoning ON but shallow, tools bound per call.
+    """Build the judge client — a CLASSIFIER, not a reasoner, on EVERY family.
 
-    Judging a query/steps against policies wants SOME reasoning — the opposite
-    posture from the rewrite — but it runs inside a live verdict window, so
-    the depth knob sits at the ladder's low end: the effort ladder on GPT
-    (Luna, default ``low`` via ``OKF_CHAT_POLICY_JUDGE_EFFORT``); a thinking
-    token budget on a pre-adaptive Converse model (Haiku 4.5 rejects the
-    adaptive/effort encoding — it takes ``budget_tokens``, here
-    :data:`POLICY_JUDGE_THINKING_BUDGET`, with max_tokens lifted above it
-    since budget-encoded thinking counts inside the output ceiling). An
-    adaptive-capable Converse id keeps the effort encoding. No pinned
-    temperature anywhere (GPT reasoning models reject one, and the verdict
-    fold is deterministic downstream anyway). Same deploy-time model id as
-    the rewrite (``OKF_CHAT_POLICY_CHECK_MODEL``).
+    A judge checks ≤ shard-size policies against one query/window and
+    answers with ids only: a Converse (Anthropic) id runs with thinking OFF
+    and temperature 0; an OpenAI id (GPT 5.6 Terra) runs with reasoning
+    ``"none"``. Single forward pass either way, and policy_check binds a
+    FORCED ``report_violations`` tool choice (legal on Anthropic exactly
+    because thinking is off), so a prose-only reply is structurally
+    unreachable. Two reasons, both observed live (2026-08-03): reasoning
+    judges spent 40-50s per shard (5-6k thinking tokens for a checklist),
+    and occasionally exhausted into prose WITHOUT the verdict tool call,
+    tripping the missing-call retry and doubling the shard. Same
+    deploy-time model id as the rewrite (``OKF_CHAT_POLICY_CHECK_MODEL``).
     """
     from okf_aws import model_factory as mf
 
@@ -390,7 +382,7 @@ def build_policy_judge_model(cfg: ChatConfig):
     if mf.is_openai_model(model):
         return mf.build_mantle_openai(
             model,
-            cfg.policy_judge_effort,
+            "none",  # classifier: no reasoning pass
             POLICY_JUDGE_MAX_TOKENS,
             region=cfg.mantle_region,
             use_responses_api=cfg.mantle_use_responses_api,
@@ -398,19 +390,12 @@ def build_policy_judge_model(cfg: ChatConfig):
             timeout=cfg.bedrock_read_timeout,
             max_retries=cfg.bedrock_max_attempts,
         )
-    if "haiku" in model:
-        return mf.build_bedrock_converse(
-            model,
-            cfg.policy_judge_effort,  # unused by the budget encoding
-            POLICY_JUDGE_THINKING_BUDGET + POLICY_JUDGE_MAX_TOKENS,
-            region=cfg.region,
-            botocore_config=_bedrock_config(cfg),
-            thinking_budget=POLICY_JUDGE_THINKING_BUDGET,
-        )
     return mf.build_bedrock_converse(
         model,
-        cfg.policy_judge_effort,
+        "none",  # unused: thinking is off
         POLICY_JUDGE_MAX_TOKENS,
         region=cfg.region,
         botocore_config=_bedrock_config(cfg),
+        thinking=False,
+        temperature=0,
     )

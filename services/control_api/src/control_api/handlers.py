@@ -3154,8 +3154,10 @@ def _signal_policy_rebuild(
     fingerprint gate makes a policy built off older sources unusable rather than
     wrong, and the nightly hash-verify rebuilds it regardless, so a swallowed
     failure here costs freshness, never truth. A dataset with no AR attrs flags
-    nothing — the conditional write must never CREATE policy state for a dataset
-    that has none.
+    nothing (the conditional write must never CREATE row state), but the event
+    still publishes — for a dataset restored to a version that predates its
+    policy document (or that never had one), this is the AUTOMATIC first
+    authoring: the rebuild authority sees no usable document and dispatches.
 
     ``events`` doubles as the accelerator's structural off switch — handlers read
     no environment, so an unconfigured publisher is how "policy builds are off"
@@ -3215,14 +3217,15 @@ def _signal_policy_rebuild(
 
 
 # --------------------------------------------------------------------------- #
-# Reasoning (AR policy) enrollment — the UI's Reasoning page
+# Reasoning (AR policy) — the UI's Reasoning page
 # --------------------------------------------------------------------------- #
 #
-# Enrollment is the per-dataset OPT-IN under the deploy-wide flags: the build
-# paths (harvest finalize, incremental rebuild authority) and the chat check
-# all read `ar_enrolled` off the mapping row and skip datasets without it. The
-# 100-policy account cap (non-adjustable) is why this is opt-in: the cap is a
-# budget the user spends per dataset, never a race between harvests.
+# Policy documents are ALWAYS ON per dataset (the v1-era `ar_enrolled` opt-in
+# is retired — the LLM-judge engine has no per-account policy cap to budget):
+# any dataset with a committed wiki authors automatically at harvest finalize
+# and re-authors on wiki changes. Pre-existing datasets are deliberately NOT
+# backfilled in bulk — their first document comes from the Sync button here,
+# their next harvest/increment, or a repromote.
 
 
 def _reasoning_row(ddb, registry_table: str, data_domain: str, dataset: str) -> dict:
@@ -3288,26 +3291,38 @@ def get_reasoning_status(
 
     ``up_to_date`` is the user-facing face of the fingerprint gate: the stored
     ``ar_source_hash`` (what the document was authored from) against a hash
-    computed from the LIVE wiki right now. ``sources`` is the live source-file
-    set — what an authoring run started today would read — and ``policies``
-    is the authored document's entries (empty until the first authoring run
-    completes), each individually trackable by its stable id.
+    computed from the LIVE wiki right now — except while a build is RUNNING,
+    where it is ``None`` (the verdict is moot mid-build and computing it
+    would download the whole source corpus on every few-second poll).
+    ``sources`` is the live source-file set — what an authoring run started
+    today would read — and ``policies`` is the authored document's entries
+    (empty until the first authoring run completes), each individually
+    trackable by its stable id.
     """
     item = _reasoning_row(ddb, registry_table, data_domain, dataset)
-    enrolled = ar_policy.is_enrolled(item)
     status = _row_str(item, ar_policy.ATTR_BUILD_STATUS)
     stored_hash = _row_str(item, ar_policy.ATTR_SOURCE_HASH)
 
     wiki_ready = is_bundle_ready(s3, bucket, data_domain, dataset)
-    sources = ar_policy.gather_sources(s3, bucket, data_domain, dataset)
-    fresh_hash = ar_policy.hash_sources(sources)
+    building = status == ar_policy.BUILD_BUILDING
+    if building:
+        # The UI polls every few seconds while a build runs, and the response
+        # only needs the source PATHS then (freshness is moot mid-build — the
+        # page shows the build state, not the fingerprint verdict). LIST-only
+        # instead of downloading the whole source corpus per poll.
+        source_paths = ar_policy.list_source_paths(s3, bucket, data_domain, dataset)
+        fresh_hash = None
+    else:
+        sources = ar_policy.gather_sources(s3, bucket, data_domain, dataset)
+        source_paths = [rel for rel, _content in sources]
+        fresh_hash = ar_policy.hash_sources(sources)
 
     up_to_date: bool | None = None
-    if stored_hash:
+    if stored_hash and not building:
         up_to_date = bool(fresh_hash) and fresh_hash == stored_hash
 
     policies: list[dict[str, Any]] = []
-    if enrolled and status:
+    if status:
         from okf_core import policy_doc as pdoc
 
         doc = ar_policy.read_policy_doc(
@@ -3322,23 +3337,25 @@ def get_reasoning_status(
     return {
         "data_domain": data_domain,
         "dataset": dataset,
-        "enrolled": enrolled,
-        # Enrollability: a wiki must exist first (the policy is derived FROM
-        # it), and a wiki without any policy-source files can enroll but has
-        # nothing to build — the page says so instead of showing a dead state.
-        "can_enroll": wiki_ready,
+        # A wiki must exist first (the policy is derived FROM it); until then
+        # the page explains instead of offering a dead Sync. An empty
+        # `status` with a ready wiki means "never authored" — the page offers
+        # Sync as the manual first authoring (no bulk backfill exists by
+        # design), and a wiki without policy-source files can sync but would
+        # produce no rules — the page says so instead of showing a dead state.
+        "wiki_ready": wiki_ready,
         "reason": None if wiki_ready else "no wiki yet — run a harvest first",
-        "has_sources": bool(sources),
+        "has_sources": bool(source_paths),
         "status": status,
         "built_at": _row_str(item, "ar_built_at"),
         "build_detail": _row_str(item, "ar_build_detail"),
         "up_to_date": up_to_date,
-        "sources": [rel for rel, _content in sources],
+        "sources": source_paths,
         "policies": policies,
     }
 
 
-def set_reasoning_enrollment(
+def trigger_reasoning_sync(
     ddb,
     s3,
     events,
@@ -3347,75 +3364,23 @@ def set_reasoning_enrollment(
     bucket: str,
     data_domain: str,
     dataset: str,
-    enrolled: bool,
 ) -> dict[str, Any]:
-    """Flip the dataset's reasoning enrollment. Idempotent in both directions.
+    """The Reasoning page's manual trigger: queue one rebuild now.
 
-    ENROLL sets the flag and publishes one ``policy_rebuild`` event — the first
-    build runs on the rebuild authority (minutes-scale Bedrock work has no
-    place in a 30s Lambda). Refused while no complete wiki exists: the policy
-    is derived from the bundle, so there is nothing to derive from yet.
-
-    UNENROLL is DELETE semantics (operator decision): the
-    ``policy/<d>/<ds>/`` artifacts and every ``ar_*`` row attribute all go
-    (v2: no Bedrock resources exist — the judge engine's only artifacts are
-    the S3 document + the row stamps). Refused while an authoring run is in
-    flight (it must finish or fail before its artifacts can go).
+    Doubles as the FIRST authoring for a pre-existing dataset (there is no
+    bulk backfill by design — a dataset that predates the feature authors on
+    its first Sync, harvest, or repromote) and as the fail-safe when the wiki
+    moved and no automatic trigger caught it. Just the event — the rebuild
+    authority owns the pipeline, and its rebuild-iff-changed skip means
+    syncing an already-current policy is a clean no-op rather than a wasted
+    build. Refused while no complete wiki exists: the policy is derived from
+    the bundle, so there is nothing to author from yet.
     """
-    item = _reasoning_row(ddb, registry_table, data_domain, dataset)
-    already = ar_policy.is_enrolled(item)
-
-    if enrolled:
-        if events is None:
-            raise ApiError(409, "reasoning is not enabled on this deployment")
-        if not already:
-            if not is_bundle_ready(s3, bucket, data_domain, dataset):
-                raise ApiError(
-                    409, "no wiki yet — run a harvest before enrolling in reasoning"
-                )
-            ar_policy.set_enrolled(
-                ddb, registry_table, data_domain=data_domain, dataset=dataset
-            )
-        queued = _publish_policy_rebuild(
-            events, data_domain=data_domain, dataset=dataset, reason="enroll"
-        )
-        return {"enrolled": True, "queued": queued}
-
-    if not already:
-        return {"enrolled": False, "deleted": False}
-    if _row_str(item, ar_policy.ATTR_BUILD_STATUS) == ar_policy.BUILD_BUILDING:
-        raise ApiError(
-            409,
-            "a policy build is in flight — wait for it to finish before unenrolling",
-        )
-    _purge_s3_prefix(
-        s3, bucket=bucket, prefix=ar_policy.policy_prefix(data_domain, dataset)
-    )
-    ar_policy.clear_ar_attrs(
-        ddb, registry_table, data_domain=data_domain, dataset=dataset
-    )
-    return {"enrolled": False, "deleted": True}
-
-
-def trigger_reasoning_sync(
-    ddb,
-    events,
-    *,
-    registry_table: str,
-    data_domain: str,
-    dataset: str,
-) -> dict[str, Any]:
-    """The Reasoning page's manual fail-safe: queue one rebuild now.
-
-    Just the event — the rebuild authority owns the pipeline, and its
-    rebuild-iff-changed skip means syncing an already-current policy is a
-    clean no-op rather than a wasted build.
-    """
-    item = _reasoning_row(ddb, registry_table, data_domain, dataset)
-    if not ar_policy.is_enrolled(item):
-        raise ApiError(409, "dataset is not enrolled in reasoning")
+    _reasoning_row(ddb, registry_table, data_domain, dataset)  # 404 if unknown
     if events is None:
         raise ApiError(409, "reasoning is not enabled on this deployment")
+    if not is_bundle_ready(s3, bucket, data_domain, dataset):
+        raise ApiError(409, "no wiki yet — run a harvest first")
     queued = _publish_policy_rebuild(
         events, data_domain=data_domain, dataset=dataset, reason="manual_sync"
     )
@@ -3435,9 +3400,9 @@ def get_reasoning_document(
     status call is polled every few seconds during authoring and this
     document can be tens of kilobytes: it is fetched only when the user opens
     the viewer. The live file is version-faithful by construction (authoring
-    rewrites it), so no version parameter exists. Absent (never authored, or
-    unenrolled) reads as ``exists: false`` rather than an error: the page
-    decides how to render that.
+    rewrites it), so no version parameter exists. Absent (never authored)
+    reads as ``exists: false`` rather than an error: the page decides how to
+    render that.
     """
     text = ar_policy.read_policy_doc(
         s3, bucket=bucket, data_domain=data_domain, dataset=dataset

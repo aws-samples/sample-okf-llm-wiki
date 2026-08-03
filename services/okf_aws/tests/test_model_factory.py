@@ -89,15 +89,17 @@ def test_gpt_effort_unknown_falls_back_to_xhigh():
     assert mf.gpt_effort("banana") == mf.DEFAULT_GPT_REASONING_EFFORT == "xhigh"
 
 
-@pytest.mark.parametrize("effort", ["none", "minimal"])
-def test_gpt_effort_no_reasoning_maps_to_the_floor_not_the_fallback(effort):
-    # The extraction efforts must NOT hit the unknown-value fallthrough: billing a
-    # max-reasoning run for a pass that asked for none is the silent-upgrade bug.
-    # The floor is "low", NOT a literal floor name: the floor's NAME varies by
-    # model generation (gpt-5.6-luna 400s on "minimal", older ids 400 on
-    # "none" — live-verified), while "low" is accepted fleet-wide.
-    assert mf.gpt_effort(effort) == mf.FLOOR_GPT_REASONING_EFFORT == "low"
-    assert mf.gpt_effort(effort) != mf.DEFAULT_GPT_REASONING_EFFORT
+def test_gpt_effort_no_reasoning_never_hits_the_fallback():
+    # The extraction/classifier efforts must NOT hit the unknown-value
+    # fallthrough: billing a max-reasoning run for a pass that asked for none
+    # is the silent-upgrade bug. "none" passes VERBATIM (the GPT-5.6 Mantle
+    # fleet accepts it — live-verified on Luna; the policy classifiers depend
+    # on a genuine no-reasoning pass); "minimal" floors to "low" (Luna 400s
+    # on that name, so it has no fleet-safe verbatim meaning).
+    assert mf.gpt_effort("none") == "none"
+    assert mf.gpt_effort("minimal") == mf.FLOOR_GPT_REASONING_EFFORT == "low"
+    for effort in ("none", "minimal"):
+        assert mf.gpt_effort(effort) != mf.DEFAULT_GPT_REASONING_EFFORT
 
 
 def test_gpt_effort_empty_rejected():
@@ -464,3 +466,28 @@ def test_build_model_dispatches_claude_to_converse(monkeypatch):
     assert captured["additional_model_request_fields"]["output_config"] == {
         "effort": "xhigh"
     }
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    ],
+)
+def test_converse_supports_adaptive_false_for_pre_46(model):
+    assert mf.converse_supports_adaptive(model) is False
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "global.anthropic.claude-opus-4-8-20260115-v1:0",
+        "us.anthropic.claude-sonnet-4-6-v1:0",
+        "us.anthropic.claude-haiku-4-6-v1:0",  # generation wins, not family
+        "some-unknown-model-id",  # unparseable → adaptive (current gens)
+    ],
+)
+def test_converse_supports_adaptive_true_for_46_plus(model):
+    assert mf.converse_supports_adaptive(model) is True

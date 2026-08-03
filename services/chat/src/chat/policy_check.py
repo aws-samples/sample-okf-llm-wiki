@@ -53,9 +53,10 @@ Soft contract throughout: every failure mode (unusable policies, judge
 error, timeout, state read/write failure) returns the results untouched —
 no reminder, never an error into the run.
 
-A dataset is judged only when it is enrolled, its document status is
-``ready``, AND the stored source fingerprint equals one freshly computed
-from the live wiki. A stale or invalid document NEVER renders a verdict —
+A dataset is judged only when its document status is ``ready`` AND the
+stored source fingerprint equals one freshly computed from the live wiki
+(a never-authored dataset has no status and is skipped silently — the check
+never triggers a first authoring). A stale or invalid document NEVER renders a verdict —
 the row is flagged and a ``policy_rebuild`` event is published (best-effort)
 so the check self-heals. A pre-v3 document without ``type`` fields fails the
 parse, which rides the same self-heal to a re-authored, typed document.
@@ -67,7 +68,7 @@ import json
 import logging
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from time import monotonic as _monotonic
 from typing import Any
 
@@ -168,9 +169,10 @@ def ask_human_qa(turn: list[Any]) -> list[dict[str, str]]:
                         "answer": str(a.get("answer") or ""),
                     }
                 )
-        note = parsed.get("note")
-        if note:
-            out.append({"prompt": "(free-form note)", "answer": str(note)})
+        # The payload's "note" is NOT user content — AskHumanMiddleware always
+        # sets it to a fixed harness instruction ("Use these answers to
+        # continue…"), so echoing it here would attribute harness text to the
+        # user in the judges' evidence. Only the answers are the user's words.
     return out
 
 
@@ -291,28 +293,72 @@ def _judge_tools() -> list[Any]:
     return [report_violations]
 
 
+def _usage_summary(reply: Any) -> str:
+    """Compact token-usage tail for the per-attempt log line.
+
+    Distinguishes the two slow-judge failure modes at a glance: big
+    ``out``/``reasoning`` = the call spent its time GENERATING (thinking
+    budget too generous); tiny usage on a long wall clock = the time went to
+    the wire (throttle/retry/queueing inside the SDK).
+    """
+    usage = getattr(reply, "usage_metadata", None) or {}
+    if not usage:
+        return "usage=?"
+    details = usage.get("output_token_details") or {}
+    reasoning = details.get("reasoning")
+    line = f"in={usage.get('input_tokens')} out={usage.get('output_tokens')}"
+    return f"{line} reasoning={reasoning}" if reasoning is not None else line
+
+
 def _forced_tool_call(
-    model: Any, tools: list[Any], prompt: str, *, tool_name: str
+    model: Any, tools: list[Any], prompt: str, *, tool_name: str,
+    force: bool = False,
 ) -> dict[str, Any] | None:
     """Invoke with ONE required tool; retry once on a missing call; None = fail.
 
-    The retry rebuilds the message list from scratch (never echoing the
-    tool-less reply — some providers reject dangling assistant turns). A judge
-    that still won't call the tool fails open as a missing shard, never a
-    fabricated verdict.
+    ``force=True`` binds ``tool_choice`` to the tool itself — legal because
+    every judge is a classifier build (thinking/reasoning OFF; Anthropic
+    models reject forced tool choice alongside thinking) — and it makes the
+    missing-call retry structurally unreachable. The retry stays as the
+    backstop for any non-forced caller: it rebuilds the message list from
+    scratch (never echoing the tool-less reply — some providers reject
+    dangling assistant turns), and a judge that still won't call the tool
+    fails open as a missing shard, never a fabricated verdict. Every attempt
+    logs wall-clock + token usage — a missing-tool-call retry DOUBLES a
+    shard's latency, so it must be visible in the logs, never silent.
     """
-    bound = model.bind_tools(tools)
+    bound = (
+        model.bind_tools(tools, tool_choice=tool_name)
+        if force
+        else model.bind_tools(tools)
+    )
     demand = ""
-    for _attempt in (1, 2):
+    for attempt in (1, 2):
+        t0 = _monotonic()
         try:
             reply = bound.invoke([("user", prompt + demand)])
         except Exception:  # noqa: BLE001 - fail-open is the contract
-            log.warning("policy judge call failed", exc_info=True)
+            log.warning(
+                "policy judge call failed (attempt %d, %.1fs)",
+                attempt, _monotonic() - t0, exc_info=True,
+            )
             return None
-        for call in getattr(reply, "tool_calls", None) or []:
+        calls = getattr(reply, "tool_calls", None) or []
+        log.info(
+            "policy judge attempt %d: %.1fs, %s, tool_call=%s",
+            attempt, _monotonic() - t0, _usage_summary(reply),
+            bool(calls),
+        )
+        for call in calls:
             if call.get("name") == tool_name:
                 args = call.get("args") or {}
                 return args if isinstance(args, dict) else None
+        if attempt == 1:
+            log.info(
+                "policy judge attempt 1 returned no %s call — retrying with "
+                "an explicit demand (this doubles the shard's latency)",
+                tool_name,
+            )
         demand = (
             f"\n\nRespond ONLY by calling the {tool_name} tool — no prose, "
             "no other tools."
@@ -321,14 +367,21 @@ def _forced_tool_call(
 
 
 def judge_shard(
-    model: Any, *, shard_text: str, evidence: str, prompt: str
+    model: Any, *, shard_text: str, evidence: str, prompt: str,
+    force_tool: bool = False,
 ) -> list[str] | None:
     """One mini-judge over one policy shard → violated ids. None = unjudged."""
+    t0 = _monotonic()
     args = _forced_tool_call(
         model,
         _judge_tools(),
         prompt.format(shard=shard_text, evidence=evidence),
         tool_name="report_violations",
+        force=force_tool,
+    )
+    log.info(
+        "policy judge shard done: %.1fs, judged=%s",
+        _monotonic() - t0, args is not None,
     )
     if args is None:
         return None
@@ -345,18 +398,20 @@ def judge_policies(
     *,
     shard_size: int,
     prompt: str,
+    force_tool: bool = False,
 ) -> tuple[list[str], int, int]:
     """Map step: ``(flagged_policy_ids, failed_shards, total_shards)``.
 
-    Shards run in parallel; a flagged id must belong to the judged set or it
-    is dropped (a judge can only fire policies it was shown). ``prompt``
+    Shards run in parallel; a flagged id must belong to the ids of the shard
+    THAT judge was shown or it is dropped — a judge can only fire policies it
+    actually evaluated, so an id copied/hallucinated from another shard (whose
+    own judge returned clean) never becomes a phantom violation. ``prompt``
     picks the track framing (:data:`_QUERY_JUDGE_PROMPT` /
     :data:`_STEPS_JUDGE_PROMPT`).
     """
     from okf_core.policy_doc import render_policies_for_judge, shard_policies
 
     shards = shard_policies(policies, shard_size)
-    known_ids = {p["id"] for p in policies}
     flagged: list[str] = []
     failed = 0
     with ThreadPoolExecutor(max_workers=min(4, len(shards))) as pool:
@@ -367,16 +422,18 @@ def judge_policies(
                     shard_text=render_policies_for_judge(shard),
                     evidence=evidence,
                     prompt=prompt,
+                    force_tool=force_tool,
                 ),
                 shards,
             )
         )
-    for result in results:
+    for shard, result in zip(shards, results):
         if result is None:
             failed += 1
             continue
+        shard_ids = {p["id"] for p in shard}
         for pid in result:
-            if pid in known_ids and pid not in flagged:
+            if pid in shard_ids and pid not in flagged:
                 flagged.append(pid)
     return flagged, failed, len(shards)
 
@@ -414,7 +471,7 @@ def render_judged_findings(
 # standings table is the canonical additivity violation.
 _ANALYTICAL_RE = re.compile(
     r"""
-    \b(?:join|group\s+by|union)\b
+    \b(?:join|group\s+by|union|except|intersect)\b
     | \bover\s*\(
     | \b(?:count|sum|avg|min|max|approx_distinct|stddev(?:_pop|_samp)?
          |var(?:iance|_pop|_samp)|corr)\s*\(
@@ -424,8 +481,16 @@ _ANALYTICAL_RE = re.compile(
 
 
 def is_analytical_sql(sql: str) -> bool:
-    """True when the query computes something worth judging (see gate above)."""
-    s = (sql or "").strip().rstrip(";").strip()
+    """True when the query computes something worth judging (see gate above).
+
+    Comments are stripped FIRST (same as the engine's read-only guard and
+    :func:`extract_sql_schemas`): a leading ``--``/``/* */`` comment — a
+    common LLM habit — must not disguise an analytical query as exploration,
+    or the query executes fine while silently bypassing both check tracks.
+    """
+    from chat.sql import strip_sql_comments
+
+    s = strip_sql_comments(sql or "").strip().rstrip(";").strip()
     head = s.split(None, 1)[0].upper() if s else ""
     if head not in ("SELECT", "WITH"):
         return False
@@ -444,9 +509,17 @@ def is_analytical_sql(sql: str) -> bool:
 # engine can only be built from the scope's source descriptor), so the pinned
 # scope answers directly — see docs/CONVENTIONS.md.
 _STRING_LIT_RE = re.compile(r"'(?:[^']|'')*'")
-_QUALIFIED_REF_RE = re.compile(
-    r"\b(?:from|join)\s+"
-    r"((?:\"[^\"]+\"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:\"[^\"]+\"|[A-Za-z_][\w$]*)){1,2})",
+_IDENT = r'(?:"[^"]+"|[A-Za-z_][\w$]*)'
+_QUALIFIED = rf"{_IDENT}(?:\s*\.\s*{_IDENT}){{1,2}}"
+_QUALIFIED_REF_RE = re.compile(rf"\b(?:from|join)\s+({_QUALIFIED})", re.IGNORECASE)
+# An old-style comma join continues the FROM list: after a matched table ref
+# (and its optional ``alias`` / ``AS alias``), a comma introduces the NEXT
+# table. Only a comma reached by WALKING from a FROM/JOIN anchor counts — a
+# bare ``, x.y`` elsewhere (a SELECT list's ``alias.col``) must never read as
+# a table reference, which is why this is anchored continuation, not a global
+# scan.
+_COMMA_REF_RE = re.compile(
+    rf"\s*(?:as\s+{_IDENT}\s*|{_IDENT}\s*)?,\s*({_QUALIFIED})",
     re.IGNORECASE,
 )
 
@@ -455,36 +528,53 @@ def extract_sql_schemas(sql: str) -> list[str]:
     """Distinct schema/database names the query reads, in first-use order.
 
     ``"db"."table"`` → ``db``; ``"catalog"."db"."table"`` → ``db`` (the
-    second-from-last part). Lowercased for the registry match.
+    second-from-last part). Lowercased for the registry match. Covers
+    FROM/JOIN position plus old-style comma joins (``FROM a.t x, b.u y``) by
+    walking each FROM item's comma continuations.
     """
     from chat.sql import strip_sql_comments
 
     s = _STRING_LIT_RE.sub("''", strip_sql_comments(sql or ""))
     out: list[str] = []
-    for m in _QUALIFIED_REF_RE.finditer(s):
-        parts = [p.strip().strip('"').lower() for p in m.group(1).split(".")]
+
+    def _record(ref: str) -> None:
+        parts = [p.strip().strip('"').lower() for p in ref.split(".")]
         schema = parts[-2]
         if schema and schema not in out:
             out.append(schema)
+
+    for m in _QUALIFIED_REF_RE.finditer(s):
+        _record(m.group(1))
+        pos = m.end()
+        while True:
+            cont = _COMMA_REF_RE.match(s, pos)
+            if not cont:
+                break
+            _record(cont.group(1))
+            pos = cont.end()
     return out
 
 
-def _enrolled_glue_map(ddb, table: str) -> dict[str, tuple[str, str]]:
-    """``{glue_database (lower) -> (data_domain, dataset)}`` over ENROLLED rows.
+def _policy_glue_map(ddb, table: str) -> dict[str, tuple[str, str]]:
+    """``{glue_database (lower) -> (data_domain, dataset)}`` over POLICY-BEARING rows.
 
-    The mapping row's ``glue_database`` wins (a dataset id need not equal its
-    Glue DB name — same contract as the server's scope enrichment); the
-    dataset id is the fallback. Enrolled datasets are few, so one filtered
-    scan per turn is cheap.
+    "Policy-bearing" = the policy lifecycle has begun (``ar_build_status``
+    present — the same gate as ``okf_aws.ar_policy.lifecycle_begun``); the
+    per-dataset usability check downstream still decides whether verdicts
+    render. A never-authored dataset is invisible here by design: the check
+    must not become a backfill trigger. The mapping row's ``glue_database``
+    wins (a dataset id need not equal its Glue DB name — same contract as the
+    server's scope enrichment); the dataset id is the fallback. Policy-bearing
+    datasets are few, so one filtered scan per turn is cheap.
     """
     out: dict[str, tuple[str, str]] = {}
     kwargs: dict[str, Any] = {
         "TableName": table,
         "FilterExpression": (
-            "ar_enrolled = :t AND begins_with(pk, :p) AND begins_with(sk, :s)"
+            "attribute_exists(ar_build_status) AND "
+            "begins_with(pk, :p) AND begins_with(sk, :s)"
         ),
         "ExpressionAttributeValues": {
-            ":t": {"BOOL": True},
             ":p": {"S": "DOMAIN#"},
             ":s": {"S": "DATASET#"},
         },
@@ -763,9 +853,12 @@ class PolicyChecker:
     other while their callers' wait budgets burn. Cold-start state (boto3
     clients, the judge + rewrite models, the freshness gate, the
     curated-question rewrite, the loaded policy sets) is built lazily on the
-    first submitted work and cached for the turn; every shared cache is
-    guarded by one RLock, held for the bookkeeping and the one-time gates but
-    NEVER across a judge fleet call.
+    first submitted work and cached for the turn. The shared RLock guards
+    BOOKKEEPING ONLY — it is never held across a model call, a judge fleet,
+    or S3/DynamoDB I/O; each expensive one-time computation has its own
+    once-guard (a dedicated lock for the curated question, in-flight Futures
+    for the policy gates and per-SQL verdicts) so one slow network call can
+    never stall unrelated checker operations (or the server's teardown).
 
     Computational: ``submit(sql)`` returns a Future the tool resolves AFTER
     the query comes back, bounded by ``wait_budget_s`` — the judges run
@@ -776,9 +869,9 @@ class PolicyChecker:
     Which dataset's policies apply: an @-scoped run pins it via
     ``data_domain``/``dataset`` (Redshift runs are ALWAYS pinned — scoped by
     construction). UNSCOPED Athena runs read the dataset from the SQL itself
-    (qualified names in FROM/JOIN position → the enrolled-dataset Glue map);
-    a query touching several enrolled datasets is judged against each, and
-    one touching only un-enrolled data is skipped for free.
+    (qualified names in FROM/JOIN position → the policy-bearing-dataset Glue
+    map); a query touching several policy-bearing datasets is judged against
+    each, and one touching only policy-less data is skipped for free.
     """
 
     def __init__(
@@ -807,17 +900,28 @@ class PolicyChecker:
         self._rewriter = rewrite_model
         # (domain, dataset) -> usable policy list, or None (gated: unusable).
         self._policies_by_ds: dict[tuple[str, str], list[dict[str, str]] | None] = {}
+        # (domain, dataset) -> in-flight gate run: concurrent checks needing
+        # the same dataset wait on the owner's Future instead of re-running
+        # the gate (or blocking every OTHER operation behind its I/O).
+        self._policy_loads: dict[tuple[str, str], Future] = {}
         self._glue_map: dict[str, tuple[str, str]] | None = None
         self._notes: dict[str, str] = {}  # normalized SQL -> reminder ("" = clean)
+        # normalized SQL -> in-flight verdict: identical parallel queries
+        # share one fleet round (and one budget unit) instead of racing the
+        # _notes cache and double-spending.
+        self._note_inflight: dict[str, Future] = {}
         self._checks = 0
         self._warmed = False
         self._curated_q: str | None = None
         self._ask_qa: list[dict[str, str]] = []
         # Behavioural flags already reported this turn (never nag twice).
         self._behaviour_flagged: set[tuple[str, str, str]] = set()
-        # Re-entrant because the one-time gates nest (warm-up -> curated
-        # question -> policy state read) while holding it.
+        # Bookkeeping only — never held across network I/O (see class doc).
+        # Re-entrant because nested helpers re-take it for their own reads.
         self._lock = threading.RLock()
+        # Once-guard for the curated-question rewrite (a model call): its
+        # owner computes OUTSIDE the shared lock; peers wait here, not there.
+        self._curate_lock = threading.Lock()
         self._pool = ThreadPoolExecutor(
             max_workers=_POOL_WORKERS, thread_name_prefix="policy-check"
         )
@@ -853,17 +957,54 @@ class PolicyChecker:
         return self._pool.submit(self._check_behavioural, list(messages))
 
     def prewarm(self) -> None:
-        """Queue the cold-start work without a query (middleware calls, once).
+        """Kick the turn's cold-start work — in PARALLEL — without a query.
 
-        A behavioural-only run has no ``submit(sql)`` to piggyback the warm-up
-        on, so its first eval would pay model build + curated rewrite + gates
-        INSIDE the wait window. Kicked on the middleware's first hook instead
-        — the turn's exploration phase absorbs it. Idempotent (``_warmed``).
+        The server calls this at run start (fresh user message, or an
+        ask_human resume AFTER the clarification fold) for EVERY run the
+        deploy gate allows, armed or not: the curated-question rewrite runs
+        every turn so the rolling chain never goes stale across unarmed
+        turns (arming Policy mid-conversation then finds a fresh chain, not
+        turn-1 amnesia). The behavioural middleware's first hook remains a
+        second, idempotent caller.
+
+        Each piece is its own pool task behind its own once-guard, so the
+        slow piece (the rewrite — a model call) never delays the judge
+        build or the gates — and NOTHING downstream ever waits on it:
+        evaluators fire the moment they are triggered and take the curated
+        question only if it has already landed (:meth:`_curated_now`).
+        Judge build and gates are skipped for an unarmed (curation-only)
+        checker — there is nothing to judge.
+        """
+        with self._lock:
+            if self._warmed:
+                return
+            self._warmed = True
+        pieces: list[Any] = [self._curated]
+        if self.tracks:
+            pieces.append(self._judge_model)
+            if self._domain and self._dataset:
+                pieces.append(
+                    lambda: self._load_policies(self._domain, self._dataset)
+                )
+            else:
+                pieces.append(self._glue)
+        for piece in pieces:
+            try:
+                self._pool.submit(self._warm_piece, piece)
+            except Exception:  # noqa: BLE001 - warm-up is best-effort
+                log.warning("policy prewarm submit failed (non-fatal)", exc_info=True)
+
+    def _warm_piece(self, fn: Any) -> None:
+        """Run one warm-up piece on the pool; failures degrade, never break.
+
+        Every piece's underlying cache computes-on-miss for whoever needs it
+        first, so a failed (or still-queued) piece costs freshness, never
+        correctness — the check path recomputes inline.
         """
         try:
-            self._pool.submit(self._warm_once)
+            fn()
         except Exception:  # noqa: BLE001 - warm-up is best-effort
-            log.warning("policy prewarm submit failed (non-fatal)", exc_info=True)
+            log.warning("policy warm-up piece failed (non-fatal)", exc_info=True)
 
     def fold_clarifications(self, raw_question: str, qa: list[dict[str, str]]) -> None:
         """Fold an answered ask_human exchange into the curated question.
@@ -874,33 +1015,57 @@ class PolicyChecker:
         ask-first evidence lives in the behavioural steps track, and the
         computational judges need the clarified intent).
         """
-        if raw_question and not self._question:
-            self._question = raw_question
-        if qa:
-            self._ask_qa = list(qa)
-        self._curated_q = None  # recompute with the fold on next use
+        with self._lock:
+            if raw_question and not self._question:
+                self._question = raw_question
+            if qa:
+                self._ask_qa = list(qa)
+            self._curated_q = None  # recompute with the fold on next use
 
     def record_final_answer(self, answer_text: str) -> None:
         """Persist the turn's final answer for the NEXT turn's rewrite (async).
 
-        Queued on the worker so stream teardown never blocks on DynamoDB;
-        best-effort like every policy-state write.
+        Queued on the worker so stream teardown never blocks: the DynamoDB
+        client is resolved INSIDE the worker (:meth:`_write_answer`) —
+        resolving it here would run boto construction, and the shared-lock
+        acquisition it needs, on the server's event-loop thread. Best-effort
+        like every policy-state write.
         """
         if not (self._user_sub and self._thread_id and answer_text):
             return
-        from chat.threads import write_policy_state
-
         try:
-            self._pool.submit(
-                write_policy_state,
-                self._ddb(),
-                threads_table=self._cfg.threads_table,
-                user_sub=self._user_sub,
-                thread_id=self._thread_id,
-                last_answer=answer_text,
-            )
+            self._pool.submit(self._write_answer, answer_text)
         except Exception:  # noqa: BLE001 - advisory context, never fatal
             log.warning("policy answer write submit failed (non-fatal)", exc_info=True)
+
+    def _write_answer(self, answer_text: str) -> None:
+        """Worker-side final-answer persist (write_policy_state never raises)."""
+        from chat.threads import write_policy_state
+
+        write_policy_state(
+            self._ddb(),
+            threads_table=self._cfg.threads_table,
+            user_sub=self._user_sub,
+            thread_id=self._thread_id,
+            last_answer=answer_text,
+        )
+
+    def close(self) -> None:
+        """Release the turn's worker threads (idempotent, never raises).
+
+        Called by the server once the run's chunk stream finishes. Work
+        already submitted (the final-answer write, an unclaimed verdict)
+        still completes — ``shutdown(wait=False)`` only refuses NEW submits
+        and lets idle workers exit. Without this the pool's threads live as
+        long as the checker object does, and the live-stream registry keeps
+        the last run (graph → tools/middleware → checker) per conversation —
+        a busy container would accrete 8 idle threads per policy-armed
+        conversation. Later submits (all wrapped) fail open as designed.
+        """
+        try:
+            self._pool.shutdown(wait=False)
+        except Exception:  # noqa: BLE001 - teardown must never raise
+            log.warning("policy checker close failed (non-fatal)", exc_info=True)
 
     # -- worker side ----------------------------------------------------------------
 
@@ -913,47 +1078,48 @@ class PolicyChecker:
             return ""
 
     def _warm_once(self) -> None:
-        """Front-load the cold start into the turn's FIRST work item (usually
-        an exploration probe or the middleware's prewarm — nobody waits on
-        it): judge-model build, the curated question rewrite (racing the
-        query's own execution — the first analytical check then waits on a
-        warm cache), and the freshness gate / enrolled-dataset map. Without
-        this, the first analytical query pays it all inside its own verdict
-        window — the observed cause of dropped verdicts. Runs under the lock:
-        concurrent workers block here until the caches they need exist.
+        """Belt-and-braces warm-up for a check whose prewarm never fired.
+
+        The server prewarms every checker at run start, so this is normally
+        a no-op flag read. When it isn't (a direct construction, a test),
+        it fires the same parallel pieces and RETURNS — this worker proceeds
+        straight into the check, whose getters compute judge model/policies
+        on miss (fast) and never wait on the rewrite (:meth:`_curated_now`).
         """
-        with self._lock:
-            if self._warmed:
-                return
-            self._warmed = True
-            try:
-                self._judge_model()
-                self._curated()
-                if self._domain and self._dataset:
-                    self._load_policies(self._domain, self._dataset)
-                elif self._glue_map is None:
-                    self._glue_map = _enrolled_glue_map(
-                        self._ddb(), self._cfg.registry_table
-                    )
-            except Exception:  # noqa: BLE001 - warm-up is best-effort
-                log.warning("policy warm-up failed (non-fatal)", exc_info=True)
+        self.prewarm()
 
     def _check_inner(self, sql: str) -> str:
         if not is_analytical_sql(sql):
             return ""
         key = " ".join(sql.split())
-        max_checks = int(getattr(self._cfg, "policy_query_max_per_turn", 3))
         with self._lock:
             if key in self._notes:
                 return self._notes[key]
-            if self._checks >= max_checks:
-                log.info(
-                    "query policy check budget (%d) exhausted this turn", max_checks
-                )
-                return ""
+            inflight = self._note_inflight.get(key)
+            if inflight is None:
+                fut: Future = Future()
+                self._note_inflight[key] = fut
+        if inflight is not None:
+            # An identical query is already being judged (parallel tool
+            # calls both missed the cache): share the owner's verdict rather
+            # than running a duplicate fleet and double-spending the budget.
+            return inflight.result() or ""
+        note = ""
+        try:
+            note = self._judge_query(sql)
+        finally:
+            with self._lock:
+                self._notes[key] = note
+                self._note_inflight.pop(key, None)
+            fut.set_result(note)
+        return note
+
+    def _judge_query(self, sql: str) -> str:
+        """One query's verdict (the in-flight owner's path — see _check_inner)."""
         from okf_core.policy_doc import policies_of_type
 
-        evidence = build_query_evidence(self._curated(), sql)
+        max_checks = int(getattr(self._cfg, "policy_query_max_per_turn", 3))
+        evidence = build_query_evidence(self._curated_now(), sql)
         notes: list[str] = []
         judged_query = False
         for domain, dataset in self._resolve_datasets([sql]):
@@ -965,8 +1131,8 @@ class PolicyChecker:
             if not judged_query:
                 # The budget counts QUERIES, not datasets — a rare
                 # cross-dataset join costs two fleets but one budget unit.
-                # Re-checked under the lock: concurrent checks race the
-                # pre-check above, and the cap must hold across them.
+                # Checked under the lock so the cap holds across concurrent
+                # (distinct-SQL) checks.
                 with self._lock:
                     if self._checks >= max_checks:
                         log.info(
@@ -988,10 +1154,7 @@ class PolicyChecker:
                         closing=_QUERY_CLOSING,
                     )
                 )
-        note = "\n\n".join(notes)
-        with self._lock:
-            self._notes[key] = note
-        return note
+        return "\n\n".join(notes)
 
     def _check_behavioural(self, window: list[Any]) -> str:
         try:
@@ -1005,7 +1168,7 @@ class PolicyChecker:
         from okf_core.policy_doc import policies_of_type
 
         sqls = analytical_sqls(window)
-        evidence = build_steps_evidence(window, question=self._curated())
+        evidence = build_steps_evidence(window, question=self._curated_now())
         notes: list[str] = []
         for domain, dataset in self._resolve_datasets(sqls):
             policies = policies_of_type(
@@ -1059,6 +1222,9 @@ class PolicyChecker:
             evidence,
             shard_size=self._cfg.policy_shard_size,
             prompt=prompt,
+            # Every judge is a classifier build (no thinking/reasoning), so
+            # the verdict tool is FORCED on every family.
+            force_tool=True,
         )
         log.info(
             "policy fleet for %s/%s: %d policies, %d flagged, %.1fs",
@@ -1068,11 +1234,44 @@ class PolicyChecker:
 
     # -- the rolling curated question -------------------------------------------------
 
+    def _curated_now(self) -> str:
+        """The curated question if the rewrite has LANDED, else the raw one.
+
+        Evaluators never block on the rewrite — the fleet fires the moment
+        it is triggered. The curation task starts with the turn (prewarm),
+        so by the first verdict it has usually landed; when it hasn't, the
+        raw question is the honest input (both judge prompts already
+        tolerate an absent or abbreviated question). The rewrite still
+        completes and persists in the background for the NEXT turn's chain.
+        Logged per use so the operator can tell FROM THE LOGS which question
+        an evaluation actually judged against.
+        """
+        with self._lock:
+            curated = self._curated_q
+        if curated is not None:
+            log.info("policy evidence question (curated): %.160s", curated)
+            return curated
+        log.info(
+            "policy evidence question (raw — rewrite not landed yet): %.160s",
+            self._question,
+        )
+        return self._question
+
     def _curated(self) -> str:
         with self._lock:
-            if self._curated_q is None:
-                self._curated_q = self._curate()
-            return self._curated_q
+            if self._curated_q is not None:
+                return self._curated_q
+        # Compute OUTSIDE the shared lock — the rewrite is a model call plus
+        # a DynamoDB read, and holding the shared lock across it would stall
+        # every other checker operation. _curate_lock is the once-guard.
+        with self._curate_lock:
+            with self._lock:
+                if self._curated_q is not None:
+                    return self._curated_q
+            curated = self._curate()
+            with self._lock:
+                self._curated_q = curated
+            return curated
 
     def _curate(self) -> str:
         """Resolve the turn's curated question (worker-side, once per turn).
@@ -1112,6 +1311,10 @@ class PolicyChecker:
                     thread_id=self._thread_id,
                     curated_question=raw,
                 )
+            log.info(
+                "curated question seeded from the raw question (turn 1): %.160s",
+                raw,
+            )
             return raw
         # prev_q may still be empty here (e.g. the previous armed turn ran no
         # SQL, so only its ANSWER was recorded) — the answer alone still gives
@@ -1123,8 +1326,19 @@ class PolicyChecker:
             raw_question=raw,
             qa=self._ask_qa,
         )
-        curated = curated or raw or prev_q
-        if curated and curated != prev_q and self._user_sub and self._thread_id:
+        if not curated:
+            # The rewrite FAILED — fall back for THIS turn's evidence, but do
+            # NOT persist the fallback: overwriting the previous good curated
+            # question with a raw fragment ("and for 2019?") would poison
+            # every later turn's rewrite, not just this one. Only a rewrite
+            # that actually landed advances the durable chain.
+            log.info(
+                "curated-question rewrite failed — this turn's evaluations "
+                "use the raw question: %.160s", raw or prev_q,
+            )
+            return raw or prev_q
+        log.info("curated question landed: %.160s", curated)
+        if curated != prev_q and self._user_sub and self._thread_id:
             write_policy_state(
                 self._ddb(),
                 threads_table=self._cfg.threads_table,
@@ -1142,8 +1356,8 @@ class PolicyChecker:
         A pinned scope answers directly (Redshift runs always land here —
         scoped by construction). Otherwise the schemas the SQL reads
         (FROM/JOIN qualified names — mandatory without a default database)
-        are matched against the enrolled datasets' Glue map, built once per
-        turn. No match = nothing enrolled to judge against = skip for free.
+        are matched against the policy-bearing datasets' Glue map, built once
+        per turn. No match = no policy state to judge against = skip for free.
         """
         if self._domain and self._dataset:
             return [(self._domain, self._dataset)]
@@ -1154,53 +1368,81 @@ class PolicyChecker:
                     schemas.append(schema)
         if not schemas:
             return []
-        with self._lock:
-            if self._glue_map is None:
-                self._glue_map = _enrolled_glue_map(
-                    self._ddb(), self._cfg.registry_table
-                )
+        glue = self._glue()
         seen: list[tuple[str, str]] = []
         for schema in schemas:
-            pair = self._glue_map.get(schema)
+            pair = glue.get(schema)
             if pair and pair not in seen:
                 seen.append(pair)
         return seen
+
+    def _glue(self) -> dict[str, tuple[str, str]]:
+        """The policy-bearing-dataset Glue map, computed OUTSIDE the shared lock.
+
+        A rare concurrent miss scans twice (first result wins) — cheaper than
+        holding the lock across a DynamoDB scan and stalling everything else.
+        """
+        with self._lock:
+            cached = self._glue_map
+        if cached is not None:
+            return cached
+        computed = _policy_glue_map(self._ddb(), self._cfg.registry_table)
+        with self._lock:
+            if self._glue_map is None:
+                self._glue_map = computed
+            return self._glue_map
 
     def _load_policies(
         self, domain: str, dataset: str
     ) -> list[dict[str, str]] | None:
         """The dataset's usable policy set (BOTH types), gated ONCE per turn.
 
-        Unusable states (not enrolled, building, failed, stale fingerprint,
+        Unusable states (never authored, building, failed, stale fingerprint,
         missing/invalid document — including a pre-v3 document without
         ``type`` fields) yield None for the rest of the turn; a stale or
         document-less READY row additionally publishes the rebuild event —
-        the soft check self-heals. Runs under the lock: without it, a
-        concurrent check racing the gate would read the ``None`` sentinel
-        mid-load and silently skip a dataset that is actually usable.
+        the soft check self-heals. Bookkeeping runs under the shared lock but
+        the gate's network I/O does NOT: a concurrent check needing the same
+        dataset waits on the owner's Future (so it can never read a
+        mid-load sentinel), while checks on other state proceed untouched.
         """
+        key = (domain, dataset)
         with self._lock:
-            return self._load_policies_locked(domain, dataset)
+            if key in self._policies_by_ds:
+                return self._policies_by_ds[key]
+            inflight = self._policy_loads.get(key)
+            if inflight is None:
+                fut: Future = Future()
+                self._policy_loads[key] = fut
+        if inflight is not None:
+            return inflight.result()
+        policies: list[dict[str, str]] | None = None
+        try:
+            policies = self._run_policy_gate(domain, dataset)
+        except Exception:  # noqa: BLE001 - a failed gate reads as "no policy"
+            log.warning("policy gate failed (non-fatal)", exc_info=True)
+        finally:
+            with self._lock:
+                self._policies_by_ds[key] = policies
+                self._policy_loads.pop(key, None)
+            fut.set_result(policies)
+        return policies
 
-    def _load_policies_locked(
+    def _run_policy_gate(
         self, domain: str, dataset: str
     ) -> list[dict[str, str]] | None:
         from okf_aws import ar_policy as ap
         from okf_core import policy_doc as pdoc
 
-        cache_key = (domain, dataset)
-        if cache_key in self._policies_by_ds:
-            return self._policies_by_ds[cache_key]
-        self._policies_by_ds[cache_key] = None  # gate ran; overwrite on success
-
         ddb, s3 = self._ddb(), self._s3()
         row = _registry_row(ddb, self._cfg.registry_table, domain, dataset)
-        if not ap.is_enrolled(row):
-            return None
+        # An absent row or a never-begun lifecycle both read as status "" and
+        # fall out here — the check must stay silent for them (no rebuild
+        # publish): it is a consumer of policy state, never a backfill trigger.
         status = _row_s(row, ap.ATTR_BUILD_STATUS)
         if status not in ap.USABLE_BUILD_STATUSES:
             return None
-        fresh = ap.source_hash(s3, self._cfg.bundle_bucket, domain, dataset)
+        fresh = _cached_source_hash(s3, self._cfg.bundle_bucket, domain, dataset)
         if not fresh or fresh != _row_s(row, ap.ATTR_SOURCE_HASH):
             try:
                 ap.flag_stale(
@@ -1228,7 +1470,6 @@ class PolicyChecker:
         if not policies:
             _publish_rebuild(self._events(), domain, dataset)
             return None
-        self._policies_by_ds[cache_key] = policies
         return policies
 
     # -- lazy seams (tests inject via the constructor) ---------------------------------
@@ -1281,13 +1522,20 @@ def make_policy_checker(
     user_sub: str,
     thread_id: str,
 ) -> PolicyChecker | None:
-    """The run's checker, or None (deploy gate off / no track opted in).
+    """The run's checker, or None (deploy gate off).
 
-    Construction is cheap — clients, both models, the freshness gate, and
-    the curated question are all lazy inside the checker's worker thread.
+    Built for EVERY run the deploy gate allows — including runs with no
+    track armed: an unarmed checker exists solely to keep the rolling
+    curated-question chain fresh (prewarm kicks the rewrite; the final
+    answer is recorded at stream end), so arming Policy mid-conversation
+    inherits a current chain instead of turn-1 amnesia. ``wants()`` is
+    False for both tracks then, so nothing wires into the SQL tool or the
+    middleware and nothing is ever judged. Construction is cheap — clients,
+    both models, the freshness gate, and the curated question are all lazy
+    inside the checker's worker pool.
     """
     tracks = frozenset(tracks or ())
-    if not tracks or not getattr(chat_config, "policy_check_enabled", False):
+    if not getattr(chat_config, "policy_check_enabled", False):
         return None
     return PolicyChecker(
         chat_config=chat_config,
@@ -1380,13 +1628,17 @@ class BehaviouralPolicyMiddleware(AgentMiddleware):  # type: ignore[misc]
             self._covered = count
             return
         if count > self._covered and self._future is None:
-            self._covered = count
             try:
                 self._future = self._checker.submit_behavioural(window)
             except Exception:  # noqa: BLE001 - advisory, never fatal
                 log.warning(
                     "behavioural policy submit failed (non-fatal)", exc_info=True
                 )
+            else:
+                # Advance the watermark only when the eval actually queued —
+                # a failed submit must leave the queries eligible for the
+                # next hook, not permanently marked covered.
+                self._covered = count
 
     def _await_note(self) -> str:
         """Resolve the pending eval within the budget; "" = nothing to inject.
@@ -1428,6 +1680,32 @@ class BehaviouralPolicyMiddleware(AgentMiddleware):  # type: ignore[misc]
 
 
 # --- shared plumbing ---------------------------------------------------------------
+
+#: The live source fingerprint is EXPENSIVE (ap.source_hash walks the whole
+#: source corpus on S3), and the per-turn checker cache never amortizes it
+#: across turns — so a short module-level TTL cache does. Staleness inside the
+#: window only DELAYS a stale flag by minutes on an advisory check; the next
+#: expiry (and the nightly reconcile) both catch it.
+_SOURCE_HASH_TTL_S = 300.0
+_source_hash_cache: dict[tuple[str, str, str], tuple[float, str | None]] = {}
+_source_hash_lock = threading.Lock()
+
+
+def _cached_source_hash(
+    s3, bucket: str, domain: str, dataset: str
+) -> str | None:
+    from okf_aws import ar_policy as ap
+
+    key = (bucket, domain, dataset)
+    now = _monotonic()
+    with _source_hash_lock:
+        hit = _source_hash_cache.get(key)
+        if hit is not None and now - hit[0] < _SOURCE_HASH_TTL_S:
+            return hit[1]
+    fresh = ap.source_hash(s3, bucket, domain, dataset)
+    with _source_hash_lock:
+        _source_hash_cache[key] = (now, fresh)
+    return fresh
 
 
 def _publish_rebuild(events, data_domain: str, dataset: str) -> None:
