@@ -720,6 +720,11 @@ function Console({ auth, api }) {
   const chat = useChatController({
     urlThreadId: route.threadId,
     onThreadChange: setChatThread,
+    // Only bind the thread into the URL while chat is the active section — see
+    // useChatController: this is what stops a chat→browse→chat hop from shoving
+    // #/chat/<id> back over the section you navigated to.
+    active: section === "chat",
+    userSub: auth.user?.profile?.sub,
   })
 
   // Jump from the Graph view to the Browse view, opening a concept's doc.
