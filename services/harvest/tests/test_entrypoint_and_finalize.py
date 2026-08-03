@@ -16,6 +16,21 @@ def test_validate_rejects_missing_fields():
     assert "changed_table" in r["error"]
 
 
+def test_ar_rules_mode_validates_and_dispatches_to_the_build_trigger(monkeypatch):
+    # ar_rules is a benchmark-style non-harvest mode: no lease, no mount — the
+    # dispatch must route straight to maybe_build_policy and return.
+    assert ep._validate({"mode": "ar_rules", "data_domain": "d"}) is not None
+    assert ep._validate({"mode": "ar_rules", "data_domain": "d", "dataset": "x"}) is None
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "harvest.ar_build.maybe_build_policy",
+        lambda **kw: calls.append(kw) or "unchanged",
+    )
+    ep._dispatch({"mode": "ar_rules", "data_domain": "d", "dataset": "x"})
+    assert calls == [{"data_domain": "d", "dataset": "x"}]
+
+
 def test_model_config_from_payload_absent_is_none():
     # No model/effort in the payload -> None so the runner uses env defaults.
     assert ep._model_config_from_payload({"data_domain": "d", "dataset": "x"}) is None

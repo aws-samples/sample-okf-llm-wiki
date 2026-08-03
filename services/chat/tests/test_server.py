@@ -290,6 +290,40 @@ def test_process_stream_data_tool_result_error_status():
     assert out["content"] == "boom"  # non-JSON left raw
 
 
+def test_process_stream_data_splits_policy_flag_from_run_sql_result():
+    # A run_sql result carrying the query-time policy reminder yields TWO
+    # chunks: the tool result (reminder stripped, payload JSON-parsed) and a
+    # "policy" chunk holding just the finding lines for the shield step.
+    from langchain_core.messages import ToolMessage
+
+    from chat.policy_check import (
+        _QUERY_CLOSING,
+        _QUERY_SUBJECT,
+        compose_policy_reminder,
+    )
+
+    reminder = compose_policy_reminder(
+        [{"policy_id": "P013", "why": "collapsed the grain.",
+          "condition": "a collapse happens", "action": "state the rule",
+          "source": "references/known_issues/k.md"}],
+        "bird/formula_1",
+        subject=_QUERY_SUBJECT,
+        closing=_QUERY_CLOSING,
+    )
+    tm = ToolMessage(
+        content='{"rows": []}' + "\n\n" + reminder,
+        name="run_sql",
+        tool_call_id="c7",
+    )
+    out = server.process_stream_data("messages", (tm, {}))
+    assert isinstance(out, list) and len(out) == 2
+    tool, flag = out
+    assert tool["type"] == "tool" and tool["content"] == {"rows": []}
+    assert flag["type"] == "policy"
+    assert flag["content"].startswith("- [P013]")
+    assert "Do not mention" not in flag["content"]  # model-facing framing dropped
+
+
 # --- a full streamed turn over a real create_agent graph --------------------
 
 
@@ -371,7 +405,8 @@ def test_stream_run_emits_typed_chunks_and_end_marker():
     cp = InMemorySaver()
     seen = {}
 
-    def build_agent(model, effort, scope, checkpointer, features=None, user_sub=""):
+    def build_agent(model, effort, scope, checkpointer, features=None, user_sub="",
+                    policy_checker=None):
         seen["model"], seen["effort"], seen["scope"] = model, effort, scope
         seen["features"] = features
         return _scripted_graph(checkpointer)
@@ -635,7 +670,8 @@ def test_read_history_folds_messages_into_turns():
 
     cp = InMemorySaver()
 
-    def build_agent(model, effort, scope, checkpointer, features=None, user_sub=""):
+    def build_agent(model, effort, scope, checkpointer, features=None, user_sub="",
+                    policy_checker=None):
         return _scripted_graph(checkpointer)
 
     # Run one turn to populate the checkpoint, then read it back.
@@ -721,6 +757,67 @@ def test_process_stream_updates_emits_steer_chunks():
 
     unmarked = {"node": {"messages": [HumanMessage(content="hello")]}}
     assert server.process_stream_data("updates", unmarked) is None
+
+
+def test_process_stream_updates_emits_policy_chunks_for_behavioural_notes():
+    # A BehaviouralPolicyMiddleware injection carries the POLICY marker — it
+    # becomes a typed "policy" chunk holding just the finding lines (the same
+    # shield step as the query-time split), never a "steer".
+    from langchain_core.messages import HumanMessage
+
+    from chat.policy_check import (
+        _STEPS_CLOSING,
+        _STEPS_SUBJECT,
+        POLICY_MARKER,
+        compose_policy_reminder,
+    )
+
+    note = compose_policy_reminder(
+        [{"policy_id": "P002", "why": "computed on an ambiguity.",
+          "condition": "an ambiguous term is computed on", "action": "ask first",
+          "source": "references/usage_guardrails.md"}],
+        "bird/formula_1",
+        subject=_STEPS_SUBJECT,
+        closing=_STEPS_CLOSING,
+    )
+    data = {
+        "BehaviouralPolicyMiddleware.before_model": {
+            "messages": [
+                HumanMessage(content=note, additional_kwargs={POLICY_MARKER: "behavioural"})
+            ]
+        }
+    }
+    chunks = server.process_stream_data("updates", data)
+    assert len(chunks) == 1 and chunks[0]["type"] == "policy"
+    assert chunks[0]["content"].startswith("- [P002]")
+    assert "Do not mention" not in chunks[0]["content"]
+
+
+def test_history_renders_policy_notes_as_policy_events_not_user_turns():
+    # The behavioural note is a HumanMessage in the checkpoint — it must not
+    # open a phantom turn; it re-emerges as the same "policy" event the live
+    # stream emitted, so the shield step survives a history reload.
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from chat.policy_check import POLICY_MARKER
+
+    msgs = [
+        HumanMessage(content="real question"),
+        AIMessage(content="digging"),
+        HumanMessage(
+            content="<system-reminder>\nAutomated policy screening flagged x:\n"
+                    "- [P002] computed on an ambiguity.\nclosing\n</system-reminder>",
+            additional_kwargs={POLICY_MARKER: "behavioural"},
+        ),
+        AIMessage(content="the answer"),
+    ]
+    turns = server._messages_to_turns(msgs)
+    assert len(turns) == 1  # the marker message opened no second turn
+    events = turns[0]["aiMessage"]
+    flags = [e for e in events if e.get("type") == "policy"]
+    assert [f["content"] for f in flags] == ["- [P002] computed on an ambiguity."]
+    order = [e.get("type") for e in events if e.get("type") in ("text", "policy")]
+    assert order == ["text", "policy", "text"]
 
 
 def test_read_history_empty_for_unknown_thread():
@@ -1295,7 +1392,8 @@ def test_read_history_end_event_carries_token_stats():
         )
     )
 
-    def build_agent(model, effort, scope, checkpointer, features=None, user_sub=""):
+    def build_agent(model, effort, scope, checkpointer, features=None, user_sub="",
+                    policy_checker=None):
         return graph
 
     out = server.read_history(build_agent, cp, "alice:conv-u")

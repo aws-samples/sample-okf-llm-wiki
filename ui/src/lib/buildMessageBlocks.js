@@ -192,6 +192,15 @@ export function buildMessageBlocks(events, isEnd) {
       continue
     }
 
+    // A query-time policy flag (split out of a run_sql result server-side):
+    // its own segment with a shield marker. Never gated — unlike steering,
+    // this is user-relevant substance, not harness meta.
+    if (ev.type === "policy" && ev.content) {
+      const tb = openThink()
+      tb.contentSegments.push({ type: "policy", content: ev.content })
+      continue
+    }
+
     if (ev.type === "text" && ev.content != null) {
       // A text run ends the reasoning block, then starts (or extends) the answer.
       closeThink()

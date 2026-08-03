@@ -216,6 +216,19 @@ export function makeApi(token) {
     repromoteStatus: (domain, dataset) =>
       request(token, "GET", `/bundle/${domain}/${dataset}/repromote`),
 
+    // Guardrails (policy checks) — the Guardrails page (internal name
+    // "reasoning"). Always-on per dataset: guardrails author automatically
+    // when the wiki changes (harvest, increment, restore); sync queues a
+    // manual (re)build — the first authoring for datasets predating the
+    // feature, and the fail-safe when the wiki moved and the automatic
+    // trigger was missed. (The GET /reasoning/{d}/{ds}/document endpoint
+    // still exists server-side for raw policies.yaml access; the page no
+    // longer embeds a viewer.)
+    getReasoning: (domain, dataset) =>
+      request(token, "GET", `/reasoning/${domain}/${dataset}`),
+    triggerReasoningSync: (domain, dataset) =>
+      request(token, "POST", `/reasoning/${domain}/${dataset}/sync`),
+
     // Annotations (user-scoped feedback on concept docs). All calls are scoped
     // server-side to the caller's Cognito sub — you only ever see/act on your
     // own. `concept` (a slash path like tables/races) rides in the query string

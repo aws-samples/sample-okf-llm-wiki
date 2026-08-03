@@ -470,6 +470,64 @@ variable "harvest_log_group" {
   EOT
 }
 
+# --- Automated Reasoning policy checks ---------------------------------------
+
+variable "enable_policy_checks" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Master deploy switch for the mid-turn policy checks — ADVISORY checks of a
+    chat run's SQL queries (computational policies) and steps (behavioural
+    policies) against the dataset's authored policy document, judged by a
+    map-reduce fleet of LLM judges (chat/policy_check.py). Flags ride back
+    into the model's own context as hedged system reminders — the model
+    decides the correction; nothing blocks or gates. Per-run opt-in sits
+    below this gate: the composer's Policy feature (requires the SQL tool).
+
+    When true: the chat runtime's role gains the registry stale-flag write and
+    events:PutEvents (the judges use the SAME model path as chat — no extra
+    Bedrock grants); the Control API gains events:PutEvents; and the
+    policy_rebuild EventBridge rule is created onto the incremental queue.
+    Works in EVERY region the chat model works in. Costs a handful of small
+    judge calls per opted-in analytical query / step batch.
+  EOT
+}
+
+variable "enable_policy_build" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Author/refresh policy documents from the wiki (requires
+    var.enable_policy_checks). Turns on the HARVEST runtime's finalize hook
+    (gather sources -> run the policy-author agent -> persist policies.yaml ->
+    stamp ready, best-effort AFTER the commit marker) and the INCREMENTAL
+    rebuild authority (policy_rebuild events + the nightly reconcile that
+    reaps stalled authoring runs and hash-verifies every policy-bearing
+    dataset; never-authored datasets are not backfilled).
+    No Bedrock control-plane resources are involved.
+
+    Separate from enable_policy_checks so a deployment can consume documents
+    authored elsewhere, or turn checks on before the authoring is trusted.
+  EOT
+}
+
+
+variable "chat_policy_check_model" {
+  type        = string
+  # Sonnet 5, no reasoning: both consumers run classifier-style anyway, and a
+  # Claude 5 head gives better verdicts than a small model at the same
+  # single-pass latency. "openai.gpt-5.6-terra" (reasoning "none") remains a
+  # tested alternative.
+  default     = "global.anthropic.claude-sonnet-5"
+  description = "The policy checks' model id, serving BOTH the curated-question rewrite (minimal effort — extraction) and the judge fleets. Judges run CLASSIFIER-style on every family — thinking off + temperature 0 on a Converse (Anthropic) id, reasoning \"none\" on an openai.* id (e.g. openai.gpt-5.6-terra) — with a FORCED report_violations tool call: fast single-pass verdicts. An openai.* value is fully supported: chat_mantle_enabled derives the role's Mantle grants from this var too (gated on enable_policy_checks)."
+}
+
+variable "policy_preprocess_model" {
+  type        = string
+  default     = "global.anthropic.claude-sonnet-5"
+  description = "Model for the ar_rules.md authoring agent (harvest.ar_author), run with FULL reasoning (effort high — OKF_POLICY_AUTHOR_EFFORT) — turning wiki prose into decidable rules is judgment work, and it runs only when policy sources actually change. Runs exclusively on the harvest runtime (mode=\"ar_rules\"); harvest_mantle_enabled derives the Mantle grants from this var (gated on enable_policy_build). Kept separate from chat_policy_check_model — different services, different env namespaces."
+}
+
 variable "tags" {
   type    = map(string)
   default = { project = "okf-on-aws", managed_by = "terraform" }

@@ -42,7 +42,9 @@ data "aws_iam_policy_document" "reindex" {
 }
 
 # Incremental orchestrator: read Glue, read/write freshness + registry, write the
-# pending diff to S3, invoke the harvest runtime, consume its SQS.
+# pending diff to S3, invoke the harvest runtime, consume its SQS. With policy
+# builds on, it is also the AR rebuild authority (policy_rebuild events + the
+# nightly reconcile that completes/repairs policies).
 data "aws_iam_policy_document" "incremental" {
   # checkov:skip=CKV_AWS_356:glue:Get* (read-only metadata) targets the whole catalog by design — the source database being reconciled is not known until an event arrives and Glue read actions carry no cross-database data exposure here. InvokeAgentRuntime IS scoped to the single harvest runtime (local.harvest_invoke_resources) below. All write paths (DynamoDB, S3, SQS) are resource-scoped.
   statement {
@@ -66,6 +68,27 @@ data "aws_iam_policy_document" "incremental" {
   statement {
     actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
     resources = [aws_sqs_queue.incremental.arn]
+  }
+
+  # Policy rebuild authority (var.enable_policy_build): reached by
+  # `policy_rebuild` events and the nightly reconcile. v2 (LLM-judge engine)
+  # makes only DETERMINISTIC decisions here — fingerprint checks, document
+  # reads, stall reaping, and mode="ar_rules" dispatches through the
+  # InvokeAgentRuntime grant above. NO Bedrock grants at all: the authoring
+  # agent runs on the harvest runtime.
+
+  # The AR source fingerprint (ar_source_hash) is computed by LISTING the
+  # source prefix and GETting each file. The S3 statement above has Put/Get on
+  # ".../*" but NO bucket-level ListBucket, so the gather step would
+  # AccessDeny on ListObjectsV2 without this (moto doesn't enforce IAM — only
+  # a live deploy catches it, the BatchGetItem class of bug).
+  dynamic "statement" {
+    for_each = local.ar_build_enabled ? [1] : []
+    content {
+      sid       = "ArSourceList"
+      actions   = ["s3:ListBucket"]
+      resources = [local.d.bundle_bucket_arn]
+    }
   }
 }
 
@@ -147,6 +170,21 @@ data "aws_iam_policy_document" "control_api" {
       "cognito-idp:DescribeUserPoolClient",
     ]
     resources = [local.d.user_pool_arn]
+  }
+
+  # `policy_rebuild` publish from the REPROMOTE success path (a non-blocking
+  # accelerator: after the restore commits, one UpdateItem flags the dataset
+  # row stale and one PutEvents starts the repair — milliseconds; repromote
+  # never waits on a build). Correctness still comes from the fingerprint
+  # gate, so a lost event only costs freshness until the nightly reconcile.
+  # Publish-only, scoped to the DEFAULT bus every rule in this stack lives on.
+  dynamic "statement" {
+    for_each = local.ar_enabled ? [1] : []
+    content {
+      sid       = "PolicyRebuildPublish"
+      actions   = ["events:PutEvents"]
+      resources = [local.event_bus_arn]
+    }
   }
 
   # Redshift source pickers (var.enable_redshift): the UI lists clusters/workgroups

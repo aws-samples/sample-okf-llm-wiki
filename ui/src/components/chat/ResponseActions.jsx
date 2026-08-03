@@ -1,6 +1,8 @@
-// The action bar under a completed AI response: copy the answer, and give
-// like/dislike feedback. Rendered only for finished turns that produced text
-// (no bar while streaming or on a tool-only/empty turn).
+// The action bar under a completed AI response: copy the answer, inspect its token
+// usage, and give like/dislike feedback. Rendered only for finished turns that
+// produced text (no bar while streaming or on a tool-only/empty turn). Policy
+// flags need no button here — they arrive mid-turn as shield timeline steps
+// when the run opted in (the composer's Policy feature).
 //
 // Feedback is LOCAL toggle state (mutually exclusive, click again to clear) — the
 // chat has no feedback sink yet, so this is a UI affordance; wiring it to a
@@ -110,7 +112,10 @@ function UsageAction({ stats }) {
   )
 }
 
-export const ResponseActions = memo(function ResponseActions({ text, stats }) {
+export const ResponseActions = memo(function ResponseActions({
+  text,
+  stats,
+}) {
   const [feedback, setFeedback] = useState(null) // "up" | "down" | null
   const copy = (text || "").trim()
 

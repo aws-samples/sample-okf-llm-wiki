@@ -55,6 +55,13 @@ except Exception:  # pragma: no cover - only when langchain is absent
 #: is the signal kind ("repetition" / "futility" / "silence").
 STEERING_MARKER = "okf_steering"
 
+#: Every marker that identifies a harness-INJECTED HumanMessage: steering
+#: nudges plus the behavioural policy notes (``chat.policy_check.POLICY_MARKER``
+#: — the string is duplicated here rather than imported to avoid a module
+#: cycle; a test pins the two equal). None of these may open a turn slice,
+#: reset the counters, or render as a user bubble.
+_INJECTED_MARKER_KEYS = (STEERING_MARKER, "okf_policy")
+
 # ask_human legitimately repeats (a re-ask after a malformed set) and is owned
 # by its own middleware — excluded from repetition tracking.
 _REPETITION_EXEMPT = frozenset({"ask_human"})
@@ -147,7 +154,9 @@ def _silence_text(calls: int) -> str:
 
 
 def _is_steering(msg: Any) -> bool:
-    return bool((getattr(msg, "additional_kwargs", None) or {}).get(STEERING_MARKER))
+    """True for ANY injected message (steering or policy note) — see markers."""
+    kwargs = getattr(msg, "additional_kwargs", None) or {}
+    return any(kwargs.get(k) for k in _INJECTED_MARKER_KEYS)
 
 
 def _is_genuine_user(msg: Any) -> bool:
@@ -206,7 +215,9 @@ def detect(messages: list[Any]) -> Signal | None:
     last_reminder_idx: int | None = None
     for idx, msg in enumerate(window):
         if isinstance(msg, HumanMessage) and _is_steering(msg):
-            fired_kinds.add(msg.additional_kwargs[STEERING_MARKER])
+            kind = msg.additional_kwargs.get(STEERING_MARKER)
+            if kind:  # a policy note has no steering kind but still cools down
+                fired_kinds.add(kind)
             last_reminder_idx = idx
     if last_reminder_idx is not None:
         calls_since = sum(

@@ -140,18 +140,23 @@ export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
 
   const getToken = () => auth?.user?.access_token
 
-  // Doc peek: the citation-opened doc reader. Open flag and target are separate
-  // so closing collapses the clip while the content stays mounted (no blank
-  // panel mid-animation), and reopening the same doc is instant. A conversation
-  // switch clears both — another thread's doc is stale context here.
-  const [peekOpen, setPeekOpen] = useState(false)
+  // ONE side-panel slot: the citation-opened doc reader. `open` is separate
+  // from the target so closing collapses the clip while the content stays
+  // MOUNTED (no blank panel mid-animation), and reopening the same doc is
+  // instant. A conversation switch clears it — another thread's doc is stale
+  // context.
+  const [slot, setSlot] = useState({ open: false })
   const [peekTarget, setPeekTarget] = useState(null)
+  const closePanel = useCallback(
+    () => setSlot((cur) => ({ ...cur, open: false })),
+    []
+  )
   const openDoc = useCallback((target) => {
     setPeekTarget(target)
-    setPeekOpen(true)
+    setSlot({ open: true })
   }, [])
   useEffect(() => {
-    setPeekOpen(false)
+    setSlot({ open: false })
     setPeekTarget(null)
   }, [conv.threadId])
 
@@ -197,22 +202,22 @@ export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
         />
       </div>
 
-      {/* Doc peek — opened by clicking a wiki citation. Same width-animated
-          clip pattern as the history drawer below, so it PUSHES the chat
-          (transcript + doc readable side by side) instead of overlaying it.
-          Width is user-resizable (the panel's left-edge handle) — inline style
-          rather than a class since it's a live number. */}
+      {/* The side panel — a cited doc. Same width-animated clip pattern as the
+          history drawer below, so it PUSHES the chat (transcript + doc readable
+          side by side) instead of overlaying it. Width is user-resizable (the
+          panel's left-edge handle) — inline style rather than a class since
+          it's a live number. */}
       <div
         className={cn(
           "h-full shrink-0 overflow-hidden",
           !peekDragging &&
             "transition-[width] duration-300 ease-in-out motion-reduce:transition-none"
         )}
-        style={{ width: peekOpen ? peekWidth : 0 }}
-        aria-hidden={!peekOpen}
+        style={{ width: slot.open ? peekWidth : 0 }}
+        aria-hidden={!slot.open}
       >
         <div
-          className={cn("h-full", !peekOpen && "invisible")}
+          className={cn("h-full", !slot.open && "invisible")}
           style={{ width: peekWidth }}
         >
           {peekTarget ? (
@@ -220,7 +225,7 @@ export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
               api={api}
               target={peekTarget}
               onTarget={setPeekTarget}
-              onClose={() => setPeekOpen(false)}
+              onClose={closePanel}
               onResizeStart={startPeekResize}
               resizing={peekDragging}
             />

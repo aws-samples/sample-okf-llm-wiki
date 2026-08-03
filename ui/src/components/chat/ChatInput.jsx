@@ -12,6 +12,7 @@ import {
   AtSignIcon,
   DatabaseIcon,
   PlusIcon,
+  ShieldCheckIcon,
   SlidersHorizontalIcon,
   SquareIcon,
   XIcon,
@@ -34,6 +35,9 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
@@ -43,7 +47,13 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover"
 import { Slider } from "@/components/ui/slider"
-import { AVAILABLE_FEATURES, featureById } from "@/lib/chatFeatures"
+import {
+  AVAILABLE_FEATURES,
+  featureById,
+  isPolicyId,
+  POLICY_AVAILABLE,
+  POLICY_OPTIONS,
+} from "@/lib/chatFeatures"
 import { cn } from "@/lib/utils"
 
 const MAX_HEIGHT = 200
@@ -131,7 +141,7 @@ function FeatureChip({ feature, onRemove }) {
 // `canScope` adds a "Scope to a dataset" entry (an explicit, discoverable
 // alternative to typing "@" — see ChatInput). Picking it fires `onScope`, which
 // opens the same dataset picker the "@" mention does.
-function AddFeatureMenu({ enabled, onToggle, canScope, onScope }) {
+function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) {
   const [open, setOpen] = useState(false)
   // Set when the "Scope to a dataset" item is chosen, so onCloseAutoFocus knows
   // to skip Radix's focus-restore to the "+" trigger — that restore lands
@@ -139,11 +149,17 @@ function AddFeatureMenu({ enabled, onToggle, canScope, onScope }) {
   // instantly. onScope focuses the picker itself, so no focus is lost.
   const scopeSelectedRef = useRef(false)
   const enabledSet = new Set(enabled)
-  // Nothing left to add once every available feature is enabled — hide the "+".
   const remaining = AVAILABLE_FEATURES.filter((f) => !enabledSet.has(f.id))
+  // The Policy field is offered while no policy option is active. Its hard
+  // dependency: it only ENABLES while the SQL feature is checked (the checks
+  // judge SQL conduct — nothing to check without the tool). The chip cascade
+  // (removing SQL removes Policy) lives in the feature sanitizer.
+  const sqlOn = enabledSet.has("sql")
+  const policyActive = enabled.some(isPolicyId)
+  const offerPolicy = POLICY_AVAILABLE && !policyActive
   // Hide the "+" only when there's genuinely nothing to offer — no remaining
-  // features AND no dataset to scope to.
-  if (remaining.length === 0 && !canScope) return null
+  // features, no policy field, AND no dataset to scope to.
+  if (remaining.length === 0 && !offerPolicy && !canScope) return null
 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
@@ -192,7 +208,7 @@ function AddFeatureMenu({ enabled, onToggle, canScope, onScope }) {
             </DropdownMenuItem>
           </>
         ) : null}
-        {remaining.length > 0 ? (
+        {remaining.length > 0 || offerPolicy ? (
           <>
             {canScope ? <DropdownMenuSeparator /> : null}
             <DropdownMenuLabel className="text-xs text-muted-foreground">
@@ -220,6 +236,43 @@ function AddFeatureMenu({ enabled, onToggle, canScope, onScope }) {
                 </DropdownMenuItem>
               )
             })}
+            {offerPolicy ? (
+              <DropdownMenuSub>
+                {/* The trigger stays a ROW: the text stacks in an inner column so
+                    the SubTrigger's built-in chevron keeps its place at the right,
+                    vertically centered — a flex-col on the trigger itself would
+                    wrap the chevron onto its own line below the description. */}
+                <DropdownMenuSubTrigger disabled={!sqlOn}>
+                  <span className="flex flex-col gap-0.5">
+                    <span className="flex items-center gap-2">
+                      <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
+                      Guardrails
+                    </span>
+                    <span className="pl-5.5 text-[11px] text-muted-foreground">
+                      {sqlOn
+                        ? "Flag documented-guardrail violations mid-turn"
+                        : "Requires the SQL capability"}
+                    </span>
+                  </span>
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="w-64">
+                  {POLICY_OPTIONS.map((o) => (
+                    <DropdownMenuItem
+                      key={o.id}
+                      onSelect={() => onPickPolicy(o.id)}
+                      className="flex-col items-start gap-0.5"
+                    >
+                      <span className="text-sm">{o.label}</span>
+                      {o.description ? (
+                        <span className="text-[11px] text-muted-foreground">
+                          {o.description}
+                        </span>
+                      ) : null}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            ) : null}
           </>
         ) : null}
       </DropdownMenuContent>
@@ -337,8 +390,21 @@ export function ChatInput({
     },
     [enabledFeatures, onFeaturesChange]
   )
+  // Picking a policy option replaces any current one (mutually exclusive).
+  const pickPolicy = useCallback(
+    (id) =>
+      onFeaturesChange?.([...enabledFeatures.filter((f) => !isPolicyId(f)), id]),
+    [enabledFeatures, onFeaturesChange]
+  )
+  // Removing SQL also drops the policy selection (the controller's sanitizer
+  // enforces the same dependency; filtering here keeps the UI instant).
   const removeFeature = useCallback(
-    (id) => onFeaturesChange?.(enabledFeatures.filter((f) => f !== id)),
+    (id) =>
+      onFeaturesChange?.(
+        enabledFeatures.filter(
+          (f) => f !== id && !(id === "sql" && isPolicyId(f))
+        )
+      ),
     [enabledFeatures, onFeaturesChange]
   )
 
@@ -588,6 +654,7 @@ export function ChatInput({
           <AddFeatureMenu
             enabled={enabledFeatures}
             onToggle={addFeature}
+            onPickPolicy={pickPolicy}
             canScope={canMention}
             onScope={openScopePicker}
           />

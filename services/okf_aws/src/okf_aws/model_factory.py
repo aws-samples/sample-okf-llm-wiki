@@ -17,6 +17,13 @@ Provider selection is by model-id prefix (see :func:`is_openai_model`):
   :func:`build_bedrock_converse` — a ``ChatBedrockConverse`` with adaptive
   thinking configured.
 
+Reasoning is on by default because every agent path here wants it, but both
+builders can also be driven as a plain, deterministic completion client
+(``thinking=False`` / a minimal GPT effort, plus ``temperature``) for the cheap
+extraction passes that surround the agents — a transcript summariser, a
+question rewrite, a docs→rules conversion. Those want a fixed sampling
+temperature, which is precisely what a reasoning model cannot honour.
+
 All framework imports (``langchain_aws``, ``langchain_openai``,
 ``aws_bedrock_token_generator``) are deferred inside the builders, so importing
 this module never requires them — services and their unit tests import it freely
@@ -25,6 +32,7 @@ and stub the SDKs.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # --- Bedrock Converse (Claude / Anthropic) ----------------------------------
@@ -33,6 +41,34 @@ from typing import Any
 # VERBATIM. Bedrock is the authority on which values a given model accepts (it
 # varies per model — e.g. Opus 4.8 supports "xhigh"), so we keep NO client-side
 # allow-list that could reject a valid value.
+
+
+# Claude version extractor for the adaptive-thinking capability gate. Both id
+# shapes are covered: family-first (``claude-haiku-4-5-20251001``,
+# ``claude-opus-4-8-…``) and version-first (``claude-3-5-sonnet-20241022``).
+_CLAUDE_VERSION_RE = re.compile(r"claude-(?:[a-z]+-)?(\d+)[.-](\d+)")
+
+# Adaptive thinking (``thinking.type=adaptive`` + ``output_config.effort``)
+# arrived with the Claude 4.6 generation.
+_ADAPTIVE_SINCE = (4, 6)
+
+
+def converse_supports_adaptive(model: str) -> bool:
+    """Whether a Converse (Anthropic) id accepts the ADAPTIVE thinking shape.
+
+    Pre-adaptive generations (< 4.6 — Haiku 4.5, Sonnet 4.5, every 3.x) take
+    a token budget (``thinking.type=enabled`` + ``budget_tokens``) and REJECT
+    the adaptive form with a ``ValidationException`` — a caller that guesses
+    the encoding by family-name substring silently mis-encodes every other
+    pre-adaptive id. This predicate is the single owner of that generation
+    knowledge; callers pick ``thinking_budget`` vs effort off it. Unknown /
+    unparseable ids default to adaptive (current generations are the common
+    case, and a wrong guess there fails loudly at invoke time either way).
+    """
+    m = _CLAUDE_VERSION_RE.search(model)
+    if not m:
+        return True
+    return (int(m.group(1)), int(m.group(2))) >= _ADAPTIVE_SINCE
 
 
 def thinking_fields(effort: str, *, summarize: bool = False) -> dict[str, Any]:
@@ -66,6 +102,9 @@ def build_bedrock_converse(
     botocore_config: Any = None,
     callbacks: Any = None,
     summarize_reasoning: bool = False,
+    thinking: bool = True,
+    temperature: float | None = None,
+    thinking_budget: int | None = None,
 ):
     """Construct a ``ChatBedrockConverse`` with adaptive thinking configured.
 
@@ -80,19 +119,41 @@ def build_bedrock_converse(
     ``summarize_reasoning`` requests a streamed reasoning summary
     (``thinking.display="summarized"``) — pass it when the UI shows thinking
     (chat). Off by default so harvest is unchanged.
+
+    ``thinking=False`` OMITS ``additional_model_request_fields`` entirely
+    (rather than sending a disabled thinking block, which Converse has no
+    encoding for) — the model runs as a plain completion client. ``effort`` is
+    then unused, so callers of the non-reasoning path may pass any value.
+    That switch is what makes ``temperature`` meaningful: Converse rejects a
+    caller-set temperature while thinking is on, so a deterministic extraction
+    pass MUST turn thinking off, not merely pin the temperature. ``temperature``
+    is forwarded only when given, so the default remains the model's own.
     """
     from langchain_aws import ChatBedrockConverse
 
-    return ChatBedrockConverse(
-        model=model,
-        region_name=region,
-        max_tokens=max_tokens,
-        additional_model_request_fields=thinking_fields(
-            effort, summarize=summarize_reasoning
-        ),
-        config=botocore_config,
-        callbacks=callbacks,
-    )
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "region_name": region,
+        "max_tokens": max_tokens,
+        "config": botocore_config,
+        "callbacks": callbacks,
+    }
+    if thinking:
+        # Two thinking encodings, model-generation dependent: adaptive+effort is
+        # the 4.6+ shape; pre-adaptive models (e.g. Haiku 4.5) take a token
+        # budget instead and REJECT the adaptive form. thinking_budget selects
+        # the budget encoding; the caller's max_tokens must exceed it.
+        if thinking_budget is not None:
+            kwargs["additional_model_request_fields"] = {
+                "thinking": {"type": "enabled", "budget_tokens": int(thinking_budget)}
+            }
+        else:
+            kwargs["additional_model_request_fields"] = thinking_fields(
+                effort, summarize=summarize_reasoning
+            )
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    return ChatBedrockConverse(**kwargs)
 
 
 # --- GPT on Bedrock Mantle (OpenAI-compatible) ------------------------------
@@ -110,12 +171,29 @@ DEFAULT_MANTLE_REGION = "us-east-2"
 # enforced by the model catalog (the trust boundary) + Bedrock, NOT here.
 # Unknown values fall through to xhigh so a stray effort never quietly
 # downgrades the model.
+#
+# "none"/"minimal" are the deliberate exception to that fallthrough: they mean
+# "this call is extraction/classification, not reasoning" (a transcript pass,
+# a rewrite, a policy judge), and
+# letting them reach the xhigh default would silently bill a max-reasoning run
+# for a job that wanted none. "none" passes VERBATIM: the whole GPT-5.6
+# Mantle fleet accepts it (LIVE-VERIFIED 2026-08-01 on gpt-5.6-luna:
+# `'minimal' is not supported ... Supported values are: 'none', 'low',
+# 'medium', 'high', 'xhigh'`), and the policy classifiers (judge + rewrite)
+# depend on a genuine no-reasoning pass — an older GPT-5.x id that rejects
+# the name fails loudly at invoke, which is the codebase's standing posture
+# (Bedrock/the catalog are the authority, no client-side allow-list).
+# "minimal" still floors to "low": Luna 400s on that name, so it has no
+# fleet-safe verbatim meaning.
+FLOOR_GPT_REASONING_EFFORT = "low"
 GPT_EFFORT_MAP = {
     "max": "max",
     "xhigh": "xhigh",
     "high": "high",
     "medium": "medium",
     "low": "low",
+    "minimal": FLOOR_GPT_REASONING_EFFORT,
+    "none": "none",
 }
 DEFAULT_GPT_REASONING_EFFORT = "xhigh"
 
@@ -185,6 +263,7 @@ def build_mantle_openai(
     token_ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS,
     reasoning_summary: str | None = None,
     callbacks: Any = None,
+    temperature: float | None = None,
 ):
     """Construct a ``ChatOpenAI`` pointed at the Bedrock Mantle OpenAI endpoint.
 
@@ -211,6 +290,11 @@ def build_mantle_openai(
     None (harvest's default), we keep the plain ``reasoning_effort`` so nothing
     changes for callers that don't surface thinking. Only meaningful with the
     Responses API; ignored for Chat Completions (gpt-oss).
+
+    ``temperature`` is forwarded only when given (default: the model's own), for
+    extraction passes that need determinism. Pair it with effort
+    ``"none"``/``"minimal"`` — see :data:`GPT_EFFORT_MAP`; a GPT model at a high
+    reasoning effort samples regardless of what temperature asks for.
     """
     from langchain_openai import ChatOpenAI
 
@@ -227,6 +311,8 @@ def build_mantle_openai(
         "max_retries": max_retries,
         "callbacks": callbacks,
     }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
     if reasoning_summary and use_responses_api:
         # The `reasoning` object controls BOTH effort and whether a summary is
         # returned; use it INSTEAD of reasoning_effort (they're the same knob).

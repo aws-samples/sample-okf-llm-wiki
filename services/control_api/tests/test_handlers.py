@@ -438,6 +438,29 @@ def test_delete_domain_mapping_idempotent_when_nothing_exists(cfg):
     }
 
 
+def _seed_policy_dataset(cfg, dd="sport", ds="f1"):
+    handlers.upsert_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain=dd, dataset=ds,
+        glue_database="db",
+    )
+    cfg.s3.put_object(Bucket=BUCKET, Key=f"policy/{dd}/{ds}/policies.yaml", Body=b"policies: []")
+    cfg.s3.put_object(Bucket=BUCKET, Key=f"policy/{dd}/{ds}/sources_manifest.json", Body=b"{}")
+
+
+def test_delete_domain_mapping_purges_the_policy_artifacts(cfg):
+    """policy/<d>/<ds>/ must not outlive the dataset — a re-registered
+    same-named dataset would inherit the old policy document."""
+    _seed_policy_dataset(cfg)
+    res = handlers.delete_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain="sport", dataset="f1",
+        s3=cfg.s3, bundle_bucket=BUCKET, freshness_table=FRESHNESS,
+    )
+    assert res["deleted"] is True
+    listed = cfg.s3.list_objects_v2(Bucket=BUCKET, Prefix="policy/sport/f1/")
+    assert listed.get("KeyCount", 0) == 0
+    assert handlers.list_domains(cfg.ddb, registry_table=REGISTRY) == []
+
+
 # --------------------------------------------------------------------------- #
 # MCP machine credentials
 # --------------------------------------------------------------------------- #

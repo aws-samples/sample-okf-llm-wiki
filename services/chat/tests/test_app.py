@@ -120,7 +120,7 @@ def _build_app(index_sink=None):
 
     return server.build_app(
         chat_config=_StubConfig(),
-        build_agent=lambda model, effort, scope, cp, features=None, user_sub="": _scripted_graph(cp),
+        build_agent=lambda model, effort, scope, cp, features=None, user_sub="", policy_checker=None: _scripted_graph(cp),
         index_writer=_capturing_index_writer(index_sink if index_sink is not None else []),
     )
 
@@ -437,7 +437,7 @@ def test_unknown_request_type_is_rejected_not_run_as_a_turn():
 
         app = server.build_app(
             chat_config=_StubConfig(),
-            build_agent=lambda model, effort, scope, cp, features=None, user_sub="": _boom_build(),
+            build_agent=lambda model, effort, scope, cp, features=None, user_sub="", policy_checker=None: _boom_build(),
             index_writer=_capturing_index_writer([]),
         )
         r = TestClient(app).post(

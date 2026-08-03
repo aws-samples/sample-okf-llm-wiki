@@ -4,9 +4,18 @@ On each conversation turn the chat runtime upserts a small metadata row so the
 Control API can list the user's conversations for the sidebar. The item shape +
 keys are owned by ``okf_core.chat_threads`` (shared with the Control API reader).
 
-Isolation is structural (pk = ``CHAT#<user_sub>``). This is BEST-EFFORT: a failed
-index write must never break the actual chat run — the conversation + its
-checkpoint are the source of truth; the index is a convenience for the sidebar.
+The same row also carries the policy checks' ROLLING CONTEXT (see
+docs/CONVENTIONS.md and the design doc §13.4): ``policy_curated_question`` (the
+latest turn's curated standalone question) and ``policy_last_answer`` (that
+turn's final answer, truncated). Thread rows have no TTL, so reloading a chat
+days later still chains context; both attributes are optional — a pre-v3 or
+never-opted-in thread simply lacks them and the checker falls back to the raw
+question (turn-1 semantics).
+
+Isolation is structural (pk = ``CHAT#<user_sub>``). Everything here is
+BEST-EFFORT: a failed write must never break the actual chat run — the
+conversation + its checkpoint are the source of truth; the index row is a
+convenience (sidebar) plus advisory context (policy checks).
 """
 
 from __future__ import annotations
@@ -75,3 +84,85 @@ def touch_thread(
         )
     except Exception:  # noqa: BLE001 - index write must never break the chat run
         log.warning("chat thread-index write failed (non-fatal)", exc_info=True)
+
+
+# --- the policy checks' rolling context (design §13.3/§13.4) -------------------
+
+#: Attribute caps: the curated question is one sentence by contract (the cap is
+#: a backstop); the answer is context for the NEXT turn's rewrite, not a
+#: transcript — ~2k chars carries the conclusions without bloating the row.
+POLICY_QUESTION_MAX = 2000
+POLICY_ANSWER_MAX = 2000
+
+
+def read_policy_state(
+    ddb, *, threads_table: str, user_sub: str, thread_id: str
+) -> dict[str, str]:
+    """The thread's rolling policy context: ``{curated_question, last_answer}``.
+
+    Absent attributes (pre-v3 thread, deleted row, failed prior write) come
+    back as ``""`` — the caller's raw-question fallback IS the turn-1
+    semantics, so this never raises.
+    """
+    try:
+        item = (
+            ddb.get_item(
+                TableName=threads_table,
+                Key={
+                    "pk": {"S": ct.thread_pk(user_sub)},
+                    "sk": {"S": ct.thread_sk(thread_id)},
+                },
+            ).get("Item")
+            or {}
+        )
+        return {
+            "curated_question": str(
+                (item.get("policy_curated_question") or {}).get("S") or ""
+            ),
+            "last_answer": str(
+                (item.get("policy_last_answer") or {}).get("S") or ""
+            ),
+        }
+    except Exception:  # noqa: BLE001 - fail-open to turn-1 semantics
+        log.warning("policy state read failed (non-fatal)", exc_info=True)
+        return {"curated_question": "", "last_answer": ""}
+
+
+def write_policy_state(
+    ddb,
+    *,
+    threads_table: str,
+    user_sub: str,
+    thread_id: str,
+    curated_question: str | None = None,
+    last_answer: str | None = None,
+) -> None:
+    """Best-effort SET of the rolling policy attributes on the THREAD row.
+
+    Only the given attributes are touched (the curated question lands when the
+    rewrite does; the answer lands at stream end). The thread row itself is
+    seeded by :func:`touch_thread` at turn start; an update racing a missing
+    row would just create a bare one, which the next turn's touch fills in.
+    """
+    sets: list[str] = []
+    values: dict[str, Any] = {}
+    if curated_question is not None:
+        sets.append("policy_curated_question = :cq")
+        values[":cq"] = {"S": curated_question[:POLICY_QUESTION_MAX]}
+    if last_answer is not None:
+        sets.append("policy_last_answer = :la")
+        values[":la"] = {"S": last_answer[:POLICY_ANSWER_MAX]}
+    if not sets:
+        return
+    try:
+        ddb.update_item(
+            TableName=threads_table,
+            Key={
+                "pk": {"S": ct.thread_pk(user_sub)},
+                "sk": {"S": ct.thread_sk(thread_id)},
+            },
+            UpdateExpression="SET " + ", ".join(sets),
+            ExpressionAttributeValues=values,
+        )
+    except Exception:  # noqa: BLE001 - advisory context, never fatal
+        log.warning("policy state write failed (non-fatal)", exc_info=True)

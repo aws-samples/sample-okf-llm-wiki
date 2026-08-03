@@ -20,6 +20,7 @@ import {
   NetworkIcon,
   PanelLeftIcon,
   PlayIcon,
+  ShieldCheckIcon,
   SunIcon,
 } from "lucide-react"
 
@@ -85,6 +86,8 @@ import ContextView from "@/views/ContextView.jsx"
 import CredentialsView from "@/views/CredentialsView.jsx"
 import HarvestView from "@/views/HarvestView.jsx"
 import BenchmarkView from "@/views/BenchmarkView.jsx"
+import ReasoningView from "@/views/ReasoningView.jsx"
+import { POLICY_CHECK_ENABLED } from "@/lib/chatFeatures"
 import BenchmarkReportView from "@/views/BenchmarkReportView.jsx"
 import BrowseView from "@/views/BrowseView.jsx"
 import GraphView from "@/views/GraphView.jsx"
@@ -154,6 +157,22 @@ const NAV = [
     needsSelection: true,
     group: "manage",
   },
+  // Guardrails: per-dataset policy-check status + the authored guardrails.
+  // Shown whenever the deploy exposes policy checks (same display gate as the
+  // chat toggle); the Control API is the real boundary. The key doubles as
+  // the URL section (#/guardrails/<d>/<ds>); parseHash aliases the legacy
+  // "reasoning" section so old links keep working.
+  ...(POLICY_CHECK_ENABLED
+    ? [
+        {
+          key: "guardrails",
+          label: "Guardrails",
+          icon: ShieldCheckIcon,
+          needsSelection: true,
+          group: "manage",
+        },
+      ]
+    : []),
   {
     key: "credentials",
     label: "Credentials",
@@ -1077,6 +1096,13 @@ function Console({ auth, api }) {
                       })
                     }
                   />
+                </div>
+              ) : section === "guardrails" ? (
+                // Guardrails: same full-height-column pattern as Benchmark —
+                // only the guardrail list scrolls; the card header and build
+                // status stay fixed however long the list grows.
+                <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col p-1">
+                  <ReasoningView api={api} selection={selection} />
                 </div>
               ) : (
                 // p-1 gives the cards' ring/shadow room so the vertical scroll

@@ -56,6 +56,51 @@ DEFAULT_BEDROCK_MAX_ATTEMPTS = 5
 # runtime's own AWS_REGION.
 DEFAULT_MANTLE_REGION = "us-east-2"
 
+# The policy check's pre-pass (chat/policy_check.py) is EXTRACTION — rewrite the
+# question, narrate the chain — so it runs with no reasoning pass rather than
+# on the conversation's own model. Deploy-time only: unlike the per-run chat
+# model this never comes from a client, so it deliberately bypasses the catalog
+# trust boundary (`resolve_model_effort`). Sonnet 5, no reasoning — mirrors
+# var.chat_policy_check_model's default. An openai.* value means the chat
+# role's Mantle grants must be on — infra derives that from the same var (see
+# agentcore_iam.tf chat_mantle_enabled).
+DEFAULT_POLICY_CHECK_MODEL = "global.anthropic.claude-sonnet-5"
+
+# The rewrite emits one small JSON object; a few thousand tokens is the whole
+# budget.
+POLICY_CHECK_MAX_TOKENS = 4000
+
+# Effort for the QUESTION-REWRITE call (extraction, not reasoning). Meaningless
+# with reasoning off on Converse; on Mantle "none" passes VERBATIM (the whole
+# GPT-5.6 fleet accepts it — a genuine no-reasoning pass).
+POLICY_CHECK_EFFORT = "none"
+
+# The JUDGE calls are judgment work — reasoning ON, but at the LOW end of the
+# ladder: the judges run inside a live query's verdict window, and live tuning
+# (2026-08-02) showed medium-effort rounds regularly blowing past it. The
+# judges run CLASSIFIER-style on EVERY model family — thinking off on a
+# Converse (Anthropic) id, reasoning "none" on an OpenAI (GPT 5.6) id — with
+# a FORCED report_violations tool choice (see build_policy_judge_model —
+# live 2026-08-03, reasoning judges spent 40-50s per shard and sometimes
+# exhausted into prose with no tool call). No effort knob remains: shallow
+# is not a tuning choice, it is the judge's contract.
+POLICY_JUDGE_MAX_TOKENS = 8000
+
+# Judges lose precision when a single rubric grows long; ≤ this many policies
+# per mini-judge (okf_core.policy_doc.DEFAULT_SHARD_SIZE is the format's own
+# default — this is the deploy-time override surface).
+DEFAULT_POLICY_SHARD_SIZE = 10
+
+# The query-time soft check (policy_check.PolicyChecker): how long run_sql
+# waits for a verdict AFTER the query's results are back (the judges run
+# concurrently with the engine, so this is the residual wait, not the total),
+# and how many analytical queries per turn get judged at all. 60s because a
+# medium-effort judge round can exceed 20s even warm and a dropped verdict is
+# a silently skipped check (observed live 2026-08-02) — landing the verdict
+# outranks the wait.
+DEFAULT_POLICY_QUERY_TIMEOUT_S = 60
+DEFAULT_POLICY_QUERY_MAX_PER_TURN = 3
+
 
 def _int_env(name: str, default: int, env: dict[str, str]) -> int:
     raw = env.get(name)
@@ -134,6 +179,17 @@ class ChatConfig:
     web_search_tool_name: str = ""
     web_search_max_results: int = 10
 
+    # Mid-turn policy checks (chat/policy_check.py) — the deploy-time MASTER
+    # gate above the per-run opt-in (the composer's Policy feature, carried as
+    # ``features: ["sql", "policy:…"]``). Default OFF: with it unset no checker
+    # is ever constructed, whatever the client sends — the feature degrades to
+    # absent, exactly like OKF_CHAT_SQL_ENABLED above the SQL opt-in.
+    policy_check_enabled: bool = False
+    policy_check_model: str = DEFAULT_POLICY_CHECK_MODEL
+    policy_shard_size: int = DEFAULT_POLICY_SHARD_SIZE
+    policy_query_timeout_s: int = DEFAULT_POLICY_QUERY_TIMEOUT_S
+    policy_query_max_per_turn: int = DEFAULT_POLICY_QUERY_MAX_PER_TURN
+
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ChatConfig":
         env = env if env is not None else dict(os.environ)
@@ -182,6 +238,22 @@ class ChatConfig:
             web_search_region=env.get("OKF_WEB_SEARCH_REGION") or "us-east-1",
             web_search_tool_name=env.get("OKF_WEB_SEARCH_TOOL_NAME", ""),
             web_search_max_results=_int_env("OKF_WEB_SEARCH_MAX_RESULTS", 10, env),
+            policy_check_enabled=env.get("OKF_CHAT_POLICY_CHECK_ENABLED", "").lower()
+            in ("true", "1", "yes"),
+            policy_check_model=env.get(
+                "OKF_CHAT_POLICY_CHECK_MODEL", DEFAULT_POLICY_CHECK_MODEL
+            ),
+            policy_shard_size=_int_env(
+                "OKF_CHAT_POLICY_SHARD_SIZE", DEFAULT_POLICY_SHARD_SIZE, env
+            ),
+            policy_query_timeout_s=_int_env(
+                "OKF_CHAT_POLICY_QUERY_TIMEOUT_S", DEFAULT_POLICY_QUERY_TIMEOUT_S, env
+            ),
+            policy_query_max_per_turn=_int_env(
+                "OKF_CHAT_POLICY_QUERY_MAX_PER_TURN",
+                DEFAULT_POLICY_QUERY_MAX_PER_TURN,
+                env,
+            ),
         )
 
     def resolve_model_effort(
@@ -246,4 +318,84 @@ def build_chat_model(cfg: ChatConfig, model: str, effort: str, max_tokens: int |
         # runs but returns no reasoning_content — the "LLM is reasoning but I see
         # nothing" symptom. Harvest leaves this off. (Matches Sparky's Opus 4.8.)
         summarize_reasoning=True,
+    )
+
+
+def build_policy_check_model(cfg: ChatConfig):
+    """Build the policy check's QUESTION-REWRITE client: minimal reasoning.
+
+    The rewrite resolves cross-turn anaphora — extraction, not reasoning — so
+    determinism matters more than depth. On Converse, thinking is turned OFF
+    (not merely dialed down — Converse rejects a caller-set temperature while
+    thinking is on) and temperature pinned to 0. On the GPT path reasoning is
+    ``"none"`` (verbatim — the GPT-5.6 fleet accepts it): GPT-5.x reasoning
+    models reject a non-default temperature outright, so none is sent.
+
+    Not a plain :func:`build_chat_model` call with a small model: that one always
+    configures adaptive thinking (the conversation wants it) and validates
+    nothing here, since ``policy_check_model`` is deploy-time config rather than a
+    client-supplied pair.
+    """
+    from okf_aws import model_factory as mf
+
+    model = cfg.policy_check_model
+    if mf.is_openai_model(model):
+        return mf.build_mantle_openai(
+            model,
+            POLICY_CHECK_EFFORT,
+            POLICY_CHECK_MAX_TOKENS,
+            region=cfg.mantle_region,
+            use_responses_api=cfg.mantle_use_responses_api,
+            base_url=cfg.mantle_base_url,
+            timeout=cfg.bedrock_read_timeout,
+            max_retries=cfg.bedrock_max_attempts,
+        )
+    return mf.build_bedrock_converse(
+        model,
+        POLICY_CHECK_EFFORT,
+        POLICY_CHECK_MAX_TOKENS,
+        region=cfg.region,
+        botocore_config=_bedrock_config(cfg),
+        thinking=False,
+        temperature=0,
+    )
+
+
+def build_policy_judge_model(cfg: ChatConfig):
+    """Build the judge client — a CLASSIFIER, not a reasoner, on EVERY family.
+
+    A judge checks ≤ shard-size policies against one query/window and
+    answers with ids only: a Converse (Anthropic) id runs with thinking OFF
+    and temperature 0; an OpenAI id (GPT 5.6 Terra) runs with reasoning
+    ``"none"``. Single forward pass either way, and policy_check binds a
+    FORCED ``report_violations`` tool choice (legal on Anthropic exactly
+    because thinking is off), so a prose-only reply is structurally
+    unreachable. Two reasons, both observed live (2026-08-03): reasoning
+    judges spent 40-50s per shard (5-6k thinking tokens for a checklist),
+    and occasionally exhausted into prose WITHOUT the verdict tool call,
+    tripping the missing-call retry and doubling the shard. Same
+    deploy-time model id as the rewrite (``OKF_CHAT_POLICY_CHECK_MODEL``).
+    """
+    from okf_aws import model_factory as mf
+
+    model = cfg.policy_check_model
+    if mf.is_openai_model(model):
+        return mf.build_mantle_openai(
+            model,
+            "none",  # classifier: no reasoning pass
+            POLICY_JUDGE_MAX_TOKENS,
+            region=cfg.mantle_region,
+            use_responses_api=cfg.mantle_use_responses_api,
+            base_url=cfg.mantle_base_url,
+            timeout=cfg.bedrock_read_timeout,
+            max_retries=cfg.bedrock_max_attempts,
+        )
+    return mf.build_bedrock_converse(
+        model,
+        "none",  # unused: thinking is off
+        POLICY_JUDGE_MAX_TOKENS,
+        region=cfg.region,
+        botocore_config=_bedrock_config(cfg),
+        thinking=False,
+        temperature=0,
     )

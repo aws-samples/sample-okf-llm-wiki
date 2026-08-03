@@ -402,10 +402,48 @@ _RUN_SQL_DESC_REDSHIFT = (
 )
 
 
+def _cancel_policy_check(future: Any) -> None:
+    """Best-effort cancel of a racing policy check whose query FAILED.
+
+    A query the engine rejected never produces results the model can act on,
+    so its verdict is worthless — and letting the queued check run anyway
+    would burn one of the turn's few judged-query budget units (and a fleet's
+    tokens) on SQL that never executed, starving the eventual successful
+    query. cancel() only stops a check that hasn't started; one already
+    mid-fleet keeps its (legitimately spent) budget unit.
+    """
+    if future is None:
+        return
+    try:
+        future.cancel()
+    except Exception:  # noqa: BLE001 - advisory, never fatal
+        pass
+
+
+def _await_policy_note(future: Any, checker: Any) -> str:
+    """Resolve the soft policy verdict within the residual wait budget.
+
+    A verdict that isn't ready in time is dropped (the check is advisory);
+    the future keeps running in the checker's pool, so a re-run of the same
+    SQL later in the turn hits its cache instantly.
+    """
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    try:
+        return future.result(timeout=getattr(checker, "wait_budget_s", 20)) or ""
+    except FuturesTimeout:
+        log.info("query policy verdict not ready in time; skipped (advisory)")
+        return ""
+    except Exception:  # noqa: BLE001 - advisory, never fatal
+        log.warning("query policy check failed (non-fatal)", exc_info=True)
+        return ""
+
+
 def make_sql_tool(
     engine: AthenaSQL | RedshiftDataSQL,
     *,
     dataset_scope: dict[str, str] | None = None,
+    policy_checker: Any = None,
 ) -> Any:
     """Wrap a SQL engine as a LangChain ``run_sql`` StructuredTool.
 
@@ -430,6 +468,15 @@ def make_sql_tool(
     moment the evidence is in front of it. The budget state lives in this
     closure, which is per-turn because ``server.build_agent`` constructs the
     tool fresh on every run.
+
+    ``policy_checker`` (a ``policy_check.PolicyChecker`` with the
+    computational track armed — per-run opt-in on policy-enabled deployments)
+    is the query-time SOFT policy check: the check is submitted BEFORE the
+    engine runs so the judges race the query, and after the results are back
+    the tool waits at most ``policy_checker.wait_budget_s`` for the verdict.
+    Flagged violations ride back as a second ``<system-reminder>`` after the
+    result — the model decides the correction. Every checker failure mode
+    (error, timeout) is fail-open: the results return untouched.
     """
     from langchain_core.tools import StructuredTool
 
@@ -453,13 +500,31 @@ def make_sql_tool(
         # line N:M ..., Insufficient Lake Formation permission(s) ...) is exactly
         # the feedback the model needs, so it passes through verbatim.
         nonlocal injection_count
+        # The soft policy check races the query: submit BEFORE the engine so
+        # the judges spend the query's own execution time. Failures fail open.
+        # Only ANALYTICAL queries are worth blocking on (should_wait) —
+        # exploration probes still submit (they warm the checker's caches in
+        # the worker) but return without waiting on a guaranteed-empty verdict.
+        policy_future = None
+        policy_wait = False
+        if policy_checker is not None:
+            try:
+                policy_future = policy_checker.submit(sql)
+                should_wait = getattr(policy_checker, "should_wait", None)
+                policy_wait = bool(should_wait(sql)) if should_wait else True
+            except Exception:  # noqa: BLE001 - the check is advisory
+                log.warning("policy check submit failed (non-fatal)", exc_info=True)
+                policy_future = None
         try:
             result = engine.run(sql, default_database=default_db)
         except ValueError as e:  # the read-only guard — concise, actionable
+            _cancel_policy_check(policy_future)
             return f"Error: {e}"
         except Exception as e:  # noqa: BLE001 - a tool error is feedback, not a crash
             log.warning("run_sql failed", exc_info=True)
+            _cancel_policy_check(policy_future)
             return f"Error: run_sql failed: {type(e).__name__}: {e}"
+        reminders: list[str] = []
         # Fail-open anomaly scan: a detector bug must never fail a successful
         # query. Detection runs on EVERY result (the log feeds threshold
         # calibration); injection respects the per-turn budget above.
@@ -467,7 +532,7 @@ def make_sql_tool(
             findings = sql_anomalies.detect(result)
         except Exception:  # noqa: BLE001 - detection is advisory, never fatal
             log.warning("sql anomaly detection failed", exc_info=True)
-            return result
+            findings = []
         if findings:
             log.info(
                 "run_sql anomalies detected: %s",
@@ -477,7 +542,13 @@ def make_sql_tool(
             if novel and injection_count < sql_anomalies.MAX_INJECTIONS_PER_TURN:
                 injection_count += 1
                 injected_kinds.update(f.kind for f in novel)
-                return json.dumps(result) + "\n\n" + sql_anomalies.compose(novel)
+                reminders.append(sql_anomalies.compose(novel))
+        if policy_future is not None and policy_wait:
+            note = _await_policy_note(policy_future, policy_checker)
+            if note:
+                reminders.append(note)
+        if reminders:
+            return json.dumps(result) + "\n\n" + "\n\n".join(reminders)
         return result
 
     return StructuredTool.from_function(
@@ -488,12 +559,46 @@ def make_sql_tool(
 
 
 # The known, server-recognized optional features (the browser may request a
-# subset via the run envelope's ``features``). Kept here so config/server share it.
-KNOWN_FEATURES: frozenset[str] = frozenset({"sql"})
+# subset via the run envelope's ``features``). Kept here so config/server share
+# it. The ``policy:*`` values are the composer's Policy field (Computational /
+# Behavioural / Strict = both) — they arm the mid-turn policy checks and are
+# valid ONLY alongside ``sql`` (the checks judge SQL conduct; without the SQL
+# tool there is nothing to check), a dependency the UI mirrors but the server
+# enforces independently here.
+POLICY_FEATURES: frozenset[str] = frozenset(
+    {"policy:computational", "policy:behavioural", "policy:strict"}
+)
+KNOWN_FEATURES: frozenset[str] = frozenset({"sql"}) | POLICY_FEATURES
 
 
 def normalize_features(raw: Any) -> set[str]:
-    """Coerce a client-sent ``features`` value to the recognized subset (a set)."""
+    """Coerce a client-sent ``features`` value to the recognized subset (a set).
+
+    Unknown values are dropped; ``policy:*`` values arriving WITHOUT ``sql``
+    are dropped too (orphaned opt-in — the hard dependency, enforced
+    server-side regardless of what the UI sent).
+    """
     if not isinstance(raw, (list, tuple, set)):
         return set()
-    return {str(f) for f in raw if str(f) in KNOWN_FEATURES}
+    out = {str(f) for f in raw if str(f) in KNOWN_FEATURES}
+    if "sql" not in out:
+        out -= POLICY_FEATURES
+    return out
+
+
+def policy_tracks(features: Any) -> frozenset[str]:
+    """The policy check tracks a normalized feature set arms.
+
+    ``policy:computational`` / ``policy:behavioural`` each arm their own
+    track; ``policy:strict`` arms both. Empty when nothing was opted in —
+    the server then constructs no checker at all (zero cost).
+    """
+    feats = features if isinstance(features, (set, frozenset)) else set(features or ())
+    tracks: set[str] = set()
+    if "policy:computational" in feats:
+        tracks.add("computational")
+    if "policy:behavioural" in feats:
+        tracks.add("behavioural")
+    if "policy:strict" in feats:
+        tracks.update(("computational", "behavioural"))
+    return frozenset(tracks)

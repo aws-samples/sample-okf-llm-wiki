@@ -202,3 +202,41 @@ class FakeLogs:
         if nxt < len(matched):
             resp["nextToken"] = str(nxt)
         return resp
+
+
+class FakeEvents:
+    """EventBridge fake capturing every ``put_events`` call verbatim.
+
+    Hand-rolled rather than moto-backed because the assertions are about the
+    exact wire shape (Source/DetailType/Detail) a consuming rule pattern must
+    match, which a real bus would swallow. ``raises=True`` simulates an
+    unreachable/denied publisher; ``fail_entries=True`` the nastier case of a
+    200 response that rejected the entry anyway.
+    """
+
+    def __init__(self, raises: bool = False, fail_entries: bool = False):
+        self.calls: list[dict[str, Any]] = []
+        self._raises = raises
+        self._fail_entries = fail_entries
+
+    def put_events(self, **kwargs) -> dict:
+        self.calls.append(kwargs)
+        if self._raises:
+            raise RuntimeError("events unreachable")
+        entries = kwargs.get("Entries", [])
+        if self._fail_entries:
+            return {
+                "FailedEntryCount": len(entries),
+                "Entries": [
+                    {"ErrorCode": "InternalException", "ErrorMessage": "nope"}
+                    for _ in entries
+                ],
+            }
+        return {
+            "FailedEntryCount": 0,
+            "Entries": [{"EventId": f"evt-{i}"} for i, _ in enumerate(entries)],
+        }
+
+    # convenience for assertions (mirrors FakeAgentCore.last_payload)
+    def last_detail(self) -> dict[str, Any]:
+        return json.loads(self.calls[-1]["Entries"][0]["Detail"])

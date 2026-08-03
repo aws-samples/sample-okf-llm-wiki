@@ -14,13 +14,21 @@ locals {
   harvest_mantle_enabled = anytrue(concat(
     [startswith(var.harvest_model, "openai.")],
     [for m in var.harvest_model_catalog : startswith(m.model, "openai.")],
+    # The AR rules-preprocessing pass runs in the harvest runtime at finalize;
+    # a GPT preprocess id is only reachable when policy builds are on.
+    # The policy-document AUTHOR agent (mode="ar_rules").
+    [local.ar_build_enabled && startswith(var.policy_preprocess_model, "openai.")],
   ))
 
   # Same reasoning for the chat runtime: grant Mantle when a GPT id is reachable
-  # at chat time (the deploy-time default OR any catalog entry the picker offers).
+  # at chat time (the deploy-time default, any catalog entry the picker offers,
+  # or the policy check's pre-pass model — the documented footgun: the pre-pass
+  # id never passes through the catalog, so it must be listed here explicitly).
   chat_mantle_enabled = anytrue(concat(
     [startswith(var.chat_model, "openai.")],
     [for m in var.chat_model_catalog : startswith(m.model, "openai.")],
+    # The policy check's rewrite + JUDGE fleet (chat/policy_check.py).
+    [local.ar_enabled && startswith(var.chat_policy_check_model, "openai.")],
   ))
 }
 
@@ -321,6 +329,8 @@ data "aws_iam_policy_document" "harvest" {
       # carry in lambda_policies.tf.
       "s3:GetObjectVersion", "s3:ListBucketVersions",
     ]
+    # Off-mount derived artifacts (benchmark/, policy/) ride this same
+    # bucket-wide grant — no separate policy/* statement is needed.
     resources = [
       local.d.bundle_bucket_arn,
       "${local.d.bundle_bucket_arn}/*",
@@ -329,11 +339,13 @@ data "aws_iam_policy_document" "harvest" {
 
   # The agent reports its own lifecycle back to the registry status row
   # (queued -> running -> complete|failed) so the UI's GET /harvest reflects
-  # reality. UpdateItem only (touches status/updated_at/detail); the Control
-  # API owns the initial put. Scoped to the single registry table.
+  # reality, and the AR build hook reads the DATASET# row's ar_build_status /
+  # ar_source_hash for its rebuild-iff-changed skip before conditionally
+  # flipping it to `building`. GetItem + UpdateItem only; the Control API owns
+  # the initial put. Scoped to the single registry table.
   statement {
-    sid       = "RegistryStatusWrite"
-    actions   = ["dynamodb:UpdateItem"]
+    sid       = "RegistryStatusReadWrite"
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
     resources = [local.d.registry_table_arn]
   }
 
@@ -513,6 +525,28 @@ data "aws_iam_policy_document" "chat" {
     sid       = "RegistryRead"
     actions   = ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:Scan"]
     resources = [local.d.registry_table_arn]
+  }
+
+  # policy_check's stale discovery (design §7.5): a fresh-hash mismatch flags
+  # the dataset row `stale` (a CONDITIONAL UpdateItem that only transitions
+  # from ready|degraded — it can never create AR state or clobber a build) and
+  # publishes a `policy_rebuild` event so the click starts the repair. One
+  # write action on one table + publish-only on the default bus.
+  dynamic "statement" {
+    for_each = local.ar_enabled ? [1] : []
+    content {
+      sid       = "ChatRegistryStaleFlag"
+      actions   = ["dynamodb:UpdateItem"]
+      resources = [local.d.registry_table_arn]
+    }
+  }
+  dynamic "statement" {
+    for_each = local.ar_enabled ? [1] : []
+    content {
+      sid       = "ChatPolicyRebuildPublish"
+      actions   = ["events:PutEvents"]
+      resources = [local.event_bus_arn]
+    }
   }
 
   # Conversation memory: the DynamoDBSaver checkpoint table (full item R/W —

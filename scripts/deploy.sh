@@ -248,6 +248,13 @@ stage_compute() {
   # overrode the variable's default with an explicit 0 on every deploy —
   # provisioned concurrency could never turn on without a config line few knew
   # about. ${VAR:+...} expands to nothing when the var is unset/empty.
+  # ENABLE_POLICY_CHECKS / ENABLE_POLICY_BUILD: the Automated Reasoning feature
+  # switches (both default false in Terraform). Same ${VAR:+...} treatment —
+  # passed only when the operator set them (env or scripts/.deployment.config),
+  # e.g. ENABLE_POLICY_CHECKS=true ENABLE_POLICY_BUILD=true. Checks gate the
+  # chat/UI surface (incl. the Reasoning sidebar page — VITE_CHAT_POLICY_CHECK
+  # is derived from it, so the ui stage must re-run after flipping); build
+  # gates the harvest/incremental policy-build pipeline that enrollment needs.
   tf "$ROOT/infra/compute" apply -auto-approve -input=false \
     -var="region=$AWS_REGION" \
     -var="name_prefix=${NAME_PREFIX:-okf}" \
@@ -255,7 +262,9 @@ stage_compute() {
     -var="harvest_image_uri=${HARVEST_IMAGE_URI:-}" \
     -var="consumption_image_uri=${CONSUMPTION_IMAGE_URI:-}" \
     -var="chat_image_uri=${CHAT_IMAGE_URI:-}" \
-    ${CONTROL_API_PROVISIONED_CONCURRENCY:+-var="control_api_provisioned_concurrency=$CONTROL_API_PROVISIONED_CONCURRENCY"}
+    ${CONTROL_API_PROVISIONED_CONCURRENCY:+-var="control_api_provisioned_concurrency=$CONTROL_API_PROVISIONED_CONCURRENCY"} \
+    ${ENABLE_POLICY_CHECKS:+-var="enable_policy_checks=$ENABLE_POLICY_CHECKS"} \
+    ${ENABLE_POLICY_BUILD:+-var="enable_policy_build=$ENABLE_POLICY_BUILD"}
   ok "Compute stack applied."
 }
 

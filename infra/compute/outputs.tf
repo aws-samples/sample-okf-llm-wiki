@@ -80,6 +80,11 @@ output "ui_env" {
     # Gates the composer's "+" → SQL affordance in the UI; the runtime + IAM are the
     # real boundary (offering it when off just yields a 403/handled error).
     VITE_CHAT_SQL_ENABLED = tostring(var.enable_chat_sql)
+    # Display gate for the composer's Policy feature + the Reasoning sidebar
+    # page (same pattern as VITE_CHAT_SQL_ENABLED). The chat runtime's
+    # OKF_CHAT_POLICY_CHECK_ENABLED is the REAL boundary; deriving both from
+    # local.ar_enabled keeps opt-in surface and backend coherent.
+    VITE_CHAT_POLICY_CHECK = tostring(local.ar_enabled)
     # Whether Amazon Redshift is deploy-enabled (var.enable_redshift). Gates the
     # Redshift option in the UI's new-mapping source dropdown; IAM is the real
     # boundary (offering it when off just yields empty pickers).

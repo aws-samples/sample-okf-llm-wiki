@@ -77,6 +77,19 @@ locals {
     "arn:aws:secretsmanager:${var.region}:${local.account_id}:secret:${var.redshift_secret_name_prefix}*",
   ]
 
+  # --- Policy checks (LLM-judge engine) ----------------------------------------
+  # v2: no Bedrock AR resources, no region limitation — the judges run wherever
+  # the chat model runs. The `ar_` prefix on these locals (and on the registry
+  # attributes) is legacy naming from the retired v1 (Bedrock Automated
+  # Reasoning) engine, kept to avoid a data migration.
+  ar_enabled       = var.enable_policy_checks
+  ar_build_enabled = local.ar_enabled && var.enable_policy_build
+
+  # The default EventBridge bus — this stack creates no custom bus; every rule
+  # (reindex, glue_table_change, policy_rebuild) lives on "default".
+  event_bus_arn  = "arn:aws:events:${var.region}:${local.account_id}:event-bus/default"
+  event_bus_name = "default"
+
   # OTEL/ADOT env shared by BOTH AgentCore runtime containers. These are
   # self-built images (not AgentCore-CLI builds); opentelemetry-instrument + the
   # installed aws-opentelemetry-distro run in agent-observability mode.

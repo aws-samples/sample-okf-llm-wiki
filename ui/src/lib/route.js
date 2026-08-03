@@ -29,7 +29,10 @@ export function parseHash() {
         return s
       }
     })
-  const [section, ...rest] = parts
+  let [section, ...rest] = parts
+  // The Reasoning page was renamed Guardrails (2026-08-03); alias the legacy
+  // section so old bookmarks/links keep resolving.
+  if (section === "reasoning") section = "guardrails"
   // Chat: the one trailing segment is the conversation id — never a dataset.
   if (section === "chat") {
     return {

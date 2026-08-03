@@ -460,3 +460,142 @@ def test_run_sql_timeout_returned_not_raised():
     fn = _tool_fn(_FailingEngine(TimeoutError("Athena query q1 timed out")))
     out = fn(sql="SELECT 1")
     assert "TimeoutError" in out and out.startswith("Error: run_sql failed:")
+
+
+# --- the query-time soft policy check wiring ----------------------------------
+
+
+class _StubEngine:
+    tool_description = "run_sql (test double)"
+
+    def __init__(self, result=None):
+        self._result = result if result is not None else {
+            "columns": ["n"], "rows": [{"n": "1"}],
+            "row_count": 1, "truncated": False,
+        }
+
+    def run(self, sql, *, default_database=None):
+        return self._result
+
+
+class _StubChecker:
+    """Scripted PolicyChecker double: an immediate (or never-resolving)
+    Future, mirroring only the surface make_sql_tool reads."""
+
+    wait_budget_s = 0.5
+
+    def __init__(self, note="", resolve=True, raise_on_submit=False, wait=True):
+        self._note = note
+        self._resolve = resolve
+        self._raise = raise_on_submit
+        self._wait = wait
+        self.submitted: list[str] = []
+
+    def should_wait(self, sql):
+        return self._wait
+
+    def submit(self, sql):
+        from concurrent.futures import Future
+
+        self.submitted.append(sql)
+        if self._raise:
+            raise RuntimeError("boom")
+        fut = Future()
+        if self._resolve:
+            fut.set_result(self._note)
+        self.last_future = fut
+        return fut
+
+
+def test_policy_reminder_rides_after_the_result():
+    import json as _json
+
+    checker = _StubChecker(note="<system-reminder>policy note</system-reminder>")
+    tool = make_sql_tool(_StubEngine(), policy_checker=checker)
+    out = tool.func("SELECT SUM(x) FROM t GROUP BY y")
+    assert isinstance(out, str) and out.endswith("policy note</system-reminder>")
+    # The payload survives intact ahead of the reminder, and the checker saw
+    # the exact SQL (submitted BEFORE the engine ran).
+    assert _json.loads(out.split("\n\n")[0])["rows"] == [{"n": "1"}]
+    assert checker.submitted == ["SELECT SUM(x) FROM t GROUP BY y"]
+
+
+def test_policy_clean_verdict_leaves_the_result_untouched():
+    tool = make_sql_tool(_StubEngine(), policy_checker=_StubChecker(note=""))
+    assert isinstance(tool.func("SELECT SUM(x) FROM t"), dict)
+
+
+def test_policy_verdict_timeout_is_fail_open():
+    checker = _StubChecker(resolve=False)  # the verdict never arrives
+    checker.wait_budget_s = 0.05
+    tool = make_sql_tool(_StubEngine(), policy_checker=checker)
+    assert isinstance(tool.func("SELECT SUM(x) FROM t"), dict)
+
+
+def test_policy_submit_failure_is_fail_open():
+    tool = make_sql_tool(
+        _StubEngine(), policy_checker=_StubChecker(raise_on_submit=True)
+    )
+    assert isinstance(tool.func("SELECT SUM(x) FROM t"), dict)
+
+
+def test_engine_failure_cancels_the_pending_check():
+    # A query the engine rejected has no results the model can act on, so its
+    # racing check is cancelled — a still-queued fleet must not burn one of
+    # the turn's few judged-query budget units on SQL that never executed.
+    class _FailingEngine(_StubEngine):
+        def run(self, sql, *, default_database=None):
+            raise RuntimeError("SYNTAX_ERROR: line 1:8")
+
+    checker = _StubChecker(resolve=False)  # still queued → cancellable
+    tool = make_sql_tool(_FailingEngine(), policy_checker=checker)
+    out = tool.func("SELECT SUM(x) FROM t")
+    assert isinstance(out, str) and out.startswith("Error:")
+    assert checker.submitted == ["SELECT SUM(x) FROM t"]
+    assert checker.last_future.cancelled()
+
+
+def test_read_only_guard_failure_cancels_the_pending_check():
+    class _GuardedEngine(_StubEngine):
+        def run(self, sql, *, default_database=None):
+            raise ValueError("read-only: DELETE is not allowed")
+
+    checker = _StubChecker(resolve=False)
+    tool = make_sql_tool(_GuardedEngine(), policy_checker=checker)
+    out = tool.func("DELETE FROM t")
+    assert isinstance(out, str) and out.startswith("Error:")
+    assert checker.last_future.cancelled()
+
+
+def test_exploration_queries_never_wait_on_the_verdict():
+    # should_wait=False (an exploration probe): the tool returns immediately
+    # even though the checker's future never resolves — the probe merely warms
+    # the checker's caches in the background.
+    checker = _StubChecker(resolve=False, wait=False)
+    checker.wait_budget_s = 30  # would hang the test if the tool waited
+    tool = make_sql_tool(_StubEngine(), policy_checker=checker)
+    assert isinstance(tool.func("SELECT * FROM t LIMIT 5"), dict)
+    assert checker.submitted == ["SELECT * FROM t LIMIT 5"]  # still submitted
+
+
+# --- the policy opt-in feature vocabulary -------------------------------------
+
+
+def test_normalize_features_policy_requires_sql():
+    from chat.sql import policy_tracks
+
+    # policy:* values are valid only alongside sql — orphaned ones drop.
+    assert normalize_features(["sql", "policy:strict"]) == {"sql", "policy:strict"}
+    assert normalize_features(["policy:strict"]) == set()
+    assert normalize_features(["policy:computational", "policy:behavioural"]) == set()
+    assert normalize_features(["sql", "policy:computational", "canvas"]) == {
+        "sql", "policy:computational",
+    }
+    # Track derivation: each value arms its own; strict arms both.
+    assert policy_tracks({"sql", "policy:computational"}) == {"computational"}
+    assert policy_tracks({"sql", "policy:behavioural"}) == {"behavioural"}
+    assert policy_tracks({"sql", "policy:strict"}) == {
+        "computational", "behavioural",
+    }
+    assert policy_tracks({"sql"}) == frozenset()
+    assert policy_tracks(None) == frozenset()

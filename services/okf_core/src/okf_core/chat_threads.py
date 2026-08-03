@@ -21,6 +21,11 @@ thread id); this index only carries the metadata the sidebar needs.
 AG-UI ``threadId`` (NOT the ``<sub>:<thread_id>`` checkpoint-namespaced form).
 Deleting a conversation removes this row AND purges the checkpoint via the
 saver's ``delete_thread`` (see the Control API).
+
+The same partition also holds the per-turn **policy-check reports** (the
+Automated Reasoning sidebar) under a ``POLICY#`` sort key — same table, same
+user-scoped partition, so one module owns the whole key space and a
+conversation delete knows what else to sweep.
 """
 
 from __future__ import annotations
@@ -66,3 +71,63 @@ def derive_title(first_message: str | None, *, fallback: str = "New conversation
     if not text:
         return fallback
     return text[:TITLE_MAX]
+
+
+# --------------------------------------------------------------------------- #
+# Policy-check reports (the Automated Reasoning sidebar)
+# --------------------------------------------------------------------------- #
+
+# Sort-key prefix for a per-turn policy-check report, on the SAME
+# ``CHAT#<user_sub>`` partition as the conversation index. Consequence for every
+# reader of that partition: a Query for conversations MUST constrain
+# ``begins_with(sk, "THREAD#")`` — an unconstrained Query now also returns these
+# rows.
+POLICY_SK_PREFIX = "POLICY#"
+
+
+def policy_report_sk(thread_id: str, turn_key: int) -> str:
+    """Sort key: ``POLICY#<thread_id>#<turn_key>`` — one turn's report.
+
+    ``turn_key`` is the turn's ORDINAL in the history rebuilt server-side from
+    the checkpoint (threads are append-only, so an ordinal is stable and needs
+    no id of its own). It is written as a PLAIN integer, not zero-padded, so
+    reports read by exact key are trivially addressable from the client's turn
+    index — the cost is that a ``begins_with`` Query returns ``#10`` before
+    ``#2``, so a caller that wants turn order must sort on the parsed
+    ``turn_key`` (:func:`parse_policy_report_sk`) rather than on the sk.
+    """
+    if not thread_id:
+        raise ValueError("policy_report_sk requires a non-empty thread_id")
+    turn = int(turn_key)
+    if turn < 0:
+        raise ValueError(f"turn_key must be >= 0, got {turn_key!r}")
+    return f"{POLICY_SK_PREFIX}{thread_id}#{turn}"
+
+
+def policy_report_sk_prefix(thread_id: str) -> str:
+    """The ``begins_with`` prefix for one conversation's report rows.
+
+    Note the TRAILING ``#``: thread ids are client-supplied, so without it
+    thread ``c1`` also selects ``c10``'s reports — which would make a
+    conversation delete purge a sibling conversation's history.
+    """
+    if not thread_id:
+        raise ValueError("policy_report_sk_prefix requires a non-empty thread_id")
+    return f"{POLICY_SK_PREFIX}{thread_id}#"
+
+
+def parse_policy_report_sk(sk: str) -> tuple[str, int]:
+    """``(thread_id, turn_key)`` from a report sort key, or ``ValueError``.
+
+    Splits the turn ordinal off the RIGHT, so a thread id that itself contains
+    ``#`` still round-trips with :func:`policy_report_sk`. Raises on anything
+    that is not a report key — callers Query a whole partition, so "is this row
+    a report?" must be answered by :data:`POLICY_SK_PREFIX`, never by a parse
+    that quietly returns a garbage ordinal.
+    """
+    if not sk.startswith(POLICY_SK_PREFIX):
+        raise ValueError(f"not a policy report sk: {sk!r}")
+    thread_id, sep, turn = sk[len(POLICY_SK_PREFIX) :].rpartition("#")
+    if not sep or not thread_id or not turn.isdigit():
+        raise ValueError(f"malformed policy report sk: {sk!r}")
+    return thread_id, int(turn)
