@@ -11,6 +11,7 @@ import {
   ArrowUpIcon,
   AtSignIcon,
   DatabaseIcon,
+  PinIcon,
   PlusIcon,
   ShieldCheckIcon,
   SlidersHorizontalIcon,
@@ -33,8 +34,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -178,7 +177,7 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
       <DropdownMenuContent
         align="start"
         side="top"
-        className="w-60"
+        className="min-w-56 rounded-xl"
         onCloseAutoFocus={(e) => {
           if (scopeSelectedRef.current) {
             scopeSelectedRef.current = false
@@ -187,93 +186,78 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
         }}
       >
         {canScope ? (
-          <>
-            <DropdownMenuLabel className="text-xs text-muted-foreground">
-              Scope
-            </DropdownMenuLabel>
-            <DropdownMenuItem
-              onSelect={() => {
-                scopeSelectedRef.current = true
-                onScope()
-              }}
-              className="flex-col items-start gap-0.5"
-            >
-              <span className="flex items-center gap-2">
-                <AtSignIcon className="size-3.5 text-muted-foreground" />
-                Scope to a dataset
-              </span>
-              <span className="pl-5.5 text-[11px] text-muted-foreground">
-                Focus the wiki on one dataset (or type “@”).
-              </span>
-            </DropdownMenuItem>
-          </>
+          <DropdownMenuItem
+            onSelect={() => {
+              scopeSelectedRef.current = true
+              onScope()
+            }}
+            className="rounded-lg"
+          >
+            <PinIcon className="size-3.5 text-muted-foreground" />
+            Scope to a dataset
+          </DropdownMenuItem>
         ) : null}
-        {remaining.length > 0 || offerPolicy ? (
-          <>
-            {canScope ? <DropdownMenuSeparator /> : null}
-            <DropdownMenuLabel className="text-xs text-muted-foreground">
-              Add a capability
-            </DropdownMenuLabel>
-            {remaining.map((f) => {
-              const Icon = f.icon
-              return (
-                <DropdownMenuItem
-                  key={f.id}
-                  onSelect={() => onToggle(f.id)}
-                  className="flex-col items-start gap-0.5"
-                >
-                  <span className="flex items-center gap-2">
+        {remaining.map((f) => {
+          const Icon = f.icon
+          return (
+            <DropdownMenuItem
+              key={f.id}
+              onSelect={() => onToggle(f.id)}
+              className="rounded-lg"
+            >
+              {Icon ? <Icon className="size-3.5 text-muted-foreground" /> : null}
+              {f.menuLabel || f.label}
+            </DropdownMenuItem>
+          )
+        })}
+        {offerPolicy ? (
+          <DropdownMenuSub>
+            {/* Disabled while SQL is off — the checks judge SQL conduct. */}
+            <DropdownMenuSubTrigger disabled={!sqlOn} className="rounded-lg">
+              <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
+              Guardrails
+            </DropdownMenuSubTrigger>
+            {/* Gap to the main card (sideOffset) + bottom edge aligned with
+                the BOTTOM of the Guardrails row: Radix top-aligns sub content
+                with its trigger and has no align="end" for subs, so shift it
+                up by its own height minus the trigger row's 2rem (py-1.5 ×2 +
+                one text-sm line). avoidCollisions must be OFF — the composer
+                sits at the viewport bottom, so Radix pre-shifts the card up
+                to fit and the translate would stack on that shift; with a
+                deterministic start (top = trigger top) the math is exact.
+                The `translate` property is separate from `transform`, so the
+                open/close animation doesn't clobber the offset. */}
+            <DropdownMenuSubContent
+              sideOffset={8}
+              avoidCollisions={false}
+              className="rounded-xl translate-y-[calc(-100%+2rem)]"
+            >
+              {POLICY_OPTIONS.map((o) => {
+                const Icon = o.icon
+                // Icon beside a text column (not inside the label row) so the
+                // item's default items-center centers it against BOTH lines.
+                return (
+                  <DropdownMenuItem
+                    key={o.id}
+                    onSelect={() => onPickPolicy(o.id)}
+                    className="rounded-lg py-1"
+                  >
                     {Icon ? (
                       <Icon className="size-3.5 text-muted-foreground" />
                     ) : null}
-                    {f.menuLabel || f.label}
-                  </span>
-                  {f.description ? (
-                    <span className="pl-5.5 text-[11px] text-muted-foreground">
-                      {f.description}
-                    </span>
-                  ) : null}
-                </DropdownMenuItem>
-              )
-            })}
-            {offerPolicy ? (
-              <DropdownMenuSub>
-                {/* The trigger stays a ROW: the text stacks in an inner column so
-                    the SubTrigger's built-in chevron keeps its place at the right,
-                    vertically centered — a flex-col on the trigger itself would
-                    wrap the chevron onto its own line below the description. */}
-                <DropdownMenuSubTrigger disabled={!sqlOn}>
-                  <span className="flex flex-col gap-0.5">
-                    <span className="flex items-center gap-2">
-                      <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
-                      Guardrails
-                    </span>
-                    <span className="pl-5.5 text-[11px] text-muted-foreground">
-                      {sqlOn
-                        ? "Flag documented-guardrail violations mid-turn"
-                        : "Requires the SQL capability"}
-                    </span>
-                  </span>
-                </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent className="w-64">
-                  {POLICY_OPTIONS.map((o) => (
-                    <DropdownMenuItem
-                      key={o.id}
-                      onSelect={() => onPickPolicy(o.id)}
-                      className="flex-col items-start gap-0.5"
-                    >
-                      <span className="text-sm">{o.label}</span>
+                    <span className="flex flex-col">
+                      <span>{o.label}</span>
                       {o.description ? (
                         <span className="text-[11px] text-muted-foreground">
                           {o.description}
                         </span>
                       ) : null}
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuSubContent>
-              </DropdownMenuSub>
-            ) : null}
-          </>
+                    </span>
+                  </DropdownMenuItem>
+                )
+              })}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
         ) : null}
       </DropdownMenuContent>
     </DropdownMenu>

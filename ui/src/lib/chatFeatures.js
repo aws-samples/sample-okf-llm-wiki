@@ -15,7 +15,7 @@
 // Terraform output). The server re-checks both the deploy flag AND the per-run
 // opt-in.
 
-import { DatabaseIcon, ShieldCheckIcon } from "lucide-react"
+import { DatabaseIcon, Layers2Icon, PiIcon, RouteIcon } from "lucide-react"
 
 // Vite inlines import.meta.env.* at build time. "true" (string) when the compute
 // stack was deployed with var.enable_chat_sql = true.
@@ -52,23 +52,22 @@ export const POLICY_OPTIONS = [
   {
     id: "policy:computational",
     label: "Computational",
-    description:
-      "Judge each analytical SQL query against the dataset's guardrails",
-    icon: ShieldCheckIcon,
+    description: "Judge each SQL query",
+    icon: PiIcon,
     available: POLICY_AVAILABLE,
   },
   {
     id: "policy:behavioural",
     label: "Behavioural",
-    description: "Judge the steps the agent takes against the dataset's guardrails",
-    icon: ShieldCheckIcon,
+    description: "Judge the agent's steps",
+    icon: RouteIcon,
     available: POLICY_AVAILABLE,
   },
   {
     id: "policy:strict",
     label: "Strict",
-    description: "Both checks — queries and conduct",
-    icon: ShieldCheckIcon,
+    description: "Both checks",
+    icon: Layers2Icon,
     available: POLICY_AVAILABLE,
   },
 ]

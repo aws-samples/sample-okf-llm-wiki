@@ -55,6 +55,7 @@ import {
 } from "@/components/ui/sheet"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
+import { Switch } from "@/components/ui/switch"
 import {
   AnnotationSidebar,
   PageAnnotator,
@@ -426,14 +427,18 @@ function FilesPane({
               from a text selection or the whole dataset. */}
           {!versionMode && selectedId && (
             <div className="flex shrink-0 items-center gap-2">
-              <Button
-                variant={rawView ? "secondary" : "outline"}
-                size="sm"
-                onClick={() => setRawView((v) => !v)}
-              >
+              {/* Radix's Switch renders a real <button>, which is labelable —
+                  so wrapping it in a <label> makes the icon + text clickable. */}
+              <label className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-muted-foreground">
                 <CodeIcon className="size-3.5" />
                 Raw
-              </Button>
+                <Switch
+                  size="sm"
+                  checked={rawView}
+                  onCheckedChange={setRawView}
+                  aria-label="Show raw markdown"
+                />
+              </label>
               <PageAnnotator
                 api={api}
                 domain={domain}
