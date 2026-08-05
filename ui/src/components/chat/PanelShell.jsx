@@ -6,7 +6,7 @@
 // Optionally resizable: pass `onResizeStart` and a drawer-style grip renders in
 // a left GUTTER beside the card (not on its border). The drag itself — width
 // state, clamping, persistence — is owned by ChatPanel; `resizing` mirrors its
-// drag state so the grip holds its cyan (primary) tint even when the pointer
+// drag state so the grip holds its sky (primary) tint even when the pointer
 // outruns the handle mid-drag (where CSS :active would flicker).
 
 import { cn } from "@/lib/utils"

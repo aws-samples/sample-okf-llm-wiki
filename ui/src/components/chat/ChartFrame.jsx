@@ -186,7 +186,7 @@ function ChartGenerating({ active }) {
         s.transform = `scale(${(SKETCH_REST_SCALE + (1.35 - SKETCH_REST_SCALE) * v).toFixed(3)})`
         // Aggressive shading: the halftone base only sets the REST look; a
         // peak lifts any dot it covers all the way to opacity 1 — full
-        // button-cyan at the crest — with the gaussian grading the ring.
+        // button-sky at the crest — with the gaussian grading the ring.
         const rest = d.base * SKETCH_REST_ALPHA
         s.opacity = (rest + (1 - rest) * v).toFixed(3)
       }

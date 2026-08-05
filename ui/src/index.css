@@ -54,19 +54,19 @@
 }
 
 :root {
-    /* LIGHT-mode neutrals are shadcn STONE (warm gray, hue ~50-106) — not
-       zinc/cool grays. The soft-gray-page structure is kept: --background
-       stays at the same lightness as before (page reads a step darker than
-       the white cards), only the hue moved to the stone family. This is
-       light-mode ONLY — dark mode keeps its cool grays on purpose (see .dark). */
+    /* LIGHT-mode neutrals are shadcn STONE (warm gray, hue ~50-106). The
+       soft-gray-page structure is kept: --background stays at the same
+       lightness as always (page reads a step darker than the white cards),
+       hue in the stone family. Light-mode ONLY — dark mode is pure
+       achromatic neutral (see .dark). */
     --background: oklch(0.9626 0.0021 106.4); /* #F3F3F1 — soft warm-gray page */
     --foreground: oklch(0.147 0.004 49.25);
     --card: oklch(1 0 0);
     --card-foreground: oklch(0.147 0.004 49.25);
     --popover: oklch(1 0 0);
     --popover-foreground: oklch(0.147 0.004 49.25);
-    --primary: oklch(0.52 0.105 223.128);
-    --primary-foreground: oklch(0.984 0.019 200.873);
+    --primary: oklch(0.5 0.134 242.749); /* sky-700 — the brand accent (was cyan-700) */
+    --primary-foreground: oklch(0.977 0.013 236.62); /* sky-50 */
     --secondary: oklch(0.97 0.001 106.424);
     --secondary-foreground: oklch(0.216 0.006 56.043);
     --muted: oklch(0.963 0.002 106.4);
@@ -77,12 +77,12 @@
     --border: oklch(0.923 0.003 48.717);
     --input: oklch(0.923 0.003 48.717);
     --ring: oklch(0.709 0.01 56.259);
-    /* Chart palette for LIGHT mode — anchored on the app's BRAND CYAN (--primary,
-       hue ~223) and extending to the sidebar sky-blue (~237), so charts read as the
-       Categorical (identity) hues, NOT a single-hue cyan ramp: an all-cyan chart
+    /* Chart palette for LIGHT mode — anchored on the app's BRAND SKY (--primary,
+       hue ~242; the sidebar accent shares the family), so charts read as the
+       Categorical (identity) hues, NOT a single-hue blue ramp: an all-blue chart
        spends only lightness to tell series apart, which collapses on a screen
-       or in a photo/printout. --chart-1 stays the brand cyan (matches --primary,
-       hue 227) so a single-series chart still reads as "the app's color"; slots
+       or in a photo/printout. --chart-1 stays the brand hue (matches --primary,
+       hue 242) so a single-series chart still reads as "the app's color"; slots
        2-5 use distinct hue FAMILIES (orange / aqua-green / amber / magenta) —
        adjacent-pair validated (dataviz skill's validate_palette.js: CVD ΔE ≥ 8,
        normal-vision floor ≥ 15, both hard-pass here at 9.0/19.4 light,
@@ -106,7 +106,7 @@
        forms, where ANY two marks can sit side by side, only the first THREE
        slots clear the all-pairs gate — past three, fold to "Other" or facet
        rather than reaching for slot 4. */
-    --chart-1: oklch(0.556 0.108 227); /* cyan (brand) */
+    --chart-1: oklch(0.556 0.108 242); /* sky (brand) — hue moved with the Aug-2026 cyan→sky rebrand; same L/C */
     --chart-2: oklch(0.67 0.175 41); /* orange */
     --chart-3: oklch(0.67 0.14 162); /* aqua-green */
     --chart-4: oklch(0.76 0.16 75); /* amber */
@@ -116,12 +116,12 @@
     --chart-8: oklch(0.55 0.14 145); /* green */
     --chart-9: oklch(0.55 0.16 262); /* blue */
     --chart-10: oklch(0.58 0.19 20); /* red */
-    /* GraphView cross-dataset (external/) node cards: a faint brand-cyan wash
+    /* GraphView cross-dataset (external/) node cards: a faint brand-sky wash
        on the white card surface. An explicit per-mode token (see .dark) rather
-       than a runtime color-mix: mixing the cyan accents with white IN OKLCH
+       than a runtime color-mix: mixing the brand accents with white IN OKLCH
        hue-rotates through rose (white's explicit hue is 0), which is exactly
-       the pink-card bug this replaces. Keep in the brand cyan family. */
-    --xref-node-bg: oklch(0.965 0.018 220);
+       the pink-card bug this replaces. Keep in the brand sky family. */
+    --xref-node-bg: oklch(0.965 0.018 240);
     --radius: 0.625rem;
     /* Dark sidebar (#2E2E2E) against the light content area. Its sub-tokens are
        flipped to light-on-dark so nav text, hover/active states, and borders
@@ -137,29 +137,29 @@
 }
 
 .dark {
-    /* Dark neutrals are deliberately NOT stone (unlike :root): the warm stone
-       band was tried in dark mode and rejected — these cool, faintly
-       cyan-tinted grays are the preferred dark look. Don't "align" them with
-       the light theme's stone family. */
-    --background: oklch(0.1477 0.004 228.8); /* #090B0C — page background */
-    --foreground: oklch(0.987 0.002 197.1);
-    --card: oklch(0.218 0.008 223.9);
-    --card-foreground: oklch(0.987 0.002 197.1);
-    --popover: oklch(0.218 0.008 223.9);
-    --popover-foreground: oklch(0.987 0.002 197.1);
-    --primary: oklch(0.6 0.11 224.283);
-    --primary-foreground: oklch(0.984 0.019 200.873);
-    --secondary: oklch(0.274 0.006 286.033);
+    /* Dark neutrals are pure ACHROMATIC NEUTRAL (chroma 0; replaced the
+       original cool cyan-tinted grays Aug 2026) at the same tuned lightness
+       steps: page 0.1477 < card 0.218 < muted 0.275. NOT the light theme's
+       mauve — the temperature split between modes is deliberate. */
+    --background: oklch(0.1477 0 0); /* #0B0B0B — page background */
+    --foreground: oklch(0.987 0 0);
+    --card: oklch(0.218 0 0);
+    --card-foreground: oklch(0.987 0 0);
+    --popover: oklch(0.218 0 0);
+    --popover-foreground: oklch(0.987 0 0);
+    --primary: oklch(0.588 0.158 241.966); /* sky-600 — brand accent, dark-stepped */
+    --primary-foreground: oklch(0.977 0.013 236.62); /* sky-50 */
+    --secondary: oklch(0.274 0 0);
     --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.275 0.011 216.9);
-    --muted-foreground: oklch(0.723 0.014 214.4);
-    --accent: oklch(0.275 0.011 216.9);
-    --accent-foreground: oklch(0.987 0.002 197.1);
+    --muted: oklch(0.275 0 0);
+    --muted-foreground: oklch(0.723 0 0);
+    --accent: oklch(0.275 0 0);
+    --accent-foreground: oklch(0.987 0 0);
     --destructive: oklch(0.704 0.191 22.216);
     --border: oklch(1 0 0 / 10%);
     --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.56 0.021 213.5);
-    /* Chart palette for DARK mode — same categorical HUES as :root (cyan /
+    --ring: oklch(0.56 0 0);
+    /* Chart palette for DARK mode — same categorical HUES as :root (sky /
        orange / aqua-green / amber / magenta), independently stepped into the
        dark lightness band (OKLCH L 0.48-0.67) rather than just brightened —
        validate_palette.js passes both bands as separate ramps, not one ramp
@@ -169,7 +169,7 @@
        surface (dark mode needs no contrast relief, unlike light). Same ten
        hues and same slot order as :root — see the light block for why the
        order is what it is and for the scatter/bubble series cap. */
-    --chart-1: oklch(0.64 0.13 223); /* cyan (brand, dark-stepped) */
+    --chart-1: oklch(0.64 0.13 242); /* sky (brand, dark-stepped) */
     --chart-2: oklch(0.62 0.17 40); /* orange */
     --chart-3: oklch(0.62 0.13 163); /* aqua-green */
     --chart-4: oklch(0.67 0.14 73); /* amber */
@@ -180,9 +180,9 @@
     --chart-9: oklch(0.58 0.15 262); /* blue */
     --chart-10: oklch(0.6 0.18 20); /* red */
     /* GraphView cross-dataset node cards, dark variant: one step lighter than
-       --card (0.218) with a touch more cyan chroma, so the wash reads on the
+       --card (0.218) with a touch more sky chroma, so the wash reads on the
        dark surface without glowing. Same hue family as the light token. */
-    --xref-node-bg: oklch(0.27 0.028 222);
+    --xref-node-bg: oklch(0.27 0.028 240);
     /* Darker sidebar (#161616) in dark mode — reads as a recessed panel against
        the lighter content bg. Hover accent is a lighter gray so it stays
        visible on the near-black surface. */
@@ -272,7 +272,7 @@
     @apply mx-0.5 inline-flex cursor-pointer items-center gap-1 rounded-md border align-baseline font-medium whitespace-nowrap;
     font-size: 0.72em;
     padding: 0.15em 0.42em;
-    /* The app's cyan (primary) flavour, same recipe as the concept-id labels —
+    /* The app's sky (primary) flavour, same recipe as the concept-id labels —
        citations are part of the same source-reference color language, in both
        modes. The primary-tinted mixes have real contrast against the page in
        light AND dark (unlike --muted, which matches the light page's lightness). */
@@ -295,7 +295,7 @@
     text-overflow: ellipsis;
   }
   /* "+2" — the other sources behind this claim, page through them in the card.
-     Slightly quieter than the label, but still in the cyan family. */
+     Slightly quieter than the label, but still in the sky family. */
   .okf-prose .okf-cite-more {
     @apply font-semibold tabular-nums;
     color: color-mix(in oklch, var(--primary) 65%, var(--muted-foreground));
@@ -305,7 +305,7 @@
   }
   /* NOTE: no `.okf-cite svg { color: … }` rule here — it would sit in @layer
      components and LOSE to the icon's text-muted-foreground utility (utilities
-     layer comes later; layer order beats specificity). The doc glyph's cyan is
+     layer comes later; layer order beats specificity). The doc glyph's sky is
      applied as `text-primary` at the component instead (Citation.jsx). */
   /* Markdown's BARE fenced blocks only — CodeView brings its own chrome
      (header + scroll container), so its pre must not inherit this panel
@@ -319,7 +319,7 @@
   }
   /* highlight.js (rehype-highlight) token colors, mapped onto our theme tokens
      so SQL/code highlighting reads well in BOTH light and dark mode instead of
-     shipping a fixed-palette hljs theme. Keywords use the primary (cyan); the
+     shipping a fixed-palette hljs theme. Keywords use the primary (sky); the
      rest lean on chart/muted tokens — but this is a WCAG text-contrast job
      (readable code characters), not the categorical-series job --chart-1..5
      are now tuned for (see the --chart-1 definition above), so the three roles
@@ -546,9 +546,9 @@
      chat surface, like the revealed chart itself (transparent iframe). The
      overflow clip just keeps edge squares from spilling past the reserved box. */
   overflow: hidden;
-  /* PURE primary — a square at full peak is exactly the button cyan (the
+  /* PURE primary — a square at full peak is exactly the button sky (the
      token already carries the right light/dark value). All the shading comes
-     from per-dot opacity: faint cyan at rest, full cyan at a peak's crest. */
+     from per-dot opacity: faint sky at rest, full sky at a peak's crest. */
   color: var(--primary);
 }
 .okf-sketch-dot {

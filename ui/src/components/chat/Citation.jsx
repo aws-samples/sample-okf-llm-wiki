@@ -178,7 +178,7 @@ export function CitationGroup({
           {isWebSource(first) ? (
             <SourceIcon url={first} size={11} className="okf-cite-icon" />
           ) : (
-            // text-primary: the kind glyph joins the badge's cyan family (cn
+            // text-primary: the kind glyph joins the badge's sky family (cn
             // merges it over DocIcon's muted default). Favicons keep their own
             // colors — the site's mark IS the signal there. conceptIdOf strips a
             // qualified id's domain/dataset prefix so the glyph keys on the kind.

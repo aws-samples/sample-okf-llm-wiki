@@ -402,13 +402,13 @@ const PolicyStep = memo(function PolicyStep({ step, isLast }) {
                   ) : null}
                 </div>
                 <div className="text-foreground">
-                  <span className="font-medium text-cyan-600 dark:text-cyan-400">
+                  <span className="font-medium text-sky-600 dark:text-sky-400">
                     Condition:
                   </span>{" "}
                   {f.condition}
                 </div>
                 <div className="text-foreground">
-                  <span className="font-medium text-cyan-600 dark:text-cyan-400">
+                  <span className="font-medium text-sky-600 dark:text-sky-400">
                     Action:
                   </span>{" "}
                   {f.action}

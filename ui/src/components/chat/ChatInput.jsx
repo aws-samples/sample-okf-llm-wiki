@@ -602,9 +602,12 @@ export function ChatInput({
   // The composer card is borderless in LIGHT mode (the white card + shadow
   // already separates it from the gray page); dark mode keeps the border — it's
   // the only thing separating surfaces there. border-transparent (not border-0)
-  // so the box size is identical in both modes.
+  // so the box size is identical in both modes. In DARK mode the fill is one
+  // step lighter than --card — the same effective color as Browse's file-tree
+  // pane (bg-muted/40 over the card), mixed from the tokens so it tracks
+  // theme changes — which lifts the composer off the transcript surface.
   return (
-    <div className="flex flex-col gap-2 rounded-2xl border border-transparent bg-card px-4 py-3 shadow-sm dark:border-border">
+    <div className="flex flex-col gap-2 rounded-2xl border border-transparent bg-card px-4 py-3 shadow-sm dark:border-border dark:bg-[color-mix(in_oklch,var(--muted)_40%,var(--card))]">
       {asking ? (
         <AskHumanForm
           questions={pendingAsk.questions}
