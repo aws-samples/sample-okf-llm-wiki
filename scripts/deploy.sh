@@ -200,14 +200,17 @@ stage_durable() {
     -var="admin_given_name=${ADMIN_GIVEN_NAME:-OKF}" \
     -var="admin_family_name=${ADMIN_FAMILY_NAME:-Admin}"
   ok "Durable stack applied."
-  backfill_registry_entity
 }
 
 # Stamp the by-entity GSI keys onto pre-index registry rows and write the
 # readiness marker (readers Query the index only once the marker exists — see
-# docs/CONVENTIONS.md "Registry entity index"). Idempotent and seconds-fast, so
-# it runs after EVERY durable apply. Non-fatal: until it succeeds, listings
-# simply keep using the legacy scan.
+# docs/CONVENTIONS.md "Registry entity index"). Runs at the END of the compute
+# stage, NOT after the durable apply: the marker vouches that every row is in
+# the index, so it must not be stamped while the still-deployed OLD writers
+# can add rows without entity/pair (anything registered in the durable→compute
+# window would then be invisible to every GSI-backed listing). Idempotent and
+# seconds-fast, so it runs after EVERY compute apply. Non-fatal: until it
+# succeeds, listings simply keep using the legacy scan.
 backfill_registry_entity() {
   local py="$ROOT/.venv/bin/python"
   [ -x "$py" ] || py="python3"
@@ -283,6 +286,7 @@ stage_compute() {
     ${ENABLE_POLICY_CHECKS:+-var="enable_policy_checks=$ENABLE_POLICY_CHECKS"} \
     ${ENABLE_POLICY_BUILD:+-var="enable_policy_build=$ENABLE_POLICY_BUILD"}
   ok "Compute stack applied."
+  backfill_registry_entity
 }
 
 stage_cognito_urls() {

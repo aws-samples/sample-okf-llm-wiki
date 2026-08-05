@@ -92,13 +92,30 @@ the skill's own text, not from this list of names.
     matching a name ACROSS all tables. This is your join-key and near-synonym
     discovery tool: one grep finds every table carrying `customer_id`.
   - `read_file .metadata/database.md` — database-level metadata.
+  - `read_file .metadata/profile/<table>.md` — the table's COLUMN PROFILE
+    (null share, ~distinct count, min/max, top values), when present. Read it
+    BEFORE writing probe queries: it already answers most null/enum/range
+    questions for free. A sheet marked INDICATIVE was computed from a sample —
+    treat its value lists as leads, never as a complete enum; verify with
+    `run_sql` before documenting a legend.
   `.metadata/` is READ-ONLY (writes are refused) — it is an input, like
   `.context/`, never a place you author.
 - **Live source tools** (the snapshot can't answer these): `sample_rows` (a
   small sample of real values) and `run_sql` (execute ⟪DIALECT⟫ SQL to
   verify grain, joins, casts, and gotchas against live data — a failing query is
   itself signal). Catalog metadata can be wrong/stale, so confirm load-bearing
-  claims with these, don't just transcribe `.metadata/`.
+  claims with these, don't just transcribe `.metadata/`. `run_sql` results are
+  row-capped (`truncated: true` means add a LIMIT or aggregate) and report
+  `data_scanned_bytes` — when a pattern scans heavily, document the cheaper
+  form in the doc's query guidance.
+- **Deterministic verification probes** (prefer these over hand-written probe
+  SQL — one call, standardized evidence): `check_grain(concept_id,
+  key_columns)` verifies a claimed grain (unique or not, duplicate samples);
+  `validate_join(left_id, left_cols, right_id, right_cols)` verifies a
+  candidate join (match rate BOTH ways, null-key share, 1:1/1:N/N:1/M:N
+  cardinality — put its numbers in the join doc as evidence); `explain_sql`
+  (when available) validates any SQL you are about to ship in a doc against
+  the live schema WITHOUT scanning data — run every ```sql fence through it.
 - **`run_code`** — a Python sandbox for reading uploaded source docs under
   `.context/` whose formats the built-in `read_file` can't decode (PDF, `.docx`,
   `.pptx`, `.xlsx`, CSV, XML — `read_file` only base64-encodes those). The
@@ -572,8 +589,12 @@ report on the rest of the bundle.
      `.metadata/tables/<table>.md` sheet? Any invented, dropped, or mis-typed
      column?
    - **Query patterns / joins / metrics**: does each SQL snippet actually run and
-     return sensible rows? Do join `ON` keys match real values on both sides, and
-     is the stated cardinality (1:1 / 1:many) what the data shows? Also probe for
+     return sensible rows? Screen every fence cheaply with `explain_sql` first
+     (when available — a failing EXPLAIN is an immediate finding, no scan
+     billed), then `run_sql` the load-bearing ones. Do join `ON` keys match
+     real values on both sides, and is the stated cardinality (1:1 / 1:many)
+     what the data shows? `validate_join`/`check_grain` reproduce a doc's join
+     and grain claims in one call each. Also probe for
      an OBVIOUS join the doc MISSES: `grep .metadata/columns.tsv` for a shared key
      between this table and a sibling that has no documented join — a real,
      unverified relationship left out is a finding.

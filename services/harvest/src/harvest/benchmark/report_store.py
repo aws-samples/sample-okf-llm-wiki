@@ -5,9 +5,9 @@ read them; served only via the Cognito-authed Control API):
 
 * ``benchmark/<d>/<ds>/reports/<report_id>/report.json`` — config recap,
   scores, stability, per-question detail, judge output, telemetry.
-* ``.../traces.json`` — the failed attempts' solver traces (large; the UI
-  fetches it lazily). Written best-effort AFTER the report: losing step detail
-  must never lose the report.
+* ``.../traces.json`` — EVERY attempt's solver trace, passing and failing
+  (large; the UI fetches it lazily). Written best-effort AFTER the report:
+  losing step detail must never lose the report.
 
 The **index row** (``pk=HARVEST#<d>#<ds>``, ``sk=REPORT#<report_id>``) is what
 the Benchmark list polls: status, config summary, live progress, and headline
@@ -33,6 +33,12 @@ log = logging.getLogger("harvest.benchmark.report_store")
 # often we write so a 100-question round doesn't hammer DynamoDB.
 _PROGRESS_MIN_INTERVAL_S = 2.0
 
+# Terminal-status writes get a bounded retry: every non-terminal write has a
+# later write to correct it, but a transient DDB fault on the LAST write would
+# leave an eternal `running` row in front of a durable S3 report.
+_TERMINAL_WRITE_ATTEMPTS = 3
+_TERMINAL_WRITE_BACKOFF_S = 0.5
+
 
 def persist_report_artifacts(
     *,
@@ -43,8 +49,25 @@ def persist_report_artifacts(
     report_doc: dict[str, Any],
     traces_doc: dict[str, Any] | None,
     put_object: Any = None,
+    registry: tuple[Any, str] | None = None,
 ) -> None:
-    """PUT report.json (must succeed — raises) then traces.json (best-effort)."""
+    """PUT report.json (must succeed — raises) then traces.json (best-effort).
+
+    When ``registry`` is provided, the REPORT# row is checked first: a report
+    the human deleted mid-run must not have its artifacts re-materialize as
+    orphans (the row write is already conditional; this closes the S3 side —
+    a small race between the check and the PUTs remains and is acceptable).
+    The check itself is best-effort: a registry read error never blocks the
+    durable report.
+    """
+    if registry is not None and not _report_row_exists(
+        registry, data_domain=data_domain, dataset=dataset, report_id=report_id
+    ):
+        log.info(
+            "Report row %s for %s/%s is gone (deleted); skipping artifact PUTs.",
+            report_id, data_domain, dataset,
+        )
+        return
     put = put_object or _default_put_object
     put(
         bucket,
@@ -71,6 +94,24 @@ def _default_put_object(bucket: str, key: str, body: bytes) -> None:
     region = os.environ.get("AWS_REGION", "us-east-1")
     s3 = boto3.client("s3", region_name=region)
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+
+
+def _report_row_exists(
+    registry: tuple[Any, str], *, data_domain: str, dataset: str, report_id: str
+) -> bool:
+    """Whether the REPORT# row still exists. Fail-open on read errors."""
+    client, table = registry
+    try:
+        resp = client.get_item(
+            TableName=table,
+            Key={
+                "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+                "sk": {"S": br.report_sk(report_id)},
+            },
+        )
+        return bool(resp.get("Item"))
+    except Exception:  # noqa: BLE001 - the check is a courtesy, never a gate
+        return True
 
 
 def headline_kpis(report_doc: dict[str, Any]) -> dict[str, Any]:
@@ -119,45 +160,66 @@ def update_report_row(
     runtime finishing after the human deleted the report would resurrect a
     phantom row (partial attrs, no ``status``) that the UI renders as a stuck
     active run. A deleted report stays deleted; the late write is dropped.
+    TERMINAL statuses (run or agg) additionally retry a transient fault — the
+    terminal write has no later write to correct it (see the module constants);
+    a failed condition (deleted row) is never retried, that drop is the point.
     """
     if registry is None or not attrs:
         return
-    client, table = registry
-    try:
-        from datetime import datetime, timezone
+    import time
+    from datetime import datetime, timezone
 
-        names: dict[str, str] = {}
-        values: dict[str, Any] = {}
-        sets: list[str] = []
-        for i, (key, value) in enumerate(attrs.items()):
-            alias, placeholder = f"#a{i}", f":v{i}"
-            names[alias] = key
-            values[placeholder] = _marshal(value)
-            sets.append(f"{alias} = {placeholder}")
-        names["#u"] = "updated_at"
-        values[":u"] = {
-            "S": datetime.now(timezone.utc).isoformat(timespec="seconds")
-        }
-        sets.append("#u = :u")
-        client.update_item(
-            TableName=table,
-            Key={
-                "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
-                "sk": {"S": br.report_sk(report_id)},
-            },
-            UpdateExpression="SET " + ", ".join(sets),
-            ConditionExpression="attribute_exists(pk)",
-            ExpressionAttributeNames=names,
-            ExpressionAttributeValues=values,
-        )
-    except Exception:  # noqa: BLE001 - the S3 report is the durable truth
-        log.warning(
-            "Failed to update report row %s for %s/%s (continuing)",
-            report_id,
-            data_domain,
-            dataset,
-            exc_info=True,
-        )
+    client, table = registry
+    terminal = attrs.get("status") in (br.STATUS_COMPLETE, br.STATUS_FAILED) or attrs.get(
+        "agg_status"
+    ) in (br.AGG_COMPLETE, br.AGG_FAILED)
+    attempts = _TERMINAL_WRITE_ATTEMPTS if terminal else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            names: dict[str, str] = {}
+            values: dict[str, Any] = {}
+            sets: list[str] = []
+            for i, (key, value) in enumerate(attrs.items()):
+                alias, placeholder = f"#a{i}", f":v{i}"
+                names[alias] = key
+                values[placeholder] = _marshal(value)
+                sets.append(f"{alias} = {placeholder}")
+            names["#u"] = "updated_at"
+            values[":u"] = {
+                "S": datetime.now(timezone.utc).isoformat(timespec="seconds")
+            }
+            sets.append("#u = :u")
+            client.update_item(
+                TableName=table,
+                Key={
+                    "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+                    "sk": {"S": br.report_sk(report_id)},
+                },
+                UpdateExpression="SET " + ", ".join(sets),
+                ConditionExpression="attribute_exists(pk)",
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+            return
+        except Exception as e:  # noqa: BLE001 - the S3 report is the durable truth
+            code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+            if code == "ConditionalCheckFailedException":
+                # The row was deleted — dropping the late write is the contract.
+                log.info(
+                    "Report row %s for %s/%s no longer exists; write dropped.",
+                    report_id, data_domain, dataset,
+                )
+                return
+            if attempt < attempts:
+                time.sleep(_TERMINAL_WRITE_BACKOFF_S * attempt)
+                continue
+            log.warning(
+                "Failed to update report row %s for %s/%s (continuing)",
+                report_id,
+                data_domain,
+                dataset,
+                exc_info=True,
+            )
 
 
 def _marshal(value: Any) -> dict[str, Any]:

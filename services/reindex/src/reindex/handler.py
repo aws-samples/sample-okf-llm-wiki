@@ -48,6 +48,7 @@ from okf_aws import (
     embed_text,
     parse_bundle_key,
     put_vector,
+    registry_entity,
 )
 from okf_core.document import OKFDocument
 from okf_core.embedding import (
@@ -243,8 +244,8 @@ def _upsert_xref(ddb, *, registry_table: str, location: ConceptLocation) -> None
             # by-entity GSI keys (CONVENTIONS.md "Registry entity index"):
             # a paged dataset listing can then fetch ALL xref rows in one
             # small Query instead of scanning every DOMAIN# partition.
-            "entity": "xref",
-            "pair": f"{pair[0]}/{pair[1]}",
+            "entity": registry_entity.ENTITY_XREF,
+            "pair": registry_entity.entity_pair(*pair),
             "target_data_domain": pair[0],
             "target_dataset": pair[1],
             "source_data_domain": location.data_domain,

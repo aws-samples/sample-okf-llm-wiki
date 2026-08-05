@@ -42,6 +42,7 @@ class FakeAthena:
     ):
         self._rows = rows if rows is not None else [{"raceid": "1", "year": "2009"}]
         self._state = state
+        self.stop_calls: list[dict[str, Any]] = []
 
     def start_query_execution(self, **kwargs) -> dict:
         return {"QueryExecutionId": "qid-123"}
@@ -52,6 +53,10 @@ class FakeAthena:
                 "Status": {"State": self._state, "StateChangeReason": "boom"}
             }
         }
+
+    def stop_query_execution(self, **kwargs) -> dict:
+        self.stop_calls.append(kwargs)
+        return {}
 
     def get_query_results(self, **kwargs) -> dict:
         if not self._rows:
@@ -70,6 +75,40 @@ def _datum(value: Any) -> dict[str, str]:
     if value is None:
         return {}
     return {"VarCharValue": str(value)}
+
+
+class QueryKeyedAthena:
+    """Athena fake mapping QueryString → an explicit (header, rows) result.
+
+    Unlike :class:`FakeAthena` (one canned dict-shaped result for every query),
+    this drives the REAL collection path with per-query results whose header is
+    an arbitrary list — including duplicate column labels, which dict-shaped
+    rows cannot express.
+    """
+
+    def __init__(self, results: dict[str, tuple[list[str], list[list[Any]]]]):
+        self._results = results
+        self._queries: dict[str, str] = {}
+        self._n = 0
+
+    def start_query_execution(self, **kwargs) -> dict:
+        self._n += 1
+        qid = f"q-{self._n}"
+        self._queries[qid] = kwargs["QueryString"]
+        return {"QueryExecutionId": qid}
+
+    def get_query_execution(self, **kwargs) -> dict:
+        return {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
+
+    def get_query_results(self, **kwargs) -> dict:
+        header, rows = self._results[self._queries[kwargs["QueryExecutionId"]]]
+        data = [{"Data": [{"VarCharValue": h} for h in header]}]
+        for r in rows:
+            data.append({"Data": [_datum(v) for v in r]})
+        return {"ResultSet": {"Rows": data}}
+
+    def stop_query_execution(self, **kwargs) -> dict:
+        return {}
 
 
 def _table(name: str, columns: list[tuple[str, str, str]]) -> dict[str, Any]:

@@ -83,7 +83,9 @@ Delete last season's results.,,Should refuse: the wiki is read-only for consumer
 
 Upload it on the **Benchmark** tab (gauge icon). The file lands off the agents'
 reach; the page immediately shows per-check counts ("sql: 62, behavior: 25") —
-exactly what each check would grade.
+exactly what each check would grade. A run pins the CSV version it was started
+with, so re-uploading mid-run never changes what an in-flight run grades —
+only future runs see the new set.
 
 ---
 
@@ -200,6 +202,13 @@ datasets; full descriptions in [`CONVENTIONS.md`](./CONVENTIONS.md)):
 |---|---|---|
 | `OKF_BENCHMARK_MAX_CONCURRENCY` | `10` | Peak concurrent solver (and judge) model requests. Lower on `ThrottlingException`. |
 | `OKF_BENCHMARK_ATHENA_CONCURRENCY` | `15` | Peak concurrent grading queries. Keep under the Athena workgroup's concurrent-DML limit. |
+| `OKF_BENCHMARK_GRADER_TIMEOUT_S` | `60` | Per-query timeout for grading executions; a timed-out query is cancelled so it doesn't hold a workgroup slot. Raise for slow warehouses. |
+| `OKF_BENCHMARK_GRADER_MAX_ROWS` | `50000` | Row cap per grading result set. Past it, a gold is DISCARDED / a prediction FAILS with an explicit "exceeds N rows" reason. |
+
+Grading errors are classified: transient Athena faults (throttles, 5xx,
+timeouts) are retried with backoff, and if one still fails the outcome reads
+`grading unavailable (...)` — distinguishable from a gold that genuinely
+doesn't execute — and is re-tried on the next run instead of sticking.
 
 ---
 
@@ -210,7 +219,12 @@ datasets; full descriptions in [`CONVENTIONS.md`](./CONVENTIONS.md)):
 - **"No question participates in the selected checks"** — the CSV has no gold
   cells for the checks you enabled; add the matching gold column.
 - **Lots of DISCARDED (SQL EX)** — your gold SQL isn't running on Athena;
-  translate it to Trino against this dataset's tables.
+  translate it to Trino against this dataset's tables. A DISCARDED whose
+  reason says `grading unavailable (...)` is different: Athena was throttled
+  or timing out during grading, not a broken gold — re-run, or lower
+  `OKF_BENCHMARK_ATHENA_CONCURRENCY`. One that says `gold result exceeds N
+  rows` hit the grading row cap — tighten the gold or raise
+  `OKF_BENCHMARK_GRADER_MAX_ROWS`.
 - **Behavior failing on answers that look fine** — read the judge's per-run
   comment (it's the grading reason on each attempt) and the question-level
   synthesis in the judge box (it names the cross-run pattern): the expectation

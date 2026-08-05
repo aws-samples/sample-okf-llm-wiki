@@ -23,11 +23,12 @@ from okf_core.hive_types import flatten_hive_type
 # from one home. Re-exported here for back-compat with existing importers.
 from harvest.source_base import (
     ConceptRef,
+    ResultCapExceeded,
     SourceMetadataProfile,
     SourcePromptProfile,
 )
 
-__all__ = ["ConceptRef", "GlueAthenaSource"]
+__all__ = ["ConceptRef", "GlueAthenaSource", "ResultCapExceeded"]
 
 # Athena terminal states — note CANCELLED has two L's.
 _ATHENA_TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
@@ -43,6 +44,7 @@ class AthenaClient(Protocol):  # pragma: no cover - typing only
     def start_query_execution(self, **kwargs) -> dict: ...
     def get_query_execution(self, **kwargs) -> dict: ...
     def get_query_results(self, **kwargs) -> dict: ...
+    def stop_query_execution(self, **kwargs) -> dict: ...
 
 
 class GlueAthenaSource:
@@ -57,6 +59,7 @@ class GlueAthenaSource:
         catalog_name="Glue Data Catalog",
         resource_label="Resource (ARN)",
         rowcount_param_keys=("recordCount", "numRows", "rowCount"),
+        bytesize_param_keys=("totalSize", "sizeKey", "rawDataSize"),
     )
 
     #: Source facts the harvest prompts state (see SourcePromptProfile). Reproduces
@@ -233,14 +236,58 @@ class GlueAthenaSource:
         except Exception:
             return None
 
+    # -- SQL capability atoms (column profiles + verification tools) -----
+
+    #: Athena supports EXPLAIN — the explain_sql tool is registered when a
+    #: source advertises this.
+    supports_explain = True
+
+    def sql_table_ref(self, table: str) -> str:
+        """Fully-quoted Trino reference for one of this dataset's tables."""
+        return f'"{self.database}"."{table}"'
+
+    def sql_approx_distinct(self, col_sql: str) -> str:
+        """Trino's approximate-distinct aggregate (cheap on wide profiles)."""
+        return f"approx_distinct({col_sql})"
+
+    def sql_sample_clause(self, percent: float) -> tuple[str, str]:
+        """(FROM-suffix, WHERE-predicate) sampling ~percent% of the table."""
+        return (f"TABLESAMPLE BERNOULLI ({percent:g})", "")
+
     def run_query(
-        self, query: str, *, timeout_s: float = 60.0, poll_s: float = 1.0
-    ) -> list[dict[str, str | None]]:
+        self,
+        query: str,
+        *,
+        timeout_s: float = 60.0,
+        poll_s: float = 1.0,
+        max_rows: int | None = None,
+        positional: bool = False,
+        stats: dict[str, Any] | None = None,
+        truncate_at: int | None = None,
+    ) -> list[dict[str, str | None]] | tuple[list[str], list[list[str | None]]]:
         """Start an Athena query, poll to terminal state, return rows as dicts.
 
         Header-aware (row 0 of the first page is the column header). A SQL NULL
         cell is returned as ``None`` (distinct from an empty string ``""``).
-        Raises on a non-SUCCEEDED terminal state or timeout.
+        Raises on a non-SUCCEEDED terminal state or timeout (the query is
+        best-effort cancelled on timeout so it doesn't hold a workgroup slot).
+
+        ``positional=True`` returns ``(header, rows)`` with each row a
+        POSITIONAL list instead of a dict — the benchmark grader's shape, where
+        header-keyed dicts would collapse duplicate SELECT labels (e.g.
+        ``SELECT r.name, c.name``) into one cell and mis-grade. ``max_rows``
+        (default None = unbounded, the harvest callers' behavior) raises
+        :class:`ResultCapExceeded` when the result outgrows the cap.
+
+        ``stats`` (optional caller-owned dict) is filled with the execution's
+        ``data_scanned_bytes`` / ``engine_ms`` from Athena's final poll — a
+        sink parameter rather than a return-shape change so existing callers
+        and concurrent sub-agents stay unaffected.
+
+        ``truncate_at`` is the SOFT cap the agent-facing run_sql tool uses:
+        collection stops at N rows and ``stats["truncated"] = True`` (vs
+        ``max_rows``, the grading path's HARD cap, which raises — an equality
+        check over a silently-truncated set would be meaningless).
         """
         if self.athena is None:
             raise RuntimeError("Athena client not configured")
@@ -268,15 +315,38 @@ class GlueAthenaSource:
                 if state != "SUCCEEDED":
                     reason = info["Status"].get("StateChangeReason", "")
                     raise RuntimeError(f"Athena query {state}: {reason}")
+                if stats is not None:
+                    s = info.get("Statistics", {}) or {}
+                    stats["data_scanned_bytes"] = s.get("DataScannedInBytes")
+                    stats["engine_ms"] = s.get("EngineExecutionTimeInMillis")
                 break
             if time.monotonic() > deadline:
+                # Best-effort cancel so an abandoned query doesn't keep holding
+                # a workgroup slot after we stop waiting for it.
+                try:
+                    self.athena.stop_query_execution(QueryExecutionId=qid)
+                except Exception:  # noqa: BLE001 - the timeout is the real error
+                    pass
                 raise TimeoutError(f"Athena query {qid} timed out")
             time.sleep(poll_s)
 
-        return self._collect_results(qid)
+        header, rows, truncated = self._collect_results(
+            qid, max_rows=max_rows, truncate_at=truncate_at
+        )
+        if truncated and stats is not None:
+            stats["truncated"] = True
+        if positional:
+            return header, rows
+        return [dict(zip(header, vals)) for vals in rows]
 
-    def _collect_results(self, qid: str) -> list[dict[str, str | None]]:
-        rows: list[dict[str, str | None]] = []
+    def _collect_results(
+        self,
+        qid: str,
+        *,
+        max_rows: int | None = None,
+        truncate_at: int | None = None,
+    ) -> tuple[list[str], list[list[str | None]], bool]:
+        rows: list[list[str | None]] = []
         header: list[str] | None = None
         token = None
         while True:
@@ -295,12 +365,19 @@ class GlueAthenaSource:
                 # distinction (None vs ""). Collapsing both to "" — the old
                 # `.get("VarCharValue", "")` — misled the authoring model into
                 # empty-string semantics and wrong `= ''` / `<> ''` idioms.
-                vals = [c.get("VarCharValue") for c in r["Data"]]
-                rows.append(dict(zip(header, vals)))
+                rows.append([c.get("VarCharValue") for c in r["Data"]])
+                if max_rows is not None and len(rows) > max_rows:
+                    raise ResultCapExceeded(f"result exceeds {max_rows} rows")
+                if truncate_at is not None and len(rows) > truncate_at:
+                    # Soft cap: flag truncation only once a row BEYOND the cap
+                    # arrived — an exactly-cap-sized result is complete, and a
+                    # false `truncated` makes the agent distrust and re-run it.
+                    del rows[truncate_at:]
+                    return header or [], rows, True
             token = res.get("NextToken")
             if not token:
                 break
-        return rows
+        return header or [], rows, False
 
 
 # -- helpers -----------------------------------------------------------------

@@ -268,6 +268,86 @@ def test_sql_discards_excluded_from_scores_and_never_judged():
     assert q0["checks"][CHECK_SQL]["discarded"] is True
 
 
+class _Throttle(Exception):
+    """A botocore-shaped ClientError carrying a transient error code."""
+
+    def __init__(self):
+        super().__init__("rate exceeded")
+        self.response = {"Error": {"Code": "ThrottlingException"}}
+
+
+def _throttle_then_rows(gold_sql, pred_rows, attempts=3):
+    """An execute whose gold throttles through ``attempts`` calls (one run's
+    full retry budget → a transient, NON-memoized DISCARD), then succeeds."""
+    calls = {"n": 0}
+
+    def execute(sql):
+        if sql == gold_sql:
+            calls["n"] += 1
+            if calls["n"] <= attempts:
+                raise _Throttle()
+            return [{"c": "1"}]
+        return pred_rows
+
+    return execute
+
+
+def test_transient_discard_beside_a_pass_counts_as_passed():
+    # Reproduced: runs=2, the gold throttles through run 0's whole retry
+    # budget (transient DISCARD, deliberately not memoized), run 1 re-executes
+    # and the prediction PASSes. The [DISCARDED, PASS] pair used to tally as
+    # confirmed_failed AND flaky with no judge review — a question whose only
+    # graded run passed rendered as a red "Wiki gap".
+    q = _q(0, sql="G")
+    seen = []
+
+    async def judge(cases, on_progress=None):
+        seen.extend(cases)
+        return []
+
+    report, _ = _run(
+        report_id="r1", checks=[CHECK_SQL], runs=2, questions=[q],
+        make_solve=_scripted_solver({(CHECK_SQL, "Q0"): "P"}),
+        grader=Grader(_throttle_then_rows("G", [{"c": "1"}]),
+                      sleep=lambda _s: None),
+        judge=judge,
+    )
+    s = report["scores"][CHECK_SQL]
+    assert s["passed_all_runs"] == 1
+    assert s["confirmed_failed"] == 0 and s["flaky"] == 0
+    assert s["failed_all_runs"] == 0 and s["discarded"] == 0
+    assert s["graded"] == 1
+    assert seen == []  # nothing failed → nothing for the judge
+    # Per-run scores keep their graded-only denominators: run 0 graded nothing
+    # (0.0 by the graded=0 convention), run 1 passed everything.
+    assert s["raw"]["per_run"] == [0.0, 1.0]
+    row = report["questions"][0]["checks"][CHECK_SQL]
+    assert row["discarded"] is False  # mixed pair, not an all-discarded one
+    assert [a["outcome"] for a in row["attempts"]] == ["DISCARDED", "PASS"]
+
+
+def test_transient_discard_beside_a_fail_is_confirmed_with_a_judge_case():
+    q = _q(0, sql="G")
+    seen = []
+
+    async def judge(cases, on_progress=None):
+        seen.extend(cases)
+        return [JudgeVerdict(q_id=c.q_id, check=c.check, verdict=VERDICT_FAIL,
+                             comment="confirmed") for c in cases]
+
+    report, _ = _run(
+        report_id="r1", checks=[CHECK_SQL], runs=2, questions=[q],
+        make_solve=_scripted_solver({(CHECK_SQL, "Q0"): "P"}),
+        grader=Grader(_throttle_then_rows("G", [{"c": "9"}]),
+                      sleep=lambda _s: None),
+        judge=judge,
+    )
+    s = report["scores"][CHECK_SQL]
+    assert s["confirmed_failed"] == 1 and s["failed_all_runs"] == 1
+    assert s["flaky"] == 0 and s["passed_all_runs"] == 0 and s["discarded"] == 0
+    assert len(seen) == 1  # the failed pair reached the judge
+
+
 def test_no_participating_questions_raises_loudly():
     with pytest.raises(ValueError):
         _run(
@@ -552,6 +632,63 @@ def test_public_surfaces_note_gold_stays_human_facing():
     )
     assert "SECRET_GOLD" not in repr(ticks)
     assert "SECRET_GOLD" in repr(report)  # deliberately present, human-only
+
+
+def test_solver_crash_reason_survives_grading():
+    # An engine-level solver exception used to leave prediction=""/trace=None
+    # with NO reason — indistinguishable from a solver that answered nothing.
+    q = _q(0, sql="G")
+    rows = {"G": [{"c": "1"}]}
+
+    def make_solve(spec):
+        async def solve(question):
+            raise RuntimeError("bedrock exploded")
+        return solve
+
+    report, _ = _run(
+        report_id="r1", checks=[CHECK_SQL], runs=1, questions=[q],
+        make_solve=make_solve, grader=Grader(_fake_execute(rows)),
+        judge=_judge_all_fail,
+    )
+    attempt = report["questions"][0]["checks"][CHECK_SQL]["attempts"][0]
+    assert attempt["outcome"] == "FAIL"
+    assert "empty predicted SQL" in attempt["reason"]
+    assert "solver error: RuntimeError: bedrock exploded" in attempt["reason"]
+
+
+def test_solver_crash_reason_survives_behavior_grading():
+    q = _q(0, behavior="Should refuse.")
+
+    def make_solve(spec):
+        async def solve(question):
+            raise TimeoutError("model unreachable")
+        return solve
+
+    report, _ = _run(
+        report_id="r1", checks=[CHECK_BEHAVIOR], runs=1, questions=[q],
+        make_solve=make_solve, grader=None, judge=_judge_all_fail,
+        grade_behavior=_scripted_behavior_grader(default=VERDICT_FAIL),
+        review_behavior=_scripted_behavior_reviewer(),
+    )
+    attempt = report["questions"][0]["checks"][CHECK_BEHAVIOR]["attempts"][0]
+    assert "comment q0 r0" in attempt["reason"]  # the judge's ruling leads
+    assert "solver error: TimeoutError: model unreachable" in attempt["reason"]
+
+
+def test_zero_graded_check_is_unambiguous_in_report():
+    # Every gold broken → all pairs DISCARDED. The score block must say so
+    # (graded=0, discarded=n) rather than presenting the raw 0.0 as a measured
+    # score — the UI keys off graded.
+    qs = [_q(0, sql="BROKEN"), _q(1, sql="BROKEN")]
+    rows = {"BROKEN": RuntimeError("COLUMN_NOT_FOUND"), "P": [{"c": "1"}]}
+    report, _ = _run(
+        report_id="r1", checks=[CHECK_SQL], runs=1, questions=qs,
+        make_solve=_scripted_solver({(CHECK_SQL, "Q0"): "P", (CHECK_SQL, "Q1"): "P"}),
+        grader=Grader(_fake_execute(rows)), judge=_judge_all_fail,
+    )
+    s = report["scores"][CHECK_SQL]
+    assert s["graded"] == 0 and s["discarded"] == 2
+    assert s["raw"]["mean"] == 0.0  # the shape is kept; graded=0 disambiguates
 
 
 def test_bare_string_solver_return_is_tolerated():

@@ -30,6 +30,7 @@ function Conversation({
   onEffortChange,
   onFeaturesChange,
   datasets,
+  datasetsLoading,
   onScopeChange,
   onOpenDoc,
 }) {
@@ -107,6 +108,7 @@ function Conversation({
       features={conv.features}
       onFeaturesChange={onFeaturesChange}
       datasets={datasets}
+      datasetsLoading={datasetsLoading}
       datasetScope={conv.datasetScope}
       onScopeChange={onScopeChange}
       onOpenDoc={onOpenDoc}
@@ -121,7 +123,13 @@ const PEEK_WIDTH_KEY = "okf.chat.docPeekWidth"
 const PEEK_MIN = 320
 const PEEK_DEFAULT = 576
 
-export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
+export function ChatPanel({
+  api,
+  auth,
+  ctrl,
+  datasets = [],
+  datasetsLoading = false,
+}) {
   const {
     conv,
     resumed,
@@ -197,6 +205,7 @@ export function ChatPanel({ api, auth, ctrl, datasets = [] }) {
           onEffortChange={onEffortChange}
           onFeaturesChange={onFeaturesChange}
           datasets={datasets}
+          datasetsLoading={datasetsLoading}
           onScopeChange={onScopeChange}
           onOpenDoc={openDoc}
         />

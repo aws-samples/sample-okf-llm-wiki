@@ -97,10 +97,19 @@ class FakeAgentCore:
     def __init__(self):
         self.calls: list[dict[str, Any]] = []
         self.stop_calls: list[dict[str, Any]] = []
+        # Optional synchronous ack the runtime would answer with (the harvest
+        # entrypoint's {"status": "accepted"|"rejected", ...}). None mimics an
+        # ack-less/streaming response — callers must tolerate both.
+        self.ack: dict[str, Any] | None = None
 
     def invoke_agent_runtime(self, **kwargs) -> dict:
         self.calls.append(kwargs)
-        return {"statusCode": 200}
+        resp: dict[str, Any] = {"statusCode": 200}
+        if self.ack is not None:
+            import io
+
+            resp["response"] = io.BytesIO(json.dumps(self.ack).encode())
+        return resp
 
     def stop_runtime_session(self, **kwargs) -> dict:
         self.stop_calls.append(kwargs)

@@ -566,6 +566,86 @@ def test_delete_domain_mapping_refused_while_guardrails_author_runs(cfg):
     assert out["deleted"] is True
 
 
+class _DenyingS3:
+    """Delegates to the real (moto) client but fails deletes IN-BAND — the way
+    S3 reports per-key failures: HTTP 200 with an ``Errors`` list (e.g.
+    AccessDenied when the role lacks s3:DeleteObjectVersion). moto never
+    exercises this path because it doesn't enforce IAM."""
+
+    def __init__(self, s3):
+        self._s3 = s3
+
+    def __getattr__(self, name):
+        return getattr(self._s3, name)
+
+    def delete_objects(self, *, Bucket, Delete):
+        return {
+            "Deleted": [],
+            "Errors": [
+                {"Key": o["Key"], "Code": "AccessDenied", "Message": "denied"}
+                for o in Delete["Objects"]
+            ],
+        }
+
+
+def test_delete_domain_mapping_halts_when_the_s3_purge_fails_in_band(cfg):
+    """A purge whose DeleteObjects returns in-band Errors must RAISE, not count
+    the batch as deleted: the registry/REPORT# rows are dropped after the
+    purge, so proceeding would report success while the S3 artifacts stay
+    readable — and re-registering the same names would resurrect them."""
+    dd, ds = "sport", "european_football"
+    handlers.upsert_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain=dd, dataset=ds,
+        glue_database="european_football",
+    )
+    cfg.s3.put_object(Bucket=BUCKET, Key=f"okf/{dd}/{ds}/index.md", Body=b"x")
+    with pytest.raises(ApiError) as ei:
+        handlers.delete_domain_mapping(
+            cfg.ddb,
+            registry_table=REGISTRY,
+            data_domain=dd,
+            dataset=ds,
+            s3=_DenyingS3(cfg.s3),
+            bundle_bucket=BUCKET,
+            freshness_table=FRESHNESS,
+        )
+    assert ei.value.status == 502
+    assert "AccessDenied" in ei.value.message
+    # The mapping row survives — the dataset stays resolvable and the delete
+    # is retryable once the real failure (the IAM grant) is fixed.
+    assert handlers.list_domains(cfg.ddb, registry_table=REGISTRY) != []
+
+
+def test_purge_s3_prefix_versions_surfaces_in_band_errors():
+    """The versioned purge (gold-carrying benchmark/ prefixes) checks each
+    DeleteObjects response too — version-targeted deletes are the ones that
+    authorize as s3:DeleteObjectVersion and fail in-band without it."""
+
+    class _S3:
+        def list_object_versions(self, **kw):
+            return {
+                "Versions": [{"Key": "benchmark/d/ds/gold.json", "VersionId": "v1"}],
+                "IsTruncated": False,
+            }
+
+        def delete_objects(self, *, Bucket, Delete):
+            return {
+                "Deleted": [],
+                "Errors": [
+                    {
+                        "Key": "benchmark/d/ds/gold.json",
+                        "VersionId": "v1",
+                        "Code": "AccessDenied",
+                        "Message": "denied",
+                    }
+                ],
+            }
+
+    with pytest.raises(ApiError) as ei:
+        handlers._purge_s3_prefix_versions(_S3(), bucket="b", prefix="benchmark/d/ds/")
+    assert ei.value.status == 502
+
+
 def test_delete_domain_mapping_idempotent_when_nothing_exists(cfg):
     """Deleting an absent dataset is a clean no-op (no bundle, no rows)."""
     res = handlers.delete_domain_mapping(

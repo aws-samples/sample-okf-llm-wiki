@@ -62,6 +62,19 @@ def _resolve_files(s3, *, bucket: str, data_domain: str, dataset: str, version_i
     return files
 
 
+def _safe_rel(key: str, prefix: str) -> str | None:
+    """The key's path relative to ``prefix``, or None when it can't be laid
+    out safely under the temp root (S3 keys are raw strings — a ``..`` segment
+    or an absolute path would escape the snapshot dir)."""
+    rel = key[len(prefix):]
+    if not rel or rel.endswith("/") or rel.startswith("/"):
+        return None
+    if any(part in ("..", ".", "") for part in rel.split("/")):
+        log.warning("Skipping unsafe bundle key %s (path escape)", key)
+        return None
+    return rel
+
+
 def _write_object(s3, bucket: str, key: str, version_id, dest: Path) -> None:
     kwargs = {"Bucket": bucket, "Key": key}
     if version_id:
@@ -100,9 +113,13 @@ def materialize_snapshots(
     solver_root = Path(solver_dir)
     judge_root = Path(judge_dir) if judge_dir else None
 
+    written = 0
     for key, fv in sorted(files.items()):
-        rel = key[len(prefix):]
+        rel = _safe_rel(key, prefix)
+        if rel is None:
+            continue
         _write_object(s3, bucket, key, fv.version_id, solver_root / rel)
+        written += 1
         if judge_root is not None:
             judge_dest = judge_root / rel
             judge_dest.parent.mkdir(parents=True, exist_ok=True)
@@ -114,7 +131,7 @@ def materialize_snapshots(
                 s3, bucket=bucket, prefix=prefix + extra,
                 dest_root=judge_root / extra.rstrip("/"),
             )
-    return len(files)
+    return written
 
 
 def _copy_latest_tree(s3, *, bucket: str, prefix: str, dest_root: Path) -> None:
@@ -131,8 +148,8 @@ def _copy_latest_tree(s3, *, bucket: str, prefix: str, dest_root: Path) -> None:
             return
         for obj in resp.get("Contents", []):
             key = obj["Key"]
-            rel = key[len(prefix):]
-            if not rel or rel.endswith("/"):
+            rel = _safe_rel(key, prefix)
+            if rel is None:
                 continue
             try:
                 _write_object(s3, bucket, key, None, dest_root / rel)

@@ -68,14 +68,17 @@ function datasetKey(d) {
 // conversation's scope; the current scope shows as a removable chip.
 function DatasetScopeChip({ scope, onRemove }) {
   return (
-    <span className="group/chip inline-flex h-6 items-center gap-1 rounded-md border border-primary/25 bg-primary/10 pr-1 pl-2 text-xs font-medium text-primary">
+    <span className="group/chip inline-flex h-8 items-center gap-1 rounded-md bg-primary/10 pr-1.5 pl-2.5 text-xs font-medium text-primary">
       <AtSignIcon className="size-3 opacity-80" />
       {datasetKey(scope)}
       <button
         type="button"
         aria-label="Clear dataset scope"
         onClick={onRemove}
-        className="ml-0.5 flex size-4 items-center justify-center rounded-sm text-primary/70 transition-colors hover:bg-primary/15 hover:text-primary"
+        // Zero-width until the CHIP is hovered (saves toolbar width), w-0 rather
+        // than hidden so it stays tabbable — keyboard focus re-expands it via
+        // group-focus-within.
+        className="ml-0 flex h-4 w-0 items-center justify-center overflow-hidden rounded-sm text-primary/70 opacity-0 transition-all group-focus-within/chip:ml-0.5 group-focus-within/chip:w-4 group-focus-within/chip:opacity-100 group-hover/chip:ml-0.5 group-hover/chip:w-4 group-hover/chip:opacity-100 hover:bg-primary/15 hover:text-primary"
       >
         <XIcon className="size-3" />
       </button>
@@ -123,14 +126,15 @@ function DatasetMentionList({ datasets, onPick, onBackspaceEmpty }) {
 function FeatureChip({ feature, onRemove }) {
   const Icon = feature.icon
   return (
-    <span className="group/chip inline-flex h-6 items-center gap-1 rounded-md border bg-muted/60 pr-1 pl-2 text-xs font-medium text-foreground/80">
+    <span className="group/chip inline-flex h-8 items-center gap-1 rounded-md bg-muted/60 pr-1.5 pl-2.5 text-xs font-medium text-foreground/80">
       {Icon ? <Icon className="size-3 text-muted-foreground" /> : null}
       {feature.label}
       <button
         type="button"
         aria-label={`Disable ${feature.label}`}
         onClick={onRemove}
-        className="ml-0.5 flex size-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+        // Zero-width until the CHIP is hovered — same pattern as the scope chip's ×.
+        className="ml-0 flex h-4 w-0 items-center justify-center overflow-hidden rounded-sm text-muted-foreground opacity-0 transition-all group-focus-within/chip:ml-0.5 group-focus-within/chip:w-4 group-focus-within/chip:opacity-100 group-hover/chip:ml-0.5 group-hover/chip:w-4 group-hover/chip:opacity-100 hover:bg-foreground/10 hover:text-foreground"
       >
         <XIcon className="size-3" />
       </button>
@@ -168,7 +172,7 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
           type="button"
           variant="ghost"
           size="icon"
-          className="size-7 shrink-0 text-muted-foreground hover:text-foreground"
+          className="size-8 shrink-0 text-muted-foreground hover:text-foreground"
           title="Add a capability"
           aria-label="Add a capability"
         >
@@ -263,6 +267,12 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
   )
 }
 
+// Display names for reasoning-effort values — "xhigh" is the wire value the
+// runtime expects but reads badly in the UI, so it shows as "Extra". Label-only:
+// never feed these back into onEffortChange.
+const EFFORT_LABELS = { xhigh: "Extra" }
+const effortLabel = (e) => EFFORT_LABELS[e] ?? e
+
 // The reasoning-effort control: a toolbar button showing the current effort,
 // opening a popover with a Faster↔Smarter SLIDER (one stop per model level).
 // Changeable at any time, INCLUDING on an existing conversation — effort is
@@ -288,11 +298,11 @@ function EffortSetting({ effort, efforts, onChange }) {
           type="button"
           variant="ghost"
           size="sm"
-          className="h-7 gap-1 px-2 text-xs text-muted-foreground capitalize hover:text-foreground"
+          className="h-8 gap-1 px-2.5 text-xs text-muted-foreground capitalize hover:text-foreground"
           title="Reasoning effort"
         >
           <SlidersHorizontalIcon className="size-3.5" />
-          {effort}
+          {effortLabel(effort)}
         </Button>
       </PopoverTrigger>
       <PopoverContent align="start" side="top" className="w-60 p-2.5">
@@ -300,7 +310,10 @@ function EffortSetting({ effort, efforts, onChange }) {
             switching levels rolls the old value out below the new one. */}
         <div className="text-sm font-medium">
           Effort{" "}
-          <RollingText text={effort} textClassName="text-primary capitalize" />
+          <RollingText
+            text={effortLabel(effort)}
+            textClassName="text-primary capitalize"
+          />
         </div>
         {/* Compact: end labels + slider sit tight together, just under the header.
             --okf-effort-frac (0..1) scales the range's fade so the filled slice
@@ -351,6 +364,7 @@ export function ChatInput({
   features = [],
   onFeaturesChange,
   datasets = [],
+  datasetsLoading = false,
   datasetScope = null,
   onScopeChange,
   pendingAsk = null,
@@ -365,6 +379,15 @@ export function ChatInput({
   const [mentionQuery, setMentionQuery] = useState("")
   const mentionAtRef = useRef(-1) // index of the active "@" in the textarea value
   const canMention = Boolean(onScopeChange) && datasets.length > 0
+  // Visibility for the "+" menu's scope entry. Distinct from canMention: with
+  // every feature chip enabled, "Scope to a dataset" is the "+"'s only
+  // remaining offering, and gating it on the FETCHED list makes the button pop
+  // in a beat after first paint. While the list is still loading, assume
+  // scoping will be offered (a registered deployment has datasets) so the
+  // button mounts with the composer; it hides only when the list is KNOWN
+  // empty.
+  const offerScope =
+    Boolean(onScopeChange) && (datasetsLoading || datasets.length > 0)
 
   const enabledFeatures = Array.isArray(features) ? features : []
   const addFeature = useCallback(
@@ -576,8 +599,12 @@ export function ChatInput({
   // are hidden until the user submits, which resumes the agent.
   const asking = Boolean(pendingAsk && pendingAsk.questions?.length && onAnswer)
 
+  // The composer card is borderless in LIGHT mode (the white card + shadow
+  // already separates it from the gray page); dark mode keeps the border — it's
+  // the only thing separating surfaces there. border-transparent (not border-0)
+  // so the box size is identical in both modes.
   return (
-    <div className="flex flex-col gap-2 rounded-xl border bg-card px-4 py-3 shadow-sm">
+    <div className="flex flex-col gap-2 rounded-2xl border border-transparent bg-card px-4 py-3 shadow-sm dark:border-border">
       {asking ? (
         <AskHumanForm
           questions={pendingAsk.questions}
@@ -635,12 +662,12 @@ export function ChatInput({
       </Popover>
 
       <div className="flex items-center gap-1">
-        {onFeaturesChange || canMention ? (
+        {onFeaturesChange || offerScope ? (
           <AddFeatureMenu
             enabled={enabledFeatures}
             onToggle={addFeature}
             onPickPolicy={pickPolicy}
-            canScope={canMention}
+            canScope={offerScope}
             onScope={openScopePicker}
           />
         ) : null}

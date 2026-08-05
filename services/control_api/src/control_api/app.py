@@ -844,9 +844,11 @@ def _r_apply_report_annotations(cfg, params, body, query, caller):
     body = body or {}
     return 200, handlers.apply_report_annotations(
         cfg.ddb,
+        registry_table=cfg.registry_table,
         annotations_table=cfg.annotations_table,
         data_domain=params["domain"],
         dataset=params["dataset"],
+        report_id=params["report_id"],
         user_sub=(caller.sub if caller else "") or "",
         author=(caller.ident if caller else "") or "",
         annotations=body.get("annotations"),

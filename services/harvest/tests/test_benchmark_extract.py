@@ -54,6 +54,62 @@ def test_extract_sql_empty():
     assert extract_sql("   ") == ""
 
 
+def test_extract_sql_sql_fence_beats_trailing_other_tagged_fence():
+    # A trailing non-SQL fence (a model summarizing its answer in ```text) must
+    # not beat an earlier ```sql fence.
+    text = "```sql\nSELECT 1\n```\nIn summary:\n```text\nthe count is 1\n```"
+    assert extract_sql(text) == "SELECT 1"
+
+
+def test_extract_sql_last_sql_tagged_fence_wins_over_untagged():
+    text = "```sql\nSELECT 1\n```\nscratch:\n```\nSELECT 2\n```"
+    assert extract_sql(text) == "SELECT 1"
+
+
+def test_extract_sql_tag_word_never_bleeds_into_payload():
+    # The old `(?:sql)?` regex captured a foreign tag word into the SQL body
+    # ("text\nSELECT ..."). Tags are now captured separately.
+    text = "```text\nnot sql\n```\n```sql\nSELECT 3\n```"
+    assert extract_sql(text) == "SELECT 3"
+
+
+def test_extract_sql_other_tagged_fence_never_treated_as_sql():
+    # No sql/untagged fence at all → the whole-text fallback, never the
+    # other-tagged fence body.
+    text = 'prose\n```json\n{"a": 1}\n```\nmore prose'
+    assert extract_sql(text) == text.strip()
+
+
+def test_extract_sql_case_insensitive_tag():
+    assert extract_sql("```SQL\nSELECT 4\n```") == "SELECT 4"
+
+
+def test_extract_sql_single_line_fence_is_content_not_a_tag():
+    # A single-line fence has no tag line: the tag-capturing regex used to eat
+    # "SELECT" as a language tag, classify the fence as foreign, and fall back
+    # to the whole prose reply (backticks included).
+    assert (
+        extract_sql("Here is the query: ```SELECT * FROM t```")
+        == "SELECT * FROM t"
+    )
+    assert extract_sql("``` SELECT 2 ```") == "SELECT 2"
+
+
+def test_extract_sql_standard_tagged_block_still_extracts():
+    assert extract_sql("```sql\nSELECT 1\n```") == "SELECT 1"
+
+
+def test_extract_sql_sql_fence_beats_python_fence():
+    text = "```python\nprint(1)\n```\n```sql\nSELECT 9\n```"
+    assert extract_sql(text) == "SELECT 9"
+
+
+def test_extract_sql_single_line_sql_tagged_fence():
+    # The one tagging idiom on a single-line fence: a leading `sql` token
+    # followed by whitespace tags the remainder.
+    assert extract_sql("```sql SELECT 3```") == "SELECT 3"
+
+
 def test_extract_sql_from_message_with_thinking():
     msg = types.SimpleNamespace(
         content=[

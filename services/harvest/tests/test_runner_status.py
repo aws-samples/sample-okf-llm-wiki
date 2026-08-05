@@ -64,6 +64,7 @@ def _patch(monkeypatch, agent, transitions):
         detail=None,
         only_if_active=False,
         session_id=None,
+        run_started_at=None,
         model=None,
         effort=None,
         subagent_model=None,

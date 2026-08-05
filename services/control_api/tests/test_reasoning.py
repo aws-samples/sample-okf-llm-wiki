@@ -288,20 +288,26 @@ def test_status_dead_rewrite_stops_promising_an_auto_reauthor(cfg):
     # (nothing restores it on the failure path). Without the live-lease
     # cross-check the page would say "guardrails re-author automatically when
     # it commits" about a run that is never coming back. The honest state:
-    # not rewriting, no freshness verdict, an actionable reason.
+    # not rewriting, no freshness verdict, an actionable reason. The terminal
+    # write is 20 minutes old — well past the mount-flush grace window (see
+    # the flush-lag test below), so "dead" is safe to report.
+    from datetime import datetime, timedelta, timezone
+
     _seed_built(cfg)
     cfg.s3.put_object(
         Bucket=BUCKET,
         Key=f"okf/{DOMAIN}/{DATASET}/.harvest/state.json",
         Body=json.dumps({"status": "in_progress"}).encode(),
     )
+    now = datetime.now(timezone.utc)
     cfg.ddb.put_item(
         TableName=REGISTRY,
         Item={
             "pk": {"S": f"HARVEST#{DOMAIN}#{DATASET}"},
             "sk": {"S": "STATUS"},
             "status": {"S": "failed"},
-            "started_at": {"S": "2026-08-04T20:00:00+00:00"},
+            "started_at": {"S": (now - timedelta(hours=1)).isoformat()},
+            "updated_at": {"S": (now - timedelta(minutes=20)).isoformat()},
         },
     )
     st = _status(cfg)
@@ -310,6 +316,41 @@ def test_status_dead_rewrite_stops_promising_an_auto_reauthor(cfg):
     assert "did not complete" in st["reason"]
     assert st["policies"]  # the authored set stays visible
     assert st["up_to_date"] is None  # a half-written bundle's hash is noise
+
+
+def test_status_fresh_terminal_row_reads_as_flush_lag_not_dead_rewrite(cfg):
+    # Every SUCCESSFUL harvest ends with a terminal status row written straight
+    # to DynamoDB while the commit marker's `complete` overwrite is still
+    # riding the S3 Files mount's write-back cache (~60s — see
+    # harvest/runner.py). Within WIKI_DEAD_REWRITE_GRACE_SECONDS that
+    # terminal-row + in_progress-marker pair must read as "still rewriting" —
+    # not flash "the last harvest did not complete — run a new harvest" right
+    # after one completed.
+    from datetime import datetime, timedelta, timezone
+
+    _seed_built(cfg)
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key=f"okf/{DOMAIN}/{DATASET}/.harvest/state.json",
+        Body=json.dumps({"status": "in_progress"}).encode(),
+    )
+    now = datetime.now(timezone.utc)
+    cfg.ddb.put_item(
+        TableName=REGISTRY,
+        Item={
+            "pk": {"S": f"HARVEST#{DOMAIN}#{DATASET}"},
+            "sk": {"S": "STATUS"},
+            "status": {"S": "complete"},
+            "started_at": {"S": (now - timedelta(minutes=30)).isoformat()},
+            "updated_at": {"S": (now - timedelta(seconds=30)).isoformat()},
+        },
+    )
+    st = _status(cfg)
+    assert st["wiki_ready"] is False
+    assert st["wiki_rewriting"] is True
+    assert "rewriting" in st["reason"]
+    assert st["policies"]  # the authored set stays visible
+    assert st["up_to_date"] is None  # freshness is moot mid-flush
 
 
 def test_sync_while_a_harvest_runs_is_refused(cfg):

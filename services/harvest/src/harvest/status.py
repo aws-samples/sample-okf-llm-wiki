@@ -51,6 +51,49 @@ def build_registry_client() -> tuple[Any, str] | None:
         return None
 
 
+def read_run_identity(
+    registry: tuple[Any, str] | None, *, data_domain: str, dataset: str
+) -> str | None:
+    """The status row's ``started_at``, captured at run start as THIS run's identity.
+
+    The session pin in :func:`report_status` is vacuous on the incremental
+    path: its ``runtime_session_id`` is deliberately DETERMINISTIC per
+    (domain, dataset) — mount affinity, see ``okf_core.session`` — so a hung
+    incremental run's late terminal write would still match a SUCCESSOR
+    incremental run's row. ``started_at`` closes that gap: the lease acquire
+    PutItem rewrites it for every run and no later write touches it, so its
+    value at run start distinguishes this run's row from a successor's. Never
+    raises; None (row/field missing, read failure) leaves the terminal write
+    on the session pin alone.
+    """
+    if registry is None:
+        return None
+    client, table = registry
+    try:
+        item = (
+            client.get_item(
+                TableName=table,
+                Key={
+                    "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+                    "sk": {"S": "STATUS"},
+                },
+                ProjectionExpression="started_at",
+                ConsistentRead=True,
+            ).get("Item")
+            or {}
+        )
+        return (item.get("started_at") or {}).get("S") or None
+    except Exception:  # noqa: BLE001 - identity capture is best-effort
+        log.warning(
+            "Could not read run identity for %s/%s (terminal writes fall back "
+            "to the session pin)",
+            data_domain,
+            dataset,
+            exc_info=True,
+        )
+        return None
+
+
 def report_status(
     registry: tuple[Any, str] | None,
     *,
@@ -60,6 +103,7 @@ def report_status(
     detail: str | None = None,
     only_if_active: bool = False,
     session_id: str | None = None,
+    run_started_at: str | None = None,
     model: str | None = None,
     effort: str | None = None,
     subagent_model: str | None = None,
@@ -110,6 +154,12 @@ def report_status(
     mark the live run terminal and trigger a ghost follow-on policy build
     against its half-written bundle). None (tests, local runs) keeps the
     status-only condition.
+
+    ``run_started_at`` (from :func:`read_run_identity`, captured at run start)
+    is the second identity pin: on the INCREMENTAL path the session id is
+    deterministic per dataset, so two successive incremental runs share it and
+    the session pin alone cannot tell them apart — ``started_at``, rewritten
+    by every lease acquire, can.
     """
     if registry is None:
         return True
@@ -160,22 +210,24 @@ def report_status(
             # Row must still be in flight (or absent) to accept a terminal
             # write — and, when the caller knows its run identity, the row
             # must still be THIS run's (see docstring). The
-            # attribute_not_exists(runtime_session_id) tolerance covers rows
-            # written out-of-band without one.
+            # attribute_not_exists tolerances cover rows written out-of-band
+            # without the pinned attribute.
             values[":queued"] = {"S": "queued"}
             values[":running"] = {"S": "running"}
-            active = "#s = :queued OR #s = :running"
+            cond = "(#s = :queued OR #s = :running)"
             if session_id:
                 values[":sid"] = {"S": session_id}
-                kwargs["ConditionExpression"] = (
-                    f"attribute_not_exists(pk) OR (({active}) AND "
-                    "(attribute_not_exists(runtime_session_id) OR "
-                    "runtime_session_id = :sid))"
+                cond += (
+                    " AND (attribute_not_exists(runtime_session_id) OR "
+                    "runtime_session_id = :sid)"
                 )
-            else:
-                kwargs["ConditionExpression"] = (
-                    f"attribute_not_exists(pk) OR {active}"
+            if run_started_at:
+                values[":rsa"] = {"S": run_started_at}
+                cond += (
+                    " AND (attribute_not_exists(started_at) OR "
+                    "started_at = :rsa)"
                 )
+            kwargs["ConditionExpression"] = f"attribute_not_exists(pk) OR ({cond})"
         client.update_item(**kwargs)
         log.info("Harvest status -> %s (%s/%s)", status, data_domain, dataset)
         return True

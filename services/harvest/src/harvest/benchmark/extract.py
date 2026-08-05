@@ -18,9 +18,18 @@ import json
 import re
 from typing import Any
 
-# A fenced code block, optionally tagged (```sql / ```json / ```). Non-greedy so
-# multiple blocks are captured individually; DOTALL so bodies span lines.
-_SQL_FENCE = re.compile(r"```(?:sql)?\s*\n?(.*?)```", re.S | re.I)
+# A fenced code block, inner text captured RAW — the tag/body split happens in
+# :func:`_fence_candidates`, not here: a regex-captured tag word read the first
+# word of a SINGLE-LINE fence (```SELECT 1```) as a language tag, dropping the
+# fence as foreign-tagged. Non-greedy so multiple blocks are captured
+# individually; DOTALL so bodies span lines.
+_FENCE = re.compile(r"```(.*?)```", re.S)
+# A fence opener LINE that is a language tag: one optional [\w+-] token, spaces
+# allowed. Anything else on the opener line is content, not an info string.
+_FENCE_TAG = re.compile(r"[ \t]*([\w+-]*)[ \t]*")
+# Single-line fences have no tag line; a leading `sql` token followed by
+# whitespace is the one tagging idiom models still use there (```sql SELECT 1```).
+_INLINE_SQL_TAG = re.compile(r"[ \t]*sql[ \t]+", re.I)
 _JSON_FENCE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.S | re.I)
 
 
@@ -87,17 +96,56 @@ def _reasoning_block_text(block: dict) -> str:
     return str(block.get("text") or "")
 
 
-def extract_sql(text: Any) -> str:
-    """Pull the SQL query out of a reply — the last fenced block, else the text.
+def _fence_candidates(s: str) -> list[tuple[str, str]]:
+    """Every fenced block in ``s`` as ``(tag, body)``.
 
-    Prefers the LAST ```sql (or bare ```) fenced block (a model often restates
-    the final query in a fence after reasoning in prose). Falls back to the whole
-    stripped text when there is no fence. Returns "" for empty input.
+    A token counts as a language tag ONLY on a standard fenced block whose
+    opener line ends in a newline (```tag\\n...```). A SINGLE-LINE fence
+    (open + close on one line, as in ```SELECT 1```) has no tag line — its
+    whole inner text is content — except a leading ``sql`` token followed by
+    whitespace (```sql SELECT 1```), which tags the remainder as SQL.
+    """
+    out: list[tuple[str, str]] = []
+    for inner in _FENCE.findall(s):
+        if "\n" in inner:
+            header, _, body = inner.partition("\n")
+            if _FENCE_TAG.fullmatch(header):
+                out.append((header.strip(), body))
+            else:
+                # A multi-word opener line (```SELECT *\nFROM t```) is content,
+                # not an info string.
+                out.append(("", inner))
+            continue
+        m = _INLINE_SQL_TAG.match(inner)
+        if m:
+            out.append(("sql", inner[m.end():]))
+        else:
+            out.append(("", inner))
+    return out
+
+
+def extract_sql(text: Any) -> str:
+    """Pull the SQL query out of a reply — the last SQL fence, else the text.
+
+    Prefers the LAST ```sql-tagged fence (a model often restates the final
+    query in a fence after reasoning in prose — and a trailing non-SQL fence
+    must not beat it); falls back to the last UNTAGGED fence only when no
+    sql-tagged one exists. A fence tagged as anything else (```text, ```json)
+    is never read as SQL; a single-line fence's first word is content, never a
+    tag (see :func:`_fence_candidates`). Falls back to the whole stripped text
+    when there is no usable fence. Returns "" for empty input.
     """
     s = message_text(text)
     if not s.strip():
         return ""
-    blocks = _SQL_FENCE.findall(s)
+    sql_blocks: list[str] = []
+    bare_blocks: list[str] = []
+    for tag, body in _fence_candidates(s):
+        if tag.lower() == "sql":
+            sql_blocks.append(body)
+        elif not tag:
+            bare_blocks.append(body)
+    blocks = sql_blocks or bare_blocks
     if blocks:
         return blocks[-1].strip()
     return s.strip()

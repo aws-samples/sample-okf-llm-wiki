@@ -127,13 +127,22 @@ export default function BenchmarkReportView({
   const [traces, setTraces] = useState({ status: "idle", byId: {}, error: null })
   const tracesStarted = useRef(false)
 
+  // Stale-response guard — the `let alive` effect-cleanup idiom, hoisted to a
+  // shared epoch because `load` and the traces fetch are also called OUTSIDE
+  // the reset effect (the poll, the annotations reload, a panel open): bumping
+  // the epoch on report change makes any still-in-flight response for the
+  // previous report land silently instead of under the new one.
+  const epochRef = useRef(0)
+
   const ensureTraces = useCallback(() => {
     if (tracesStarted.current) return
     tracesStarted.current = true
+    const epoch = epochRef.current
     setTraces({ status: "loading", byId: {}, error: null })
     api
       .getBenchmarkReportTraces(domain, dataset, reportId)
       .then((doc) => {
+        if (epoch !== epochRef.current) return
         const rows = Array.isArray(doc?.traces) ? doc.traces : []
         setTraces({
           status: "ok",
@@ -144,6 +153,7 @@ export default function BenchmarkReportView({
         })
       })
       .catch((e) => {
+        if (epoch !== epochRef.current) return
         tracesStarted.current = false // the next open retries
         setTraces({ status: "error", byId: {}, error: e.message || String(e) })
       })
@@ -164,15 +174,19 @@ export default function BenchmarkReportView({
 
   const load = useCallback(async () => {
     if (!api || !domain || !dataset || !reportId) return
+    const epoch = epochRef.current
     try {
       const data = await api.getBenchmarkReport(domain, dataset, reportId)
-      setState({ status: "ok", data, error: null })
+      if (epoch === epochRef.current)
+        setState({ status: "ok", data, error: null })
     } catch (e) {
-      setState({ status: "error", data: null, error: e.message || String(e) })
+      if (epoch === epochRef.current)
+        setState({ status: "error", data: null, error: e.message || String(e) })
     }
   }, [api, domain, dataset, reportId])
 
   useEffect(() => {
+    epochRef.current += 1
     setState({ status: "loading", data: null, error: null })
     setTraceSel(null)
     setPanel(null)
@@ -460,15 +474,31 @@ function AnnotationsButton({
       </Button>
     )
   }
+  // A failed aggregation must be visible, not a silent reset to "Generate":
+  // surface the row's agg_detail (the failure reason the runtime stamps on the
+  // REPORT# row) beside the button, which stays live so the user can retry.
+  const aggFailed = aggStatus === "failed"
   return (
-    <Button onClick={generate} disabled={kicking}>
-      {kicking ? (
-        <Spinner data-icon="inline-start" />
-      ) : (
-        <SparklesIcon data-icon="inline-start" />
-      )}
-      Generate annotations ({candidates.length})
-    </Button>
+    <div className="flex min-w-0 items-center gap-2">
+      {aggFailed ? (
+        <span
+          className="max-w-72 min-w-0 truncate text-xs text-destructive"
+          title={row?.agg_detail || undefined}
+        >
+          Aggregation failed: {row?.agg_detail || "no detail recorded"}
+        </span>
+      ) : null}
+      <Button onClick={generate} disabled={kicking}>
+        {kicking ? (
+          <Spinner data-icon="inline-start" />
+        ) : (
+          <SparklesIcon data-icon="inline-start" />
+        )}
+        {aggFailed
+          ? "Retry aggregation"
+          : `Generate annotations (${candidates.length})`}
+      </Button>
+    </div>
   )
 }
 
@@ -495,7 +525,7 @@ function SummaryTab({ report, row, scope }) {
             <ScoreWidget block={scores[c]} />
             <OutcomesWidget
               block={scores[c]}
-              report={report}
+              stability={report.stability?.[c]}
               className="lg:col-span-2"
             />
             {(scores[c].raw?.per_run?.length || 0) > 1 ? (
@@ -636,6 +666,25 @@ function ScoreWidget({ block }) {
   // already carry the judge's authority, so there is no second ring to show.
   const hasAdjusted = Boolean(block.adjusted)
   const adjusted = block.adjusted?.mean || 0
+  // The spread (min–max range across the N runs) only means something with
+  // more than one run.
+  const multiRun = (block.raw?.per_run?.length || 0) > 1
+  const fmtSpread = (s) => ` ±${Math.round((s || 0) * 100)}%`
+
+  // Fully-discarded check (graded 0): a 0% dial would read as a real score.
+  if (block.graded === 0) {
+    return (
+      <Widget
+        title="Score"
+        description="No score for this check — nothing was graded."
+      >
+        <p className="flex flex-1 items-center justify-center py-2 text-xs text-muted-foreground">
+          Not graded — every question was discarded.
+        </p>
+      </Widget>
+    )
+  }
+
   return (
     <Widget
       title="Score"
@@ -651,11 +700,13 @@ function ScoreWidget({ block }) {
           <span className="flex items-center gap-1.5">
             <span className="size-2 rounded-full bg-primary" />
             raw {Math.round(raw * 100)}%
+            {multiRun ? fmtSpread(block.raw?.spread) : ""}
           </span>
           {hasAdjusted ? (
             <span className="flex items-center gap-1.5">
               <span className="size-2 rounded-full bg-primary/30" />
               judge-adjusted {Math.round(adjusted * 100)}%
+              {multiRun ? fmtSpread(block.adjusted?.spread) : ""}
             </span>
           ) : null}
         </p>
@@ -717,41 +768,41 @@ function ScoreDial({ raw = 0, adjusted = 0 }) {
 
 // The outcome story as a treemap: every graded question tiled by where it
 // ended up — tile area = count, failures split by the judge's ruling. Hover a
-// tile for its exact count.
-function OutcomesWidget({ block, report, className }) {
-  const check = block.check
+// tile for its exact count. The counts are the report's STORED breakdown
+// (report_run persists passed_all_runs/overturned/confirmed_failed/discarded
+// alongside the scores) — the per-question detail is display material, not a
+// second place to derive the same numbers. Judge-errored reviews sit inside
+// confirmed_failed: the backend counts an unreviewable failure against the
+// wiki.
+function OutcomesWidget({ block, stability, className }) {
   // Behavior failures aren't "wiki gaps" by definition — the judge failed the
   // RUN against the expectation (the fault may be the agent's); there is no
   // overturn ruling to split by.
-  const judgeGraded = check === "behavior"
-  const rows = (report.questions || [])
-    .map((q) => q.checks?.[check])
-    .filter(Boolean)
-
-  let clean = 0
-  let discarded = 0
-  const ruling = { notgap: 0, gap: 0, errored: 0 }
-  for (const b of rows) {
-    if (b.discarded) {
-      discarded += 1
-      continue
-    }
-    if (b.passed_runs === b.total_runs) {
-      clean += 1
-      continue
-    }
-    if (b.judge?.judge_error) ruling.errored += 1
-    else if (b.judge?.verdict === "pass") ruling.notgap += 1
-    else ruling.gap += 1
-  }
+  const judgeGraded = block.check === "behavior"
 
   const items = [
-    { label: "Passed", value: clean },
-    { label: judgeGraded ? "Failed" : "Wiki gap", value: ruling.gap },
-    { label: "Not a wiki gap", value: ruling.notgap },
-    { label: "Review errored", value: ruling.errored },
-    { label: "Discarded", value: discarded },
+    { label: "Passed", value: block.passed_all_runs || 0 },
+    {
+      label: judgeGraded ? "Failed" : "Wiki gap",
+      value: block.confirmed_failed || 0,
+    },
+    { label: "Not a wiki gap", value: block.overturned || 0 },
+    { label: "Discarded", value: block.discarded || 0 },
   ].filter((d) => d.value > 0)
+
+  // The stored stability histogram ({"<passes>": count}, discarded excluded),
+  // compact: how many questions passed N/N vs k/N vs 0/N. Only meaningful
+  // with more than one run.
+  const runsN = block.raw?.per_run?.length || 1
+  const stabilityLine =
+    runsN > 1
+      ? Object.entries(stability || {})
+          .map(([k, v]) => [Number(k), v])
+          .filter(([, v]) => v > 0)
+          .sort((a, b) => b[0] - a[0])
+          .map(([k, v]) => `passed ${k}/${runsN}: ${v}`)
+          .join(" · ")
+      : ""
 
   return (
     <Widget
@@ -764,30 +815,36 @@ function OutcomesWidget({ block, report, className }) {
       }
     >
       {items.length ? (
-        <WidgetChart
-          height={230}
-          spec={{
-            type: "treemap",
-            series: [
-              {
-                name: "questions",
-                data: items,
-                // Semantic tiles: pass green, wiki gap red, no-fault yellow,
-                // the rest muted (palette indices resolved in-frame).
-                colors: {
-                  Passed: 2,
-                  "Wiki gap": 9,
-                  Failed: 9,
-                  // A true yellow (the palette's closest slot is amber) — raw
-                  // triple, resolved in-frame like the palette colors.
-                  "Not a wiki gap": "234, 179, 8",
-                  "Review errored": "muted",
-                  Discarded: "muted",
+        <>
+          <WidgetChart
+            height={230}
+            spec={{
+              type: "treemap",
+              series: [
+                {
+                  name: "questions",
+                  data: items,
+                  // Semantic tiles: pass green, wiki gap red, no-fault yellow,
+                  // the rest muted (palette indices resolved in-frame).
+                  colors: {
+                    Passed: 2,
+                    "Wiki gap": 9,
+                    Failed: 9,
+                    // A true yellow (the palette's closest slot is amber) — raw
+                    // triple, resolved in-frame like the palette colors.
+                    "Not a wiki gap": "234, 179, 8",
+                    Discarded: "muted",
+                  },
                 },
-              },
-            ],
-          }}
-        />
+              ],
+            }}
+          />
+          {stabilityLine ? (
+            <p className="text-xs text-muted-foreground tabular-nums">
+              Stability — {stabilityLine}
+            </p>
+          ) : null}
+        </>
       ) : (
         <p className="text-xs text-muted-foreground">
           Nothing graded — no outcomes to chart.
@@ -990,7 +1047,12 @@ function DetailedTab({ report, activeTrace, onOpenTrace }) {
 function outcomeChip(block) {
   if (block.discarded)
     return { text: "discarded", variant: "secondary", cls: "" }
-  const { passed_runs: passed, total_runs: total } = block
+  // Denominate over GRADED runs only: a transient grading fault leaves one
+  // run DISCARDED beside graded ones, and an ungraded run must not read as a
+  // failed one (the backend's pass/flaky/confirmed tally uses the same rule).
+  const graded = (block.attempts || []).filter((a) => a.outcome !== "DISCARDED")
+  const passed = block.passed_runs
+  const total = graded.length || block.total_runs
   if (passed === total)
     return {
       text: `passed ${passed}/${total}`,
