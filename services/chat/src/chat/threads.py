@@ -6,9 +6,12 @@ keys are owned by ``okf_core.chat_threads`` (shared with the Control API reader)
 
 The same row also carries the policy checks' ROLLING CONTEXT (see
 docs/CONVENTIONS.md and the design doc §13.4): ``policy_curated_question`` (the
-latest turn's curated standalone question) and ``policy_last_answer`` (that
-turn's final answer, truncated). Thread rows have no TTL, so reloading a chat
-days later still chains context; both attributes are optional — a pre-v3 or
+latest turn's curated standalone question), ``policy_last_answer`` (that
+turn's final answer, truncated), and ``policy_question_history`` (the last few
+curated questions, most recent last — the ones before the previous question
+feed the next REWRITE as earlier-questions resolution context; the judges
+never see them). Thread rows have no TTL, so reloading a chat
+days later still chains context; all attributes are optional — a pre-v3 or
 never-opted-in thread simply lacks them and the checker falls back to the raw
 question (turn-1 semantics).
 
@@ -93,16 +96,24 @@ def touch_thread(
 #: transcript — ~2k chars carries the conclusions without bloating the row.
 POLICY_QUESTION_MAX = 2000
 POLICY_ANSWER_MAX = 2000
+#: How many curated questions the rolling history keeps (most recent last).
+#: The REWRITE receives the ones before the previous question (at most 2) as
+#: earlier-questions resolution context — the judges never see the history:
+#: 3 stored questions (the previous + 2 before it) is the design cap.
+POLICY_HISTORY_KEEP = 3
 
 
 def read_policy_state(
     ddb, *, threads_table: str, user_sub: str, thread_id: str
-) -> dict[str, str]:
-    """The thread's rolling policy context: ``{curated_question, last_answer}``.
+) -> dict[str, Any] | None:
+    """The thread's rolling policy context:
+    ``{curated_question, last_answer, question_history}``, or ``None``.
 
     Absent attributes (pre-v3 thread, deleted row, failed prior write) come
-    back as ``""`` — the caller's raw-question fallback IS the turn-1
-    semantics, so this never raises.
+    back as ``""`` / ``[]`` — the caller's raw-question fallback IS the turn-1
+    semantics. A FAILED read returns ``None`` instead: unreadable is not
+    absent, and the caller must not seed-write turn-1 state over a chain it
+    merely could not read. Never raises.
     """
     try:
         item = (
@@ -115,6 +126,11 @@ def read_policy_state(
             ).get("Item")
             or {}
         )
+        history = [
+            str(e.get("S") or "")
+            for e in (item.get("policy_question_history") or {}).get("L") or []
+            if isinstance(e, dict)
+        ]
         return {
             "curated_question": str(
                 (item.get("policy_curated_question") or {}).get("S") or ""
@@ -122,10 +138,19 @@ def read_policy_state(
             "last_answer": str(
                 (item.get("policy_last_answer") or {}).get("S") or ""
             ),
+            "question_history": [q for q in history if q],
+            # The RAW question whose curated form is the history's last entry
+            # — the durable "same turn" signal an ask_human fold needs to
+            # REPLACE that entry instead of appending a second one. Cleared
+            # ("") by the final-answer write so it never outlives its turn
+            # (an identical question RE-ASKED later must append, not replace).
+            "history_last_raw": str(
+                (item.get("policy_history_last_raw") or {}).get("S") or ""
+            ),
         }
-    except Exception:  # noqa: BLE001 - fail-open to turn-1 semantics
+    except Exception:  # noqa: BLE001 - unreadable ≠ absent; caller skips writes
         log.warning("policy state read failed (non-fatal)", exc_info=True)
-        return {"curated_question": "", "last_answer": ""}
+        return None
 
 
 def write_policy_state(
@@ -136,13 +161,17 @@ def write_policy_state(
     thread_id: str,
     curated_question: str | None = None,
     last_answer: str | None = None,
+    question_history: list[str] | None = None,
+    history_last_raw: str | None = None,
 ) -> None:
     """Best-effort SET of the rolling policy attributes on the THREAD row.
 
     Only the given attributes are touched (the curated question lands when the
-    rewrite does; the answer lands at stream end). The thread row itself is
-    seeded by :func:`touch_thread` at turn start; an update racing a missing
-    row would just create a bare one, which the next turn's touch fills in.
+    rewrite does; the answer lands at stream end; the history rides along with
+    the curated-question write — the caller builds the rolled list, this just
+    trims and stores it). The thread row itself is seeded by
+    :func:`touch_thread` at turn start; an update racing a missing row would
+    just create a bare one, which the next turn's touch fills in.
     """
     sets: list[str] = []
     values: dict[str, Any] = {}
@@ -152,6 +181,18 @@ def write_policy_state(
     if last_answer is not None:
         sets.append("policy_last_answer = :la")
         values[":la"] = {"S": last_answer[:POLICY_ANSWER_MAX]}
+    if question_history is not None:
+        sets.append("policy_question_history = :qh")
+        values[":qh"] = {
+            "L": [
+                {"S": q[:POLICY_QUESTION_MAX]}
+                for q in question_history[-POLICY_HISTORY_KEEP:]
+                if q
+            ]
+        }
+    if history_last_raw is not None:
+        sets.append("policy_history_last_raw = :hr")
+        values[":hr"] = {"S": history_last_raw[:POLICY_QUESTION_MAX]}
     if not sets:
         return
     try:

@@ -444,7 +444,7 @@ export function VersionFilePane({ vh }) {
               onClick={() => vh.setFilter(f)}
               disabled={f !== "all" && count === 0}
               className={cn(
-                "rounded-full border px-2 py-0.5 text-[11px] capitalize transition-colors",
+                "rounded-md border px-2 py-0.5 text-[11px] capitalize transition-colors",
                 active
                   ? "border-transparent bg-muted font-medium text-foreground"
                   : "text-muted-foreground hover:bg-muted/50",
@@ -771,7 +771,7 @@ export function VersionDiffPane({ vh }) {
             </SelectContent>
           </Select>
         </div>
-        <div className="ml-auto flex h-7 items-stretch overflow-hidden rounded-2xl border">
+        <div className="ml-auto flex h-7 items-stretch overflow-hidden rounded-md border">
           {["split", "unified", "rich"].map((m) => (
             <button
               key={m}

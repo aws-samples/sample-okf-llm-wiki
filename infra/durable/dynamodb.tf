@@ -96,6 +96,29 @@ resource "aws_dynamodb_table" "registry" {
     name = "sk"
     type = "S"
   }
+  attribute {
+    name = "entity"
+    type = "S"
+  }
+  attribute {
+    name = "pair"
+    type = "S"
+  }
+
+  # Entity index (docs/CONVENTIONS.md "Registry entity index"): entity ∈
+  # {domain, dataset, xref}, pair = "<domain>[/<dataset>]". Listings Query
+  # this instead of Scan-with-filter — a Scan reads the WHOLE table (harvest
+  # status + report rows included), so its cost grows with usage, not with
+  # the dataset count. Rows written before this index existed need the
+  # scripts/backfill_registry_entity.py stamp (deploy.sh runs it after every
+  # durable apply); readers trust the index only once the backfill's
+  # readiness marker row exists, and use the legacy scan until then.
+  global_secondary_index {
+    name            = "by-entity"
+    hash_key        = "entity"
+    range_key       = "pair"
+    projection_type = "ALL"
+  }
 
   # Encryption at rest with a customer-managed CMK (CKV_AWS_119) when enabled,
   # else the AWS-managed key. Point-in-time recovery (CKV_AWS_28) so the registry

@@ -1,12 +1,13 @@
-"""Author the dataset's policy document at harvest finalize (and on dispatch).
+"""Author the dataset's policy document after a harvest (and on dispatch).
 
 The policy document (``policies.yaml``) is a DERIVED artifact of the bundle
 (like the vector index), so the moment a bundle changes is the moment to
-re-author it — and harvest finalize is the only place that knows a bundle just
-changed. Authoring is minutes-scale agent work whose value is advisory, so
-this whole step sits AFTER the commit marker and is best-effort in the
-strongest sense: it never raises, and every failure path leaves the registry
-row in a state a later trigger can retry from.
+re-author it — the RUNNER calls this as a follow-on step right after the
+terminal status write (the harvest itself is DONE at the commit marker; see
+CONVENTIONS.md "Harvest status"). Authoring is minutes-scale agent work whose
+value is advisory, so it is best-effort in the strongest sense: it never
+raises, and every failure path leaves the registry row in a state a later
+trigger can retry from.
 
 The v2 (LLM-judge) lifecycle is deliberately short: gather sources →
 fingerprint-skip → flip ``building`` (the lease) → run the author agent →
@@ -21,16 +22,18 @@ Load-bearing properties (unchanged from v1):
   here reads S3, DynamoDB, or the environment beyond that one flag.
 * **Always on per dataset** (the ``ar_enrolled`` opt-in is retired): every
   committed harvest — full, incremental, annotation — brings the policy
-  document along with it. This finalize hook is exactly why a pre-existing
+  document along with it. This follow-on build is exactly why a pre-existing
   dataset needs no backfill sweep: its first wiki change authors the first
   document.
 * **Re-author iff the sources changed** (or the document is missing — a
   dataset's first harvest under this feature, or one predating v2). An
   unchanged harvest costs one GetItem plus one S3 walk.
-* **The flip to ``building`` is the serialization point** with no stale escape
-  hatch: once this function owns the lease, EVERY exit stamps a terminal
-  status — a row abandoned at ``building`` can never re-author (the reconcile
-  reaps it).
+* **The flip to ``building`` is the serialization point**: once this function
+  owns the lease, EVERY exit stamps a terminal status. A row abandoned at
+  ``building`` (a dead author) stops deferring work after
+  ``BUILD_LOCK_STALE_SECONDS`` — readers treat it as free and the flip itself
+  takes it over (symmetric; see ``okf_aws.ar_policy``) — and the reconcile
+  reaps it.
 * **The fingerprint is captured at gather time** and stamped verbatim, so a
   wiki that moves while the author runs yields a document that is stale on
   arrival rather than one mislabelled as current.
@@ -38,6 +41,7 @@ Load-bearing properties (unchanged from v1):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -48,6 +52,7 @@ from okf_aws.ar_policy import (
     ATTR_SOURCE_HASH,
     BUILD_BUILDING,
     USABLE_BUILD_STATUSES,
+    flag_stale,
     gather_sources,
     hash_sources,
     persist_author_state,
@@ -96,6 +101,55 @@ def build_enabled() -> bool:
         "1",
         "yes",
     )
+
+
+def publish_rebuild_event(
+    data_domain: str, dataset: str, *, reason: str, events: Any = None
+) -> None:
+    """Best-effort ``policy_rebuild`` publish. Never raises.
+
+    The runner's LOCKED fallback: a follow-on build that loses the flip race
+    (typically to the PREVIOUS harvest's still-running author) must leave a
+    trigger behind, or the newer wiki's re-author silently waits for the
+    nightly reconcile. The rebuild authority collapses duplicates via the
+    same flip, so an extra event is always safe.
+    """
+    try:
+        from okf_core import policy_rebuild
+
+        if events is None:
+            import boto3
+
+            events = boto3.client(
+                "events", region_name=os.environ.get("AWS_REGION", "us-east-1")
+            )
+        resp = events.put_events(
+            Entries=[
+                {
+                    "Source": policy_rebuild.EVENT_SOURCE,
+                    "DetailType": policy_rebuild.DETAIL_TYPE_POLICY_REBUILD,
+                    "Detail": json.dumps(
+                        policy_rebuild.build_detail(
+                            data_domain, dataset, reason=reason
+                        )
+                    ),
+                }
+            ]
+        )
+        # put_events reports per-entry rejections IN-BAND (no exception) —
+        # without this check a rejected event reads as published and the
+        # re-author silently waits for the nightly reconcile.
+        if resp.get("FailedEntryCount"):
+            entry = (resp.get("Entries") or [{}])[0]
+            log.warning(
+                "policy_rebuild publish rejected for %s/%s: %s %s (non-fatal)",
+                data_domain,
+                dataset,
+                entry.get("ErrorCode", ""),
+                entry.get("ErrorMessage", ""),
+            )
+    except Exception:  # noqa: BLE001 - the nightly reconcile is the safety net
+        log.warning("policy_rebuild publish failed (non-fatal)", exc_info=True)
 
 
 def maybe_build_policy(
@@ -172,7 +226,7 @@ def _author_and_stamp(
 
     # Registration first — before any S3 walk — so authoring can never
     # resurrect state for a dataset whose mapping row is gone (a delete that
-    # raced the finalize hook costs exactly one GetItem and writes nothing).
+    # raced the follow-on build costs exactly one GetItem and writes nothing).
     registered, status, stored_hash = _read_build_state(
         ddb, table, data_domain=data_domain, dataset=dataset
     )
@@ -232,9 +286,12 @@ def _author_and_stamp(
         )
         return OUTCOME_LOCKED
 
-    # From here the lease is HELD and the flip has no stale escape hatch, so
-    # every exit must stamp a terminal status or the dataset can never
-    # re-author (the reconcile's reaper is the last-resort backstop).
+    # From here the lease is HELD, so every exit must stamp a terminal status
+    # or the dataset stays `building` — which now also 409s harvest starts
+    # and repromotes until the staleness escape / the reconcile's reaper. The
+    # ready stamp lives INSIDE this try for exactly that reason: a throttled
+    # stamp_ready after a successful authoring must still release the lease
+    # (as `failed`, which the rebuild authority retries), never wedge the row.
     try:
         doc_text = _author_doc(
             author, s3=s3, bucket=bucket,
@@ -261,6 +318,10 @@ def _author_and_stamp(
             s3, bucket=bucket, data_domain=data_domain, dataset=dataset,
             sources=sources, doc_text=doc_text,
         )
+        stamp_ready(
+            ddb, table, data_domain=data_domain, dataset=dataset,
+            fingerprint=fresh_hash,
+        )
     except Exception as e:  # noqa: BLE001 - release the lease, then report
         stamp_build_failed(
             ddb,
@@ -271,15 +332,34 @@ def _author_and_stamp(
         )
         raise
 
-    stamp_ready(
-        ddb, table, data_domain=data_domain, dataset=dataset, fingerprint=fresh_hash
-    )
     log.info(
         "policy document authored for %s/%s (fingerprint %s)",
         data_domain,
         dataset,
         fresh_hash[:12],
     )
+    # Stale-on-arrival self-heal, INLINE: the fingerprint was captured at
+    # gather time, so a wiki that moved while the author ran (a fast second
+    # harvest is the common cause — its own follow-on build lost the flip to
+    # THIS run, and a rebuild event delivered mid-build is dropped as
+    # in-flight by the rebuild authority) leaves the fresh document already
+    # outdated. Re-check here and leave a durable trigger, instead of the
+    # dataset waiting for the chat gate or the nightly reconcile to notice.
+    try:
+        moved = hash_sources(gather_sources(s3, bucket, data_domain, dataset))
+        if moved and moved != fresh_hash:
+            flag_stale(ddb, table, data_domain=data_domain, dataset=dataset)
+            publish_rebuild_event(data_domain, dataset, reason="stale_on_arrival")
+            log.info(
+                "wiki moved during authoring for %s/%s — flagged stale and "
+                "queued a rebuild",
+                data_domain,
+                dataset,
+            )
+    except Exception:  # noqa: BLE001 - advisory; the reconcile is the backstop
+        log.warning(
+            "post-build freshness re-check failed (non-fatal)", exc_info=True
+        )
     return OUTCOME_AUTHORED
 
 

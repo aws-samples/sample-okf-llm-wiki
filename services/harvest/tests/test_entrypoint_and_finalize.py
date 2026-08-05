@@ -247,6 +247,19 @@ def test_dataset_root_layout():
     assert dataset_root("/mnt/data", "sales", "orders") == "/mnt/data/sales/orders"
 
 
+def test_finalize_has_no_policy_build_binding():
+    # The harvest is DONE at the commit marker: the policy build moved to the
+    # RUNNER as a follow-on step after the terminal status write. The
+    # regression to guard is finalize regaining the import — that would run
+    # the build back inside the harvest window. (A monkeypatch on
+    # harvest.ar_build would be vacuous here: it can never intercept a
+    # module-level from-import binding, and with the env flag unset the real
+    # function no-ops anyway.)
+    import harvest.finalize as fin
+
+    assert not hasattr(fin, "maybe_build_policy")
+
+
 def test_finalize_writes_commit_marker_last(tmp_path):
     # a minimal bundle
     (tmp_path / "tables").mkdir()

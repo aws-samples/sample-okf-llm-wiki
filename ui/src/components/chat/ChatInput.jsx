@@ -21,6 +21,7 @@ import {
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 
 import { AskHumanForm } from "@/components/chat/AskHumanForm"
+import { RollingText } from "@/components/RollingText"
 import { Button } from "@/components/ui/button"
 import {
   Command,
@@ -67,14 +68,14 @@ function datasetKey(d) {
 // conversation's scope; the current scope shows as a removable chip.
 function DatasetScopeChip({ scope, onRemove }) {
   return (
-    <span className="group/chip inline-flex h-6 items-center gap-1 rounded-full border border-primary/25 bg-primary/10 pr-1 pl-2 text-xs font-medium text-primary">
+    <span className="group/chip inline-flex h-6 items-center gap-1 rounded-md border border-primary/25 bg-primary/10 pr-1 pl-2 text-xs font-medium text-primary">
       <AtSignIcon className="size-3 opacity-80" />
       {datasetKey(scope)}
       <button
         type="button"
         aria-label="Clear dataset scope"
         onClick={onRemove}
-        className="ml-0.5 flex size-4 items-center justify-center rounded-full text-primary/70 transition-colors hover:bg-primary/15 hover:text-primary"
+        className="ml-0.5 flex size-4 items-center justify-center rounded-sm text-primary/70 transition-colors hover:bg-primary/15 hover:text-primary"
       >
         <XIcon className="size-3" />
       </button>
@@ -122,14 +123,14 @@ function DatasetMentionList({ datasets, onPick, onBackspaceEmpty }) {
 function FeatureChip({ feature, onRemove }) {
   const Icon = feature.icon
   return (
-    <span className="group/chip inline-flex h-6 items-center gap-1 rounded-full border bg-muted/60 pr-1 pl-2 text-xs font-medium text-foreground/80">
+    <span className="group/chip inline-flex h-6 items-center gap-1 rounded-md border bg-muted/60 pr-1 pl-2 text-xs font-medium text-foreground/80">
       {Icon ? <Icon className="size-3 text-muted-foreground" /> : null}
       {feature.label}
       <button
         type="button"
         aria-label={`Disable ${feature.label}`}
         onClick={onRemove}
-        className="ml-0.5 flex size-4 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+        className="ml-0.5 flex size-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
       >
         <XIcon className="size-3" />
       </button>
@@ -167,7 +168,7 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
           type="button"
           variant="ghost"
           size="icon"
-          className="size-7 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
+          className="size-7 shrink-0 text-muted-foreground hover:text-foreground"
           title="Add a capability"
           aria-label="Add a capability"
         >
@@ -177,7 +178,7 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
       <DropdownMenuContent
         align="start"
         side="top"
-        className="min-w-56 rounded-xl"
+        className="min-w-56"
         onCloseAutoFocus={(e) => {
           if (scopeSelectedRef.current) {
             scopeSelectedRef.current = false
@@ -191,7 +192,6 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
               scopeSelectedRef.current = true
               onScope()
             }}
-            className="rounded-lg"
           >
             <PinIcon className="size-3.5 text-muted-foreground" />
             Scope to a dataset
@@ -203,7 +203,6 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
             <DropdownMenuItem
               key={f.id}
               onSelect={() => onToggle(f.id)}
-              className="rounded-lg"
             >
               {Icon ? <Icon className="size-3.5 text-muted-foreground" /> : null}
               {f.menuLabel || f.label}
@@ -213,7 +212,7 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
         {offerPolicy ? (
           <DropdownMenuSub>
             {/* Disabled while SQL is off — the checks judge SQL conduct. */}
-            <DropdownMenuSubTrigger disabled={!sqlOn} className="rounded-lg">
+            <DropdownMenuSubTrigger disabled={!sqlOn}>
               <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
               Guardrails
             </DropdownMenuSubTrigger>
@@ -230,7 +229,7 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
             <DropdownMenuSubContent
               sideOffset={8}
               avoidCollisions={false}
-              className="rounded-xl translate-y-[calc(-100%+2rem)]"
+              className="translate-y-[calc(-100%+2rem)]"
             >
               {POLICY_OPTIONS.map((o) => {
                 const Icon = o.icon
@@ -240,7 +239,7 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
                   <DropdownMenuItem
                     key={o.id}
                     onSelect={() => onPickPolicy(o.id)}
-                    className="rounded-lg py-1"
+                    className="py-1"
                   >
                     {Icon ? (
                       <Icon className="size-3.5 text-muted-foreground" />
@@ -289,17 +288,19 @@ function EffortSetting({ effort, efforts, onChange }) {
           type="button"
           variant="ghost"
           size="sm"
-          className="h-7 gap-1 rounded-full px-2 text-xs text-muted-foreground capitalize hover:text-foreground"
+          className="h-7 gap-1 px-2 text-xs text-muted-foreground capitalize hover:text-foreground"
           title="Reasoning effort"
         >
           <SlidersHorizontalIcon className="size-3.5" />
           {effort}
         </Button>
       </PopoverTrigger>
-      <PopoverContent align="start" side="top" className="w-60 rounded-xl p-2.5">
-        {/* Header: "Effort <Level>" with the level highlighted in the accent. */}
+      <PopoverContent align="start" side="top" className="w-60 p-2.5">
+        {/* Header: "Effort <Level>" with the level highlighted in the accent;
+            switching levels rolls the old value out below the new one. */}
         <div className="text-sm font-medium">
-          Effort <span className="text-primary capitalize">{effort}</span>
+          Effort{" "}
+          <RollingText text={effort} textClassName="text-primary capitalize" />
         </div>
         {/* Compact: end labels + slider sit tight together, just under the header.
             --okf-effort-frac (0..1) scales the range's fade so the filled slice
@@ -576,7 +577,7 @@ export function ChatInput({
   const asking = Boolean(pendingAsk && pendingAsk.questions?.length && onAnswer)
 
   return (
-    <div className="flex flex-col gap-2 rounded-3xl border bg-card px-4 py-3 shadow-sm">
+    <div className="flex flex-col gap-2 rounded-xl border bg-card px-4 py-3 shadow-sm">
       {asking ? (
         <AskHumanForm
           questions={pendingAsk.questions}
@@ -678,7 +679,7 @@ export function ChatInput({
               type="button"
               size="icon"
               variant="outline"
-              className="size-8 rounded-full"
+              className="size-8"
               onClick={() => onStop?.()}
               aria-label="Stop"
             >
@@ -688,7 +689,7 @@ export function ChatInput({
             <Button
               type="button"
               size="icon"
-              className="size-8 rounded-full"
+              className="size-8"
               onClick={send}
               disabled={!canSend}
               aria-label="Send"

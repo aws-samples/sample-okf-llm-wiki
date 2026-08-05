@@ -12,7 +12,7 @@ function Skeleton({
       // page surface was invisible. The tint reads in both themes — the same
       // fix as the tabs track and the prose code pills.
       className={cn(
-        "animate-pulse rounded-2xl bg-foreground/[0.08] dark:bg-muted",
+        "animate-pulse rounded-md bg-foreground/[0.08] dark:bg-muted",
         className
       )}
       {...props} />

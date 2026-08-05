@@ -16,6 +16,7 @@ import {
   MessageSquareTextIcon,
   PlayIcon,
   SearchIcon,
+  ShieldCheckIcon,
   SlidersHorizontalIcon,
   SparklesIcon,
   TerminalIcon,
@@ -115,6 +116,14 @@ const TERMINAL_STATUSES = new Set(["complete", "failed", "cancelled"])
 // In-flight states: a harvest here can be cancelled (stops the AgentCore session
 // and frees the lease). Mirrors the backend's cancellable predicate.
 const CANCELLABLE_STATUSES = new Set(["queued", "running"])
+
+// How long to keep polling AFTER the status row goes terminal before trusting
+// guardrails_building:false. The runner flips `building` only after waiting
+// out the S3 mount flush (up to 180s + a 10s settle — see harvest/runner.py's
+// _BUNDLE_FLUSH_TIMEOUT_S) plus a full S3 source walk, so the flip can land
+// MINUTES after the terminal write; a grace window shorter than that bound
+// means the badge never shows and the poll stops before the flip.
+const GUARDRAILS_FLIP_GRACE_MS = 240_000
 
 // Human-facing labels for the backend's mode strings (the wire values are
 // frozen in CONVENTIONS.md; presentation is the UI's job). Unknown modes fall
@@ -294,6 +303,10 @@ export default function HarvestView({
   // with nothing in between.
   const [draining, setDraining] = useState(false)
   const intervalRef = useRef(null)
+  // When the status first read terminal WITHOUT a live guardrails author —
+  // the poll keeps going for GUARDRAILS_FLIP_GRACE_MS from here before it
+  // trusts that no author is coming (the flip lands after the terminal write).
+  const terminalIdleSinceRef = useRef(null)
   // Live feed: its own faster interval + a monotonic seq cursor. The cursor is a
   // ref (not state) so advancing it never re-triggers the poll effect.
   const feedIntervalRef = useRef(null)
@@ -428,7 +441,26 @@ export default function HarvestView({
         setError(null)
         // Stop the live poll once the harvest reaches a terminal state — the
         // status row is durable and won't change until a new harvest starts.
-        if (TERMINAL_STATUSES.has(s?.status?.status)) stopPolling()
+        // EXCEPT around the follow-on guardrails author: while it runs, keep
+        // polling so its badge shows and clears live — and for a grace window
+        // after the terminal write, because the `building` flip lands seconds
+        // LATER (after the author's source walk) and the first post-terminal
+        // poll would otherwise stop before ever seeing it.
+        if (TERMINAL_STATUSES.has(s?.status?.status)) {
+          if (s?.guardrails_building) {
+            terminalIdleSinceRef.current = null // author live — keep polling
+          } else {
+            if (terminalIdleSinceRef.current == null)
+              terminalIdleSinceRef.current = Date.now()
+            else if (
+              Date.now() - terminalIdleSinceRef.current >
+              GUARDRAILS_FLIP_GRACE_MS
+            )
+              stopPolling()
+          }
+        } else {
+          terminalIdleSinceRef.current = null
+        }
         return s
       } catch (e) {
         setError(e.message || String(e))
@@ -515,6 +547,10 @@ export default function HarvestView({
     setError(null)
     setHasExternal(false)
     setCrossTarget("")
+    // The guardrails grace window is per-dataset: an expired timestamp left
+    // over from the PREVIOUS selection would kill the new dataset's polling
+    // on its very first status read.
+    terminalIdleSinceRef.current = null
     // Reset the feed whenever the selection changes so a prior dataset's steps
     // don't bleed into the new one (also invalidates any in-flight poll).
     resetFeed()
@@ -835,6 +871,10 @@ export default function HarvestView({
   const currentStatus = inner.status || null
   const ready = status?.ready
   const running = CANCELLABLE_STATUSES.has(currentStatus)
+  // The follow-on guardrails author (its own process — the harvest row is
+  // already terminal). Shows the badge AND disables the start controls: a
+  // start would 409 against the build lock anyway, so don't offer it.
+  const authoringGuardrails = Boolean(status?.guardrails_building)
   const aborted = currentStatus === "failed" || currentStatus === "cancelled"
   // Started and Updated only differ once the run reaches a terminal state
   // (report_status writes updated_at on transitions). While running they mirror
@@ -956,9 +996,13 @@ export default function HarvestView({
                   <DropdownMenuTrigger asChild>
                     <Button
                       size="icon"
-                      disabled={starting || startingAnnotations}
+                      disabled={starting || startingAnnotations || authoringGuardrails}
                       aria-label="More harvest options"
-                      title="More harvest options"
+                      title={
+                        authoringGuardrails
+                          ? "Guardrails are being authored — wait for the badge to clear"
+                          : "More harvest options"
+                      }
                       // Buttons carry `border border-transparent bg-clip-padding`;
                       // in dark mode that transparent 1px reveals the near-black
                       // page behind the button (a stray dark ring). Tint the border
@@ -1003,7 +1047,12 @@ export default function HarvestView({
                 </DropdownMenu>
                 <Button
                   onClick={requestStartHarvest}
-                  disabled={starting}
+                  disabled={starting || authoringGuardrails}
+                  title={
+                    authoringGuardrails
+                      ? "Guardrails are being authored — wait for the badge to clear"
+                      : undefined
+                  }
                   // border-primary blends the transparent edges into the fill (no
                   // dark ring in dark mode); the left edge is the divider seam.
                   className="border-primary border-l-primary-foreground/30"
@@ -1102,7 +1151,7 @@ export default function HarvestView({
                 <Label htmlFor="cross-target">Target dataset</Label>
                 {/* A searchable list, not a plain dropdown: real catalogs run
                     to thousands of datasets. cmdk filters as you type. */}
-                <Command className="rounded-2xl border">
+                <Command className="rounded-xl border">
                   <CommandInput
                     id="cross-target"
                     placeholder="Search datasets…"
@@ -1343,6 +1392,17 @@ export default function HarvestView({
                 ) : (
                   <Badge variant="outline">no harvest yet</Badge>
                 )}
+                {/* The harvest itself is done (row terminal) — the follow-on
+                    guardrails author is running under its own build lock. */}
+                {authoringGuardrails ? (
+                  <Badge
+                    variant="outline"
+                    className="border-amber-300 text-amber-600 dark:border-amber-700 dark:text-amber-500"
+                  >
+                    <ShieldCheckIcon />
+                    Authoring guardrails
+                  </Badge>
+                ) : null}
                 <Separator orientation="vertical" className="h-5" />
                 <span className="text-sm text-muted-foreground">Bundle</span>
                 {ready ? (
@@ -1848,7 +1908,7 @@ function HarvestSettingsSheet({
         // Floating mode: inset from the viewport edges with rounded corners
         // (data-side variants so they win over the flush inset-y-0/right-0 the
         // base sheet sets for side="right").
-        className="rounded-2xl border shadow-lg data-[side=right]:inset-y-3 data-[side=right]:right-3 data-[side=right]:h-auto data-[side=right]:sm:max-w-md"
+        className="rounded-xl border shadow-lg data-[side=right]:inset-y-3 data-[side=right]:right-3 data-[side=right]:h-auto data-[side=right]:sm:max-w-md"
         onPointerDownOutside={keepOpenOnSelectInteraction}
         onInteractOutside={keepOpenOnSelectInteraction}
       >

@@ -1,6 +1,6 @@
 """Policy rebuild authority: fingerprint-verify, dispatch authoring, reap stalls.
 
-The harvest finalize hook can only act while a harvest is running — this module
+The runner's post-complete build only fires when a harvest ran — this module
 is the other half of the policy-document lifecycle, reached by
 ``policy_rebuild`` events (EventBridge -> the same SQS queue as the Glue
 events; published by the Control API's repromote/sync paths and by the
@@ -207,8 +207,8 @@ def _run_rebuild(
     # Only bundles a full harvest has committed get policies. This is also
     # what a first-authoring event (a manual Sync on a never-authored
     # dataset, a repromote) rides through — no lifecycle gate here — while an
-    # event landing mid-(re)harvest defers to the finalize hook, which
-    # authors at commit anyway.
+    # event landing mid-(re)harvest defers to the runner's post-complete
+    # follow-on build, which authors when the run finishes anyway.
     if not is_bundle_ready(s3, bucket, data_domain, dataset):
         return OUTCOME_NO_WIKI
 
@@ -303,7 +303,7 @@ def reconcile_policies(
     (``ar_build_status`` present; ALL sources, not just Glue — a
     Redshift-backed dataset gets a policy too). Never-authored datasets are
     deliberately not backfilled — their first document comes from a manual
-    Sync, the next harvest/increment's finalize hook, or a repromote; this
+    Sync, the next harvest/increment's follow-on build, or a repromote; this
     sweep only keeps already-authored documents honest. Per-dataset errors
     are counted and logged, never propagated: one broken dataset must not
     block the rest. Returns ``{datasets, rebuilt, recovered, in_flight,
@@ -371,7 +371,7 @@ def reconcile_policies(
                 summary["recovered"] += 1
                 continue
             # Only bundles a full harvest has committed get policies — never
-            # race a (re)harvest mid-write; its finalize hook re-authors.
+            # race a (re)harvest mid-write; its follow-on build re-authors.
             if not is_bundle_ready(s3, bucket, data_domain, dataset):
                 summary["skipped"] += 1
                 continue

@@ -191,7 +191,7 @@ export function ChatHistory({
         <HistoryIcon className="size-4 text-muted-foreground" />
         <span className="text-sm font-medium">History</span>
         {!loading && hasThreads ? (
-          <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground tabular-nums">
+          <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground tabular-nums">
             {threads.length}
           </span>
         ) : null}

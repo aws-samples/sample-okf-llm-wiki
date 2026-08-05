@@ -5,11 +5,12 @@ bundle. We write ``.harvest/state.json`` LAST as a commit marker: consumers (and
 the reindex worker's readiness checks) treat a bundle as ready only when this
 marker is present and its ``status`` is ``complete``.
 
-The Automated Reasoning policy build hangs off the END of this function, after
-the marker: the policy is a derived artifact of the bundle, so "the bundle just
-changed" is exactly the trigger it needs, and running it after the commit means
-the bundle is already consumable no matter what the build does. It is
-default-off and never raises (see :mod:`harvest.ar_build`).
+The policy build does NOT live here: the harvest is DONE at the commit marker
+(the runner flips the status row terminal right after this returns), and the
+policy document authors as its own follow-on step in the runner — serialized
+against new bundle-writing work by ITS OWN lock, the mapping row's
+``ar_build_status = building`` flip (see ``okf_aws.ar_policy.build_lock_active``
+and CONVENTIONS.md).
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from harvest.ar_build import maybe_build_policy
 from harvest.fsutil import mkdirs, write_text
 from okf_core.index_gen import regenerate_indexes
 
@@ -68,12 +68,6 @@ def finalize_bundle(
         json.dumps(state, indent=2, sort_keys=True) + "\n",
     )
 
-    # 3) Rebuild the dataset's AR policy if its source docs moved. AFTER the
-    # marker, and a no-op for a cross-dataset run: that mode writes only
-    # ``external/…``, which is not policy material, so the fingerprint cannot
-    # have changed and the walk would find nothing to do.
-    if not (extra or {}).get("cross_target"):
-        maybe_build_policy(data_domain=data_domain, dataset=dataset)
     return state
 
 

@@ -22,6 +22,7 @@ import { memo, useCallback, useMemo, useState } from "react"
 
 import { CodeView } from "@/components/chat/CodeView"
 import { Markdown } from "@/components/chat/Markdown"
+import { RollingText } from "@/components/RollingText"
 import { SourceIcon } from "@/components/chat/SourceIcon"
 import { buildTimelineSteps, mergeThinkingSteps } from "@/components/chat/timelineParser"
 import {
@@ -526,8 +527,14 @@ export function UnifiedThinkingBlock({ contentBlocks = [], isGroupComplete = fal
       <div className="unified-block-header">
         <Marker asChild>
           <button type="button" onClick={toggle} aria-expanded={expanded}>
-            <MarkerContent className={cn(!isGroupComplete && "text-shimmer")}>
-              {label}
+            <MarkerContent>
+              {/* The shimmer sits on RollingText's INNER spans — background-
+                  clip:text doesn't survive a styled parent (child text would
+                  render transparent). Label changes roll old-out/new-in. */}
+              <RollingText
+                text={label}
+                textClassName={cn(!isGroupComplete && "text-shimmer")}
+              />
             </MarkerContent>
             <ChevronDown
               className={cn(

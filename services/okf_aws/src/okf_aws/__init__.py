@@ -21,6 +21,8 @@ from okf_aws.model_factory import (
 )
 from okf_aws.s3_bundle import (
     ConceptLocation,
+    bundle_marker_state,
+    bundle_marker_status,
     bundle_prefix,
     domain_doc_key,
     is_bundle_ready,

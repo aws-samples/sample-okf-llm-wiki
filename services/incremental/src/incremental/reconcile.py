@@ -111,6 +111,7 @@ def reconcile(
                     registry_table=registry_table,
                     freshness_table=freshness_table,
                     harvest_runtime_arn=harvest_runtime_arn,
+                    ddb_client=ddb_client,
                 )
                 if result.get("action") == "invoked":
                     enqueued += 1

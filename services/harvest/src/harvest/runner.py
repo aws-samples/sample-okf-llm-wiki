@@ -27,6 +27,12 @@ from harvest.annotations import (
     revert_to_open,
 )
 from harvest.code_interpreter import sandbox_session
+from harvest.ar_build import (
+    OUTCOME_LOCKED,
+    build_enabled,
+    maybe_build_policy,
+    publish_rebuild_event,
+)
 from harvest.finalize import finalize_bundle, mark_in_progress
 from harvest.fsutil import clean_authored_output, remove_tree, write_text
 from harvest.metadata_export import export_metadata, export_target_metadata
@@ -57,6 +63,110 @@ log = logging.getLogger(__name__)
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+#: How long the follow-on policy build waits for the bundle's S3 flush, and
+#: the extra settle margin after the commit marker appears. The bundle is
+#: written THROUGH the S3 Files mount, whose write-back can lag the terminal
+#: status write by a minute (observed live 2026-08-04: the regenerated
+#: index.md files + marker landed 62s after the runner moved on) — and the
+#: flush is not strictly ordered (two index files landed AFTER the marker),
+#: hence the margin on top of marker visibility.
+_BUNDLE_FLUSH_TIMEOUT_S = 180.0
+_POST_MARKER_SETTLE_S = 10.0
+
+
+def _wait_for_bundle_flush(
+    *, data_domain: str, dataset: str, completed_at: str = ""
+) -> None:
+    """Block until the committed bundle is visible in S3 (bounded; never raises).
+
+    Gathering before the mount flush settles fingerprints a PARTIAL wiki: the
+    authored document then reads "out of date" the moment the flush lands
+    (and checks pause) even though nothing really changed. The marker is
+    written last, so marker-visible ≈ flush-settled; the margin covers the
+    near-marker stragglers.
+
+    ``completed_at`` pins the wait to THIS run's marker: on a re-harvest the
+    PREVIOUS run's ``complete`` marker is still the visible object until the
+    mount flushes (mark_in_progress's overwrite lags exactly like every other
+    write), so a bare status check would return immediately and fingerprint
+    the PRE-run wiki. Best-effort — the post-build freshness re-check and the
+    rebuild event self-heal whatever slips through.
+    """
+    import time
+
+    bucket = os.environ.get("OKF_BUNDLE_BUCKET", "")
+    if not bucket:
+        return
+    try:
+        import boto3
+
+        from okf_aws import bundle_marker_state
+
+        s3 = boto3.client(
+            "s3", region_name=os.environ.get("AWS_REGION", "us-east-1")
+        )
+        deadline = time.monotonic() + _BUNDLE_FLUSH_TIMEOUT_S
+        while time.monotonic() < deadline:
+            state = bundle_marker_state(s3, bucket, data_domain, dataset) or {}
+            if state.get("status") == "complete" and (
+                not completed_at or state.get("completed_at") == completed_at
+            ):
+                time.sleep(_POST_MARKER_SETTLE_S)
+                return
+            time.sleep(5)
+        log.warning(
+            "bundle flush for %s/%s not visible in S3 after %.0fs — "
+            "authoring anyway (the freshness re-check self-heals)",
+            data_domain,
+            dataset,
+            _BUNDLE_FLUSH_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 - advisory wait, never fatal
+        log.warning("bundle flush wait failed (non-fatal)", exc_info=True)
+
+
+def _follow_on_policy_build(
+    *,
+    data_domain: str,
+    dataset: str,
+    completed: bool,
+    marker_completed_at: str = "",
+) -> None:
+    """The post-terminal guardrails build (one shared tail for all run modes).
+
+    Runs ONLY when the terminal `complete` write actually landed: a False
+    from report_status means an operator cancel won the race, and authoring
+    guardrails for a run the operator was just told is cancelled would hold
+    the build lock (and 409 their next action) for a ghost. The feature flag
+    is checked BEFORE the flush wait — with policy builds off,
+    maybe_build_policy is a no-op and the (up to ~190s of billed runtime)
+    wait would buy nothing. ``marker_completed_at`` is the timestamp
+    finalize_bundle stamped into THIS run's commit marker (see
+    ``_wait_for_bundle_flush``). Losing the flip race (another author still
+    running — typically the previous harvest's) leaves a `policy_rebuild`
+    trigger behind so the newer wiki still gets its re-author without waiting
+    for the nightly reconcile. Never raises.
+    """
+    if not completed:
+        log.info(
+            "harvest row already terminal (cancelled?) — skipping the "
+            "follow-on policy build for %s/%s",
+            data_domain,
+            dataset,
+        )
+        return
+    if not build_enabled():
+        return
+    _wait_for_bundle_flush(
+        data_domain=data_domain, dataset=dataset, completed_at=marker_completed_at
+    )
+    outcome = maybe_build_policy(data_domain=data_domain, dataset=dataset)
+    if outcome == OUTCOME_LOCKED:
+        publish_rebuild_event(
+            data_domain, dataset, reason="post_harvest_build_locked"
+        )
 
 
 def _build_emitter(*, data_domain: str, dataset: str, session_id: str | None):
@@ -325,15 +435,17 @@ def run_full_harvest(
             status="failed",
             detail=f"{type(e).__name__}: {e}",
             only_if_active=True,
+            session_id=session_id,
         )
         raise
 
-    report_status(
+    completed = report_status(
         registry,
         data_domain=data_domain,
         dataset=dataset,
         status="complete",
         only_if_active=True,
+        session_id=session_id,
     )
     # The bundle now reflects this guidance version — clear its DIRTY state.
     stamp_guidance_applied(
@@ -343,6 +455,16 @@ def run_full_harvest(
         version=dataset_guidance_version,
     )
     log.info("Harvest complete: %s/%s (%d tables)", data_domain, dataset, len(tables))
+    # The HARVEST is done — status is terminal and the bundle is consumable.
+    # The policy document authors as its own follow-on step: its `building`
+    # flip on the mapping row (okf_aws.ar_policy.build_lock_active) is what
+    # keeps new bundle-writing work out until it lands. Never raises.
+    _follow_on_policy_build(
+        data_domain=data_domain,
+        dataset=dataset,
+        completed=completed,
+        marker_completed_at=str(state.get("completed_at") or ""),
+    )
     return state
 
 
@@ -472,6 +594,7 @@ def run_incremental_harvest(
             status="failed",
             detail=f"{type(e).__name__}: {e}",
             only_if_active=True,
+            session_id=session_id,
         )
         raise
 
@@ -479,12 +602,13 @@ def run_incremental_harvest(
     pend_file = dataset_root / ".harvest" / "pending.json"
     if pend_file.exists():
         pend_file.unlink()
-    report_status(
+    completed = report_status(
         registry,
         data_domain=data_domain,
         dataset=dataset,
         status="complete",
         only_if_active=True,
+        session_id=session_id,
     )
     stamp_guidance_applied(
         registry,
@@ -493,6 +617,13 @@ def run_incremental_harvest(
         version=dataset_guidance_version,
     )
     log.info("Incremental harvest complete: %s.%s", dataset, changed_table)
+    # Follow-on policy authoring under its own lock (see run_full_harvest).
+    _follow_on_policy_build(
+        data_domain=data_domain,
+        dataset=dataset,
+        completed=completed,
+        marker_completed_at=str(state.get("completed_at") or ""),
+    )
     return state
 
 
@@ -707,6 +838,7 @@ def run_cross_harvest(
             status="failed",
             detail=f"{type(e).__name__}: {e}",
             only_if_active=True,
+            session_id=session_id,
         )
         raise
 
@@ -722,6 +854,7 @@ def run_cross_harvest(
         status="complete",
         detail=detail,
         only_if_active=True,
+        session_id=session_id,
     )
     log.info("Cross harvest complete: %s/%s (%s)", data_domain, dataset, detail)
     return state
@@ -950,6 +1083,7 @@ def run_annotation_harvest(
             status="failed",
             detail=f"{type(e).__name__}: {e}",
             only_if_active=True,
+            session_id=session_id,
         )
         # A failed run leaves the survivors stuck in_review — return them to open
         # so the feedback survives (mirrors the Control API's invoke-failure revert).
@@ -994,13 +1128,14 @@ def run_annotation_harvest(
         f"annotations: {tally['applied']} applied, "
         f"{tally['rejected']} rejected, {tally['reverted']} returned to open"
     )
-    report_status(
+    completed = report_status(
         registry,
         data_domain=data_domain,
         dataset=dataset,
         status="complete",
         detail=detail,
         only_if_active=True,
+        session_id=session_id,
     )
     # The bundle now reflects this guidance version — clear its DIRTY state. (A
     # zero-annotation run that ran ONLY because guidance was dirty still lands here.)
@@ -1011,4 +1146,11 @@ def run_annotation_harvest(
         version=dataset_guidance_version,
     )
     log.info("Annotation harvest complete: %s/%s (%s)", data_domain, dataset, detail)
+    # Follow-on policy authoring under its own lock (see run_full_harvest).
+    _follow_on_policy_build(
+        data_domain=data_domain,
+        dataset=dataset,
+        completed=completed,
+        marker_completed_at=str(state.get("completed_at") or ""),
+    )
     return state

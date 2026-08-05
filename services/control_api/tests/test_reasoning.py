@@ -248,6 +248,100 @@ def test_sync_without_a_wiki_is_refused(cfg):
     assert e.value.status == 409 and "harvest" in e.value.message
 
 
+def test_status_mid_rewrite_keeps_the_guardrails_on_screen(cfg):
+    # An annotation/full re-harvest overwrites the commit marker with
+    # in_progress. That must read as "wiki being rewritten" — NOT "no wiki
+    # yet" — and the authored guardrails must still be returned (live bug,
+    # 2026-08-04: the page collapsed to 'run a harvest first' mid-annotation
+    # on a dataset with 46 authored guardrails). "Rewriting" requires the
+    # harvest lease to actually be LIVE (see the dead-rewrite test below).
+    from datetime import datetime, timezone
+
+    _seed_built(cfg)
+    st = _status(cfg)
+    assert st["wiki_ready"] is True and st["policies"]
+
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key=f"okf/{DOMAIN}/{DATASET}/.harvest/state.json",
+        Body=json.dumps({"status": "in_progress"}).encode(),
+    )
+    cfg.ddb.put_item(
+        TableName=REGISTRY,
+        Item={
+            "pk": {"S": f"HARVEST#{DOMAIN}#{DATASET}"},
+            "sk": {"S": "STATUS"},
+            "status": {"S": "running"},
+            "started_at": {"S": datetime.now(timezone.utc).isoformat()},
+        },
+    )
+    st = _status(cfg)
+    assert st["wiki_ready"] is False
+    assert st["wiki_rewriting"] is True
+    assert "rewriting" in st["reason"]
+    assert st["policies"]  # the authored set stays visible
+    assert st["up_to_date"] is None  # freshness is moot mid-rewrite
+
+
+def test_status_dead_rewrite_stops_promising_an_auto_reauthor(cfg):
+    # A failed/cancelled harvest leaves the marker at in_progress FOREVER
+    # (nothing restores it on the failure path). Without the live-lease
+    # cross-check the page would say "guardrails re-author automatically when
+    # it commits" about a run that is never coming back. The honest state:
+    # not rewriting, no freshness verdict, an actionable reason.
+    _seed_built(cfg)
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key=f"okf/{DOMAIN}/{DATASET}/.harvest/state.json",
+        Body=json.dumps({"status": "in_progress"}).encode(),
+    )
+    cfg.ddb.put_item(
+        TableName=REGISTRY,
+        Item={
+            "pk": {"S": f"HARVEST#{DOMAIN}#{DATASET}"},
+            "sk": {"S": "STATUS"},
+            "status": {"S": "failed"},
+            "started_at": {"S": "2026-08-04T20:00:00+00:00"},
+        },
+    )
+    st = _status(cfg)
+    assert st["wiki_ready"] is False
+    assert st["wiki_rewriting"] is False
+    assert "did not complete" in st["reason"]
+    assert st["policies"]  # the authored set stays visible
+    assert st["up_to_date"] is None  # a half-written bundle's hash is noise
+
+
+def test_sync_while_a_harvest_runs_is_refused(cfg):
+    # The reverse of the build-lock gate on harvest starts: an author
+    # dispatched mid-harvest would gather sources from a bundle being wiped
+    # and rewritten under it. The finished harvest authors on its own anyway.
+    from datetime import datetime, timezone
+
+    _seed(cfg)
+    cfg.ddb.put_item(
+        TableName=REGISTRY,
+        Item={
+            "pk": {"S": f"HARVEST#{DOMAIN}#{DATASET}"},
+            "sk": {"S": "STATUS"},
+            "status": {"S": "running"},
+            "started_at": {"S": datetime.now(timezone.utc).isoformat()},
+        },
+    )
+    with pytest.raises(handlers.ApiError) as e:
+        _sync(cfg, events=FakeEvents())
+    assert e.value.status == 409 and "in flight" in e.value.message
+
+    # A STALE lease (dead job past the 8h window) no longer blocks the Sync.
+    cfg.ddb.update_item(
+        TableName=REGISTRY,
+        Key={"pk": {"S": f"HARVEST#{DOMAIN}#{DATASET}"}, "sk": {"S": "STATUS"}},
+        UpdateExpression="SET started_at = :t",
+        ExpressionAttributeValues={":t": {"S": "2020-01-01T00:00:00+00:00"}},
+    )
+    assert _sync(cfg, events=FakeEvents())["queued"] is True
+
+
 def test_sync_when_the_feature_is_off_is_refused(cfg):
     _seed(cfg)
     with pytest.raises(handlers.ApiError) as e:

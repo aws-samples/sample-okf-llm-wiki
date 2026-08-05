@@ -643,22 +643,50 @@ def test_repromote_survives_a_raising_registry_client(aws):
     assert events.calls == []
 
 
-def test_repromote_does_not_clobber_an_in_flight_build(aws):
+def test_repromote_refuses_while_a_fresh_build_runs_then_skips_stale(aws):
+    import pytest
+
+    from control_api.handlers import ApiError
+
     v1, _v2 = _write_history(aws["s3"])
     ddb, events = aws["ddb"], FakeEvents()
-    # ``building`` IS the per-dataset build lease. Overwriting it with ``stale``
-    # would re-arm the conditional flip and let a second build start.
-    _seed_mapping(ddb, ar_build_status="building", ar_pending_source_hash="pending1")
+    # ``building`` IS the per-dataset build lease — a FRESH author is reading
+    # the very wiki this restore would rewrite, so the repromote 409s outright
+    # (the build lock gates every bundle-writing start; CONVENTIONS.md).
+    _seed_mapping(
+        ddb,
+        ar_build_status="building",
+        ar_pending_source_hash="pending1",
+        ar_build_started_at=datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        ),
+    )
     time.sleep(1.05)
 
+    with pytest.raises(ApiError) as ei:
+        _repromote(aws, v1, events=events)
+    assert ei.value.status == 409
+    assert "guardrails" in str(ei.value)
+    assert len(events.calls) == 0
+
+    # A STALE building row (dead author) no longer blocks — and the restore
+    # still must not clobber the build state: overwriting it with ``stale``
+    # would re-arm the conditional flip and let a second build start (the
+    # reconcile owns reaping abandoned rows).
+    ddb.update_item(
+        TableName=REGISTRY,
+        Key={"pk": {"S": f"DOMAIN#{DOMAIN}"}, "sk": {"S": f"DATASET#{DATASET}"}},
+        UpdateExpression="SET ar_build_started_at = :t",
+        ExpressionAttributeValues={":t": {"S": "2020-01-01T00:00:00+00:00"}},
+    )
     out = _repromote(aws, v1, events=events)
 
     assert out["status"] == "complete"
     row = _mapping_row(ddb)
     assert row["ar_build_status"]["S"] == "building"
     assert row["ar_pending_source_hash"]["S"] == "pending1"
-    # The event still goes out: the in-flight build stamps a pending hash from
-    # BEFORE the restore, so it lands stale on arrival and needs the rebuild.
+    # The event still goes out: the (dead) build's pending hash predates the
+    # restore, so any document it left lands stale and needs the rebuild.
     assert len(events.calls) == 1
 
 

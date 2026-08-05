@@ -16,7 +16,7 @@ from .fakes import FakeBedrock, FakeS3Vectors
 
 
 def test_list_domains_returns_only_domain_items(tools):
-    domains = tools.list_domains()
+    domains = tools.list_domains()["datasets"]
     pairs = sorted((d["data_domain"], d["dataset"]) for d in domains)
     assert pairs == [("ops", "logs"), ("sales", "f1")]
     # The HARVEST#... status item must not leak in.
@@ -42,7 +42,10 @@ def test_list_domains_surfaces_cross_reference_signal(tools, aws):
             "updated_at": "t",
         }
     )
-    by_id = {(d["data_domain"], d["dataset"]): d for d in tools.list_domains()}
+    by_id = {
+        (d["data_domain"], d["dataset"]): d
+        for d in tools.list_domains()["datasets"]
+    }
     assert by_id[("sales", "f1")]["cross_references"] == ["ops/logs"]
     assert "cross_referenced_by" not in by_id[("sales", "f1")]
     assert by_id[("ops", "logs")]["cross_referenced_by"] == ["sales/f1"]
@@ -53,7 +56,7 @@ def test_list_domains_ignores_malformed_xref_rows(tools, aws):
     aws["table"].put_item(
         Item={"pk": "DOMAIN#ops", "sk": "XREF#logs#sales#f1", "updated_at": "t"}
     )
-    domains = tools.list_domains()
+    domains = tools.list_domains()["datasets"]
     assert all("cross_referenced_by" not in d for d in domains)
     # And the XREF row itself is never mistaken for a dataset mapping.
     pairs = sorted((d["data_domain"], d["dataset"]) for d in domains)
@@ -605,7 +608,9 @@ def test_docstrings_carry_no_maintainer_only_prose(name):
 def test_list_domains_doc_keeps_both_cross_reference_directions():
     doc = _doc("list_domains")
     # Compressed, but each direction must still say WHERE its pair docs are read.
-    assert len(doc.split()) < 80, f"list_domains doc is {len(doc.split())} words"
+    # Budget raised (80 -> 110) when pagination joined the contract: the
+    # cursor/limit/query semantics must be in the doc or agents cannot page.
+    assert len(doc.split()) < 110, f"list_domains doc is {len(doc.split())} words"
     assert "cross_references" in doc and "cross_referenced_by" in doc
     assert "external/<d>/<ds>/" in doc
     assert "<that dataset>/external/<this>/" in doc
@@ -684,3 +689,206 @@ def test_read_page_and_get_backlinks_docs_explain_their_responses():
     assert "total_lines" in page and "returned_lines" in page
     backlinks = _doc("get_backlinks")
     assert "heading" in backlinks
+
+
+def test_list_domains_pages_and_filters_via_the_entity_index(tools, aws):
+    # A GSI-enabled registry with STAMPED rows exercises the paged path
+    # (Query, never Scan): the substring filter, the domain filter, cursor
+    # continuation, and the enrichment queries.
+    import boto3
+
+    from consumption_mcp.tools import ConsumptionConfig, ConsumptionTools
+
+    ddb = boto3.resource("dynamodb", region_name="us-east-1")
+    table = ddb.create_table(
+        TableName="okf-registry-gsi",
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "entity", "AttributeType": "S"},
+            {"AttributeName": "pair", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "by-entity",
+                "KeySchema": [
+                    {"AttributeName": "entity", "KeyType": "HASH"},
+                    {"AttributeName": "pair", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for i in range(1, 6):
+        table.put_item(
+            Item={
+                "pk": "DOMAIN#sales",
+                "sk": f"DATASET#ds{i}",
+                "entity": "dataset",
+                "pair": f"sales/ds{i}",
+                "data_domain": "sales",
+                "dataset": f"ds{i}",
+            }
+        )
+    table.put_item(
+        Item={
+            "pk": "DOMAIN#ops",
+            "sk": "DATASET#logs",
+            "entity": "dataset",
+            "pair": "ops/logs",
+            "data_domain": "ops",
+            "dataset": "logs",
+        }
+    )
+    table.put_item(
+        Item={
+            "pk": "DOMAIN#sales",
+            "sk": "META",
+            "entity": "domain",
+            "pair": "sales",
+            "data_domain": "sales",
+            "description": "sales world",
+        }
+    )
+    table.put_item(
+        Item={
+            "pk": "DOMAIN#ops",
+            "sk": "XREF#logs#sales#ds1",
+            "entity": "xref",
+            "pair": "ops/logs",
+            "target_data_domain": "ops",
+            "target_dataset": "logs",
+            "source_data_domain": "sales",
+            "source_dataset": "ds1",
+        }
+    )
+    # The backfill's readiness marker: readers Query the index only once it
+    # exists (a partially-stamped registry would Query back a partial catalog).
+    table.put_item(Item={"pk": "REGISTRY", "sk": "ENTITY_INDEX_READY"})
+    t2 = ConsumptionTools(
+        s3=tools.s3,
+        s3vectors=tools.s3vectors,
+        bedrock_runtime=tools.bedrock_runtime,
+        ddb=table,
+        config=ConsumptionConfig(
+            bundle_bucket=BUNDLE_BUCKET,
+            vector_bucket="vb",
+            vector_index="vi",
+            registry_table="okf-registry-gsi",
+        ),
+    )
+
+    # Domain filter: base-table partition query, sorted, enriched.
+    out = t2.list_domains(domain="sales")
+    assert [d["dataset"] for d in out["datasets"]] == [f"ds{i}" for i in range(1, 6)]
+    assert out["datasets"][0]["domain_description"] == "sales world"
+    assert out["next_cursor"] is None
+
+    # Substring filter over "<domain>/<dataset>".
+    out = t2.list_domains(query="OPS/")
+    assert [d["dataset"] for d in out["datasets"]] == ["logs"]
+    assert out["datasets"][0]["cross_referenced_by"] == ["sales/ds1"]
+
+    # Pagination: each page carries `limit` entries (the DDB queries are
+    # Limit-bounded — without that, tiny mapping rows would let one 1MB page
+    # return the whole catalog and the cap would never bite) and a cursor;
+    # the pages tile the catalog with no overlap.
+    seen: list[str] = []
+    cursor = None
+    pages = 0
+    for _ in range(10):
+        out = t2.list_domains(limit=2, cursor=cursor)
+        assert len(out["datasets"]) <= 2
+        pages += 1
+        seen.extend(f"{d['data_domain']}/{d['dataset']}" for d in out["datasets"])
+        cursor = out["next_cursor"]
+        if cursor is None:
+            break
+    assert pages >= 3  # 6 datasets at limit=2 => at least three pages
+    assert sorted(seen) == sorted(
+        [f"sales/ds{i}" for i in range(1, 6)] + ["ops/logs"]
+    )
+    assert len(seen) == len(set(seen))  # no page overlap
+
+
+def test_list_domains_rejects_a_garbled_cursor(tools):
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        tools.list_domains(cursor="not-a-cursor")
+
+
+def test_list_domains_partially_stamped_registry_uses_the_scan(tools, aws):
+    # One row already carries the GSI keys (a fresh registration on an
+    # un-backfilled registry) but the readiness marker is absent: the index
+    # holds a PARTIAL catalog, so readers must keep scanning — trusting a
+    # non-empty Query here silently hid every pre-index dataset.
+    aws["table"].put_item(
+        Item={
+            "pk": "DOMAIN#fresh",
+            "sk": "DATASET#newds",
+            "entity": "dataset",
+            "pair": "fresh/newds",
+            "data_domain": "fresh",
+            "dataset": "newds",
+        }
+    )
+    out = tools.list_domains()
+    pairs = {f"{d['data_domain']}/{d['dataset']}" for d in out["datasets"]}
+    # BOTH the stamped newcomer and the unstamped legacy rows are visible.
+    assert {"fresh/newds", f"{DOMAIN}/{DATASET}", "ops/logs"} <= pairs
+    # `query` filters fine on the scan path too (it must not require the GSI).
+    out = tools.list_domains(query="ops/")
+    assert [d["dataset"] for d in out["datasets"]] == ["logs"]
+
+
+def test_list_domains_marker_without_index_falls_back_to_scan(tools, aws):
+    # The one legitimate post-marker fallback: the marker was stamped before
+    # the terraform apply, so the Query fails with "no such index" — the scan
+    # still returns the full catalog instead of an error.
+    aws["table"].put_item(Item={"pk": "REGISTRY", "sk": "ENTITY_INDEX_READY"})
+    out = tools.list_domains()
+    pairs = {f"{d['data_domain']}/{d['dataset']}" for d in out["datasets"]}
+    assert {f"{DOMAIN}/{DATASET}", "ops/logs"} <= pairs
+
+
+def test_list_domains_mid_pagination_error_surfaces(tools, config):
+    # A throttle (or a cursor replayed against a different query shape)
+    # mid-pagination must SURFACE as an error: the old blanket fallback
+    # silently re-ran the FULL scan, handing the caller the whole catalog
+    # again (pages 1..N-1 duplicated) with next_cursor=null.
+    import pytest as _pytest
+
+    from consumption_mcp.tools import ConsumptionTools
+
+    class _Throttle(Exception):
+        def __init__(self):
+            super().__init__("throttled")
+            self.response = {
+                "Error": {"Code": "ThrottlingException", "Message": "slow down"}
+            }
+
+    class _FakeDdb:
+        def get_item(self, **kw):
+            key = kw.get("Key") or {}
+            if key.get("pk") == "REGISTRY" and key.get("sk") == "ENTITY_INDEX_READY":
+                return {"Item": {"pk": "REGISTRY", "sk": "ENTITY_INDEX_READY"}}
+            return {}
+
+        def query(self, **kw):
+            raise _Throttle()
+
+    t2 = ConsumptionTools(
+        s3=tools.s3,
+        s3vectors=tools.s3vectors,
+        bedrock_runtime=tools.bedrock_runtime,
+        ddb=_FakeDdb(),
+        config=config,
+    )
+    with _pytest.raises(_Throttle):
+        t2.list_domains(limit=2)

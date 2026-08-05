@@ -63,6 +63,7 @@ def _patch(monkeypatch, agent, transitions):
         status,
         detail=None,
         only_if_active=False,
+        session_id=None,
         model=None,
         effort=None,
         subagent_model=None,
@@ -73,8 +74,16 @@ def _patch(monkeypatch, agent, transitions):
         transitions.append(
             (status, detail, subagent_model, subagent_effort, reviewer_model)
         )
+        return True  # the write landed (False = a cancel won the race)
 
     monkeypatch.setattr(runner, "report_status", fake_report)
+    # The follow-on build's feature flag reads as ON here so the stubs below
+    # are reachable (the flag gate itself has its own test); the real
+    # maybe_build_policy is stubbed so nothing ever authors.
+    monkeypatch.setattr(runner, "build_enabled", lambda: True)
+    monkeypatch.setattr(runner, "maybe_build_policy", lambda **kw: "disabled")
+    monkeypatch.setattr(runner, "publish_rebuild_event", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_wait_for_bundle_flush", lambda **kw: None)
 
 
 def test_full_harvest_reports_running_then_complete(tmp_path, monkeypatch):
@@ -89,6 +98,167 @@ def test_full_harvest_reports_running_then_complete(tmp_path, monkeypatch):
     )
 
     assert [t[0] for t in transitions] == ["running", "complete"]
+
+
+def test_full_harvest_builds_policy_after_the_terminal_write(tmp_path, monkeypatch):
+    # The follow-on guardrails build fires exactly once, AFTER the `complete`
+    # write has landed — the moved-out-of-finalize contract (the harvest is
+    # DONE at the commit; the build serializes via its own `building` lock).
+    transitions: list[tuple] = []
+    _patch(monkeypatch, _OkAgent(), transitions)
+    builds: list[list[str]] = []
+    monkeypatch.setattr(
+        runner,
+        "maybe_build_policy",
+        lambda **kw: builds.append([t[0] for t in transitions]) or "authored",
+    )
+
+    runner.run_full_harvest(
+        source=_Src(),
+        dataset_root=tmp_path / "s" / "db",
+        data_domain="s",
+        dataset="db",
+    )
+
+    assert len(builds) == 1
+    assert builds[0] == ["running", "complete"]  # complete landed FIRST
+
+
+def test_full_harvest_skips_policy_build_when_cancel_won(tmp_path, monkeypatch):
+    # report_status(complete) returning False means an operator cancel flipped
+    # the row first — authoring guardrails for that run would hold the build
+    # lock (and 409 the operator's next action) for a ghost.
+    transitions: list[tuple] = []
+    _patch(monkeypatch, _OkAgent(), transitions)
+
+    def cancelled_report(registry, *, status, **kw):
+        transitions.append((status,))
+        return status != "complete"
+
+    monkeypatch.setattr(runner, "report_status", cancelled_report)
+    builds: list[str] = []
+    monkeypatch.setattr(
+        runner, "maybe_build_policy", lambda **kw: builds.append("build")
+    )
+
+    runner.run_full_harvest(
+        source=_Src(),
+        dataset_root=tmp_path / "s" / "db",
+        data_domain="s",
+        dataset="db",
+    )
+
+    assert builds == []
+
+
+def test_wait_for_bundle_flush_polls_until_the_marker_lands(monkeypatch):
+    # The bundle is written through the S3 Files mount, whose flush can lag
+    # the terminal write by a minute — gathering early fingerprints a partial
+    # wiki and the fresh document immediately reads "out of date" (live
+    # 2026-08-04). The wait polls for the commit marker, then adds a settle
+    # margin (the flush is not strictly ordered).
+    import time as _time
+
+    import boto3
+
+    import okf_aws
+
+    monkeypatch.setenv("OKF_BUNDLE_BUCKET", "b")
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: object())
+    states = iter([None, {"status": "in_progress"}, {"status": "complete"}])
+    monkeypatch.setattr(
+        okf_aws, "bundle_marker_state", lambda *a, **k: next(states)
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+
+    runner._wait_for_bundle_flush(data_domain="s", dataset="db")
+
+    # Two 5s polls while the marker was absent/mid-write, then the settle.
+    assert sleeps == [5, 5, runner._POST_MARKER_SETTLE_S]
+
+
+def test_wait_for_bundle_flush_ignores_the_previous_runs_marker(monkeypatch):
+    # On a re-harvest, the PREVIOUS run's `complete` marker is still the
+    # visible S3 object until the mount flushes (mark_in_progress's overwrite
+    # lags too) — a bare status check would return immediately and the build
+    # would fingerprint the PRE-run wiki. Pinning on completed_at holds the
+    # wait until THIS run's marker is the one visible.
+    import time as _time
+
+    import boto3
+
+    import okf_aws
+
+    monkeypatch.setenv("OKF_BUNDLE_BUCKET", "b")
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: object())
+    states = iter(
+        [
+            {"status": "complete", "completed_at": "2026-08-04T20:00:00+00:00"},
+            {"status": "complete", "completed_at": "2026-08-04T21:00:00+00:00"},
+        ]
+    )
+    monkeypatch.setattr(
+        okf_aws, "bundle_marker_state", lambda *a, **k: next(states)
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+
+    runner._wait_for_bundle_flush(
+        data_domain="s", dataset="db", completed_at="2026-08-04T21:00:00+00:00"
+    )
+
+    # One 5s poll rejecting the OLD marker, then this run's marker + settle.
+    assert sleeps == [5, runner._POST_MARKER_SETTLE_S]
+
+
+def test_wait_for_bundle_flush_noop_without_a_bucket(monkeypatch):
+    monkeypatch.delenv("OKF_BUNDLE_BUCKET", raising=False)
+    runner._wait_for_bundle_flush(data_domain="s", dataset="db")  # returns fast
+
+
+def test_follow_on_build_skips_the_flush_wait_when_disabled(monkeypatch):
+    # With OKF_POLICY_BUILD_ENABLED off (the default), maybe_build_policy is
+    # a no-op — the up-to-190s flush wait would be pure billed runtime waste,
+    # so the flag is checked FIRST and nothing below it runs.
+    monkeypatch.setattr(runner, "build_enabled", lambda: False)
+    touched: list[str] = []
+    monkeypatch.setattr(
+        runner, "_wait_for_bundle_flush", lambda **kw: touched.append("wait")
+    )
+    monkeypatch.setattr(
+        runner, "maybe_build_policy", lambda **kw: touched.append("build")
+    )
+
+    runner._follow_on_policy_build(data_domain="s", dataset="db", completed=True)
+
+    assert touched == []
+
+
+def test_full_harvest_locked_build_leaves_a_rebuild_trigger(tmp_path, monkeypatch):
+    # Losing the flip race (the previous harvest's author still running) must
+    # leave a policy_rebuild trigger behind, or the newer wiki's re-author
+    # waits for the nightly reconcile.
+    transitions: list[tuple] = []
+    _patch(monkeypatch, _OkAgent(), transitions)
+    monkeypatch.setattr(
+        runner, "maybe_build_policy", lambda **kw: runner.OUTCOME_LOCKED
+    )
+    published: list[tuple] = []
+    monkeypatch.setattr(
+        runner,
+        "publish_rebuild_event",
+        lambda d, ds, *, reason: published.append((d, ds, reason)),
+    )
+
+    runner.run_full_harvest(
+        source=_Src(),
+        dataset_root=tmp_path / "s" / "db",
+        data_domain="s",
+        dataset="db",
+    )
+
+    assert published == [("s", "db", "post_harvest_build_locked")]
 
 
 def test_full_harvest_stamps_subagent_override_on_running(tmp_path, monkeypatch):

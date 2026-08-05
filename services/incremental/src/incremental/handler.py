@@ -40,6 +40,7 @@ import logging
 import os
 from typing import Any, Callable
 
+from okf_aws import ar_policy
 from okf_aws.s3_bundle import is_bundle_ready
 from okf_core import policy_rebuild
 from okf_core.session import runtime_session_id
@@ -71,6 +72,7 @@ def process_event(
     registry_table: str,
     freshness_table: str,
     harvest_runtime_arn: str,
+    ddb_client=None,
 ) -> dict[str, Any]:
     """Handle one Glue table-change ``detail``. Returns a result dict for logging.
 
@@ -170,6 +172,36 @@ def process_event(
     # version, so the change is re-detected (by the next event or the nightly
     # reconcile) once the in-flight harvest finishes — no update is lost.
     session_id = _session_id(data_domain, dataset)
+    # A live guardrails authoring run also defers the re-harvest: the harvest
+    # row is terminal while the author reads the committed wiki, so the lease
+    # alone can't see it. Same no-version-recorded semantics as skipped_locked
+    # — the change is re-detected once the build lands. The SHARED gate (one
+    # staleness window fleet-wide) speaks typed attributes, so it needs the
+    # LOW-LEVEL client — never the resource's `.meta.client`, whose
+    # document-type transformer double-serializes typed keys.
+    if ddb_client is None:
+        import boto3
+
+        ddb_client = boto3.client(
+            "dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-1")
+        )
+    if ar_policy.build_lock_active(
+        ddb_client, registry_table, data_domain=data_domain, dataset=dataset
+    ):
+        log.info(
+            "Guardrails authoring in flight for %s/%s; deferring table=%s "
+            "(will be re-detected)",
+            data_domain,
+            dataset,
+            table,
+        )
+        return {
+            "action": "skipped_guardrails_building",
+            "data_domain": data_domain,
+            "dataset": dataset,
+            "table": table,
+            "version_id": current_version,
+        }
     if not store.acquire_harvest_lease(
         ddb,
         registry_table,
@@ -365,6 +397,7 @@ def lambda_handler(
                 registry_table=registry_table,
                 freshness_table=freshness_table,
                 harvest_runtime_arn=harvest_runtime_arn,
+                ddb_client=clients.get("ddb_client"),
             )
         except Exception:  # noqa: BLE001 - one bad record must not fail the batch
             log.exception("Failed to process SQS record %s", message_id)

@@ -64,7 +64,8 @@ def test_registered_wrappers_delegate(tools):
     page = mcp.registered["read_page"]("tables/races", DOMAIN, DATASET, 0, 2)
     assert page["returned_lines"] == 2
     domains = mcp.registered["list_domains"]()
-    assert any(d["dataset"] == DATASET for d in domains)
+    assert any(d["dataset"] == DATASET for d in domains["datasets"])
+    assert domains["next_cursor"] is None  # everything fits one page here
 
 
 def _wrapper_doc(tools, name: str) -> str:

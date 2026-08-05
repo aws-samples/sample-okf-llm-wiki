@@ -10,7 +10,7 @@ files are policy material, and the fingerprint a document is stamped with);
 this module owns everything S3/DynamoDB-shaped around them, because three
 services touch the same shapes and must never disagree:
 
-* **harvest** (finalize hook + ``mode="ar_rules"``) — gather sources, run the
+* **harvest** (post-complete follow-on + ``mode="ar_rules"``) — gather sources, run the
   author, persist the document + author state, stamp the row.
 * **incremental** (the rebuild authority) — fingerprint-compare and dispatch
   authoring runs; reap abandoned ``building`` rows.
@@ -37,7 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from okf_aws.s3_bundle import bundle_prefix
@@ -475,15 +475,24 @@ def try_flip_building(
     """Claim the dataset's authoring slot. True when this caller owns the run.
 
     THE serialization point for the whole feature: the flip to ``building`` is a
-    conditional UpdateItem, so the finalize hook, the nightly reconcile and N
-    duplicate ``policy_rebuild`` events collapse to exactly one authoring run.
+    conditional UpdateItem, so the post-harvest build, the nightly reconcile and
+    N duplicate ``policy_rebuild`` events collapse to exactly one authoring run.
     Returns False (never raises) when another run already holds the row, and
     False when the mapping row is gone.
+
+    STALENESS TAKEOVER, symmetric with :func:`build_lock_active`: a ``building``
+    flip older than :data:`BUILD_LOCK_STALE_SECONDS` is a dead author — past
+    that window the READERS already treat the lock as free (harvests proceed),
+    so the flip must too, or every completed harvest's follow-on build would
+    silently lose to the corpse until the reconcile reaps it.
 
     ``pending_hash`` is the fingerprint of the sources this run is about to
     author from, parked on :data:`ATTR_PENDING_SOURCE_HASH` for the ready
     stamp to carry over verbatim.
     """
+    stale_cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=BUILD_LOCK_STALE_SECONDS)
+    ).isoformat(timespec="seconds")
     try:
         _set_attrs(
             ddb,
@@ -497,10 +506,14 @@ def try_flip_building(
             },
             condition=(
                 "attribute_exists(pk) AND "
-                "(attribute_not_exists(#bs) OR #bs <> :building)"
+                "(attribute_not_exists(#bs) OR #bs <> :building "
+                "OR ar_build_started_at < :stale)"
             ),
             extra_names={"#bs": ATTR_BUILD_STATUS},
-            extra_values={":building": {"S": BUILD_BUILDING}},
+            extra_values={
+                ":building": {"S": BUILD_BUILDING},
+                ":stale": {"S": stale_cutoff},
+            },
         )
         return True
     except Exception as e:  # noqa: BLE001 - a lost condition means "already building"
@@ -591,3 +604,48 @@ def lifecycle_begun(item: dict[str, Any] | None) -> bool:
     paths. An absent row or absent ``ar_build_status`` has NOT begun.
     """
     return bool(((item or {}).get(ATTR_BUILD_STATUS) or {}).get("S"))
+
+
+#: How long a ``building`` flip may block bundle-WRITING work (harvest starts,
+#: repromotes) before it reads as abandoned. Authoring is minutes-scale; a row
+#: stuck at ``building`` past this is a dead run the reconcile will reap, and
+#: it must not wedge harvests until then.
+BUILD_LOCK_STALE_SECONDS = 3600
+
+
+def build_lock_active(
+    ddb, registry_table: str, *, data_domain: str, dataset: str
+) -> bool:
+    """Whether a FRESH policy-authoring run holds this dataset's build lock.
+
+    True only when the mapping row says ``building`` AND the flip
+    (``ar_build_started_at``) is younger than :data:`BUILD_LOCK_STALE_SECONDS`.
+    Bundle-writing work (harvest/annotation/cross starts, repromotes, the
+    incremental orchestrator) checks this BEFORE taking the harvest lease:
+    the harvest status row goes terminal at the bundle commit, so the policy
+    author — still reading the just-committed wiki — is the only writer left
+    to serialize against. Fail-open on read errors: the gate is a courtesy,
+    not a correctness requirement (a wiki that moves mid-authoring yields a
+    stale-on-arrival document that self-heals via the rebuild path).
+    """
+    try:
+        item = (
+            ddb.get_item(
+                TableName=registry_table, Key=registry_key(data_domain, dataset)
+            ).get("Item")
+            or {}
+        )
+        if str((item.get(ATTR_BUILD_STATUS) or {}).get("S") or "") != BUILD_BUILDING:
+            return False
+        started = str((item.get("ar_build_started_at") or {}).get("S") or "")
+        if not started:
+            # Building with no start stamp (shouldn't happen) — treat as held;
+            # the reconcile reaps abandoned rows either way.
+            return True
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=BUILD_LOCK_STALE_SECONDS)
+        ).isoformat(timespec="seconds")
+        return started >= cutoff
+    except Exception:  # noqa: BLE001 - fail-open (see docstring)
+        log.warning("build-lock read failed (treating as free)", exc_info=True)
+        return False
