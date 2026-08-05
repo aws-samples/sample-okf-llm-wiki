@@ -29,6 +29,16 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 
+class ResultCapExceeded(RuntimeError):
+    """A ``run_query(max_rows=...)`` result outgrew its cap.
+
+    Raised mid-collection so an unbounded predicted/gold query can't buffer
+    millions of rows into memory. The benchmark grader matches this BY NAME
+    (it stays import-free of the source layer) and classifies it as a
+    deterministic grading failure, never a transient one.
+    """
+
+
 @dataclass(frozen=True)
 class ConceptRef:
     """A source-advertised concept. Mirrors the reference agent's ConceptRef.
@@ -76,6 +86,10 @@ class SourceMetadataProfile:
     #: Table-property keys that hint at a row count WITHOUT a billed scan, in
     #: preference order (Glue crawler/ETL ``Parameters`` keys for a glue source).
     rowcount_param_keys: tuple[str, ...]
+    #: Table-property keys that hint at the table's BYTE size, in preference
+    #: order — the profile scan budget (harvest/profile.py) samples any table
+    #: above its threshold, and treats a table with NO size hint as large.
+    bytesize_param_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -165,7 +179,30 @@ class Source(Protocol):  # pragma: no cover - typing only
         ...
 
     def run_query(
-        self, query: str, *, timeout_s: float = 60.0, poll_s: float = 1.0
-    ) -> list[dict[str, str | None]]:
-        """Run a read-only query and return rows as dicts (SQL NULL -> None)."""
+        self,
+        query: str,
+        *,
+        timeout_s: float = 60.0,
+        poll_s: float = 1.0,
+        max_rows: int | None = None,
+        positional: bool = False,
+        stats: dict[str, Any] | None = None,
+        truncate_at: int | None = None,
+    ) -> list[dict[str, str | None]] | tuple[list[str], list[list[str | None]]]:
+        """Run a read-only query and return rows as dicts (SQL NULL -> None).
+
+        ``positional=True`` returns ``(header, rows)`` with each row a
+        positional list instead — required by the benchmark grader, where
+        header-keyed dicts would collapse duplicate SELECT labels. ``max_rows``
+        (None = unbounded) raises :class:`ResultCapExceeded` past the cap;
+        ``truncate_at`` is the soft variant (stop collecting, flag
+        ``stats["truncated"]``) the agent-facing run_sql tool uses.
+        ``stats`` (optional caller-owned dict) receives execution telemetry
+        (``data_scanned_bytes`` / ``engine_ms``) where the engine exposes it.
+
+        Optional SQL capability atoms a source MAY additionally provide (looked
+        up with ``getattr``; see harvest/profile.py and source_tools.py):
+        ``sql_table_ref(table)``, ``sql_approx_distinct(col_sql)``,
+        ``sql_sample_clause(percent)``, and the ``supports_explain`` flag.
+        """
         ...

@@ -600,7 +600,11 @@ conditional on the row still being in flight AND still being THIS run's
 (`runtime_session_id` must match when the runner knows its own — a hung
 run's late write must not clobber a successor that took the lease via the
 staleness escape, nor trigger a ghost policy build against its mid-write
-bundle). That step runs only when the terminal
+bundle). The session pin alone can't protect the INCREMENTAL path, whose
+session id is deliberately deterministic per dataset (two successive
+incremental runs share it) — so the runner also pins on `started_at`
+(`status.read_run_identity`): every lease acquire rewrites it and no later
+write touches it, making it a per-run identity the condition checks too. That step runs only when the terminal
 write actually landed (`report_status` returns False when a cancel won the
 race — no authoring for a cancelled run), is SKIPPED outright when the
 policy feature is off (`OKF_POLICY_BUILD_ENABLED` unset — no flush wait for
@@ -793,9 +797,16 @@ POLLS rows for live progress, there is no benchmark CloudWatch feed), headline
 KPIs once complete (`<check>_raw`, `<check>_adjusted`, `<check>_graded`,
 `total_tokens`, `annotation_candidates`), and the annotation-aggregation
 sub-lifecycle (`agg_status`: `idle | running | complete | failed`,
-`annotation_final_count`). The Control API writes the QUEUED row (conditional
-PutItem) and invokes the runtime; the runtime owns everything after via
-UpdateItem. **No lease semantics**: benchmark runs never touch the `STATUS`
+`agg_detail` — the aggregation's OWN failure reason, separate from the run's
+`detail` so an agg failure never clobbers the run's; cleared on every agg
+start — and `annotation_final_count`). The Control API writes the QUEUED row
+(conditional PutItem) and invokes the runtime; the runtime owns everything
+after via UpdateItem — terminal statuses (`complete`/`failed`, agg included)
+retry a transient DynamoDB fault a few times, since the terminal write has no
+later write to correct it. Starting an aggregation flips `agg_status` with a
+CONDITIONAL UpdateItem ("not already running unless the `updated_at` heartbeat
+is past the 8h stale cutoff" — the same escape as report deletion), so a dead
+aggregator is retryable and two concurrent POSTs can't both start one. **No lease semantics**: benchmark runs never touch the `STATUS`
 row — they write nothing to the bundle, so they run concurrently with harvests
 and with each other. Rows persist until the user deletes the report (no TTL).
 
@@ -850,9 +861,12 @@ keying the `by-entity` GSI (projection ALL). Listings **Query** it instead of
 Scan-with-filter: a Scan reads the whole table (harvest status + `REPORT#`
 rows included), so its cost grows with usage rather than with the dataset
 count. Every writer stamps the attributes (`upsert_domain_mapping`,
-`declare_domain`, reindex's XREF upsert); rows written before the index
-existed need `scripts/backfill_registry_entity.py` (deploy.sh runs it after
-every durable apply — idempotent), whose LAST step writes the readiness
+`declare_domain`, reindex's XREF upsert — all via the `okf_aws.registry_entity`
+vocabulary); rows written before the index existed need
+`scripts/backfill_registry_entity.py` (deploy.sh runs it at the END of the
+compute stage — after the writers that stamp the attributes are deployed,
+so no row can land unstamped once the marker exists — idempotent), whose
+LAST step writes the readiness
 marker row `pk = "REGISTRY"`, `sk = "ENTITY_INDEX_READY"`. Readers Query the
 index ONLY once that marker exists (`okf_aws.registry_entity` — the one
 shared read protocol) and use the legacy filtered Scan until then: a GSI
@@ -950,7 +964,9 @@ durable row; the worst a stray `expires_at` can do is delete an annotation.
 **Annotation.** `pk = "ANNO#<data_domain>#<dataset>#<user_sub>"`,
 `sk = "<concept_id>#<annotation_id>"`, attrs `{data_domain, dataset, concept_id,
 annotation_id, author?, quote, prefix?, suffix?, block_line?, note, status,
-outcome?, resolution?, created_at, updated_at, expires_at?}`.
+outcome?, resolution?, report_id?, created_at, updated_at, expires_at?}`
+(`report_id` only on `submitted_via: "benchmark"` items — the report the note
+was applied from, provenance only).
 
 **Isolation is structural.** The author's immutable Cognito `sub` is baked into
 the partition key, so a user's `Query` can only ever return their OWN annotations
@@ -1144,11 +1160,18 @@ are retired end to end. The payload (`okf_core.benchmark_report` field names):
   "runs": 3,
   "version_id": "",
   "questions_key": "benchmark/sales/orders/questions.csv",
+  "questions_version_id": "3sL4kqQJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo",
   "solver_model": "global.anthropic.claude-sonnet-5", "solver_effort": "high",
   "judge_model": "global.anthropic.claude-opus-5", "judge_effort": "xhigh",
   "behavior_live_sql": false,
   "source": {"type": "glue", "glue_database": "orders"} }
 ```
+
+`questions_version_id` (optional) is the CSV's S3 VersionId as the Control API
+validated/counted it at start — the bundle bucket is versioned, so the runtime
+GETs exactly that version and a re-upload between start and the fetch can't
+swap the graded set. Absent (older payloads, or a CSV written while the bucket
+was unversioned) → the runtime reads the latest object.
 
 `behavior_live_sql` (optional, default false; also a `BOOL` on the REPORT#
 row's config summary when true) hands the BEHAVIOR solver read-only `run_sql`
@@ -1227,15 +1250,26 @@ the run or an aggregation is genuinely active, but a row whose `updated_at`
 heartbeat predates the harvest-lease stale cutoff (8 h) is deletable — a
 killed runtime must not leave an immortal zombie — and the runtime's row
 writes are conditional on the row existing, so a late finish can't resurrect
-a deleted report. Deleting the DATASET purges the whole
-`benchmark/<d>/<ds>/` prefix (questions.csv + all report artifacts) and every
-`REPORT#` row along with the bundle. `POST .../runs/{report_id}/aggregate`
+a deleted report (the runtime also re-checks the row before persisting the S3
+artifacts, so a delete mid-run doesn't leave orphaned gold behind). Because
+the bundle bucket is VERSIONED, deletion purges **every object version and
+delete marker** under the report prefix (`list_object_versions` + per-version
+deletes) — a plain delete would leave the gold readable as noncurrent
+versions. Deleting the DATASET purges the whole
+`benchmark/<d>/<ds>/` prefix the same versioned way (questions.csv + all
+report artifacts) and every `REPORT#` row along with the bundle. `POST
+.../runs/{report_id}/aggregate`
 kicks `mode: "aggregate_annotations"` — the ReAct aggregator dedupes the
 candidates into the final set on the report — and `POST
 .../runs/{report_id}/annotations` batch-creates the human-selected set as
 normal annotations with `submitted_via: "benchmark"` (validated whole-batch
-before anything is written — no partial commits); an unscoped annotation
-harvest then applies them. The judge reads each solver's trace — what it
+before anything is written — no partial commits; the path's `report_id` must
+name an existing report row and is stamped on each created annotation for
+provenance); an unscoped annotation
+harvest then applies them. On both start routes (run + aggregate) the Control
+API reads the invoke's synchronous ack: a `{"status": "rejected"}` from the
+runtime flips the row to `failed` (run `detail` / `agg_detail`) and answers
+502 — an accepted invoke API call is not an accepted payload. The judge reads each solver's trace — what it
 searched, which docs it opened — which is what separates "the wiki never
 says this" from "the wiki says it and the solver never found it"; beyond the
 per-case inline summaries, ALL traces are laid into the judge's file tree as
@@ -1346,10 +1380,18 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_HARVEST_MAX_TOKENS` | harvest model max output tokens. Default is provider-aware when unset: `128000` for Converse (Opus 4.8), `32000` for GPT. An explicit value always wins |
 | `OKF_HARVEST_MAX_SUBAGENT_CONCURRENCY` | how many dynamic subagents run at once on a `task()` fan-out (default `5`). This lowers langchain_quickjs's per-REPL `task()` semaphore, so a `Promise.all` keeps at most this many crawls in flight and queues the rest. It is not `config.max_concurrency` — the fan-out is a QuickJS `Promise.all`, not a LangGraph batch, so only the semaphore bounds it. |
 | `OKF_HARVEST_BEDROCK_READ_TIMEOUT` | botocore read timeout in seconds for the harvest bedrock-runtime client (default `600`). Botocore's 60s default is too low: one xhigh Opus 4.8 turn can generate for minutes, and a slow Converse response would otherwise raise `ReadTimeoutError` and fail the harvest. |
+| `OKF_HARVEST_SQL_MAX_ROWS` | soft row cap on the agent-facing `run_sql` tool's result (default `200`). Collection stops at the cap and the tool reports `truncated: true` — a hint to the agent to add a LIMIT or aggregate — instead of buffering an unbounded result into its context. Distinct from the benchmark grader's hard `OKF_BENCHMARK_GRADER_MAX_ROWS` (which raises: a truncated set can't be equality-graded) |
+| `OKF_HARVEST_PROFILE_ENABLED` | `"0"` disables the snapshot-time column profiles (`.metadata/profile/<table>.md` — null share, ~distinct, min/max, top-K values; see `harvest/profile.py`). Default on. Profiles are best-effort: any failure downgrades to a manifest note, never fails the snapshot |
+| `OKF_HARVEST_PROFILE_SAMPLE_ABOVE_BYTES` | byte-size threshold above which a table is profiled from a sample instead of a full scan (default 1 GiB). The size comes from the catalog's size hint; a table with NO hint is treated as large. Sampled sheets are stamped INDICATIVE — value lists from a sample are never treated as closed enums |
+| `OKF_HARVEST_PROFILE_TARGET_SAMPLE_BYTES` | the scan budget one sampled profile aims for (default 256 MiB) — the sample percent is `target/size`, clamped to 0.01–100 |
+| `OKF_HARVEST_PROFILE_ENUM_MAX_DISTINCT` / `OKF_HARVEST_PROFILE_TOPK` / `OKF_HARVEST_PROFILE_MAX_ENUM_QUERIES` | value-list bounds: only columns with ~distinct ≤ the first (default `50`) get a value list, capped at TOPK values (default `20`), at most MAX_ENUM_QUERIES per table (default `15`, most enum-like first). Higher-cardinality columns report the count only ("not enumerated") |
+| `OKF_HARVEST_PROFILE_MAX_COLUMNS` / `OKF_HARVEST_PROFILE_BUDGET_S` / `OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S` | remaining cost caps: columns profiled per table (default `100`), overall wall-clock budget for the whole profiling pass (default `600`s — tables past it are `skipped-budget` in the manifest), and per-query timeout (default `60`s). Reuse makes re-runs cheap: profiles persist on the mount and are fingerprint-keyed (catalog update time + version + column set), so incremental runs re-profile only the changed table and cross runs only mismatches; a full harvest always re-profiles |
 | `OKF_HARVEST_BEDROCK_CONNECT_TIMEOUT` | botocore connect timeout in seconds (default `10`) |
 | `OKF_HARVEST_BEDROCK_MAX_ATTEMPTS` | botocore `retries.max_attempts` in adaptive mode (default `5`); retries transient throttles and timeouts instead of failing the run |
 | `OKF_BENCHMARK_MAX_CONCURRENCY` | how many benchmark solver ReAct loops (and judge reviews) run at once in a Benchmark Studio run (default `10`). Its own `asyncio.Semaphore` — each solver is one in-flight model request at a time, so this is the peak concurrent Bedrock requests from the benchmark. Raise on generous quota, lower on `ThrottlingException`. `mode: "benchmark"` runs only. |
 | `OKF_BENCHMARK_ATHENA_CONCURRENCY` | how many benchmark grading queries (gold/predicted SQL EX executions) run against Athena at once (default `15`); size under the Athena workgroup's concurrent-DML limit. `mode: "benchmark"` runs only |
+| `OKF_BENCHMARK_GRADER_TIMEOUT_S` | per-query timeout in seconds for the SQL EX grader's Athena executions (default `60`). A timed-out query is best-effort cancelled (`stop_query_execution`) so it doesn't keep holding a workgroup slot; the timeout classifies as TRANSIENT (retried with backoff, never memoized). Grading only — the harvest's own `sample_rows`/`run_sql` keep their own timeout. `mode: "benchmark"` runs only |
+| `OKF_BENCHMARK_GRADER_MAX_ROWS` | row cap on one grading query's result set (default `50000`). Past the cap collection stops and the outcome is classified — gold → DISCARDED ("gold result exceeds N rows"), prediction → FAIL — instead of buffering an unbounded result. Grading only. `mode: "benchmark"` runs only |
 | `OKF_POLICY_BUILD_ENABLED` | (harvest, incremental) `"true"` → author and refresh policy documents from the wiki (default `false`). The runner's post-complete follow-on build and the rebuild authority both no-op when unset — an ALREADY-authored document keeps being usable, since usability is decided by the row's `ar_build_status` + fingerprint, not by this flag. Set from `var.enable_policy_build` |
 | `OKF_USER_POOL_ID` | Cognito user pool id (the Control API vends and revokes M2M app clients in this pool) |
 | `OKF_MCP_SCOPE` | the custom scope (`okf-mcp/invoke`) granted to vended M2M clients; must match the consumption authorizer's `allowed_scopes` |

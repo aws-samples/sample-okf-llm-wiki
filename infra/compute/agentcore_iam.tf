@@ -361,6 +361,21 @@ data "aws_iam_policy_document" "harvest" {
     resources = [local.d.annotations_table_arn]
   }
 
+  # Self-heal publishers: when the post-harvest guardrails build is skipped
+  # (another author holds the building flip) or a snapshot arrives already
+  # stale, the RUNNER publishes a `policy_rebuild` event so the repair isn't
+  # deferred to the nightly reconcile. publish_rebuild_event swallows failures,
+  # so a missing grant here fails SILENTLY — publish-only on the default bus,
+  # mirroring the chat role's ChatPolicyRebuildPublish.
+  dynamic "statement" {
+    for_each = local.ar_enabled ? [1] : []
+    content {
+      sid       = "HarvestPolicyRebuildPublish"
+      actions   = ["events:PutEvents"]
+      resources = [local.event_bus_arn]
+    }
+  }
+
   # S3 Files mount. Canonical form (AWS "File system configurations" doc): the
   # RESOURCE is the FILE-SYSTEM arn, gated by an ArnEquals condition on
   # s3files:AccessPointArn — NOT the access-point arn as the resource.

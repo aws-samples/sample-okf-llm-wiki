@@ -54,24 +54,29 @@
 }
 
 :root {
-    --background: oklch(0.9626 0.0021 197.1); /* #F1F3F3 — soft gray page */
-    --foreground: oklch(0.148 0.004 228.8);
+    /* LIGHT-mode neutrals are shadcn STONE (warm gray, hue ~50-106) — not
+       zinc/cool grays. The soft-gray-page structure is kept: --background
+       stays at the same lightness as before (page reads a step darker than
+       the white cards), only the hue moved to the stone family. This is
+       light-mode ONLY — dark mode keeps its cool grays on purpose (see .dark). */
+    --background: oklch(0.9626 0.0021 106.4); /* #F3F3F1 — soft warm-gray page */
+    --foreground: oklch(0.147 0.004 49.25);
     --card: oklch(1 0 0);
-    --card-foreground: oklch(0.148 0.004 228.8);
+    --card-foreground: oklch(0.147 0.004 49.25);
     --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0.148 0.004 228.8);
+    --popover-foreground: oklch(0.147 0.004 49.25);
     --primary: oklch(0.52 0.105 223.128);
     --primary-foreground: oklch(0.984 0.019 200.873);
-    --secondary: oklch(0.967 0.001 286.375);
-    --secondary-foreground: oklch(0.21 0.006 285.885);
-    --muted: oklch(0.963 0.002 197.1);
-    --muted-foreground: oklch(0.56 0.021 213.5);
-    --accent: oklch(0.963 0.002 197.1);
-    --accent-foreground: oklch(0.218 0.008 223.9);
+    --secondary: oklch(0.97 0.001 106.424);
+    --secondary-foreground: oklch(0.216 0.006 56.043);
+    --muted: oklch(0.963 0.002 106.4);
+    --muted-foreground: oklch(0.553 0.013 58.071);
+    --accent: oklch(0.963 0.002 106.4);
+    --accent-foreground: oklch(0.216 0.006 56.043);
     --destructive: oklch(0.577 0.245 27.325);
-    --border: oklch(0.925 0.005 214.3);
-    --input: oklch(0.925 0.005 214.3);
-    --ring: oklch(0.723 0.014 214.4);
+    --border: oklch(0.923 0.003 48.717);
+    --input: oklch(0.923 0.003 48.717);
+    --ring: oklch(0.709 0.01 56.259);
     /* Chart palette for LIGHT mode — anchored on the app's BRAND CYAN (--primary,
        hue ~223) and extending to the sidebar sky-blue (~237), so charts read as the
        Categorical (identity) hues, NOT a single-hue cyan ramp: an all-cyan chart
@@ -132,6 +137,10 @@
 }
 
 .dark {
+    /* Dark neutrals are deliberately NOT stone (unlike :root): the warm stone
+       band was tried in dark mode and rejected — these cool, faintly
+       cyan-tinted grays are the preferred dark look. Don't "align" them with
+       the light theme's stone family. */
     --background: oklch(0.1477 0.004 228.8); /* #090B0C — page background */
     --foreground: oklch(0.987 0.002 197.1);
     --card: oklch(0.218 0.008 223.9);

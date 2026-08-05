@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-from harvest.benchmark.react import is_recursion_limit
+from harvest.benchmark.react import count_nudges, is_recursion_limit
 
 _HAVE_LANGCHAIN = (
     importlib.util.find_spec("langchain") is not None
@@ -22,6 +22,22 @@ def test_is_recursion_limit_matches_by_name():
 
     assert is_recursion_limit(GraphRecursionError("Recursion limit of 40 reached"))
     assert not is_recursion_limit(ValueError("Recursion limit of 40 reached"))
+
+
+def test_count_nudges_handles_block_list_content():
+    # A provider round trip can re-shape a human message's string content into
+    # a block list — the nudge count must still see it, or the middleware
+    # nudges forever.
+    msgs = [
+        types.SimpleNamespace(type="human", content="NUDGE"),
+        types.SimpleNamespace(
+            type="human", content=[{"type": "text", "text": "NUDGE"}]
+        ),
+        types.SimpleNamespace(type="ai", content="NUDGE"),  # not a human message
+        types.SimpleNamespace(type="human", content="something else"),
+    ]
+    assert count_nudges(msgs, "NUDGE") == 2
+    assert count_nudges([], "NUDGE") == 0
 
 
 @pytest.mark.skipif(

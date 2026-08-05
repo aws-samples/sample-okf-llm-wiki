@@ -108,6 +108,28 @@ def test_no_header_raises():
         load_questions("")
 
 
+def test_quoted_fields_with_commas_and_embedded_newlines():
+    # Real gold SQL is multi-line and comma-heavy; the csv module must see one
+    # ROW per question, not one per physical line.
+    csv_text = (
+        "question,gold_sql,expected_behavior\n"
+        '"Wins, by driver?","SELECT name, wins\nFROM standings\nORDER BY wins",\n'
+        '"Pit stops?",,"Should say:\n- durations are not tracked\n- never invent one"\n'
+    )
+    out = load_questions(csv_text)
+    assert [q.question for q in out.questions] == ["Wins, by driver?", "Pit stops?"]
+    assert (
+        out.questions[0].gold_sql
+        == "SELECT name, wins\nFROM standings\nORDER BY wins"
+    )
+    assert out.questions[0].checks() == (CHECK_SQL,)
+    assert (
+        out.questions[1].expected_behavior
+        == "Should say:\n- durations are not tracked\n- never invent one"
+    )
+    assert out.check_counts == {CHECK_SQL: 1, CHECK_BEHAVIOR: 1}
+
+
 def test_blank_rows_skipped_and_ids_are_dense():
     csv_text = (
         "question,gold_sql\n"

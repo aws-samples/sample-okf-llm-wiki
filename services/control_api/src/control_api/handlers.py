@@ -460,8 +460,8 @@ def declare_domain(
             ":desc": {"S": description},
             ":ctx": {"S": context},
             ":now": {"S": now},
-            ":ent": {"S": "domain"},
-            ":pair": {"S": data_domain},
+            ":ent": {"S": registry_entity.ENTITY_DOMAIN},
+            ":pair": {"S": registry_entity.entity_pair(data_domain)},
         },
     )
     return {
@@ -641,8 +641,8 @@ def upsert_domain_mapping(
         "sk": {"S": f"DATASET#{dataset}"},
         # by-entity GSI keys (CONVENTIONS.md "Registry entity index") — what
         # lets listings Query instead of Scan.
-        "entity": {"S": "dataset"},
-        "pair": {"S": f"{data_domain}/{dataset}"},
+        "entity": {"S": registry_entity.ENTITY_DATASET},
+        "pair": {"S": registry_entity.entity_pair(data_domain, dataset)},
         "data_domain": {"S": data_domain},
         "dataset": {"S": dataset},
         "source": {"M": source_map},
@@ -940,13 +940,17 @@ def delete_domain_mapping(
     # 1. Bundle + benchmark + AR policy artifacts (+ cascade to vectors via
     #    Object-Deleted events for the .md keys). policy/<d>/<ds>/ holds the
     #    derived ar_rules.md + grounding.json — off-mount, like benchmark/.
+    #    benchmark/ carries GOLD, so it purges ALL versions (the bucket is
+    #    versioned; plain deletes leave gold readable as noncurrent versions).
     if s3 is not None and bundle_bucket:
         for prefix in (
             bundle_prefix(data_domain, dataset),
-            _benchmark_prefix(data_domain, dataset),
             ar_policy.policy_prefix(data_domain, dataset),
         ):
             purged_objects += _purge_s3_prefix(s3, bucket=bundle_bucket, prefix=prefix)
+        purged_objects += _purge_s3_prefix_versions(
+            s3, bucket=bundle_bucket, prefix=_benchmark_prefix(data_domain, dataset)
+        )
 
     # 2. Freshness rows: TABLE#<d>#<ds>#* / VERSION and VEC#<d>/<ds>/* / SEQ.
     if freshness_table:
@@ -975,6 +979,32 @@ def delete_domain_mapping(
     }
 
 
+def _checked_delete_objects(s3, *, bucket: str, objects: list[dict[str, str]]) -> int:
+    """One DeleteObjects call; returns how many S3 CONFIRMED deleted.
+
+    ``delete_objects`` reports per-key failures IN-BAND — HTTP 200 with an
+    ``Errors`` list (e.g. AccessDenied on a version-targeted delete) — so a
+    blind ``+= len(batch)`` counts objects that are still there. Any error
+    must raise: the delete handler drops the registry/REPORT# rows AFTER the
+    purge, and proceeding past a failed purge leaves the S3 artifacts alive
+    (readable, and resurrected by a re-register) while the API reports
+    success. Message bounded to the first few Code/Key pairs — a purge can
+    carry a thousand keys.
+    """
+    resp = s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+    errors = resp.get("Errors") or []
+    if errors:
+        sample = "; ".join(
+            f"{e.get('Code', '?')} on {e.get('Key', '?')}" for e in errors[:3]
+        )
+        raise ApiError(
+            502,
+            f"S3 purge failed for {len(errors)} object(s) under s3://{bucket}: "
+            f"{sample}",
+        )
+    return len(resp.get("Deleted") or [])
+
+
 def _purge_s3_prefix(s3, *, bucket: str, prefix: str) -> int:
     """Batch-delete every object under ``prefix``; returns the count deleted."""
     deleted = 0
@@ -982,13 +1012,37 @@ def _purge_s3_prefix(s3, *, bucket: str, prefix: str) -> int:
     for key in _iter_bundle_keys(s3, bucket=bucket, prefix=prefix):
         batch.append({"Key": key})
         if len(batch) == 1000:  # DeleteObjects hard limit
-            s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
-            deleted += len(batch)
+            deleted += _checked_delete_objects(s3, bucket=bucket, objects=batch)
             batch = []
     if batch:
-        s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
-        deleted += len(batch)
+        deleted += _checked_delete_objects(s3, bucket=bucket, objects=batch)
     return deleted
+
+
+def _purge_s3_prefix_versions(s3, *, bucket: str, prefix: str) -> int:
+    """Delete EVERY version and delete marker under ``prefix``; returns the count.
+
+    For gold-carrying prefixes (``benchmark/…``) in the VERSIONED bundle
+    bucket: a plain delete only stacks a delete marker and the objects stay
+    readable as noncurrent versions — "delete" must mean purge there.
+    """
+    deleted = 0
+    kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+    while True:
+        resp = s3.list_object_versions(**kwargs)
+        batch = [
+            {"Key": v["Key"], "VersionId": v["VersionId"]}
+            for group in ("Versions", "DeleteMarkers")
+            for v in resp.get(group, [])
+        ]
+        for i in range(0, len(batch), 1000):  # DeleteObjects hard limit
+            chunk = batch[i : i + 1000]
+            deleted += _checked_delete_objects(s3, bucket=bucket, objects=chunk)
+        if not resp.get("IsTruncated") or not resp.get("NextKeyMarker"):
+            return deleted
+        kwargs["KeyMarker"] = resp["NextKeyMarker"]
+        if resp.get("NextVersionIdMarker"):
+            kwargs["VersionIdMarker"] = resp["NextVersionIdMarker"]
 
 
 def _delete_report_rows(
@@ -1587,6 +1641,55 @@ def _report_pk(data_domain: str, dataset: str) -> str:
     return f"HARVEST#{data_domain}#{dataset}"
 
 
+def _invoke_ack(resp: Any) -> dict[str, Any] | None:
+    """Parse an ``invoke_agent_runtime`` ack body (best-effort, never raises).
+
+    The harvest entrypoint answers SYNCHRONOUSLY with a small JSON ack —
+    ``{"status": "accepted" | "rejected", ...}`` — inside the response's
+    streaming body. A payload the runtime rejects otherwise looks exactly like
+    success (the API itself returns 200), leaving the queued row to rot until
+    the stale escape. Returns None when there is no parseable ack.
+    """
+    try:
+        body = (resp or {}).get("response")
+        if body is None:
+            return None
+        if hasattr(body, "read"):
+            body = body.read()
+        if isinstance(body, (bytes, bytearray)):
+            body = bytes(body).decode("utf-8")
+        ack = json.loads(body)
+        return ack if isinstance(ack, dict) else None
+    except Exception:  # noqa: BLE001 - the ack is advisory; absence is not an error
+        return None
+
+
+def _fail_report_row(
+    ddb, *, registry_table: str, data_domain: str, dataset: str,
+    report_id: str, detail: str,
+) -> None:
+    """Best-effort flip of a REPORT# row to failed (start-path cleanup only)."""
+    from okf_core import benchmark_report as br
+
+    try:
+        ddb.update_item(
+            TableName=registry_table,
+            Key={
+                "pk": {"S": _report_pk(data_domain, dataset)},
+                "sk": {"S": br.report_sk(report_id)},
+            },
+            UpdateExpression="SET #s = :s, detail = :d, updated_at = :u",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": {"S": br.STATUS_FAILED},
+                ":d": {"S": detail[:1024]},
+                ":u": {"S": _now_iso()},
+            },
+        )
+    except Exception:  # noqa: BLE001 - best-effort cleanup
+        pass
+
+
 def _plain_attr(av: dict[str, Any] | None) -> Any:
     """One DynamoDB attribute value → a plain scalar (the row is flat by contract)."""
     if not isinstance(av, dict):
@@ -1653,11 +1756,19 @@ def start_benchmark_run(
     except br.BenchmarkRunConfigError as e:
         raise ApiError(400, str(e)) from e
 
+    # Registration preflight: an unregistered dataset must fail HERE with a
+    # 404, not minutes later on the row when the runtime tries to snapshot.
+    if not ddb.get_item(
+        TableName=registry_table,
+        Key={"pk": {"S": f"DOMAIN#{data_domain}"}, "sk": {"S": f"DATASET#{dataset}"}},
+    ).get("Item"):
+        raise ApiError(404, f"no such dataset: {data_domain}/{dataset}")
+
     # The question set: present, parseable, and USABLE for the enabled checks.
     questions_key = benchmark_questions_key(data_domain, dataset)
     try:
         obj = s3.get_object(Bucket=bucket, Key=questions_key)
-        text = obj["Body"].read(_BENCHMARK_CSV_MAX_BYTES).decode("utf-8")
+        raw = obj["Body"].read(_BENCHMARK_CSV_MAX_BYTES + 1)
     except Exception as e:  # noqa: BLE001 - a missing CSV is a user-fixable 400
         code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
         if code in ("NoSuchKey", "404", "NotFound"):
@@ -1665,8 +1776,20 @@ def start_benchmark_run(
                 400, "no question set uploaded — upload the CSV first"
             ) from e
         raise ApiError(502, f"could not read the question set: {e}") from e
+    if len(raw) > _BENCHMARK_CSV_MAX_BYTES:
+        # Same gate as inspect: reject rather than silently truncate at the cap.
+        raise ApiError(
+            400,
+            f"CSV exceeds the {_BENCHMARK_CSV_MAX_BYTES // (1024 * 1024)} MiB limit",
+        )
+    # Pin the exact object version graded (the bundle bucket is versioned):
+    # the payload carries it so a re-upload between start and the runtime's
+    # fetch can't swap the question set. "null" = written while unversioned.
+    questions_version_id = str(obj.get("VersionId") or "")
+    if questions_version_id.lower() == "null":
+        questions_version_id = ""
     try:
-        loaded = load_questions(text)
+        loaded = load_questions(raw.decode("utf-8"))
     except (BenchmarkCSVError, UnicodeDecodeError) as e:
         raise ApiError(400, f"invalid question set: {e}") from e
     enabled_counts = {c: loaded.check_counts.get(c, 0) for c in checks}
@@ -1684,6 +1807,12 @@ def start_benchmark_run(
         )
         if not any(m.version_id == version_id for m in markers):
             raise ApiError(400, f"unknown bundle version: {version_id}")
+
+    # Resolve the source BEFORE writing the queued row — a DDB read throwing
+    # after the PutItem would orphan a queued row no runtime will ever touch.
+    source = get_dataset_source(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
 
     now = _now_iso()
     report_id = br.new_report_id(
@@ -1740,6 +1869,8 @@ def start_benchmark_run(
         br.FIELD_VERSION_ID: version_id,
         br.FIELD_QUESTIONS_KEY: questions_key,
     }
+    if questions_version_id:
+        payload[br.FIELD_QUESTIONS_VERSION_ID] = questions_version_id
     if solver_model:
         payload[br.FIELD_SOLVER_MODEL] = solver_model
     if solver_effort:
@@ -1750,38 +1881,35 @@ def start_benchmark_run(
         payload[br.FIELD_JUDGE_EFFORT] = judge_effort
     if behavior_live_sql:
         payload[br.FIELD_BEHAVIOR_LIVE_SQL] = True
-    source = get_dataset_source(
-        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
-    )
     if source:
         payload["source"] = source
 
     try:
-        agentcore.invoke_agent_runtime(
-            agentRuntimeArn=runtime_arn,
-            runtimeSessionId=session_id,
-            payload=json.dumps(payload).encode(),
-            qualifier="DEFAULT",
+        ack = _invoke_ack(
+            agentcore.invoke_agent_runtime(
+                agentRuntimeArn=runtime_arn,
+                runtimeSessionId=session_id,
+                payload=json.dumps(payload).encode(),
+                qualifier="DEFAULT",
+            )
         )
     except Exception as e:  # noqa: BLE001 - flip the row so no phantom queued run
-        try:
-            ddb.update_item(
-                TableName=registry_table,
-                Key={
-                    "pk": {"S": _report_pk(data_domain, dataset)},
-                    "sk": {"S": br.report_sk(report_id)},
-                },
-                UpdateExpression="SET #s = :s, detail = :d, updated_at = :u",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":s": {"S": br.STATUS_FAILED},
-                    ":d": {"S": f"invoke failed: {e}"[:1024]},
-                    ":u": {"S": _now_iso()},
-                },
-            )
-        except Exception:  # noqa: BLE001 - best-effort cleanup
-            pass
+        _fail_report_row(
+            ddb, registry_table=registry_table, data_domain=data_domain,
+            dataset=dataset, report_id=report_id, detail=f"invoke failed: {e}",
+        )
         raise ApiError(502, f"could not start the benchmark run: {e}") from e
+    if isinstance(ack, dict) and ack.get("status") == "rejected":
+        # The invoke API returned 200, but the runtime's synchronous ack says
+        # it will never run the payload — without reading it the queued row
+        # would sit untouched until the stale escape.
+        err = str(ack.get("error") or "the runtime rejected the payload")
+        _fail_report_row(
+            ddb, registry_table=registry_table, data_domain=data_domain,
+            dataset=dataset, report_id=report_id,
+            detail=f"runtime rejected: {err}",
+        )
+        raise ApiError(502, f"the runtime rejected the benchmark run: {err}")
 
     return {
         "report_id": report_id,
@@ -1977,22 +2105,12 @@ def delete_benchmark_report(
             409, "an annotation aggregation is running; wait for it to finish"
         )
 
-    prefix = br.report_prefix(data_domain, dataset, report_id)
-    deleted = 0
-    token = None
-    while True:
-        kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
-        if token:
-            kwargs["ContinuationToken"] = token
-        resp = s3.list_objects_v2(**kwargs)
-        for obj in resp.get("Contents", []):
-            s3.delete_object(Bucket=bucket, Key=obj["Key"])
-            deleted += 1
-        if not resp.get("IsTruncated"):
-            break
-        token = resp.get("NextContinuationToken")
-        if not token:
-            break
+    # ALL versions: the bundle bucket is versioned, and a plain delete_object
+    # only stacks a delete marker — the gold-carrying artifacts would stay
+    # readable as noncurrent versions. Deletion means PURGE (CONVENTIONS.md).
+    deleted = _purge_s3_prefix_versions(
+        s3, bucket=bucket, prefix=br.report_prefix(data_domain, dataset, report_id)
+    )
     ddb.delete_item(
         TableName=registry_table,
         Key={
@@ -2015,9 +2133,13 @@ def start_annotation_aggregation(
 ) -> dict[str, Any]:
     """Kick the aggregator (mode=aggregate_annotations) for a COMPLETE report.
 
-    409 unless the report is complete and no aggregation is currently running.
-    The aggregator inherits the report's judge model (stored in the report's
-    config) — deliberately no model choice here.
+    409 unless the report is complete and no aggregation is genuinely running —
+    an ``agg_status=running`` whose heartbeat predates the lease-stale cutoff
+    is a dead aggregator (killed container, lost terminal write) and is
+    retryable, mirroring the delete route's escape. The flip to running is
+    CONDITIONAL on that same predicate so two concurrent POSTs can't both
+    start an aggregator. The aggregator inherits the report's judge model
+    (stored in the report's config) — deliberately no model choice here.
     """
     from okf_core import benchmark_report as br
 
@@ -2027,21 +2149,38 @@ def start_annotation_aggregation(
     )
     if _s(item.get("status")) != br.STATUS_COMPLETE:
         raise ApiError(409, "the report is not complete yet")
-    if _s(item.get("agg_status")) == br.AGG_RUNNING:
+    if _s(item.get("agg_status")) == br.AGG_RUNNING and not _report_row_is_stale(item):
         raise ApiError(409, "an aggregation is already running for this report")
 
-    ddb.update_item(
-        TableName=registry_table,
-        Key={
-            "pk": {"S": _report_pk(data_domain, dataset)},
-            "sk": {"S": br.report_sk(report_id)},
-        },
-        UpdateExpression="SET agg_status = :s, updated_at = :u",
-        ExpressionAttributeValues={
-            ":s": {"S": br.AGG_RUNNING},
-            ":u": {"S": _now_iso()},
-        },
-    )
+    stale_cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=HARVEST_LEASE_STALE_SECONDS)
+    ).isoformat()
+    try:
+        ddb.update_item(
+            TableName=registry_table,
+            Key={
+                "pk": {"S": _report_pk(data_domain, dataset)},
+                "sk": {"S": br.report_sk(report_id)},
+            },
+            # agg_detail cleared so a retry doesn't show a previous failure.
+            UpdateExpression="SET agg_status = :s, agg_detail = :empty, updated_at = :u",
+            # Closes the check-then-set race: re-assert "not already running
+            # unless stale" atomically at the flip itself.
+            ConditionExpression="agg_status <> :s OR updated_at < :cutoff",
+            ExpressionAttributeValues={
+                ":s": {"S": br.AGG_RUNNING},
+                ":u": {"S": _now_iso()},
+                ":empty": {"S": ""},
+                ":cutoff": {"S": stale_cutoff},
+            },
+        )
+    except Exception as e:  # noqa: BLE001 - a lost race is a clean 409
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            raise ApiError(
+                409, "an aggregation is already running for this report"
+            ) from e
+        raise
     session_id = runtime_session_id(
         data_domain, dataset, unique_token=f"agg-{report_id}-{uuid.uuid4().hex[:8]}"
     )
@@ -2051,14 +2190,8 @@ def start_annotation_aggregation(
         "mode": "aggregate_annotations",
         "report_id": report_id,
     }
-    try:
-        agentcore.invoke_agent_runtime(
-            agentRuntimeArn=runtime_arn,
-            runtimeSessionId=session_id,
-            payload=json.dumps(payload).encode(),
-            qualifier="DEFAULT",
-        )
-    except Exception as e:  # noqa: BLE001 - revert so the button isn't wedged
+
+    def _revert(detail: str) -> None:
         try:
             ddb.update_item(
                 TableName=registry_table,
@@ -2066,24 +2199,45 @@ def start_annotation_aggregation(
                     "pk": {"S": _report_pk(data_domain, dataset)},
                     "sk": {"S": br.report_sk(report_id)},
                 },
-                UpdateExpression="SET agg_status = :s, updated_at = :u",
+                UpdateExpression=(
+                    "SET agg_status = :s, agg_detail = :d, updated_at = :u"
+                ),
                 ExpressionAttributeValues={
                     ":s": {"S": br.AGG_FAILED},
+                    ":d": {"S": detail[:1024]},
                     ":u": {"S": _now_iso()},
                 },
             )
         except Exception:  # noqa: BLE001 - best-effort revert
             pass
+
+    try:
+        ack = _invoke_ack(
+            agentcore.invoke_agent_runtime(
+                agentRuntimeArn=runtime_arn,
+                runtimeSessionId=session_id,
+                payload=json.dumps(payload).encode(),
+                qualifier="DEFAULT",
+            )
+        )
+    except Exception as e:  # noqa: BLE001 - revert so the button isn't wedged
+        _revert(f"invoke failed: {e}")
         raise ApiError(502, f"could not start the aggregation: {e}") from e
+    if isinstance(ack, dict) and ack.get("status") == "rejected":
+        err = str(ack.get("error") or "the runtime rejected the payload")
+        _revert(f"runtime rejected: {err}")
+        raise ApiError(502, f"the runtime rejected the aggregation: {err}")
     return {"report_id": report_id, "agg_status": br.AGG_RUNNING}
 
 
 def apply_report_annotations(
     ddb,
     *,
+    registry_table: str,
     annotations_table: str,
     data_domain: str,
     dataset: str,
+    report_id: str,
     user_sub: str,
     author: str,
     annotations: Any,
@@ -2095,9 +2249,17 @@ def apply_report_annotations(
     ACTING user's sub with ``submitted_via="benchmark"``; a normal
     annotation-harvest then folds them into the wiki (zero new harvest
     machinery). The de-identification boundary moved from machine to human: the
-    user saw every note before it exists.
+    user saw every note before it exists. ``report_id`` must name an existing
+    report row (404 otherwise — the route carries it, so a stale/foreign id
+    must not mint annotations) and is stamped on each created annotation for
+    provenance.
     """
     user_sub = _require_user_sub(user_sub)
+    # Validates the id shape (400) and the row's existence (404).
+    _get_report_row(
+        ddb, registry_table=registry_table, data_domain=data_domain,
+        dataset=dataset, report_id=report_id,
+    )
     if not isinstance(annotations, list) or not annotations:
         raise ApiError(400, "annotations must be a non-empty list of {note, concept_id}")
     if len(annotations) > _REPORT_APPLY_MAX:
@@ -2140,6 +2302,7 @@ def apply_report_annotations(
                 concept_id=concept_id,
                 note=note,
                 submitted_via=anno.SUBMITTED_VIA_BENCHMARK,
+                report_id=report_id,
             )
         )
     return {"created": created, "count": len(created)}
@@ -3448,6 +3611,54 @@ def _publish_policy_rebuild(
         return False
 
 
+# How long a TERMINAL harvest status row may coexist with a bundle commit
+# marker still reading `in_progress` before that pair means a dead rewrite.
+# The runner writes its terminal status straight to DynamoDB while the
+# marker's own overwrite is still riding the S3 Files mount's write-back
+# cache (observed ~62s late — see the flush-wait comment in
+# harvest/runner.py), so for a minute after every SUCCESSFUL harvest the
+# terminal-row + in_progress-marker combination is the normal flush lag, not
+# a run that died. Sized well past the observed lag; the cost of waiting is
+# only that a genuinely dead rewrite reads "rewriting" a few minutes longer.
+WIKI_DEAD_REWRITE_GRACE_SECONDS = 600
+
+
+def _harvest_terminal_settled(
+    ddb, *, registry_table: str, data_domain: str, dataset: str
+) -> bool:
+    """Whether the harvest status row went terminal beyond the flush grace window.
+
+    The dead-rewrite verdict may only fire once this is True: a terminal row
+    younger than ``WIKI_DEAD_REWRITE_GRACE_SECONDS`` is a successful run whose
+    marker overwrite is still flushing through the S3 mount. A missing row or
+    timestamp settles immediately — there is no recent terminal write whose
+    flush could still be in flight. Fail-open on read errors, mirroring
+    :func:`harvest_lease_held`: an unreadable row cannot veto the verdict.
+    """
+    try:
+        item = (
+            ddb.get_item(
+                TableName=registry_table,
+                Key={
+                    "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+                    "sk": {"S": "STATUS"},
+                },
+            ).get("Item")
+            or {}
+        )
+    except Exception:  # noqa: BLE001 - fail-open (see docstring)
+        log.warning("harvest status read failed (treating as settled)", exc_info=True)
+        return True
+    ts = _s(item.get("updated_at")) or _s(item.get("started_at"))
+    if not ts:
+        return True
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=WIKI_DEAD_REWRITE_GRACE_SECONDS)
+    ).isoformat()
+    return ts < cutoff
+
+
 def get_reasoning_status(
     ddb,
     s3,
@@ -3481,11 +3692,24 @@ def get_reasoning_status(
     # "Rewriting" additionally requires a LIVE harvest lease: a failed or
     # cancelled run leaves the marker at `in_progress` FOREVER (nothing
     # restores it on the failure path), and without the cross-check the page
-    # would promise an auto re-author that is never coming.
+    # would promise an auto re-author that is never coming. "Dead" further
+    # requires the terminal status to have SETTLED past the mount-flush grace
+    # window: every successful harvest spends ~a minute with a terminal row
+    # and an `in_progress` marker (the marker overwrite lags through the S3
+    # mount), and calling that dead flashed a false "run a new harvest" after
+    # each success — see WIKI_DEAD_REWRITE_GRACE_SECONDS.
     marker = bundle_marker_status(s3, bucket, data_domain, dataset)
     wiki_ready = marker == "complete"
-    wiki_dead_rewrite = marker == "in_progress" and not harvest_lease_held(
-        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    wiki_dead_rewrite = (
+        marker == "in_progress"
+        and not harvest_lease_held(
+            ddb, registry_table=registry_table, data_domain=data_domain,
+            dataset=dataset,
+        )
+        and _harvest_terminal_settled(
+            ddb, registry_table=registry_table, data_domain=data_domain,
+            dataset=dataset,
+        )
     )
     wiki_rewriting = marker == "in_progress" and not wiki_dead_rewrite
     building = status == ar_policy.BUILD_BUILDING
@@ -3992,6 +4216,8 @@ def _annotation_to_dict(item: dict[str, Any]) -> dict[str, Any]:
         "note": _s(item.get("note")),
         # "ui" (default) or "agent" — the chat agent filing on the user's behalf.
         "submitted_via": _s(item.get("submitted_via")) or anno.SUBMITTED_VIA_UI,
+        # Benchmark provenance: which report the note was applied from.
+        "report_id": _s(item.get("report_id")),
         "status": _s(item.get("status")),
         "outcome": _s(item.get("outcome")),
         "resolution": _s(item.get("resolution")),
@@ -4015,6 +4241,7 @@ def create_annotation(
     suffix: str = "",
     block_line: int | None = None,
     submitted_via: str = "",
+    report_id: str = "",
 ) -> dict[str, Any]:
     """Persist one open annotation, scoped to the caller.
 
@@ -4028,7 +4255,8 @@ def create_annotation(
     ``anno.DATASET_WIDE_CONCEPT`` sentinel. Unanchored notes skip quote
     re-anchoring in the harvest sweep (they orphan only if the doc vanishes;
     dataset-wide never). ``submitted_via`` records provenance ("ui" default,
-    "agent" when the chat agent files on the user's behalf).
+    "agent" when the chat agent files on the user's behalf); ``report_id``
+    (benchmark provenance only) records which report the note came from.
     """
     user_sub = _require_user_sub(user_sub)
     if not concept_id:
@@ -4075,6 +4303,8 @@ def create_annotation(
         item["suffix"] = {"S": suffix[:_ANNO_CONTEXT_MAX]}
     if block_line is not None:
         item["block_line"] = {"N": str(int(block_line))}
+    if report_id:
+        item["report_id"] = {"S": report_id}
     ddb.put_item(TableName=annotations_table, Item=item)
     return _annotation_to_dict(item)
 

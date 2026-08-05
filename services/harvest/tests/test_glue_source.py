@@ -1,7 +1,7 @@
 import pytest
 
-from harvest.glue_source import GlueAthenaSource
-from tests.fakes import FakeAthena, f1_like_glue
+from harvest.glue_source import GlueAthenaSource, ResultCapExceeded
+from tests.fakes import FakeAthena, QueryKeyedAthena, f1_like_glue
 
 
 def _source(athena=None):
@@ -80,6 +80,39 @@ def test_run_query_raises_on_failed_state():
     with pytest.raises(RuntimeError) as e:
         src.run_query("SELECT 1")
     assert "FAILED" in str(e.value)
+
+
+def test_run_query_timeout_cancels_query():
+    # A timed-out query must be best-effort cancelled — an orphaned execution
+    # keeps holding an Athena workgroup slot after we stop waiting for it.
+    athena = FakeAthena(state="RUNNING")  # never reaches a terminal state
+    src = _source(athena=athena)
+    with pytest.raises(TimeoutError):
+        src.run_query("SELECT 1", timeout_s=-1.0)
+    assert athena.stop_calls == [{"QueryExecutionId": "qid-123"}]
+
+
+def test_run_query_positional_preserves_duplicate_headers_and_nulls():
+    # `SELECT r.name, c.name` yields a duplicate header; dict rows collapse it
+    # (last value wins) — the positional shape must keep every cell, and the
+    # None (SQL NULL) vs "" distinction with it.
+    athena = QueryKeyedAthena({"Q": (["name", "name"], [["a", None], ["", "b"]])})
+    src = _source(athena=athena)
+    header, rows = src.run_query("Q", positional=True)
+    assert header == ["name", "name"]
+    assert rows == [["a", None], ["", "b"]]
+    # The default dict shape is unchanged (existing harvest callers).
+    assert src.run_query("Q") == [{"name": None}, {"name": "b"}]
+
+
+def test_run_query_max_rows_cap_raises_classified_error():
+    athena = QueryKeyedAthena({"Q": (["c"], [["1"], ["2"], ["3"]])})
+    src = _source(athena=athena)
+    with pytest.raises(ResultCapExceeded) as e:
+        src.run_query("Q", max_rows=2)
+    assert "exceeds 2 rows" in str(e.value)
+    # At or under the cap collects normally.
+    assert src.run_query("Q", max_rows=3) == [{"c": "1"}, {"c": "2"}, {"c": "3"}]
 
 
 def test_sample_rows_none_without_athena():

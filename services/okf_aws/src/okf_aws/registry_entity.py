@@ -31,9 +31,8 @@ ENTITY_DATASET = "dataset"
 ENTITY_DOMAIN = "domain"
 ENTITY_XREF = "xref"
 
-# The backfill's completion marker row. scripts/backfill_registry_entity.py
-# writes it standalone (the script is deliberately boto3-only, so these
-# literals are duplicated there — keep them in sync).
+# The backfill's completion marker row, written by
+# scripts/backfill_registry_entity.py via mark_entity_index_ready().
 MARKER_PK = "REGISTRY"
 MARKER_SK = "ENTITY_INDEX_READY"
 

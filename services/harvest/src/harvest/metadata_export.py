@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from harvest.fsutil import write_text
+from harvest.profile import read_cached_profiles, write_profiles
 from harvest.source_base import Source, SourceMetadataProfile
 from okf_core.paths import EXTERNAL_DIR, external_pair_prefix
 
@@ -144,6 +145,8 @@ def _manifest_markdown(
     db_resource: str | None,
     rows: list[dict[str, Any]],
     profile: SourceMetadataProfile,
+    *,
+    has_profiles: bool = False,
 ) -> str:
     """The .metadata/index.md manifest: how to explore + one line per table."""
     parts = [
@@ -156,6 +159,17 @@ def _manifest_markdown(
         "- `grep <name> .metadata/columns.tsv` — every (table, column, type, comment) "
         "matching a name, ACROSS all tables (use for join keys + near-synonyms).",
         "- `read_file .metadata/database.md` — database-level metadata.",
+        *(
+            [
+                "- `read_file .metadata/profile/<table>.md` — the table's column "
+                "profile (null share, ~distinct, min/max, top values). READ THIS "
+                "BEFORE probing with run_sql — it answers most null/enum/range "
+                "questions. A sheet marked INDICATIVE was sampled: its value "
+                "lists are not exhaustive."
+            ]
+            if has_profiles
+            else []
+        ),
         "",
         "These files are catalog metadata (which can be wrong/stale) — VERIFY "
         "load-bearing claims with `sample_rows` / `run_sql` against live data.",
@@ -205,13 +219,15 @@ def _database_markdown(meta: dict[str, Any], profile: SourceMetadataProfile) -> 
 
 def _write_snapshot(
     source: Source, meta_root: Path, rel_prefix: str
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], dict[str, dict[str, Any]]]:
     """Write one source's catalog snapshot (database.md, tables/, columns.tsv).
 
     Shared by :func:`export_metadata` (this dataset, under ``.metadata/``) and
     :func:`export_target_metadata` (the cross-mode counterpart, under
     ``.metadata/external/<d>/<ds>/``). Returns ``(db_meta, manifest_rows,
-    written)``; the caller writes its own ``index.md`` manifest.
+    written, tables_meta)``; the caller writes its own ``index.md`` manifest
+    (and, for the dataset's own snapshot, the column profiles built from
+    ``tables_meta``).
     """
     profile = source.metadata_profile
     tables_dir = meta_root / "tables"
@@ -225,6 +241,7 @@ def _write_snapshot(
 
     # Per-table metadata + the flat cross-table column index.
     manifest_rows: list[dict[str, Any]] = []
+    tables_meta: dict[str, dict[str, Any]] = {}
     tsv_lines = ["table\tcolumn\ttype\tcomment"]
 
     for name in source.table_names():
@@ -232,6 +249,7 @@ def _write_snapshot(
         if ref is None:
             continue
         meta = source.read_concept(ref)
+        tables_meta[name] = meta
         write_text(tables_dir / f"{name}.md", _table_markdown(meta, profile))
         written.append(f"{rel_prefix}/tables/{name}.md")
 
@@ -258,13 +276,23 @@ def _write_snapshot(
 
     write_text(meta_root / "columns.tsv", "\n".join(tsv_lines) + "\n")
     written.append(f"{rel_prefix}/columns.tsv")
-    return db_meta, manifest_rows, written
+    return db_meta, manifest_rows, written, tables_meta
 
 
 def export_metadata(
-    source: Source, dataset_root: str | Path
+    source: Source,
+    dataset_root: str | Path,
+    *,
+    profile_mode: str = "full",
+    changed_tables: frozenset[str] | set[str] = frozenset(),
 ) -> dict[str, Any]:
     """Fetch all Glue metadata for the dataset and write it under ``.metadata/``.
+
+    Also writes the ``.metadata/profile/`` column profiles (see
+    :mod:`harvest.profile`): ``profile_mode`` selects the cache-reuse policy
+    ("full" re-profiles everything; "incremental" only ``changed_tables``;
+    "cross" only fingerprint-mismatched tables) — the previous run's sheets
+    persist on the mount and are read back before the wipe below.
 
     Returns a small summary dict (table count, files written) for logging. Pure
     w.r.t. AWS beyond the injected ``source``; the offline E2E and unit tests
@@ -273,17 +301,38 @@ def export_metadata(
     profile = source.metadata_profile
     meta_root = Path(dataset_root) / METADATA_DIR
 
+    # The previous run's profiles must be read BEFORE the wipe — they are the
+    # reuse cache for incremental/cross runs.
+    profile_cache = read_cached_profiles(dataset_root)
+
     # Always start from a clean snapshot so a table dropped from the source since
     # the last run leaves no stale sheet. write_text recreates the dirs.
     if meta_root.exists():
         shutil.rmtree(meta_root)
 
-    db_meta, manifest_rows, written = _write_snapshot(source, meta_root, METADATA_DIR)
+    db_meta, manifest_rows, written, tables_meta = _write_snapshot(
+        source, meta_root, METADATA_DIR
+    )
+
+    # Column profiles: best-effort by contract (write_profiles never raises out).
+    prof = write_profiles(
+        source,
+        meta_root,
+        tables_meta=tables_meta,
+        cache=profile_cache,
+        profile_mode=profile_mode,
+        changed_tables=changed_tables,
+    )
+    written.extend(f"{METADATA_DIR}/{rel}" for rel in prof.get("files", []))
 
     write_text(
         meta_root / "index.md",
         _manifest_markdown(
-            source.database, db_meta.get("resource"), manifest_rows, profile
+            source.database,
+            db_meta.get("resource"),
+            manifest_rows,
+            profile,
+            has_profiles=bool(prof.get("files")),
         ),
     )
     written.append(f"{METADATA_DIR}/index.md")
@@ -292,6 +341,7 @@ def export_metadata(
         "table_count": len(manifest_rows),
         "files_written": len(written),
         "files": written,
+        "profiles": {k: prof.get(k, 0) for k in ("profiled", "cached", "skipped")},
     }
 
 
@@ -364,7 +414,10 @@ def export_target_metadata(
     if meta_root.exists():
         shutil.rmtree(meta_root)
 
-    db_meta, manifest_rows, written = _write_snapshot(
+    # Target snapshots carry no column profiles: profiling scans the TARGET's
+    # data on this run's bill, and the pair docs must verify cross-joins with
+    # run_sql anyway.
+    db_meta, manifest_rows, written, _ = _write_snapshot(
         target_source, meta_root, rel_prefix
     )
 

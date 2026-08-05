@@ -35,6 +35,7 @@ from okf_core.concept_types import (
 
 from harvest.source_base import (
     ConceptRef,
+    ResultCapExceeded,
     SourceMetadataProfile,
     SourcePromptProfile,
 )
@@ -74,6 +75,10 @@ class RedshiftSource:
         catalog_name="Redshift system catalog (SVV_* views)",
         resource_label="Resource (URI)",
         rowcount_param_keys=("tbl_rows", "estimated_visible_rows"),
+        # Synthesized by _table_info from SVV_TABLE_INFO.size (1 MB blocks).
+        # Without it the profiler treats every table as over-budget and falls
+        # back to a 10% sample — INDICATIVE stats even for tiny dimensions.
+        bytesize_param_keys=("size_bytes",),
     )
 
     #: Source facts the harvest prompts state (see SourcePromptProfile). Redshift
@@ -293,7 +298,8 @@ class RedshiftSource:
         """
         try:
             rows = self._run_sql(
-                'SELECT diststyle, sortkey1, tbl_rows, estimated_visible_rows '
+                'SELECT diststyle, sortkey1, tbl_rows, estimated_visible_rows, '
+                '"size" '
                 "FROM svv_table_info "
                 f"WHERE \"schema\" = '{_q(schema)}' "
                 f"AND \"table\" = '{_q(table)}'"  # nosec B608 - catalog identifiers, single-quoted; read-only
@@ -308,6 +314,18 @@ class RedshiftSource:
             val = r.get(key)
             if val not in (None, ""):
                 params[key] = val
+        # SVV_TABLE_INFO.size counts 1 MB blocks; expose BYTES under the key the
+        # profiler's scan budget reads (metadata_profile.bytesize_param_keys) so
+        # small tables get full-scan profiles instead of the no-size-hint
+        # fallback sample. It also rides into the profile fingerprint as the
+        # data-reload signal Redshift's catalog otherwise lacks (no update
+        # time / version id).
+        try:
+            size_mb = int(str(r.get("size")))
+        except (TypeError, ValueError):
+            size_mb = 0
+        if size_mb > 0:
+            params["size_bytes"] = size_mb * (1 << 20)
         return params
 
     def _external_location(self, schema: str, table: str) -> str | None:
@@ -363,27 +381,88 @@ class RedshiftSource:
         except Exception:  # noqa: BLE001
             return None
 
+    # -- SQL capability atoms (column profiles + verification tools) -----
+
+    #: Redshift supports EXPLAIN — the explain_sql tool is registered when a
+    #: source advertises this.
+    supports_explain = True
+
+    def sql_table_ref(self, table: str) -> str:
+        """Quoted reference for a ``<schema>.<table>`` name from table_names()."""
+        schema, _, tbl = table.partition(".")
+        return f'"{schema}"."{tbl}"' if tbl else f'"{schema}"'
+
+    def sql_approx_distinct(self, col_sql: str) -> str:
+        return f"APPROXIMATE COUNT(DISTINCT {col_sql})"
+
+    def sql_sample_clause(self, percent: float) -> tuple[str, str]:
+        """Redshift has no TABLESAMPLE — ``RANDOM() < p`` emulates a ~percent% sample.
+
+        A row-level predicate: Redshift still reads every block, so unlike
+        Athena's TABLESAMPLE this bounds aggregation work and result size, NOT
+        bytes scanned. The real budget lever here is the SVV_TABLE_INFO size
+        hint (_table_info's ``size_bytes``), which keeps small tables on exact
+        full-scan profiles.
+        """
+        return ("", f"RANDOM() < {percent / 100.0:g}")
+
     def run_query(
-        self, query: str, *, timeout_s: float = 60.0, poll_s: float = 1.0
-    ) -> list[dict[str, str | None]]:
+        self,
+        query: str,
+        *,
+        timeout_s: float = 60.0,
+        poll_s: float = 1.0,
+        max_rows: int | None = None,
+        positional: bool = False,
+        stats: dict[str, Any] | None = None,
+        truncate_at: int | None = None,
+    ) -> list[dict[str, str | None]] | tuple[list[str], list[list[str | None]]]:
         """Run a Redshift statement and return rows as dicts.
 
         A SQL NULL cell is returned as ``None`` (distinct from an empty string
-        ``""``), matching ``GlueAthenaSource.run_query``. Raises on a non-FINISHED
-        terminal state; on timeout the statement is best-effort cancelled first.
+        ``""``), matching ``GlueAthenaSource.run_query`` — including the
+        ``positional``/``max_rows`` grading-path extensions (see the Source
+        protocol). Raises on a non-FINISHED terminal state; on timeout the
+        statement is best-effort cancelled first. ``stats`` is accepted for
+        protocol parity but left unfilled — the Data API exposes no
+        bytes-scanned figure.
 
         Read-only expectation: statements execute with the SQL privileges of the
         connection secret's DB USER — IAM cannot make Redshift SQL read-only the
         way it bounds Athena. Provision the mapping's secret with a least-
         privilege, read-only user (see docs/DATA_SOURCES.md).
         """
-        return self._run_sql(query, timeout_s=timeout_s, poll_s=poll_s)
+        header, rows, truncated = self._run_sql_raw(
+            query,
+            timeout_s=timeout_s,
+            poll_s=poll_s,
+            max_rows=max_rows,
+            truncate_at=truncate_at,
+        )
+        if truncated and stats is not None:
+            stats["truncated"] = True
+        if positional:
+            return header, rows
+        return [dict(zip(header, vals)) for vals in rows]
 
     # -- Redshift Data API plumbing -------------------------------------
 
     def _run_sql(
         self, sql: str, *, timeout_s: float = 60.0, poll_s: float = 1.0
     ) -> list[dict[str, str | None]]:
+        """Dict-row convenience over :meth:`_run_sql_raw` (the catalog readers)."""
+        header, rows, _ = self._run_sql_raw(sql, timeout_s=timeout_s, poll_s=poll_s)
+        return [dict(zip(header, vals)) for vals in rows]
+
+    def _run_sql_raw(
+        self,
+        sql: str,
+        *,
+        timeout_s: float = 60.0,
+        poll_s: float = 1.0,
+        max_rows: int | None = None,
+        truncate_at: int | None = None,
+    ) -> tuple[list[str], list[list[str | None]], bool]:
         params: dict[str, Any] = {"Sql": sql, "Database": self.database}
         if self.cluster_identifier:
             params["ClusterIdentifier"] = self.cluster_identifier
@@ -405,7 +484,7 @@ class RedshiftSource:
                     reason = info.get("Error", "")
                     raise RuntimeError(f"Redshift statement {status}: {reason}")
                 if not info.get("HasResultSet"):
-                    return []
+                    return [], [], False
                 break
             if time.monotonic() > deadline:
                 # Best-effort cancel so an abandoned statement doesn't keep
@@ -417,10 +496,16 @@ class RedshiftSource:
                 raise TimeoutError(f"Redshift statement {sid} timed out")
             time.sleep(poll_s)
 
-        return self._collect_results(sid)
+        return self._collect_results(sid, max_rows=max_rows, truncate_at=truncate_at)
 
-    def _collect_results(self, sid: str) -> list[dict[str, str | None]]:
-        rows: list[dict[str, str | None]] = []
+    def _collect_results(
+        self,
+        sid: str,
+        *,
+        max_rows: int | None = None,
+        truncate_at: int | None = None,
+    ) -> tuple[list[str], list[list[str | None]], bool]:
+        rows: list[list[str | None]] = []
         columns: list[str] | None = None
         token = None
         while True:
@@ -431,11 +516,19 @@ class RedshiftSource:
             if columns is None:
                 columns = [c.get("name", "") for c in res.get("ColumnMetadata", [])]
             for rec in res.get("Records", []):
-                rows.append({columns[i]: _cell(rec[i]) for i in range(len(columns))})
+                rows.append([_cell(rec[i]) for i in range(len(columns))])
+                if max_rows is not None and len(rows) > max_rows:
+                    raise ResultCapExceeded(f"result exceeds {max_rows} rows")
+                if truncate_at is not None and len(rows) > truncate_at:
+                    # Soft cap: flag truncation only once a row BEYOND the cap
+                    # arrived — an exactly-cap-sized result is complete, and a
+                    # false `truncated` makes the agent distrust and re-run it.
+                    del rows[truncate_at:]
+                    return columns or [], rows, True
             token = res.get("NextToken")
             if not token:
                 break
-        return rows
+        return columns or [], rows, False
 
 
 # -- helpers -----------------------------------------------------------------

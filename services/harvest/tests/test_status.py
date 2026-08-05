@@ -236,6 +236,85 @@ def test_build_registry_client_none_without_env(monkeypatch):
     assert status.build_registry_client() is None
 
 
+# --- read_run_identity + the started_at run-identity pin ---------------------
+# The incremental path's runtime_session_id is deterministic per dataset, so
+# the session pin can't tell two successive incremental runs apart. started_at
+# (rewritten by every lease acquire, untouched afterwards) can.
+
+
+class _FakeDDBWithGet(_FakeDDB):
+    def __init__(self, item: dict | None = None, raise_on_get: bool = False):
+        super().__init__()
+        self._item = item
+        self._raise_get = raise_on_get
+        self.get_calls: list[dict] = []
+
+    def get_item(self, **kwargs):
+        if self._raise_get:
+            raise RuntimeError("ddb down")
+        self.get_calls.append(kwargs)
+        return {"Item": self._item} if self._item else {}
+
+
+def test_read_run_identity_returns_started_at():
+    ddb = _FakeDDBWithGet(item={"started_at": {"S": "2026-08-05T12:00:00+00:00"}})
+    got = status.read_run_identity((ddb, "t"), data_domain="d", dataset="ds")
+    assert got == "2026-08-05T12:00:00+00:00"
+    call = ddb.get_calls[0]
+    assert call["Key"] == {"pk": {"S": "HARVEST#d#ds"}, "sk": {"S": "STATUS"}}
+
+
+def test_read_run_identity_none_when_row_or_field_missing():
+    ddb = _FakeDDBWithGet()  # no row at all
+    assert status.read_run_identity((ddb, "t"), data_domain="d", dataset="ds") is None
+    assert status.read_run_identity(None, data_domain="d", dataset="ds") is None
+
+
+def test_read_run_identity_never_raises():
+    # Identity capture is best-effort: a registry blip falls back to the
+    # session-pin-only condition, never a crashed run.
+    ddb = _FakeDDBWithGet(raise_on_get=True)
+    assert status.read_run_identity((ddb, "t"), data_domain="d", dataset="ds") is None
+
+
+def test_report_status_pins_started_at_alongside_the_session():
+    # Both identity pins compose, each tolerating rows missing the attribute
+    # (out-of-band writes).
+    ddb = _FakeDDB()
+    status.report_status(
+        (ddb, "t"),
+        data_domain="d",
+        dataset="ds",
+        status="failed",
+        only_if_active=True,
+        session_id="okf-d-ds-abc123",
+        run_started_at="2026-08-05T12:00:00+00:00",
+    )
+    call = ddb.calls[0]
+    cond = call["ConditionExpression"]
+    assert "runtime_session_id = :sid" in cond
+    assert "started_at = :rsa" in cond
+    assert "attribute_not_exists(started_at)" in cond
+    assert call["ExpressionAttributeValues"][":rsa"] == {
+        "S": "2026-08-05T12:00:00+00:00"
+    }
+
+
+def test_report_status_started_at_pin_works_without_a_session_pin():
+    ddb = _FakeDDB()
+    status.report_status(
+        (ddb, "t"),
+        data_domain="d",
+        dataset="ds",
+        status="complete",
+        only_if_active=True,
+        run_started_at="t0",
+    )
+    cond = ddb.calls[0]["ConditionExpression"]
+    assert "started_at = :rsa" in cond
+    assert "runtime_session_id" not in cond
+
+
 # --- stamp_guidance_applied (clears guidance dirty on a successful harvest) --
 
 

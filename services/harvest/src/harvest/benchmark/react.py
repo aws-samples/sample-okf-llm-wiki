@@ -82,6 +82,24 @@ def _is_final_ai_turn(msg: Any) -> bool:
     return not getattr(msg, "tool_calls", None)
 
 
+def count_nudges(messages: list, nudge: str) -> int:
+    """How many prior injections of ``nudge`` the conversation carries.
+
+    Text-extracted (not a bare ``==`` on ``content``) because a provider round
+    trip can re-shape a human message's string content into a block list
+    (``[{"type": "text", "text": ...}]``), which used to make the count miss
+    and the middleware nudge forever.
+    """
+    from harvest.benchmark.extract import message_text
+
+    return sum(
+        1
+        for m in messages or []
+        if getattr(m, "type", "") == "human"
+        and message_text(getattr(m, "content", "")) == nudge
+    )
+
+
 def called_tool(messages: list, tool_name: str) -> bool:
     """True iff any AI message in ``messages`` called ``tool_name``."""
     for m in messages or []:
@@ -126,12 +144,7 @@ class SubmitToolNudgeMiddleware(AgentMiddleware):  # type: ignore[misc]
             return None  # still working — never interfere mid-flight
         if called_tool(messages, self.tool_name):
             return None  # delivered (validity is the extractor's concern)
-        nudges = sum(
-            1
-            for m in messages
-            if getattr(m, "type", "") == "human"
-            and getattr(m, "content", "") == self.nudge
-        )
+        nudges = count_nudges(messages, self.nudge)
         if nudges >= self.max_nudges:
             log.warning(
                 "Agent ended without calling %s after %d nudge(s); giving up.",

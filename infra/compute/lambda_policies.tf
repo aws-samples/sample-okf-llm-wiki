@@ -132,8 +132,15 @@ data "aws_iam_policy_document" "control_api" {
     # GetObjectVersion + ListBucketVersions power the bundle version history /
     # diff / repromote endpoints (CopyObject with a source VersionId authorizes
     # as GetObjectVersion on the source + PutObject on the destination).
+    # DeleteObjectVersion: the dataset-delete purge issues version-targeted
+    # DeleteObjects (Key + VersionId) against the gold-carrying benchmark/
+    # prefix — those authorize as DeleteObjectVersion, NOT DeleteObject, and
+    # the failures come back in-band (HTTP 200 with per-key Errors), so a
+    # missing grant silently purges nothing (moto doesn't enforce IAM; only a
+    # live deploy catches it).
     actions = [
       "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
+      "s3:DeleteObjectVersion",
       "s3:GetObjectVersion", "s3:ListBucketVersions",
     ]
     resources = [local.d.bundle_bucket_arn, "${local.d.bundle_bucket_arn}/*"]

@@ -12,7 +12,8 @@ guessing from the SQL alone:
 So each solve is captured as a bounded :class:`SolverTrace`: the reasoning, the tool
 calls with their arguments, a preview of each tool result, and the files read. It is
 rendered compactly into the judge's prompt (:func:`render_for_judge`) and persisted
-off-mount for the UI (see :mod:`.review_store`).
+off-mount for the UI (the report's companion ``traces.json`` — see
+:mod:`.report_store`).
 
 **Everything here is bounded.** A 100-question round × up to 5 rounds must not blow
 up the persisted artifact or the judge's context, so steps, per-step text, and the

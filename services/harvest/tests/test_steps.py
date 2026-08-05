@@ -821,3 +821,19 @@ def test_subagent_events_share_seq_space_with_steps():
         {"type": "subagent", "phase": "complete", "id": "p1", "eval_id": "b"}
     )
     assert [e["seq"] for e in events] == [1, 2, 3]
+
+
+def test_emit_status_narrates_pre_agent_phases():
+    """The runner narrates the pre-agent snapshot/profiling phases through
+    emit_status — a plain kind="agent" one-liner (same shape the UI already
+    renders), sharing the same monotonic seq stream as callback events."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+
+    em.emit_status("Snapshotting catalog metadata and profiling columns (12 tables)…")
+    em.emit_status("Column profiles: 10 profiled, 2 reused from cache")
+
+    assert [e["seq"] for e in events] == [1, 2]
+    assert all(e["kind"] == KIND_AGENT for e in events)
+    assert "profiling columns" in events[0]["label"]
+    assert events[1]["label"] == "Column profiles: 10 profiled, 2 reused from cache"

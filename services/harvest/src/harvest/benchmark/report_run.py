@@ -158,19 +158,25 @@ async def _solve_round(
 
     async def _one(q: BenchmarkQuestion) -> Attempt:
         nonlocal done
+        solve_error = ""
         async with sem:
             try:
                 prediction, trace, usage, wall_ms = _split_solve_result(
                     await solve(q.question)
                 )
-            except Exception:  # noqa: BLE001 - a stuck solver is a miss, not a crash
+            except Exception as e:  # noqa: BLE001 - a stuck solver is a miss, not a crash
                 prediction, trace, usage, wall_ms = "", None, {}, 0
+                # The only diagnosis of WHY the prediction is empty — grading
+                # folds it into the final reason (_apply_grade /
+                # _apply_behavior_grades) so infra failures stay visible.
+                solve_error = f"solver error: {type(e).__name__}: {e}"
         done += 1
         if progress and (done % step == 0 or done == total):
             progress(PHASE_SOLVING, check, run_index, done, total)
         return Attempt(
             q_id=q.q_id, check=check, run_index=run_index,
             prediction=prediction, trace=trace, usage=usage, wall_ms=wall_ms,
+            reason=solve_error,
         )
 
     return await asyncio.gather(*[_one(q) for q in questions])
@@ -237,6 +243,10 @@ def _apply_grade(attempt: Attempt, result: QuestionResult) -> None:
         reason = f"{reason} ({detail})"
     if result.outcome is Outcome.DISCARDED and result.discard_reason:
         reason = f"{reason}: {result.discard_reason}"
+    if attempt.reason:
+        # A solve-time note (the solver crashed) — the grade must not erase
+        # the only diagnosis of why the prediction is empty.
+        reason = f"{reason} ({attempt.reason})"
     attempt.reason = reason
 
 
@@ -263,6 +273,9 @@ def _apply_behavior_grades(
         )
         if g.judge_error:
             reason = f"{reason} (review error: {g.judge_error})"
+        if a.reason:
+            # Preserve the solve-time note (a crashed solver) under the ruling.
+            reason = f"{reason} ({a.reason})"
         a.reason = reason
 
 
@@ -276,10 +289,12 @@ def _build_judge_cases(
     """Group attempts by (q_id, check); a failed pair becomes one judge case.
 
     Failed = at least one FAIL attempt across the runs. Fully-passing pairs
-    never reach the judge; all-DISCARDED pairs (SQL EX gold that can't execute
-    — deterministic via the gold cache, so never mixed with FAILs) are excluded
-    from scores upstream and aren't wiki failures to review. The case carries
-    ALL attempts, passing and failing — the flaky diff is the diagnosis.
+    never reach the judge, and a DISCARDED attempt on its own summons no
+    review either: all-DISCARDED pairs (SQL EX gold that can't execute) are
+    excluded from scores upstream, and a transient grading fault beside
+    passing runs (transient DISCARDs are never memoized, so they CAN mix with
+    graded runs) isn't a wiki failure. The case carries ALL attempts, passing
+    and failing — the flaky diff is the diagnosis.
 
     ``judge_graded`` selects which checks' pairs to build: False → the
     deterministic checks' failure-review (overturn) cases; True → the
@@ -362,11 +377,17 @@ def _check_scores(
         pairs.setdefault(a.q_id, []).append(a)
     passed_all = flaky = failed_all = discarded = overturned = confirmed = 0
     for q_id, pair in pairs.items():
-        if all(a.outcome is Outcome.DISCARDED for a in pair):
+        # Classify on GRADED runs only. A dead gold discards deterministically
+        # (whole pair), but a transient grading fault is deliberately NOT
+        # memoized, so one run's DISCARD can sit beside graded runs — and an
+        # ungraded run must not turn a question whose graded runs all passed
+        # into a confirmed "wiki gap".
+        graded_runs = [a for a in pair if a.outcome is not Outcome.DISCARDED]
+        if not graded_runs:
             discarded += 1
             continue
-        wins = sum(1 for a in pair if a.outcome is Outcome.PASS)
-        if wins == len(pair):
+        wins = sum(1 for a in graded_runs if a.outcome is Outcome.PASS)
+        if wins == len(graded_runs):
             passed_all += 1
             continue
         verdict = verdicts_by_pair.get((q_id, check))
@@ -411,7 +432,8 @@ def _stability(attempts: list[Attempt], *, check: str, runs: int) -> dict[str, i
     """Histogram of pass counts per question: ``{"0": n0, ..., "<N>": nN}``.
 
     String keys so the JSON round-trips without int-coercion surprises.
-    DISCARDED pairs are excluded (they were never gradeable).
+    Questions with ANY DISCARDED attempt are excluded — a pass count over
+    fewer than N graded runs has no honest slot on the 0..N axis.
     """
     pairs: dict[int, int] = {}
     discarded_ids: set[int] = set()
@@ -698,9 +720,9 @@ async def execute_report(
     if progress and cases:
         # Label the failure review with the check it reviews (today always the
         # deterministic checks' — "" left the live line check-less exactly when
-        # the human most wants to know what the judge is judging).
-        review_checks = {c.check for c in cases}
-        judged_check = review_checks.pop() if len(review_checks) == 1 else ""
+        # the human most wants to know what the judge is judging). Should the
+        # cases ever span several checks, label with the first rather than none.
+        judged_check = min(c.check for c in cases)
         progress(PHASE_JUDGING, judged_check, CROSS_RUN, 0, len(cases))
 
         def judge_progress(done: int, total: int) -> None:  # noqa: F811

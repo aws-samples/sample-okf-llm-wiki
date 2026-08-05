@@ -70,6 +70,7 @@ export function ChatThread({
   features,
   onFeaturesChange,
   datasets,
+  datasetsLoading,
   datasetScope,
   onScopeChange,
   onOpenDoc,
@@ -230,6 +231,7 @@ export function ChatThread({
               features={features}
               onFeaturesChange={onFeaturesChange}
               datasets={datasets}
+              datasetsLoading={datasetsLoading}
               datasetScope={datasetScope}
               onScopeChange={onScopeChange}
             />
@@ -248,11 +250,16 @@ export function ChatThread({
       {/* okf-chat-fade (index.css) dissolves BOTH edges so text fades out (not
           hard-cuts) as it scrolls under the composer (bottom, ~4rem) and off the
           top of the layout (~2.5rem). The inner pt-10/pb-24 buffer the first/last
-          lines so they clear the mask at rest. */}
+          lines so they clear the mask at rest.
+          scrollbar-gutter reserves the scrollbar lane even while the transcript
+          fits the viewport — otherwise expanding a thinking block on a short
+          conversation summons the (classic, non-overlay) scrollbar and the
+          centered column jumps left, then back right on collapse. both-edges
+          keeps the column optically centered. */}
       <div
         ref={setViewportEl}
         onScroll={checkScroll}
-        className="okf-thin-scroll okf-chat-fade min-h-0 flex-1 overflow-y-auto"
+        className="okf-thin-scroll okf-chat-fade min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable_both-edges]"
       >
         {loadingHistory ? (
           <HistorySkeleton />
@@ -324,6 +331,7 @@ export function ChatThread({
           features={features}
           onFeaturesChange={onFeaturesChange}
           datasets={datasets}
+          datasetsLoading={datasetsLoading}
           datasetScope={datasetScope}
           onScopeChange={onScopeChange}
         />

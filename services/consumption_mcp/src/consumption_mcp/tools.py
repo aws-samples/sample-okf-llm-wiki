@@ -273,7 +273,16 @@ class ConsumptionTools:
 
         mappings: list[dict[str, Any]] = []
         next_key: dict[str, Any] | None = None
-        legacy = not registry_entity.entity_index_ready(self.ddb, resource=True)
+        # The readiness marker is consulted at most ONCE per request, and only
+        # on cursor-less first pages: a cursor can only have come from a prior
+        # GSI page (the legacy scan never emits one), so a cursored call takes
+        # the GSI path unconditionally. Re-checking the marker here would let
+        # a transient marker read (entity_index_ready fails closed to False)
+        # reroute page N to the legacy scan, which ignores start_key and hands
+        # the caller the entire catalog again with next_cursor=null.
+        legacy = start_key is None and not registry_entity.entity_index_ready(
+            self.ddb, resource=True
+        )
         # Limit each DDB request too: mapping rows are tiny, so without it a
         # single 1MB result page holds THOUSANDS of rows and the soft cap
         # would never bite (the whole catalog would return on page one).
@@ -314,13 +323,16 @@ class ConsumptionTools:
                         break
                     page_kwargs["ExclusiveStartKey"] = lek
             except Exception as e:  # noqa: BLE001 - triaged below, most re-raise
-                # ONLY "the index does not exist" may fall back to the scan
-                # (the marker was stamped before the terraform apply). Any
-                # other failure — a throttle mid-pagination, a cursor replayed
-                # against a different query shape — must SURFACE: a silent
-                # scan here would hand the caller the whole catalog again with
-                # next_cursor=null, duplicating the pages it already consumed.
-                if not registry_entity.is_missing_index_error(e):
+                # ONLY "the index does not exist" on a CURSOR-LESS first page
+                # may fall back to the scan (the marker was stamped before the
+                # terraform apply). Any other failure — a throttle
+                # mid-pagination, a cursor replayed against a different query
+                # shape — must SURFACE: a silent scan here would hand the
+                # caller the whole catalog again with next_cursor=null,
+                # duplicating the pages it already consumed.
+                if start_key is not None or not registry_entity.is_missing_index_error(
+                    e
+                ):
                     raise
                 legacy = True
                 mappings = []

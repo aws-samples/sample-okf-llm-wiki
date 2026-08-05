@@ -25,8 +25,34 @@ def _tools(glue, athena=None):
 def test_only_live_tools_exposed():
     # The static-metadata tools (list_concepts / read_concept_raw) are gone —
     # metadata is read from the .metadata/ snapshot with built-in file tools.
+    # What remains is the LIVE set: samples/queries plus the deterministic
+    # verification probes (grain, join, EXPLAIN) the methodology mandates.
     _src, tools = _tools(FakeGlue("db", {"races": _table("races", [])}))
-    assert set(tools) == {"sample_rows", "run_sql"}
+    assert set(tools) == {
+        "sample_rows",
+        "run_sql",
+        "check_grain",
+        "validate_join",
+        "explain_sql",
+    }
+
+
+def test_capability_gated_tools_absent_without_the_atoms():
+    # A source without sql_table_ref/supports_explain (e.g. a minimal fake or a
+    # future engine) gets only the two basic live tools — never a tool whose
+    # SQL it can't express.
+    class _Minimal:
+        def find(self, cid):
+            return None
+
+        def sample_rows(self, ref, n=5):
+            return None
+
+        def run_query(self, q, **kw):
+            return []
+
+    by_name = {t.name: t for t in st.make_source_tools(_Minimal())}
+    assert set(by_name) == {"sample_rows", "run_sql"}
 
 
 def test_no_untrusted_markers_in_module():
@@ -36,12 +62,17 @@ def test_no_untrusted_markers_in_module():
     assert not hasattr(st, "_frame_untrusted_metadata")
 
 
-def test_sample_rows_returns_rows():
+def test_sample_rows_returns_compact_columnar_rows():
+    # The tool result is columnar (header once, positional rows) — per-row
+    # dicts repeated the column names in every row and inflated the tokens of
+    # every wide sample.
     athena = FakeAthena(rows=[{"raceid": "1", "year": "2009"}])
     tbl = _table("races", [("raceid", "bigint", "PK")])
     _src, tools = _tools(FakeGlue("db", {"races": tbl}), athena=athena)
     out = tools["sample_rows"].invoke({"concept_id": "tables/races"})
-    assert out["rows"] == [{"raceid": "1", "year": "2009"}]
+    assert out["columns"] == ["raceid", "year"]
+    assert out["rows"] == [["1", "2009"]]
+    assert out["truncated"] is False
     assert out["note"] == ""
 
 

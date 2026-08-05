@@ -53,6 +53,7 @@ def _prompt_is_gpt(model: str | None) -> bool:
 from harvest.source_base import Source
 from harvest.status import (
     build_registry_client,
+    read_run_identity,
     report_status,
     stamp_guidance_applied,
 )
@@ -189,6 +190,29 @@ def _build_emitter(*, data_domain: str, dataset: str, session_id: str | None):
         return None
 
 
+def _emit_profile_summary(emitter, snap: dict[str, Any] | None) -> None:
+    """One live-feed line summarizing the column-profile phase.
+
+    Silent when profiling didn't run at all (disabled, or a source without the
+    SQL atoms) — a "0 profiled" line would read as a failure. Guarded like
+    every feed emission: never raises into the harvest.
+    """
+    if emitter is None or not isinstance(snap, dict):
+        return
+    prof = snap.get("profiles") or {}
+    profiled = prof.get("profiled", 0)
+    cached = prof.get("cached", 0)
+    skipped = prof.get("skipped", 0)
+    if not (profiled or cached or skipped):
+        return
+    bits = [f"{profiled} profiled"]
+    if cached:
+        bits.append(f"{cached} reused from cache")
+    if skipped:
+        bits.append(f"{skipped} skipped")
+    emitter.emit_status("Column profiles: " + ", ".join(bits))
+
+
 def _invoke_config(recursion_limit: int, emitter):
     """Build the agent-invoke config for an already-built ``emitter``.
 
@@ -311,6 +335,13 @@ def run_full_harvest(
     # lease and wedging the dataset — which is exactly what happened when the
     # incremental path polluted the mount tree with raw put_object writes.
     registry = build_registry_client()
+    # This run's row identity, captured before any work: the terminal writes
+    # below must never land on a SUCCESSOR run's row, and on the incremental
+    # path the session pin alone can't tell two runs apart (deterministic
+    # session id — see status.read_run_identity).
+    run_started_at = read_run_identity(
+        registry, data_domain=data_domain, dataset=dataset
+    )
     try:
         # Mark in-progress FIRST (creates .harvest/, flips consumers to mid-write),
         # then wipe prior authored output so a "full" harvest truly starts from
@@ -350,6 +381,13 @@ def run_full_harvest(
         )
 
         tables = source.table_names()
+        # Built BEFORE the snapshot so the pre-agent phases (metadata export +
+        # column profiling) can narrate into the live feed via emit_status —
+        # profiling can run minutes on a wide dataset, and a silent feed reads
+        # as a stuck run. (It also still rides build_harvest_agent below.)
+        emitter = _build_emitter(
+            data_domain=data_domain, dataset=dataset, session_id=session_id
+        )
         # Snapshot ALL Glue metadata to the read-only .metadata/ dir BEFORE the
         # agent runs. The agent explores it with read_file/glob/grep (one grep
         # over .metadata/columns.tsv finds every table with a given column — the
@@ -357,7 +395,13 @@ def run_full_harvest(
         # sample_rows/run_sql. Best-effort: a snapshot failure must not wedge the
         # harvest — the agent can still author from sample_rows/run_sql.
         try:
+            if emitter is not None:
+                emitter.emit_status(
+                    f"Snapshotting catalog metadata and profiling columns "
+                    f"({len(tables)} tables)…"
+                )
             snap = export_metadata(source, dataset_root)
+            _emit_profile_summary(emitter, snap)
             log.info(
                 "Metadata snapshot written for %s/%s: %d tables, %d files",
                 data_domain,
@@ -399,11 +443,9 @@ def run_full_harvest(
         # into it so the agent can extract text from binary formats. Best-effort:
         # None when no interpreter is configured (local dev / tests) — the agent
         # then runs without run_code (text-only .context reading), never wedged.
-        # Build the step emitter FIRST so its usage-metering callback can ride on
-        # the shared model instance (catches QuickJS sub-agent turns too).
-        emitter = _build_emitter(
-            data_domain=data_domain, dataset=dataset, session_id=session_id
-        )
+        # The step emitter (built above, before the snapshot) rides into
+        # build_harvest_agent so its usage-metering callback sits on the shared
+        # model instance (catches QuickJS sub-agent turns too).
         with _sandbox_for(dataset_root) as sandbox:
             built = build_harvest_agent(
                 source,
@@ -436,6 +478,7 @@ def run_full_harvest(
             detail=f"{type(e).__name__}: {e}",
             only_if_active=True,
             session_id=session_id,
+            run_started_at=run_started_at,
         )
         raise
 
@@ -446,6 +489,7 @@ def run_full_harvest(
         status="complete",
         only_if_active=True,
         session_id=session_id,
+        run_started_at=run_started_at,
     )
     # The bundle now reflects this guidance version — clear its DIRTY state.
     stamp_guidance_applied(
@@ -493,6 +537,13 @@ def run_incremental_harvest(
     # mark_in_progress reports `failed` and frees the lease instead of wedging the
     # dataset at `queued` (see run_full_harvest for the full rationale).
     registry = build_registry_client()
+    # This run's row identity, captured before any work: the terminal writes
+    # below must never land on a SUCCESSOR run's row, and on the incremental
+    # path the session pin alone can't tell two runs apart (deterministic
+    # session id — see status.read_run_identity).
+    run_started_at = read_run_identity(
+        registry, data_domain=data_domain, dataset=dataset
+    )
     try:
         mark_in_progress(
             dataset_root, data_domain=data_domain, dataset=dataset, timestamp=started
@@ -517,11 +568,29 @@ def run_incremental_harvest(
             reviewer_effort=(reviewer_model_config or {}).get("effort"),
         )
 
+        # Built before the snapshot so the profiling refresh narrates into the
+        # live feed (see run_full_harvest); reused for the agent run below.
+        emitter = _build_emitter(
+            data_domain=data_domain, dataset=dataset, session_id=session_id
+        )
         # Refresh the read-only .metadata/ snapshot so the changed table's current
         # Glue metadata (and its siblings, for backlink propagation) is on disk for
         # read_file/grep. Best-effort — the agent can fall back to live tools.
+        # profile_mode="incremental": only the changed table is re-profiled; the
+        # other tables' column profiles are reused from the previous run's cache.
         try:
-            export_metadata(source, dataset_root)
+            if emitter is not None:
+                emitter.emit_status(
+                    f"Refreshing metadata snapshot; re-profiling `{changed_table}` "
+                    "(unchanged tables reuse cached profiles)…"
+                )
+            snap = export_metadata(
+                source,
+                dataset_root,
+                profile_mode="incremental",
+                changed_tables={changed_table},
+            )
+            _emit_profile_summary(emitter, snap)
         except Exception:  # noqa: BLE001 - snapshot is an accelerator, not a hard dep
             log.warning(
                 "Metadata snapshot failed for %s/%s (incremental); continuing",
@@ -553,9 +622,6 @@ def run_incremental_harvest(
             f"overview, sibling tables — and update those so the change propagates "
             f"and nothing goes stale. Preserve existing schema fields and citations "
             f"(augmentation guard).{diff_note}"
-        )
-        emitter = _build_emitter(
-            data_domain=data_domain, dataset=dataset, session_id=session_id
         )
         with _sandbox_for(dataset_root) as sandbox:
             built = build_harvest_agent(
@@ -595,6 +661,7 @@ def run_incremental_harvest(
             detail=f"{type(e).__name__}: {e}",
             only_if_active=True,
             session_id=session_id,
+            run_started_at=run_started_at,
         )
         raise
 
@@ -609,6 +676,7 @@ def run_incremental_harvest(
         status="complete",
         only_if_active=True,
         session_id=session_id,
+        run_started_at=run_started_at,
     )
     stamp_guidance_applied(
         registry,
@@ -701,6 +769,13 @@ def run_cross_harvest(
     target_root = Path(target_root)
     started = _now_iso()
     registry = build_registry_client()
+    # This run's row identity, captured before any work: the terminal writes
+    # below must never land on a SUCCESSOR run's row, and on the incremental
+    # path the session pin alone can't tell two runs apart (deterministic
+    # session id — see status.read_run_identity).
+    run_started_at = read_run_identity(
+        registry, data_domain=data_domain, dataset=dataset
+    )
     # external_pair_prefix VALIDATES both target segments (no "/", "..", "#" can
     # reach a destructive path) — the runtime-side gate behind _validate.
     pair_dir = dataset_root / external_pair_prefix(target_data_domain, target_dataset)
@@ -719,9 +794,23 @@ def run_cross_harvest(
             reviewer_effort=(reviewer_model_config or {}).get("effort"),
         )
 
+        # Built before the snapshots so both narrate into the live feed (see
+        # run_full_harvest); reused for the agent run below.
+        emitter = _build_emitter(
+            data_domain=data_domain, dataset=dataset, session_id=session_id
+        )
         # This dataset's snapshot: best-effort, like every other mode.
+        # profile_mode="cross": a cross run documents relationships, not this
+        # dataset's own docs — cached column profiles are reused wholesale and
+        # only fingerprint-mismatched/missing tables are re-profiled.
         try:
-            export_metadata(source, dataset_root)
+            if emitter is not None:
+                emitter.emit_status(
+                    "Snapshotting catalog metadata (cached column profiles "
+                    "reused where unchanged)…"
+                )
+            snap = export_metadata(source, dataset_root, profile_mode="cross")
+            _emit_profile_summary(emitter, snap)
         except Exception:  # noqa: BLE001 - snapshot is an accelerator, not a hard dep
             log.warning(
                 "Metadata snapshot failed for %s/%s (cross); continuing",
@@ -788,9 +877,6 @@ def run_cross_harvest(
             target_domain_description=target_domain_description,
             target_domain_context=target_domain_context,
         )
-        emitter = _build_emitter(
-            data_domain=data_domain, dataset=dataset, session_id=session_id
-        )
         with _sandbox_for(dataset_root) as sandbox:
             built = build_harvest_agent(
                 source,
@@ -839,6 +925,7 @@ def run_cross_harvest(
             detail=f"{type(e).__name__}: {e}",
             only_if_active=True,
             session_id=session_id,
+            run_started_at=run_started_at,
         )
         raise
 
@@ -855,6 +942,7 @@ def run_cross_harvest(
         detail=detail,
         only_if_active=True,
         session_id=session_id,
+        run_started_at=run_started_at,
     )
     log.info("Cross harvest complete: %s/%s (%s)", data_domain, dataset, detail)
     return state
@@ -974,6 +1062,13 @@ def run_annotation_harvest(
     dataset_root = Path(dataset_root)
     started = _now_iso()
     registry = build_registry_client()
+    # This run's row identity, captured before any work: the terminal writes
+    # below must never land on a SUCCESSOR run's row, and on the incremental
+    # path the session pin alone can't tell two runs apart (deterministic
+    # session id — see status.read_run_identity).
+    run_started_at = read_run_identity(
+        registry, data_domain=data_domain, dataset=dataset
+    )
     # One annotations client for the whole run (reconcile + any failure revert),
     # instead of rebuilding boto3 clients per path.
     anno_client = build_annotations_client()
@@ -1084,6 +1179,7 @@ def run_annotation_harvest(
             detail=f"{type(e).__name__}: {e}",
             only_if_active=True,
             session_id=session_id,
+            run_started_at=run_started_at,
         )
         # A failed run leaves the survivors stuck in_review — return them to open
         # so the feedback survives (mirrors the Control API's invoke-failure revert).
@@ -1136,6 +1232,7 @@ def run_annotation_harvest(
         detail=detail,
         only_if_active=True,
         session_id=session_id,
+        run_started_at=run_started_at,
     )
     # The bundle now reflects this guidance version — clear its DIRTY state. (A
     # zero-annotation run that ran ONLY because guidance was dirty still lands here.)

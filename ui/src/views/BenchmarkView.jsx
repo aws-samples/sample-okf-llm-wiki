@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/card"
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -82,6 +83,20 @@ export const CHECK_META = [
 
 const LIST_POLL_MS = 4000
 const ACTIVE_STATUSES = new Set(["queued", "running"])
+// Mirrors the backend's lease-stale escape (HARVEST_LEASE_STALE_SECONDS): an
+// AgentCore session can't outlive 8h, so an "active" row whose last heartbeat
+// is older than this is a dead job the delete API will accept.
+const STALE_AFTER_MS = 8 * 60 * 60 * 1000
+
+// Liveness of an active row from its heartbeat: updated_at is stamped on every
+// runtime progress tick; started_at/created_at cover a row that died before
+// its first tick; no parseable timestamp at all means nothing to wait for.
+function rowIsStale(report) {
+  const ts = report.updated_at || report.started_at || report.created_at
+  const t = ts ? Date.parse(ts) : NaN
+  if (Number.isNaN(t)) return true
+  return Date.now() - t > STALE_AFTER_MS
+}
 
 export function fmtScore(v) {
   if (typeof v !== "number") return "—"
@@ -121,47 +136,65 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
   const [reports, setReports] = useState(null) // null until first load
   const [listError, setListError] = useState(null)
   const [deleting, setDeleting] = useState(() => new Set())
+  const [confirmDelete, setConfirmDelete] = useState(null) // row pending confirm
 
   // Bundle versions for the setup modal's target picker (cheap; loaded with the
   // page so the modal opens without a spinner).
   const [versions, setVersions] = useState([])
   const [setupOpen, setSetupOpen] = useState(false)
 
+  // Stale-response guard — the `let alive` effect-cleanup idiom, hoisted to a
+  // shared epoch because these loaders are also called OUTSIDE the reset
+  // effect (the poll, post-upload/-delete reloads): bumping the epoch on
+  // dataset change makes any still-in-flight response from the previous
+  // dataset land silently instead of under the new one.
+  const epochRef = useRef(0)
+
   const inspect = useCallback(async () => {
     if (!api || !hasSelection) return
+    const epoch = epochRef.current
     try {
-      setQuestions(await api.inspectBenchmarkQuestions(domain, dataset))
+      const res = await api.inspectBenchmarkQuestions(domain, dataset)
+      if (epoch === epochRef.current) setQuestions(res)
     } catch (e) {
-      setQuestions({ uploaded: false, inspectError: e.message || String(e) })
+      if (epoch === epochRef.current)
+        setQuestions({ uploaded: false, inspectError: e.message || String(e) })
     }
   }, [api, domain, dataset, hasSelection])
 
   const loadReports = useCallback(async () => {
     if (!api || !hasSelection) return
+    const epoch = epochRef.current
     try {
       const res = await api.listBenchmarkReports(domain, dataset)
+      if (epoch !== epochRef.current) return
       setReports(Array.isArray(res?.reports) ? res.reports : [])
       setListError(null)
     } catch (e) {
-      setListError(e.message || String(e))
+      if (epoch === epochRef.current) setListError(e.message || String(e))
     }
   }, [api, domain, dataset, hasSelection])
 
   const loadVersions = useCallback(async () => {
     if (!api || !hasSelection) return
+    const epoch = epochRef.current
     try {
       const res = await api.listBundleVersions(domain, dataset)
-      setVersions(Array.isArray(res?.versions) ? res.versions : [])
+      if (epoch === epochRef.current)
+        setVersions(Array.isArray(res?.versions) ? res.versions : [])
     } catch {
-      setVersions([]) // no published versions yet — "current" still works
+      // no published versions yet — "current" still works
+      if (epoch === epochRef.current) setVersions([])
     }
   }, [api, domain, dataset, hasSelection])
 
   // Reset + load on dataset change.
   useEffect(() => {
+    epochRef.current += 1
     setQuestions(null)
     setReports(null)
     setSetupOpen(false)
+    setConfirmDelete(null)
     inspect()
     loadReports()
     loadVersions()
@@ -183,6 +216,7 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
     if (fileInputRef.current) fileInputRef.current.value = ""
     if (!file || !hasSelection) return
     setUploading(true)
+    const epoch = epochRef.current
     try {
       const { url, fields, max_bytes } = await api.presignBenchmarkUpload(
         domain,
@@ -200,7 +234,7 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
       }
       await uploadToPresigned({ url, fields }, file)
       const parsed = await api.inspectBenchmarkQuestions(domain, dataset)
-      setQuestions(parsed)
+      if (epoch === epochRef.current) setQuestions(parsed)
       if (parsed?.valid) {
         toast.success(
           `${parsed.count} question${parsed.count === 1 ? "" : "s"} extracted` +
@@ -340,7 +374,7 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
                   key={r.report_id}
                   report={r}
                   onOpen={onOpenReport}
-                  onDelete={deleteReport}
+                  onDelete={setConfirmDelete}
                   deleting={deleting.has(r.report_id)}
                 />
               ))}
@@ -360,6 +394,49 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
           versions={versions}
           onStarted={loadReports}
         />
+      ) : null}
+
+      {/* Deleting is the only way a report leaves history, and a report is
+          hours of paid solving — one stray click on the trash shouldn't be
+          enough (the HarvestView full-rebuild confirm pattern). */}
+      {confirmDelete ? (
+        <Dialog
+          open
+          onOpenChange={(o) => {
+            if (!o) setConfirmDelete(null)
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Delete this report?</DialogTitle>
+              <DialogDescription>
+                The benchmark report from{" "}
+                <span className="font-medium text-foreground">
+                  {fmtWhen(confirmDelete.created_at) || confirmDelete.report_id}
+                </span>{" "}
+                will be deleted, with every attempt, trace, and judge review it
+                holds. This can't be undone — the runs it represents can only
+                be paid for again with a new benchmark.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <DialogClose asChild>
+                <Button variant="outline">Cancel</Button>
+              </DialogClose>
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  const id = confirmDelete.report_id
+                  setConfirmDelete(null)
+                  deleteReport(id)
+                }}
+              >
+                <Trash2Icon data-icon="inline-start" />
+                Delete report
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       ) : null}
     </Card>
   )
@@ -656,6 +733,9 @@ function ModelEffortField({ idPrefix, label, help, model, effort, onModel, onEff
 function ReportRow({ report, onOpen, onDelete, deleting }) {
   const status = report.status || "queued"
   const active = ACTIVE_STATUSES.has(status)
+  // An "active" row with a stale heartbeat is a killed job, not a live run —
+  // the backend deletes it on request, so the row must offer the trash.
+  const staleActive = active && rowIsStale(report)
   const complete = status === "complete"
   const failed = status === "failed"
   const checks = String(report.checks || "")
@@ -711,8 +791,10 @@ function ReportRow({ report, onOpen, onDelete, deleting }) {
         ) : null}
         <span className="min-w-0 flex-1" />
         {/* No delete affordance while the run is still working — a disabled
-            trash next to a live run read as "you could stop this". */}
-        {active ? null : (
+            trash next to a live run read as "you could stop this". A stale
+            active row is the exception: the job is dead, and without the
+            trash it would spin in the list forever. */}
+        {active && !staleActive ? null : (
           <Button
             variant="ghost"
             size="icon-sm"
@@ -720,7 +802,7 @@ function ReportRow({ report, onOpen, onDelete, deleting }) {
             disabled={deleting}
             onClick={(e) => {
               e.stopPropagation()
-              onDelete(report.report_id)
+              onDelete(report)
             }}
           >
             {deleting ? <Spinner className="size-3.5" /> : <Trash2Icon />}
@@ -740,17 +822,26 @@ function ReportRow({ report, onOpen, onDelete, deleting }) {
       ) : (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 pl-5.5 text-xs text-muted-foreground tabular-nums">
           {report.runs ? <span>Runs: {report.runs}</span> : null}
-          {checks.map((c) => (
-            <span key={c}>
-              {CHECK_META.find((m) => m.key === c)?.label || c}{" "}
-              <span className="font-medium text-foreground">
-                {fmtScore(report[`${c}_raw`])}
+          {checks.map((c) =>
+            // Nothing graded (the `<check>_graded` KPI is 0/absent — e.g.
+            // every gold discarded): a 0% here would read as a real score.
+            report[`${c}_graded`] > 0 ? (
+              <span key={c}>
+                {CHECK_META.find((m) => m.key === c)?.label || c}{" "}
+                <span className="font-medium text-foreground">
+                  {fmtScore(report[`${c}_raw`])}
+                </span>
+                {typeof report[`${c}_adjusted`] === "number" ? (
+                  <span> · Judge adjudication {fmtScore(report[`${c}_adjusted`])}</span>
+                ) : null}
               </span>
-              {typeof report[`${c}_adjusted`] === "number" ? (
-                <span> · Judge adjudication {fmtScore(report[`${c}_adjusted`])}</span>
-              ) : null}
-            </span>
-          ))}
+            ) : (
+              <span key={c}>
+                {CHECK_META.find((m) => m.key === c)?.label || c}{" "}
+                <span className="italic">not graded</span>
+              </span>
+            )
+          )}
         </div>
       )}
     </div>

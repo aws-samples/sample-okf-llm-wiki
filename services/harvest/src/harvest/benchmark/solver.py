@@ -2,7 +2,7 @@
 
 Simulates the real text-to-SQL consumer: given a question and READ-ONLY access to
 the authored bundle (a temp snapshot — no ``.metadata/``/``.context/``/gold, see
-:mod:`.snapshot`), it explores the docs and returns candidate SQL. It does NOT
+:mod:`.s3_snapshot`), it explores the docs and returns candidate SQL. It does NOT
 execute SQL (that's the grader's job — letting it run queries would let it iterate
 empirically to the answer, measuring persistence not the wiki) and it has no raw
 schema (that would let it bypass the wiki).

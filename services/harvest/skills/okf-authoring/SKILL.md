@@ -161,9 +161,11 @@ one `write` action. Steps per concept:
    - **Verify the grain before you state it.** "One row per X" is the most
      load-bearing claim in an asset doc, so measure it — don't infer it from
      column names. If X is a declared primary key you may trust it; if X is an
-     *assumed* composite key, test it:
+     *assumed* composite key, test it with the `check_grain` tool (one call:
+     unique-or-not, duplicate-group count, worst fan-out, sample duplicates) —
+     or, where that tool is unavailable, the equivalent probe:
      `SELECT COUNT(*) FROM (SELECT <key cols>, COUNT(*) c FROM <t> GROUP BY <key cols> HAVING c > 1)`.
-     A non-zero result means the grain is coarser than X — state the true grain
+     A non-unique result means the grain is coarser than X — state the true grain
      (or weaken it: "approximately one row per X; N duplicate keys exist because …")
      and note what the duplicates represent.
    - **Disambiguate near-synonyms.** Before writing column descriptions, list
@@ -173,26 +175,34 @@ one `write` action. Steps per concept:
      and write an explicit contrast — see the `# Gotchas` convention under Body.
    - **Profile for meaning, not just structure.** When catalog comments and
      uploaded context are thin, the semantics are still discoverable — from the
-     data. Run the cheap per-table probes in "No docs? Prospect in the data"
+     data. START with the precomputed column profile
+     (`.metadata/profile/<table>.md`, when present): it already carries the
+     null share, approximate distinct count, min/max, and top values per
+     column — most of the probes below answered without a single query. Honor
+     its markers: a sheet stamped INDICATIVE was computed from a sample, so
+     its value lists are leads (verify with `run_sql` before transcribing a
+     legend), and a value list at the top-K cap is NOT a closed enum. Only
+     then run the remaining probes from "No docs? Prospect in the data"
      (`references/fact-types.md`): name morphology (`_cd`/`_flg`/`is_` →
-     candidate enum or flag), distinct-value samples of low-cardinality columns
-     (an undocumented enum), null share (a mostly-NULL column has a "populated
-     only when …" rule worth finding), value ranges (implied units; out-of-band
+     candidate enum or flag), value ranges (implied units; out-of-band
      sentinels), and paired-null/ordering probes (exactly-one-of rules,
      `end >= start` invariants). Every probe result is a hypothesis to verify,
      never a fact to assert — and never full-scan a billed source to profile it.
    - **Discover joins yourself — don't wait to be told.** Find candidate
      relationships by grepping the cross-table column index for every shared key
      (`grep <name> .metadata/columns.tsv`), not just the joins a context doc
-     happens to mention. For each candidate, VERIFY it against live data before
-     documenting it — confirm the keys actually match on both sides and establish
-     the cardinality (1:1, 1:many, many:many) with a real query, e.g.
+     happens to mention. For each candidate, VERIFY it with the
+     `validate_join` tool — one call returns the key match rate in BOTH
+     directions, the null-key share, and the cardinality class (1:1 / 1:N /
+     N:1 / M:N); put those numbers in the join doc as its evidence. Where the
+     tool is unavailable, establish the same facts with real queries, e.g.
      `SELECT COUNT(*) FROM a JOIN b ON a.k = b.k` vs the row counts, or a
-     duplicate-key probe on the presumed FK. Check the **orphans** too — which
-     side has keys the other lacks and what those rows mean, so the join doc can
-     say whether to inner- or left-join — and the **value format** (casing,
-     zero-padding, types): a join that only works through a cast or
-     `TRIM`/`UPPER` must carry that normalization in its documented `ON` clause.
+     duplicate-key probe on the presumed FK. A sub-100% match rate IS the
+     orphan analysis — dig into which side has keys the other lacks and what
+     those rows mean, so the join doc can say whether to inner- or left-join
+     — and check the **value format** (casing, zero-padding, types): a join
+     that only works through a cast or `TRIM`/`UPPER` must carry that
+     normalization in its documented `ON` clause.
      Record what you measured (cardinality, orphan behavior, normalization) in
      the join doc — see the join template. Document only joins that hold; if a
      context doc's asserted join fails or has surprising cardinality, that is a

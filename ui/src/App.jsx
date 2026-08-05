@@ -59,6 +59,17 @@ import {
   CommandList,
 } from "@/components/ui/command"
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import {
   Popover,
   PopoverContent,
   PopoverTrigger,
@@ -292,27 +303,73 @@ function DatasetPicker({ datasets, selectionKey, onChange, loading }) {
   )
 }
 
-// Cycles system -> light -> dark. Rendered as a SidebarMenuButton so it matches
-// the nav items exactly (hover, collapsed icon + tooltip).
-function ThemeToggle() {
+// The sidebar footer squashed into ONE account row — initial-letter avatar +
+// the user's name (email when the pool carries no name claims) — opening a menu
+// with the theme picker (radio submenu, replaces the old cycling ThemeToggle
+// row) and Sign out. The shadcn "user button" pattern.
+function UserMenu({ name, email, onSignOut }) {
   const { theme, setTheme } = useTheme()
-  const next =
-    theme === "system" ? "light" : theme === "light" ? "dark" : "system"
-  const Icon =
+  const ThemeIcon =
     theme === "dark" ? MoonIcon : theme === "light" ? SunIcon : MonitorIcon
-  const label =
-    theme === "system"
-      ? "System theme"
-      : theme === "light"
-        ? "Light theme"
-        : "Dark theme"
+  const label = name || email || "Account"
+  const initial = label.trim().charAt(0).toUpperCase() || "?"
   return (
-    <SidebarMenuItem>
-      <SidebarMenuButton tooltip={label} onClick={() => setTheme(next)}>
-        <Icon />
-        <span>{label}</span>
-      </SidebarMenuButton>
-    </SidebarMenuItem>
+    <SidebarMenu>
+      <SidebarMenuItem>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            {/* pl-2 pulls the avatar to the nav icons' left edge (the button's
+                default pl-3 only suits text rows). */}
+            <SidebarMenuButton
+              size="lg"
+              tooltip="Account"
+              className="pl-2 data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
+            >
+              <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-sidebar-primary text-xs font-semibold text-sidebar-primary-foreground">
+                {initial}
+              </span>
+              {/* The email stays discoverable as the hover title when the name
+                  is what's shown. */}
+              <span className="min-w-0 flex-1 truncate text-xs" title={email}>
+                {label}
+              </span>
+              <ChevronsUpDownIcon className="ml-auto size-4 shrink-0 text-sidebar-foreground/70" />
+            </SidebarMenuButton>
+          </DropdownMenuTrigger>
+          {/* Opens UPWARD (the trigger is the bottom-most row) and matches the
+              trigger's width so it reads as the row unfolding. */}
+          <DropdownMenuContent
+            side="top"
+            align="start"
+            className="w-(--radix-dropdown-menu-trigger-width) min-w-56"
+          >
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger>
+                <ThemeIcon className="size-4 text-muted-foreground" />
+                Theme
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent>
+                <DropdownMenuRadioGroup value={theme} onValueChange={setTheme}>
+                  <DropdownMenuRadioItem value="system">
+                    System
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="light">
+                    Light
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="dark">
+                    Dark
+                  </DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+            <DropdownMenuItem onSelect={onSignOut}>
+              <LogOutIcon className="size-4 text-muted-foreground" />
+              Sign out
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </SidebarMenuItem>
+    </SidebarMenu>
   )
 }
 
@@ -659,24 +716,39 @@ function ChatNav({ item, active, onNavigate, ctrl, tooltip = item.label }) {
 // recentDatasets.js) — rendered identically in the sidebar and the collapsed
 // quick-nav popover, like recent chats in a chat app. Clicking one re-selects
 // it; the caller decides which section to land on.
-function RecentDatasetsMenu({ recents, selectionKey, onSelect }) {
+//
+// `scrollable` (the sidebar) keeps the label pinned and scrolls the ITEMS in
+// whatever height the caller's flex column grants — so a long list never pushes
+// the nav groups around. min-h-24 (~3 rows) is the floor: below it the group
+// stops shrinking and the whole sidebar scrolls instead (SidebarContent's own
+// overflow-auto). The popover reuse stays inline/unscrolled.
+function RecentDatasetsMenu({ recents, selectionKey, onSelect, scrollable = false }) {
   if (!recents?.length) return null
+  const menu = (
+    <SidebarMenu>
+      {recents.map((key) => (
+        <SidebarMenuItem key={key}>
+          <SidebarMenuButton
+            isActive={selectionKey === key}
+            onClick={() => onSelect(key)}
+          >
+            <HistoryIcon />
+            <span>{key}</span>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
+      ))}
+    </SidebarMenu>
+  )
   return (
     <>
       <SidebarGroupLabel>Recent datasets</SidebarGroupLabel>
-      <SidebarMenu>
-        {recents.map((key) => (
-          <SidebarMenuItem key={key}>
-            <SidebarMenuButton
-              isActive={selectionKey === key}
-              onClick={() => onSelect(key)}
-            >
-              <HistoryIcon />
-              <span>{key}</span>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        ))}
-      </SidebarMenu>
+      {scrollable ? (
+        <div className="okf-thin-scroll min-h-24 flex-1 overflow-y-auto">
+          {menu}
+        </div>
+      ) : (
+        menu
+      )}
     </>
   )
 }
@@ -872,6 +944,16 @@ function Console({ auth, api }) {
   }, [selectionKey, datasets])
 
   const email = auth.user?.profile?.email
+  // Standard OIDC name claims off the Cognito ID token: explicit given/family
+  // name first, then the combined `name`; null lets UserMenu fall back to email.
+  const displayName = useMemo(() => {
+    const p = auth.user?.profile
+    return (
+      [p?.given_name, p?.family_name].filter(Boolean).join(" ") ||
+      p?.name ||
+      null
+    )
+  }, [auth.user])
   const userSub = auth.user?.profile?.sub
 
   // Recent datasets (per-user MRU, localStorage). Recording keys off the URL's
@@ -984,37 +1066,27 @@ function Console({ auth, api }) {
             </SidebarGroupContent>
           </SidebarGroup>
           {visibleRecents.length ? (
-            <SidebarGroup>
-              <SidebarGroupContent>
+            // min-h-0 + flex-1 down the chain so the recents group takes the
+            // sidebar's leftover height and its ITEM LIST scrolls internally
+            // (see RecentDatasetsMenu `scrollable`) — nav/Manage stay pinned.
+            <SidebarGroup className="min-h-0 flex-1">
+              <SidebarGroupContent className="flex min-h-0 flex-1 flex-col">
                 <RecentDatasetsMenu
                   recents={visibleRecents}
                   selectionKey={selectionKey}
                   onSelect={openRecentDataset}
+                  scrollable
                 />
               </SidebarGroupContent>
             </SidebarGroup>
           ) : null}
         </SidebarContent>
         <SidebarFooter>
-          {email ? (
-            <span className="truncate px-2 text-xs text-sidebar-foreground/70 group-data-[collapsible=icon]:hidden">
-              {email}
-            </span>
-          ) : null}
-          {/* Same SidebarMenuButton as the nav items, so hover/active/collapsed
-              behavior is identical. */}
-          <SidebarMenu>
-            <ThemeToggle />
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                tooltip="Sign out"
-                onClick={() => auth.signoutRedirect()}
-              >
-                <LogOutIcon />
-                <span>Sign out</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </SidebarMenu>
+          <UserMenu
+            name={displayName}
+            email={email}
+            onSignOut={() => auth.signoutRedirect()}
+          />
         </SidebarFooter>
       </Sidebar>
 
@@ -1038,7 +1110,13 @@ function Console({ auth, api }) {
             section keeps the TopbarHeader (breadcrumb + dataset picker). */}
         {section === "chat" ? (
           <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
-            <ChatPanel api={api} auth={auth} ctrl={chat} datasets={datasets} />
+            <ChatPanel
+              api={api}
+              auth={auth}
+              ctrl={chat}
+              datasets={datasets}
+              datasetsLoading={datasetsLoading}
+            />
           </div>
         ) : (
           <>

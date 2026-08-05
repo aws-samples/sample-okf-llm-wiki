@@ -62,9 +62,53 @@ def _s3_client():
     return boto3.client("s3", region_name=region)
 
 
-def _get_text(s3, bucket: str, key: str) -> str:
-    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+def _get_text(s3, bucket: str, key: str, version_id: str = "") -> str:
+    kwargs: dict[str, Any] = {"Bucket": bucket, "Key": key}
+    if version_id:
+        kwargs["VersionId"] = version_id
+    body = s3.get_object(**kwargs)["Body"].read()
     return body.decode("utf-8") if isinstance(body, bytes) else body
+
+
+# The grading path's Athena knobs. Defaults match the historical hard-coded
+# behavior (60s timeout) plus a sane cap; both are per-QUERY, benchmark-only —
+# the harvest's own sample_rows/run_sql tools are untouched.
+_GRADER_DEFAULT_TIMEOUT_S = 60.0
+_GRADER_DEFAULT_MAX_ROWS = 50000
+
+
+def _grader_timeout_s() -> float:
+    try:
+        return max(1.0, float(os.environ.get("OKF_BENCHMARK_GRADER_TIMEOUT_S", "")))
+    except (TypeError, ValueError):
+        return _GRADER_DEFAULT_TIMEOUT_S
+
+
+def _grader_max_rows() -> int:
+    try:
+        return max(1, int(os.environ.get("OKF_BENCHMARK_GRADER_MAX_ROWS", "")))
+    except (TypeError, ValueError):
+        return _GRADER_DEFAULT_MAX_ROWS
+
+
+def _grading_execute(source):
+    """The grader's ``execute``: POSITIONAL rows, grading timeout, row cap.
+
+    Positional (not the dict rows the harvest tools use) because header-keyed
+    dicts collapse duplicate SELECT labels (``SELECT r.name, c.name``) into one
+    cell — a silent mis-grade. The row cap turns a pathological result set into
+    a classified grading failure instead of an unbounded buffer.
+    """
+    timeout_s = _grader_timeout_s()
+    max_rows = _grader_max_rows()
+
+    def execute(sql: str):
+        _header, rows = source.run_query(
+            sql, timeout_s=timeout_s, max_rows=max_rows, positional=True
+        )
+        return rows
+
+    return execute
 
 
 def validate_benchmark_payload(payload: dict) -> str | None:
@@ -119,6 +163,9 @@ def run_benchmark_report(payload: dict, session_id: str | None = None) -> None:
             report_id=report_id,
             report_doc=report_doc,
             traces_doc=traces_doc,
+            # Lets the store skip the PUTs when the human deleted the report
+            # mid-run — otherwise the artifacts would orphan behind no row.
+            registry=registry,
         )
         row(
             {
@@ -153,11 +200,13 @@ def _write_judge_traces(judge_dir: str, questions_by_id: dict, attempts: list) -
     """
     from harvest.benchmark.trace import render_markdown
 
-    try:
-        count = 0
-        for a in attempts:
-            if a.trace is None:
-                continue
+    count = 0
+    for a in attempts:
+        if a.trace is None:
+            continue
+        # Per-attempt try: one unwritable/oversized trace must not drop every
+        # trace after it in the loop.
+        try:
             q = questions_by_id.get(a.q_id)
             body = render_markdown(
                 a.trace,
@@ -173,9 +222,12 @@ def _write_judge_traces(judge_dir: str, questions_by_id: dict, attempts: list) -
             path = check_dir / f"q{a.q_id:03d}-run{a.run_index + 1}.md"
             path.write_text(body, encoding="utf-8")
             count += 1
-        log.info("Benchmark: wrote %d solve trace file(s) for the judge.", count)
-    except Exception:
-        log.warning("Could not write judge trace files (continuing).", exc_info=True)
+        except Exception:  # noqa: BLE001 - best-effort per file
+            log.warning(
+                "Could not write judge trace for q%d/%s run %d (continuing).",
+                a.q_id, a.check, a.run_index + 1, exc_info=True,
+            )
+    log.info("Benchmark: wrote %d solve trace file(s) for the judge.", count)
 
 
 def _execute(payload: dict, report_id: str) -> tuple[dict, dict]:
@@ -205,7 +257,16 @@ def _execute(payload: dict, report_id: str) -> tuple[dict, dict]:
     s3 = _s3_client()
 
     # Questions: a fetch/parse failure or an empty set FAILS the report (loud).
-    loaded = load_questions(_get_text(s3, bucket, payload["questions_key"]))
+    # The Control API pins the CSV's S3 VersionId at start time so a re-upload
+    # mid-run can't swap the graded set; absent (older payloads) → latest.
+    loaded = load_questions(
+        _get_text(
+            s3,
+            bucket,
+            payload["questions_key"],
+            version_id=str(payload.get(br.FIELD_QUESTIONS_VERSION_ID) or ""),
+        )
+    )
     if not loaded.questions:
         raise ValueError("the question set has no valid questions")
 
@@ -229,7 +290,7 @@ def _execute(payload: dict, report_id: str) -> tuple[dict, dict]:
         )
 
         source = build_source(dataset, source=payload.get("source"))
-        grader = Grader(source.run_query)
+        grader = Grader(_grading_execute(source))
 
         solver_cfg = resolve_model_config(
             payload.get(br.FIELD_SOLVER_MODEL), payload.get(br.FIELD_SOLVER_EFFORT)
@@ -498,7 +559,8 @@ def run_aggregate_annotations(payload: dict, session_id: str | None = None) -> N
         )
 
     try:
-        row({"agg_status": br.AGG_RUNNING})
+        # agg_detail cleared so a retry doesn't show the previous failure.
+        row({"agg_status": br.AGG_RUNNING, "agg_detail": ""})
         bucket = default_bucket()
         s3 = _s3_client()
         report_key = br.report_key(data_domain, dataset, report_id)
@@ -526,10 +588,12 @@ def run_aggregate_annotations(payload: dict, session_id: str | None = None) -> N
             report_id,
         )
     except Exception as e:  # noqa: BLE001 - loud failure on the row
+        # Its OWN attr — the shared `detail` belongs to the RUN lifecycle, and
+        # an agg failure writing there clobbered the run's failure reason.
         row(
             {
                 "agg_status": br.AGG_FAILED,
-                "detail": f"{type(e).__name__}: {e}"[:1024],
+                "agg_detail": f"{type(e).__name__}: {e}"[:1024],
             }
         )
         raise
@@ -632,6 +696,7 @@ def _aggregate(
         # consolidation ships the partial final set rather than failing the
         # whole aggregation.
         out: dict[str, Any] = {}
+        hit_step_budget = False
         try:
             out = agent.invoke(
                 {"messages": [("user", user)]},
@@ -640,11 +705,17 @@ def _aggregate(
         except Exception as e:  # noqa: BLE001 - partial store beats a dead aggregation
             if not is_recursion_limit(e):
                 raise
+            hit_step_budget = True
             log.warning(
                 "Annotation aggregator hit its step budget; shipping the %d "
                 "annotation(s) recorded so far.",
                 len(store),
             )
+        if not store and hit_step_budget:
+            # A budget-blown run that recorded NOTHING gets no nudge: pressing
+            # an already-exhausted agent to produce output invites hallucinated
+            # annotations. The empty final set is the honest outcome.
+            return store
         if not store:
             # The empty-store nudge, once: continue the SAME conversation with a
             # steering message (no middleware hook for this — the nudge is a

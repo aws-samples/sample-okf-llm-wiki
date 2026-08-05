@@ -135,6 +135,76 @@ def test_start_run_validates_models_against_catalog(cfg):
     assert payload["judge_effort"] == "xhigh"
 
 
+def test_start_run_requires_registered_dataset(cfg):
+    # No mapping row → fail fast with a 404 here, not minutes later on the row
+    # when the runtime can't snapshot.
+    _upload_csv(cfg)
+    resp = _start(cfg)
+    assert resp["statusCode"] == 404
+    assert "no such dataset" in json.loads(resp["body"])["error"]
+
+
+def test_start_run_rejects_oversize_csv(cfg, monkeypatch):
+    # Start must REJECT an oversize CSV like inspect does — reading exactly the
+    # cap silently truncated the set (and could split a row mid-line).
+    _dataset(cfg)
+    _upload_csv(cfg)
+    monkeypatch.setattr(handlers, "_BENCHMARK_CSV_MAX_BYTES", 16)
+    resp = _start(cfg)
+    assert resp["statusCode"] == 400
+    assert "exceeds" in json.loads(resp["body"])["error"]
+
+
+def test_start_run_pins_questions_version(cfg):
+    # The bundle bucket is versioned: the payload pins the CSV version counted
+    # at start, so a re-upload between start and the runtime's fetch can't
+    # swap the graded set.
+    cfg.s3.put_bucket_versioning(
+        Bucket=BUCKET, VersioningConfiguration={"Status": "Enabled"}
+    )
+    _dataset(cfg)
+    _upload_csv(cfg)
+    v1 = cfg.s3.get_object(
+        Bucket=BUCKET, Key=handlers.benchmark_questions_key("sales", "orders")
+    )["VersionId"]
+    assert _start(cfg)["statusCode"] == 200
+    payload = json.loads(cfg.agentcore.calls[-1]["payload"])
+    assert payload["questions_version_id"] == v1
+
+    _upload_csv(cfg, "question,gold_sql\nDifferent?,SELECT 2\n")
+    assert _start(cfg)["statusCode"] == 200
+    payload = json.loads(cfg.agentcore.calls[-1]["payload"])
+    assert payload["questions_version_id"] != v1
+
+
+def test_start_run_omits_questions_version_on_unversioned_bucket(cfg):
+    _dataset(cfg)
+    _upload_csv(cfg)
+    assert _start(cfg)["statusCode"] == 200
+    payload = json.loads(cfg.agentcore.calls[-1]["payload"])
+    assert "questions_version_id" not in payload
+
+
+def test_start_run_rejected_ack_flips_row_failed_and_502(cfg):
+    # invoke_agent_runtime returns 200 even when the runtime's synchronous ack
+    # says "rejected" — the row must flip to failed, not rot as queued.
+    _dataset(cfg)
+    _upload_csv(cfg)
+    cfg.agentcore.ack = {"status": "rejected", "error": "invalid report_id"}
+    resp = _start(cfg)
+    assert resp["statusCode"] == 502
+    assert "invalid report_id" in json.loads(resp["body"])["error"]
+    reports = json.loads(
+        app.route(_event("GET", "/benchmark/sales/orders/runs"), cfg)["body"]
+    )["reports"]
+    assert reports[0]["status"] == "failed"
+    assert "runtime rejected" in reports[0]["detail"]
+
+    # An accepted ack passes through untouched.
+    cfg.agentcore.ack = {"status": "accepted"}
+    assert _start(cfg)["statusCode"] == 200
+
+
 def test_start_run_rejects_unknown_version(cfg):
     _dataset(cfg)
     _upload_csv(cfg)
@@ -304,6 +374,49 @@ def test_delete_refused_while_aggregation_running(cfg):
     )["statusCode"] == 200
 
 
+def test_delete_report_purges_all_versions(cfg):
+    # The bundle bucket is versioned: a plain delete only stacks a delete
+    # marker, leaving the gold-carrying report readable as a noncurrent
+    # version. Deletion means purge — every version and marker goes.
+    cfg.s3.put_bucket_versioning(
+        Bucket=BUCKET, VersioningConfiguration={"Status": "Enabled"}
+    )
+    done_id = _mint_report(cfg, status="complete", report_doc={"v": 1})
+    cfg.s3.put_object(  # a second version of the report document
+        Bucket=BUCKET,
+        Key=br.report_key("sales", "orders", done_id),
+        Body=b'{"v": 2}',
+    )
+    resp = app.route(
+        _event("DELETE", f"/benchmark/sales/orders/runs/{done_id}"), cfg
+    )
+    assert resp["statusCode"] == 200
+    versions = cfg.s3.list_object_versions(
+        Bucket=BUCKET, Prefix=br.report_prefix("sales", "orders", done_id)
+    )
+    assert not versions.get("Versions") and not versions.get("DeleteMarkers")
+
+
+def test_delete_dataset_purges_benchmark_versions(cfg):
+    cfg.s3.put_bucket_versioning(
+        Bucket=BUCKET, VersioningConfiguration={"Status": "Enabled"}
+    )
+    _mint_report(cfg, status="complete", report_doc={"x": 1})
+    handlers.delete_domain_mapping(
+        cfg.ddb,
+        registry_table=REGISTRY,
+        data_domain="sales",
+        dataset="orders",
+        s3=cfg.s3,
+        bundle_bucket=BUCKET,
+    )
+    versions = cfg.s3.list_object_versions(
+        Bucket=BUCKET, Prefix="benchmark/sales/orders/"
+    )
+    # questions.csv + report.json: no versions, no delete markers left behind.
+    assert not versions.get("Versions") and not versions.get("DeleteMarkers")
+
+
 def test_delete_dataset_purges_benchmark_state(cfg):
     # Dataset deletion must take the gold-carrying benchmark/ prefix and the
     # REPORT# rows with it — re-registering the same names must NOT resurrect
@@ -359,6 +472,67 @@ def test_aggregate_requires_complete_report_and_flips_agg_status(cfg):
     )["statusCode"] == 409
 
 
+def test_aggregate_stale_running_can_be_retried(cfg):
+    # A dead aggregator (killed container, lost terminal write) leaves
+    # agg_status=running forever; past the heartbeat cutoff it must be
+    # retryable, mirroring the delete route's stale escape.
+    report_id = _mint_report(
+        cfg, status="complete", agg_status="running",
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+    resp = app.route(
+        _event("POST", f"/benchmark/sales/orders/runs/{report_id}/aggregate"), cfg
+    )
+    assert resp["statusCode"] == 200
+    assert json.loads(cfg.agentcore.calls[-1]["payload"])["mode"] == (
+        "aggregate_annotations"
+    )
+
+
+def test_aggregate_flip_is_conditional_against_the_race(cfg, monkeypatch):
+    # Two concurrent POSTs race the read-side check; the UpdateItem itself
+    # re-asserts "not already running unless stale". Simulate the lost race by
+    # making the read-side check say GO while the row is fresh-running.
+    report_id = _mint_report(cfg, status="complete", agg_status="running")
+    monkeypatch.setattr(handlers, "_report_row_is_stale", lambda item: True)
+    n_before = len(cfg.agentcore.calls)
+    resp = app.route(
+        _event("POST", f"/benchmark/sales/orders/runs/{report_id}/aggregate"), cfg
+    )
+    assert resp["statusCode"] == 409
+    assert len(cfg.agentcore.calls) == n_before  # no second aggregator started
+
+
+def test_aggregate_clears_stale_agg_detail_and_writes_it_on_reject(cfg):
+    report_id = _mint_report(
+        cfg, status="complete", agg_status="failed", agg_detail="old failure"
+    )
+    resp = app.route(
+        _event("POST", f"/benchmark/sales/orders/runs/{report_id}/aggregate"), cfg
+    )
+    assert resp["statusCode"] == 200
+    row = json.loads(
+        app.route(_event("GET", f"/benchmark/sales/orders/runs/{report_id}"), cfg)["body"]
+    )["row"]
+    assert row["agg_status"] == "running" and row["agg_detail"] == ""
+
+    # A runtime-rejected ack reverts to failed with the reason on agg_detail.
+    stale = _mint_report(
+        cfg, status="complete", agg_status="idle",
+    )
+    cfg.agentcore.ack = {"status": "rejected", "error": "invalid report_id"}
+    resp = app.route(
+        _event("POST", f"/benchmark/sales/orders/runs/{stale}/aggregate"), cfg
+    )
+    cfg.agentcore.ack = None
+    assert resp["statusCode"] == 502
+    row = json.loads(
+        app.route(_event("GET", f"/benchmark/sales/orders/runs/{stale}"), cfg)["body"]
+    )["row"]
+    assert row["agg_status"] == "failed"
+    assert "runtime rejected" in row["agg_detail"]
+
+
 # -- apply annotations ------------------------------------------------------------
 
 
@@ -391,6 +565,43 @@ def test_apply_annotations_batch_creates_with_benchmark_provenance(cfg):
     )["Items"]
     assert len(items) == 2
     assert all(i["status"]["S"] == "open" for i in items)
+
+
+def test_apply_annotations_validates_report_and_stamps_provenance(cfg):
+    report_id = _mint_report(cfg, status="complete")
+    resp = app.route(
+        _event(
+            "POST",
+            f"/benchmark/sales/orders/runs/{report_id}/annotations",
+            body={"annotations": [{"note": "document the join key"}]},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 200
+    created = json.loads(resp["body"])["created"]
+    assert created[0]["report_id"] == report_id  # provenance stamp
+
+    # A nonexistent report row must not mint annotations (stale/foreign id).
+    missing = "r20990101t000000-deadbeef"
+    resp = app.route(
+        _event(
+            "POST",
+            f"/benchmark/sales/orders/runs/{missing}/annotations",
+            body={"annotations": [{"note": "a note"}]},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 404
+    # An invalid id shape is a 400.
+    resp = app.route(
+        _event(
+            "POST",
+            "/benchmark/sales/orders/runs/NOT_VALID/annotations",
+            body={"annotations": [{"note": "a note"}]},
+        ),
+        cfg,
+    )
+    assert resp["statusCode"] == 400
 
 
 def test_apply_annotations_validates_body(cfg):

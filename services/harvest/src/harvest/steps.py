@@ -650,6 +650,18 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
     # dynamically, so a reliable count isn't statically knowable; the UI grows the
     # squares row as sub-agents actually start.
 
+    def emit_status(self, label: str) -> None:
+        """A runner-authored narration line for PRE-AGENT phases.
+
+        The callback surface only observes the agent, so work that happens
+        before the first model turn — the metadata snapshot and the column
+        profiling pass — was invisible in the live feed. The runner calls this
+        directly around those phases; the event is a plain ``kind="agent"``
+        one-liner, so the UI renders it like any other narration row with no
+        changes.
+        """
+        self._emit({"kind": KIND_AGENT, "label": str(label)})
+
     def emit_subagent_event(self, event: dict[str, Any]) -> None:
         """Emit one real sub-agent lifecycle event from the custom stream.
 

@@ -156,6 +156,90 @@ def test_update_report_row_never_raises():
                       report_id="r1-aaaa1111", attrs={"status": "running"})
 
 
+def test_update_report_row_retries_terminal_writes_only(monkeypatch):
+    # A transient DDB fault on the TERMINAL write would leave an eternal
+    # `running` row in front of a durable S3 report — terminal statuses get a
+    # bounded retry; every non-terminal write has a later write to correct it.
+    import time as _time
+
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)
+
+    class FlakyOnce:
+        def __init__(self):
+            self.calls = 0
+
+        def update_item(self, **_kw):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("ddb down")
+
+    flaky = FlakyOnce()
+    update_report_row(
+        (flaky, "reg"), data_domain="d", dataset="ds", report_id="r1-aaaa1111",
+        attrs={"status": br.STATUS_COMPLETE},
+    )
+    assert flaky.calls == 2  # retried once, then succeeded
+
+    flaky = FlakyOnce()
+    update_report_row(
+        (flaky, "reg"), data_domain="d", dataset="ds", report_id="r1-aaaa1111",
+        attrs={"phase": "solving"},
+    )
+    assert flaky.calls == 1  # non-terminal → no retry
+
+    class CondFail:
+        def __init__(self):
+            self.calls = 0
+
+        def update_item(self, **_kw):
+            self.calls += 1
+            e = RuntimeError("gone")
+            e.response = {"Error": {"Code": "ConditionalCheckFailedException"}}
+            raise e
+
+    cond = CondFail()
+    update_report_row(
+        (cond, "reg"), data_domain="d", dataset="ds", report_id="r1-aaaa1111",
+        attrs={"status": br.STATUS_FAILED},
+    )
+    assert cond.calls == 1  # a deleted row is a deliberate drop, never retried
+
+
+@mock_aws
+def test_persist_report_artifacts_skips_when_row_deleted():
+    # A run finishing AFTER the human deleted its report must not orphan
+    # report.json/traces.json behind no row.
+    ddb = boto3.client("dynamodb", region_name="us-east-1")
+    ddb.create_table(
+        TableName="reg",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"},
+                   {"AttributeName": "sk", "KeyType": "RANGE"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"},
+                              {"AttributeName": "sk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    puts = []
+    persist_report_artifacts(
+        bucket="b", data_domain="d", dataset="ds", report_id="r1-aaaa1111",
+        report_doc={}, traces_doc=None,
+        put_object=lambda b, k, body: puts.append(k),
+        registry=(ddb, "reg"),
+    )
+    assert puts == []  # no row → the PUTs are skipped
+
+    ddb.put_item(TableName="reg", Item={
+        "pk": {"S": "HARVEST#d#ds"}, "sk": {"S": "REPORT#r1-aaaa1111"},
+        "status": {"S": "running"},
+    })
+    persist_report_artifacts(
+        bucket="b", data_domain="d", dataset="ds", report_id="r1-aaaa1111",
+        report_doc={}, traces_doc=None,
+        put_object=lambda b, k, body: puts.append(k),
+        registry=(ddb, "reg"),
+    )
+    assert puts == ["benchmark/d/ds/reports/r1-aaaa1111/report.json"]
+
+
 def test_row_progress_throttles_but_always_writes_final_tick():
     writes = []
     clock = {"t": 0.0}
@@ -412,6 +496,105 @@ def test_write_judge_traces_is_best_effort(tmp_path):
     blocker.write_text("x")
     attempts = [Attempt(q_id=0, check="sql", run_index=0, trace=SolverTrace())]
     _write_judge_traces(str(blocker), {}, attempts)  # must not raise
+
+
+def test_run_aggregate_annotations_failure_writes_agg_detail(monkeypatch):
+    # The agg failure lands on its OWN attr (agg_detail) — writing the shared
+    # `detail` clobbered the RUN's failure reason.
+    from harvest.benchmark import studio
+
+    monkeypatch.delenv("OKF_BUNDLE_BUCKET", raising=False)
+    rows = []
+    monkeypatch.setattr(studio, "build_registry_client", lambda: ("client", "t"))
+    monkeypatch.setattr(
+        studio, "update_report_row", lambda reg, **kw: rows.append(kw["attrs"])
+    )
+    with pytest.raises(Exception):
+        studio.run_aggregate_annotations(
+            {"data_domain": "d", "dataset": "ds",
+             "report_id": "r20260729t1-abcd1234"}
+        )
+    # Start clears any previous failure's agg_detail.
+    assert rows[0] == {"agg_status": br.AGG_RUNNING, "agg_detail": ""}
+    assert rows[-1]["agg_status"] == br.AGG_FAILED
+    assert "OKF_BUNDLE_BUCKET" in rows[-1]["agg_detail"]
+    assert "detail" not in rows[-1]  # the run's failure reason stays intact
+
+
+def test_grading_execute_threads_env_knobs_and_positional(monkeypatch):
+    from harvest.benchmark.studio import _grading_execute
+
+    monkeypatch.setenv("OKF_BENCHMARK_GRADER_TIMEOUT_S", "5")
+    monkeypatch.setenv("OKF_BENCHMARK_GRADER_MAX_ROWS", "7")
+    seen = {}
+
+    class Src:
+        def run_query(self, sql, *, timeout_s, max_rows, positional):
+            seen.update(
+                sql=sql, timeout_s=timeout_s, max_rows=max_rows,
+                positional=positional,
+            )
+            return ["h"], [["v", None]]
+
+    execute = _grading_execute(Src())
+    assert execute("SELECT 1") == [["v", None]]  # rows only; None preserved
+    assert seen == {
+        "sql": "SELECT 1", "timeout_s": 5.0, "max_rows": 7, "positional": True,
+    }
+
+
+def test_grading_execute_defaults(monkeypatch):
+    from harvest.benchmark.studio import _grader_max_rows, _grader_timeout_s
+
+    monkeypatch.delenv("OKF_BENCHMARK_GRADER_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("OKF_BENCHMARK_GRADER_MAX_ROWS", raising=False)
+    assert _grader_timeout_s() == 60.0
+    assert _grader_max_rows() == 50000
+
+
+def test_get_text_pins_the_questions_version():
+    import io
+
+    from harvest.benchmark.studio import _get_text
+
+    calls = []
+
+    class S3:
+        def get_object(self, **kw):
+            calls.append(kw)
+            return {"Body": io.BytesIO(b"question,gold_sql\nQ,S\n")}
+
+    _get_text(S3(), "b", "k", version_id="v123")
+    assert calls[-1] == {"Bucket": "b", "Key": "k", "VersionId": "v123"}
+    # Back-compat: no version (older payloads) → the latest object.
+    _get_text(S3(), "b", "k")
+    assert calls[-1] == {"Bucket": "b", "Key": "k"}
+
+
+@mock_aws
+def test_materialize_skips_path_escaping_judge_extras(tmp_path):
+    # S3 keys are raw strings — a `..` segment under .metadata/ must not lay a
+    # file outside the judge's temp tree.
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="bundles")
+    prefix = "okf/sales/orders/"
+    s3.put_object(Bucket="bundles", Key=prefix + "index.md", Body=b"# index")
+    s3.put_object(
+        Bucket="bundles", Key=prefix + ".metadata/columns.tsv", Body=b"ok"
+    )
+    s3.put_object(
+        Bucket="bundles", Key=prefix + ".metadata/../../../evil.txt", Body=b"evil"
+    )
+
+    solver_dir, judge_dir = tmp_path / "solver", tmp_path / "judge"
+    materialize_snapshots(
+        s3, bucket="bundles", data_domain="sales", dataset="orders",
+        version_id="", solver_dir=str(solver_dir), judge_dir=str(judge_dir),
+    )
+    assert (judge_dir / ".metadata/columns.tsv").exists()
+    escaped = [p for p in tmp_path.rglob("evil.txt")]
+    assert escaped == []  # nothing written outside the trees
+    assert not (tmp_path.parent / "evil.txt").exists()
 
 
 def test_judge_toolset_includes_run_code_only_with_a_sandbox(tmp_path):

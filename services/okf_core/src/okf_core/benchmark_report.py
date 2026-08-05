@@ -41,6 +41,10 @@ FIELD_JUDGE_EFFORT = "judge_effort"
 #: The pinned wiki version's marker VersionId; "" = the current live bundle.
 FIELD_VERSION_ID = "version_id"
 FIELD_QUESTIONS_KEY = "questions_key"
+#: The questions CSV's S3 VersionId, captured when the run started (the bundle
+#: bucket is versioned) so a re-upload mid-run can't swap the graded set.
+#: Absent/"" on older payloads → the runtime reads the latest object.
+FIELD_QUESTIONS_VERSION_ID = "questions_version_id"
 #: Behavior-check option: give the Behavior solver read-only `run_sql` against
 #: the live dataset (a truer consumer simulation — real agents have SQL).
 #: Default False = the classic wiki-only solver. NEVER applies to the SQL EX

@@ -892,3 +892,129 @@ def test_list_domains_mid_pagination_error_surfaces(tools, config):
     )
     with _pytest.raises(_Throttle):
         t2.list_domains(limit=2)
+
+
+def test_list_domains_cursored_page_survives_a_marker_read_failure(tools, aws):
+    # A cursor is PROOF the prior page came from the GSI (the legacy scan
+    # never emits one), so a cursored call must take the GSI path without
+    # re-consulting the readiness marker: entity_index_ready fails closed to
+    # False, so a transient marker read (or a deleted marker) mid-pagination
+    # would otherwise reroute page N to the legacy scan — which ignores
+    # start_key and hands the caller the whole catalog again with
+    # next_cursor=null.
+    import boto3
+
+    from consumption_mcp.tools import ConsumptionConfig, ConsumptionTools
+
+    ddb = boto3.resource("dynamodb", region_name="us-east-1")
+    table = ddb.create_table(
+        TableName="okf-registry-flaky-marker",
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "entity", "AttributeType": "S"},
+            {"AttributeName": "pair", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "by-entity",
+                "KeySchema": [
+                    {"AttributeName": "entity", "KeyType": "HASH"},
+                    {"AttributeName": "pair", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for i in range(1, 5):
+        table.put_item(
+            Item={
+                "pk": "DOMAIN#sales",
+                "sk": f"DATASET#ds{i}",
+                "entity": "dataset",
+                "pair": f"sales/ds{i}",
+                "data_domain": "sales",
+                "dataset": f"ds{i}",
+            }
+        )
+    table.put_item(Item={"pk": "REGISTRY", "sk": "ENTITY_INDEX_READY"})
+    cfg = ConsumptionConfig(
+        bundle_bucket=BUNDLE_BUCKET,
+        vector_bucket="vb",
+        vector_index="vi",
+        registry_table="okf-registry-flaky-marker",
+    )
+
+    def make(ddb_like):
+        return ConsumptionTools(
+            s3=tools.s3,
+            s3vectors=tools.s3vectors,
+            bedrock_runtime=tools.bedrock_runtime,
+            ddb=ddb_like,
+            config=cfg,
+        )
+
+    first = make(table).list_domains(limit=2)
+    assert first["next_cursor"] is not None
+
+    class _FlakyMarkerTable:
+        def get_item(self, **kw):
+            raise RuntimeError("transient marker read failure")
+
+        def scan(self, **kw):
+            raise AssertionError("a cursored page must never fall back to the scan")
+
+        def query(self, **kw):
+            return table.query(**kw)
+
+    out = make(_FlakyMarkerTable()).list_domains(
+        limit=2, cursor=first["next_cursor"]
+    )
+    page1 = {f"{d['data_domain']}/{d['dataset']}" for d in first["datasets"]}
+    page2 = {f"{d['data_domain']}/{d['dataset']}" for d in out["datasets"]}
+    assert page2 and not (page1 & page2)  # start_key honored — no replay
+
+
+def test_list_domains_cursored_page_missing_index_error_surfaces(tools, config):
+    # Even the one fallback allowed on FIRST pages ("the index does not
+    # exist") must surface when a cursor is supplied: the cursor could only
+    # have come from a GSI page, so the scan cannot resume it.
+    import pytest as _pytest
+
+    from consumption_mcp.tools import ConsumptionTools, _encode_cursor
+
+    class _NoIndex(Exception):
+        def __init__(self):
+            super().__init__("no index")
+            self.response = {
+                "Error": {
+                    "Code": "ValidationException",
+                    "Message": "The table does not have the specified index",
+                }
+            }
+
+    class _FakeDdb:
+        def get_item(self, **kw):
+            return {"Item": {"pk": "REGISTRY", "sk": "ENTITY_INDEX_READY"}}
+
+        def query(self, **kw):
+            raise _NoIndex()
+
+        def scan(self, **kw):
+            raise AssertionError("a cursored page must never fall back to the scan")
+
+    t2 = ConsumptionTools(
+        s3=tools.s3,
+        s3vectors=tools.s3vectors,
+        bedrock_runtime=tools.bedrock_runtime,
+        ddb=_FakeDdb(),
+        config=config,
+    )
+    cursor = _encode_cursor({"pk": "DOMAIN#sales", "sk": "DATASET#ds2"})
+    with _pytest.raises(_NoIndex):
+        t2.list_domains(limit=2, cursor=cursor)
