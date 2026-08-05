@@ -148,7 +148,7 @@ const EDGE_TYPES = { floating: FloatingEdge }
 function nodeKind(type, conceptId) {
   const t = (type || "").toLowerCase()
   if ((conceptId || "").startsWith("external/") || t.includes("cross-dataset"))
-    // chart-1 (cyan) for the bar/icon: --xref-node-bg is a cyan-family tint, and
+    // chart-1 (sky) for the bar/icon: --xref-node-bg is a sky-family tint, and
     // chart-1 is the only slot that still clears 3:1 against it in LIGHT mode
     // (the other four are hue-separated for chart series identity, not stepped
     // for contrast on this specific wash — orange/aqua/magenta land at
@@ -243,7 +243,7 @@ function collapseEdges(rawEdges) {
 
 // A modern concept node: accent bar + type icon, title, and the concept id.
 // Cross-dataset reference cards get a distinct background (--xref-node-bg, an
-// explicit per-theme token in index.css — a faint brand-cyan wash in light AND
+// explicit per-theme token in index.css — a faint brand-sky wash in light AND
 // dark) — they represent knowledge about ANOTHER dataset's relationship to
 // this one, worth telling apart at a glance.
 const ConceptNode = memo(function ConceptNode({ data, selected }) {

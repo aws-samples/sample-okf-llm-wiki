@@ -83,7 +83,7 @@ const TYPE_BADGE = {
 }
 
 // One authored guardrail as its own sub-card: id + track badge + source on
-// the top line, then the two authored fields verbatim (cyan labels, full
+// the top line, then the two authored fields verbatim (sky labels, full
 // foreground text — the guardrail text is the payload, not an aside).
 function GuardrailItem({ policy }) {
   return (
@@ -109,13 +109,13 @@ function GuardrailItem({ policy }) {
         ) : null}
       </div>
       <p className="text-foreground">
-        <span className="font-medium text-cyan-600 dark:text-cyan-400">
+        <span className="font-medium text-sky-600 dark:text-sky-400">
           Condition:
         </span>{" "}
         {policy.condition}
       </p>
       <p className="text-foreground">
-        <span className="font-medium text-cyan-600 dark:text-cyan-400">
+        <span className="font-medium text-sky-600 dark:text-sky-400">
           Action:
         </span>{" "}
         {policy.action}
