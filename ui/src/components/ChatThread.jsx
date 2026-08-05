@@ -35,7 +35,7 @@ function HistorySkeleton() {
       {[0, 1].map((i) => (
         <div key={i} className="flex flex-col gap-3">
           <div className="flex justify-end">
-            <Skeleton className="h-8 w-52 rounded-2xl" />
+            <Skeleton className="h-8 w-52 rounded-xl" />
           </div>
           <div className="flex flex-col gap-2">
             <Skeleton className="h-4 w-40" />

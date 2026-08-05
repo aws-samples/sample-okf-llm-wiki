@@ -59,14 +59,23 @@ def report_status(
     status: str,
     detail: str | None = None,
     only_if_active: bool = False,
+    session_id: str | None = None,
     model: str | None = None,
     effort: str | None = None,
     subagent_model: str | None = None,
     subagent_effort: str | None = None,
     reviewer_model: str | None = None,
     reviewer_effort: str | None = None,
-) -> None:
+) -> bool:
     """Best-effort transition of the harvest status row to ``status``.
+
+    Returns False ONLY when the ``only_if_active`` condition rejected the
+    write — the row was already terminal, i.e. an operator cancel won the
+    race — so the caller can skip follow-on work (the post-complete policy
+    build) for a run the operator was just told is cancelled. Every other
+    path returns True, including a swallowed generic write failure: the run
+    itself still finished, and a registry blip must not silently drop the
+    follow-on.
 
     ``registry`` is the (client, table) tuple from :func:`build_registry_client`
     (or None — then this is a no-op). Only ``status`` / ``updated_at`` (/ optional
@@ -92,9 +101,18 @@ def report_status(
     shutdown`` from the torn-down QuickJS worker) and the runner tries to report
     ``failed`` — this guard makes that a no-op so the status stays ``cancelled``.
     A rejected conditional write is expected here, not an error.
+
+    ``session_id`` (the run's ``runtime_session_id`` — the same id the lease
+    write stamped on the row) tightens ``only_if_active`` with RUN IDENTITY: a
+    hung run's late terminal write must not land on a SUCCESSOR run's
+    queued/running row (the staleness escape lets a new run start over a dead
+    one — status alone can't tell the two apart, and a clobber here would both
+    mark the live run terminal and trigger a ghost follow-on policy build
+    against its half-written bundle). None (tests, local runs) keeps the
+    status-only condition.
     """
     if registry is None:
-        return
+        return True
     client, table = registry
     try:
         from datetime import datetime, timezone
@@ -139,25 +157,41 @@ def report_status(
             "ExpressionAttributeValues": values,
         }
         if only_if_active:
-            # Row must still be in flight (or absent) to accept a terminal write.
-            kwargs["ConditionExpression"] = (
-                "attribute_not_exists(pk) OR #s = :queued OR #s = :running"
-            )
+            # Row must still be in flight (or absent) to accept a terminal
+            # write — and, when the caller knows its run identity, the row
+            # must still be THIS run's (see docstring). The
+            # attribute_not_exists(runtime_session_id) tolerance covers rows
+            # written out-of-band without one.
             values[":queued"] = {"S": "queued"}
             values[":running"] = {"S": "running"}
+            active = "#s = :queued OR #s = :running"
+            if session_id:
+                values[":sid"] = {"S": session_id}
+                kwargs["ConditionExpression"] = (
+                    f"attribute_not_exists(pk) OR (({active}) AND "
+                    "(attribute_not_exists(runtime_session_id) OR "
+                    "runtime_session_id = :sid))"
+                )
+            else:
+                kwargs["ConditionExpression"] = (
+                    f"attribute_not_exists(pk) OR {active}"
+                )
         client.update_item(**kwargs)
         log.info("Harvest status -> %s (%s/%s)", status, data_domain, dataset)
+        return True
     except Exception as e:  # noqa: BLE001 - never let a registry write break a harvest
         code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
         if code == "ConditionalCheckFailedException":
-            # Row already terminal (e.g. cancelled) — intentionally not overwritten.
+            # Row already terminal (e.g. cancelled) — or, with session_id, a
+            # SUCCESSOR run owns it now. Intentionally not overwritten.
             log.info(
-                "Harvest status=%s skipped for %s/%s (row already terminal)",
+                "Harvest status=%s skipped for %s/%s "
+                "(row already terminal or owned by a newer run)",
                 status,
                 data_domain,
                 dataset,
             )
-            return
+            return False
         log.warning(
             "Failed to report harvest status=%s for %s/%s (continuing)",
             status,
@@ -165,6 +199,7 @@ def report_status(
             dataset,
             exc_info=True,
         )
+        return True
 
 
 def stamp_guidance_applied(

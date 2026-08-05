@@ -30,6 +30,11 @@ import { useChatController } from "@/hooks/useChatController"
 import { makeApi } from "@/lib/api"
 import { signInPreservingRoute } from "@/lib/auth"
 import {
+  IS_MAC,
+  isNewChatShortcut,
+  NEW_CHAT_SHORTCUT_LABEL,
+} from "@/lib/platform"
+import {
   loadRecentDatasets,
   pushRecentDataset,
 } from "@/lib/recentDatasets"
@@ -214,8 +219,9 @@ function LoginScreen({ onSignIn }) {
 // Dataset picker shown in the top-bar breadcrumb (in place of the dataset
 // name), on views that need a selection. Populated from the registry mappings;
 // the chosen (data_domain, dataset) is shared with Context / Harvest / Browse.
-// Styled to sit inline in the breadcrumb: borderless/transparent, muted text,
-// with a subtle hover — it reads as the breadcrumb's last segment, not a form.
+// Styled to sit inline in the breadcrumb: transparent at rest, muted text —
+// it reads as the breadcrumb's last segment; only the hover tint reveals it
+// as a control (foreground-alpha, since --muted matches the page background).
 function DatasetPicker({ datasets, selectionKey, onChange, loading }) {
   const [open, setOpen] = useState(false)
 
@@ -242,10 +248,11 @@ function DatasetPicker({ datasets, selectionKey, onChange, loading }) {
           size="sm"
           role="combobox"
           aria-expanded={open}
-          // Match the old Select trigger's inline breadcrumb look: -ml-1.5
-          // cancels the button's left padding so the TEXT lines up with the
-          // content column's left edge, muted until hover, no focus ring box.
-          className="-ml-1.5 h-7 -translate-y-px gap-1 px-1.5 font-normal text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:ring-0 [&_svg]:text-muted-foreground/70"
+          // Inline breadcrumb look: -ml-1.5 cancels the button's left padding
+          // so the TEXT lines up with the content column's left edge, muted
+          // until hover (the ghost variant's foreground-alpha tint), no focus
+          // ring box.
+          className="-ml-1.5 h-8 -translate-y-px gap-1 px-1.5 font-normal text-muted-foreground hover:text-foreground focus-visible:ring-0 [&_svg]:text-muted-foreground/70"
         >
           {selectionKey || "Select a dataset…"}
           <ChevronsUpDownIcon data-icon="inline-end" className="opacity-70" />
@@ -617,9 +624,19 @@ function ChatNav({ item, active, onNavigate, ctrl, tooltip = item.label }) {
             <SidebarMenuSubButton
               onClick={ctrl.startNewChat}
               className="cursor-pointer"
+              title={`New chat (${NEW_CHAT_SHORTCUT_LABEL})`}
             >
               <MessageSquarePlusIcon />
               <span>New chat</span>
+              {/* Inline chip only on macOS, where the glyphs (⇧⌘O) stay tiny.
+                  Windows/Linux have no standard modifier symbols — the full
+                  "Ctrl+Shift+O" would eat the row, so it lives in the hover
+                  tooltip there. The chord itself is bound globally in App. */}
+              {IS_MAC ? (
+                <kbd className="ml-auto font-sans text-[10px] tracking-wide text-muted-foreground/80">
+                  {NEW_CHAT_SHORTCUT_LABEL}
+                </kbd>
+              ) : null}
             </SidebarMenuSubButton>
           </SidebarMenuSubItem>
           <SidebarMenuSubItem>
@@ -726,6 +743,22 @@ function Console({ auth, api }) {
     active: section === "chat",
     userSub: auth.user?.profile?.sub,
   })
+
+  // Global shortcut: ⇧⌘O (macOS) / Ctrl+Shift+O — start a NEW CHAT from
+  // anywhere in the app (Claude's binding, kept for familiarity). Deliberately
+  // fires even while an input has focus (the modifier chord is unambiguous);
+  // preventDefault stops the browser from grabbing the combo (Chrome binds
+  // Ctrl+Shift+O to its bookmark manager).
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (!isNewChatShortcut(e)) return
+      e.preventDefault()
+      chat.startNewChat()
+      if (section !== "chat") navigate("chat")
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [chat.startNewChat, section, navigate])
 
   // Jump from the Graph view to the Browse view, opening a concept's doc.
   const openConceptInBrowse = useCallback(

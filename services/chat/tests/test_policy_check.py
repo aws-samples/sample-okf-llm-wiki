@@ -791,13 +791,17 @@ def test_build_curate_input_sections_are_conditional():
     text = pc.build_curate_input(raw_question="points?")
     assert "LATEST MESSAGE" in text
     assert "PREVIOUS QUESTION" not in text and "CLARIFICATIONS" not in text
+    assert "EARLIER QUESTIONS" not in text
     full = pc.build_curate_input(
         prev_question="pq", prev_answer="pa", raw_question="rq",
         qa=[{"prompt": "p", "answer": "a"}],
+        earlier_questions=["eq1", "eq2"],
     )
-    for fragment in ("PREVIOUS QUESTION", "ANSWER THE USER GOT", "LATEST MESSAGE",
-                     "CLARIFICATIONS"):
+    for fragment in ("EARLIER QUESTIONS", "PREVIOUS QUESTION",
+                     "ANSWER THE USER GOT", "LATEST MESSAGE", "CLARIFICATIONS"):
         assert fragment in full
+    # Earlier questions render before the previous one (chronological).
+    assert full.index("eq1") < full.index("eq2") < full.index("pq")
 
 
 def test_record_final_answer_persists_truncated(env):
@@ -820,7 +824,194 @@ def test_read_policy_state_is_empty_for_a_missing_row(env):
         env["ddb"], threads_table=THREADS_TABLE, user_sub="nobody",
         thread_id="ghost",
     )
-    assert state == {"curated_question": "", "last_answer": ""}
+    assert state == {
+        "curated_question": "",
+        "last_answer": "",
+        "question_history": [],
+        "history_last_raw": "",
+    }
+
+
+def test_read_policy_state_returns_none_on_a_failed_read():
+    class _Boom:
+        def get_item(self, **kw):
+            raise RuntimeError("ddb down")
+
+    # Unreadable is NOT absent: the caller must be able to tell a missing row
+    # (turn-1 semantics, seed-write allowed) from a read failure (never write).
+    assert read_policy_state(
+        _Boom(), threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    ) is None
+
+
+def test_unreadable_state_never_seeds_over_the_chain(env):
+    # A transient GetItem failure mid-conversation must not take the turn-1
+    # branch and clobber a good rolling chain with the raw fragment.
+    _seed_usable_policy(env)
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1", curated_question="good question",
+        last_answer="good answer", question_history=["q1", "good question"],
+    )
+
+    class _FailingReads:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def get_item(self, **kw):
+            if kw.get("TableName") == THREADS_TABLE:
+                raise RuntimeError("throttled")
+            return self._inner.get_item(**kw)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    judge = FakeToolModel(list(_CLEAN_SCRIPT))
+    checker = pc.PolicyChecker(
+        chat_config=_cfg(),
+        tracks=("computational",),
+        data_domain=DOMAIN,
+        dataset=DATASET,
+        question="and for 2019?",
+        user_sub="alice",
+        thread_id="conv1",
+        clients={"ddb": _FailingReads(env["ddb"]), "s3": env["s3"],
+                 "events": FakeEvents()},
+        judge_model=judge,
+        # The rewrite must never run on unreadable state.
+        rewrite_model=_RaisingModel(),
+    )
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    assert "and for 2019?" in judge.prompts[0]  # raw fallback for THIS turn
+    state = read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )
+    assert state["curated_question"] == "good question"
+    assert state["question_history"] == ["q1", "good question"]
+
+
+def test_fold_replaces_the_same_turns_history_entry(env):
+    # An ask_human fold re-curates the SAME turn: the folded question must
+    # REPLACE the turn's pre-fold history entry (matched via the stored raw
+    # question — durable across the resume's checker rebuild), never stack a
+    # second entry for one turn.
+    _seed_usable_policy(env)
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1", curated_question="q1", last_answer="a1",
+        question_history=["q1"], history_last_raw="raw-q1",
+    )
+    # The pre-fold turn: rewrite lands "points? (pre-fold)".
+    pre = _checker(
+        env, FakeToolModel(list(_CLEAN_SCRIPT)),
+        user_sub="alice", thread_id="conv1", question="points?",
+        rewrite_model=FakeModel([json.dumps({"question": "points? (pre-fold)"})]),
+    )
+    pre.prewarm()
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["curated_question"] == "points? (pre-fold)")
+    # The resume: a FRESH checker (production rebuilds it), fold, re-curate.
+    post = _checker(
+        env, FakeToolModel(list(_CLEAN_SCRIPT)),
+        user_sub="alice", thread_id="conv1", question="",
+        rewrite_model=FakeModel(
+            [json.dumps({"question": "championship points? (folded)"})]
+        ),
+    )
+    post.fold_clarifications(
+        "points?", [{"prompt": "Which points?", "answer": "championship"}]
+    )
+    post.prewarm()
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["curated_question"] == "championship points? (folded)")
+    state = read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )
+    # ONE entry for the turn — q1 survives; the unclarified variant is gone.
+    assert state["question_history"] == ["q1", "championship points? (folded)"]
+
+
+def test_identical_reask_appends_after_the_answer_clears_the_fold_signal(env):
+    # The fold-replace signal must not outlive its turn: the stream-end
+    # answer write clears history_last_raw, so a user RE-ASKING the identical
+    # raw question next turn (a common retry after a bad answer) appends its
+    # own history entry instead of silently overwriting the previous turn's.
+    _seed_usable_policy(env)
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1", curated_question="qN", last_answer="aN",
+        question_history=["q1", "qN"], history_last_raw="points?",
+    )
+
+    def _state():
+        return read_policy_state(
+            env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+            thread_id="conv1",
+        )
+
+    # Turn N ends: the final-answer write clears the same-turn signal.
+    ender = _checker(env, FakeToolModel([]), user_sub="alice", thread_id="conv1")
+    ender.record_final_answer("the final answer")
+    assert _wait_until(lambda: _state()["history_last_raw"] == "")
+
+    # Turn N+1 re-asks the IDENTICAL raw question; the landed rewrite APPENDS.
+    t = _checker(
+        env, FakeToolModel(list(_CLEAN_SCRIPT)),
+        user_sub="alice", thread_id="conv1", question="points?",
+        rewrite_model=FakeModel([json.dumps({"question": "qN+1"})]),
+    )
+    t.prewarm()
+    assert _wait_until(lambda: _state()["curated_question"] == "qN+1")
+    # qN survives — no history slot was lost to the fold heuristic.
+    assert _state()["question_history"] == ["q1", "qN", "qN+1"]
+
+
+def test_write_policy_state_trims_and_roundtrips_the_history(env):
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1", question_history=["dropped", "q2", "q3", "q4"],
+    )
+    state = read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )
+    assert state["question_history"] == ["q2", "q3", "q4"]
+
+
+def test_question_history_rolls_forward_and_caps_at_three(env):
+    # Turn 1 seeds the history with the raw question; each later turn's
+    # landed curated question appends; only the last 3 survive.
+    _seed_usable_policy(env)
+    t1 = _checker(env, FakeToolModel(list(_CLEAN_SCRIPT)),
+                  user_sub="alice", thread_id="conv1", question="q1")
+    assert t1.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["question_history"] == ["q1"])
+    for n in (2, 3, 4):
+        t = _checker(env, FakeToolModel(list(_CLEAN_SCRIPT)),
+                     user_sub="alice", thread_id="conv1",
+                     question=f"fragment {n}",
+                     rewrite_model=FakeModel([json.dumps({"question": f"q{n}"})]))
+        t.prewarm()
+        # The history rides the same write as the curated question.
+        assert _wait_until(lambda: read_policy_state(
+            env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+            thread_id="conv1",
+        )["curated_question"] == f"q{n}")
+    state = read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )
+    assert state["question_history"] == ["q2", "q3", "q4"]
 
 
 # --- the behavioural track ------------------------------------------------------
@@ -894,6 +1085,47 @@ def test_steps_evidence_excludes_injected_notes():
     ]
     text = pc.build_steps_evidence(turn, question="q")
     assert "steer" not in text and "policy</system-reminder>" not in text
+
+
+def test_rewrite_receives_the_earlier_questions_but_judges_never_do(env):
+    # A thread with 3 stored questions: the REWRITE sees the two before the
+    # previous one as labeled resolution context (the previous question keeps
+    # its own section); the judges get ONLY the curated anchor.
+    _seed_usable_policy(env)
+    write_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1", curated_question="prior-q3", last_answer="a3",
+        question_history=["prior-q1", "prior-q2", "prior-q3"],
+    )
+    rewrite = FakeModel([json.dumps({"question": "curated-q4"})])
+    judge = FakeToolModel(list(_CLEAN_SCRIPT) * 2)
+    checker = _checker(
+        env, judge, tracks=("computational", "behavioural"),
+        user_sub="alice", thread_id="conv1",
+        question="back to the first thing?", rewrite_model=rewrite,
+    )
+    checker.prewarm()
+    assert _wait_until(lambda: read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["curated_question"] == "curated-q4")
+    prompt = rewrite.prompts[0]
+    assert "EARLIER QUESTIONS IN THIS CONVERSATION" in prompt
+    assert "prior-q1" in prompt and "prior-q2" in prompt
+    # The previous question renders in its OWN section, after the earlier ones.
+    assert prompt.index("prior-q2") < prompt.index("THE PREVIOUS QUESTION")
+    assert "prior-q3" in prompt
+    # ...and the history rolled forward with the landed rewrite.
+    assert read_policy_state(
+        env["ddb"], threads_table=THREADS_TABLE, user_sub="alice",
+        thread_id="conv1",
+    )["question_history"] == ["prior-q2", "prior-q3", "curated-q4"]
+    # Neither track's judge ever sees the earlier questions.
+    assert checker.submit_behavioural(_behaviour_turn()).result(timeout=10) == ""
+    assert checker.submit(_ANALYTICAL_SQL).result(timeout=10) == ""
+    for judged in judge.prompts:
+        assert "curated-q4" in judged
+        assert "EARLIER QUESTIONS" not in judged and "prior-q1" not in judged
 
 
 class _State(dict):

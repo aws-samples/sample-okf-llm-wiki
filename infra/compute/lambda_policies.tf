@@ -52,8 +52,12 @@ data "aws_iam_policy_document" "incremental" {
     resources = ["*"]
   }
   statement {
-    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
-    resources = [local.d.freshness_table_arn, local.d.registry_table_arn]
+    actions = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
+    resources = [
+      local.d.freshness_table_arn,
+      local.d.registry_table_arn,
+      "${local.d.registry_table_arn}/index/*",
+    ]
   }
   statement {
     actions   = ["s3:PutObject", "s3:GetObject"]
@@ -115,6 +119,9 @@ data "aws_iam_policy_document" "control_api" {
     actions = ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
     resources = [
       local.d.registry_table_arn,
+      # index/*: Query against the registry's by-entity GSI authorizes on the
+      # index sub-resource, not the table ARN.
+      "${local.d.registry_table_arn}/index/*",
       local.d.freshness_table_arn,
       local.d.annotations_table_arn,
       local.d.chat_table_arn,

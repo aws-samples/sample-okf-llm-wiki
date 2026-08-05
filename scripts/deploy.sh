@@ -200,6 +200,23 @@ stage_durable() {
     -var="admin_given_name=${ADMIN_GIVEN_NAME:-OKF}" \
     -var="admin_family_name=${ADMIN_FAMILY_NAME:-Admin}"
   ok "Durable stack applied."
+  backfill_registry_entity
+}
+
+# Stamp the by-entity GSI keys onto pre-index registry rows and write the
+# readiness marker (readers Query the index only once the marker exists — see
+# docs/CONVENTIONS.md "Registry entity index"). Idempotent and seconds-fast, so
+# it runs after EVERY durable apply. Non-fatal: until it succeeds, listings
+# simply keep using the legacy scan.
+backfill_registry_entity() {
+  local py="$ROOT/.venv/bin/python"
+  [ -x "$py" ] || py="python3"
+  if "$py" "$ROOT/scripts/backfill_registry_entity.py" \
+      "${NAME_PREFIX:-okf}-registry" "$AWS_REGION"; then
+    ok "Registry entity index backfilled + marked ready."
+  else
+    warn "Registry entity backfill failed (needs python3 + boto3) — listings fall back to the legacy scan until scripts/backfill_registry_entity.py runs."
+  fi
 }
 
 stage_images() {

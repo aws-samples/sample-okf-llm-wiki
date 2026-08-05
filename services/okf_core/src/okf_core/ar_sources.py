@@ -17,7 +17,7 @@ This module owns the two invariants every service must agree on:
   against at check time (the staleness gate). Content hashes, never S3 ETags:
   SSE-KMS makes ETags unreliable as content identity.
 
-Pure Python (no AWS deps): the harvest finalize hook (build trigger), the
+Pure Python (no AWS deps): the runner's post-complete build trigger, the
 incremental service (rebuild authority), and the chat runtime (check-time
 staleness gate) all import from here so the fingerprint can never drift
 between the writer and the readers. The S3 walking lives in

@@ -39,7 +39,12 @@ the ask-first evidence lives in the behavioural STEPS track now, and the
 computational judges genuinely need the clarified intent). The state
 survives reload on the THREAD row (``policy_curated_question`` +
 ``policy_last_answer`` — ``chat.threads``), fail-open to raw-question
-semantics whenever absent.
+semantics whenever absent. The row also keeps the last few curated questions
+(``policy_question_history``); the rewrite receives the ones BEFORE the
+previous question (at most 2) as extra resolution context, so a user jumping
+back past the immediately previous topic ("back to the podiums question")
+still curates to the right intent. The judges never see them — both tracks
+judge against the single current curated question.
 
 Both tracks are armed PER RUN from the composer's Policy feature
 (``features: ["sql", "policy:computational" | "policy:behavioural" |
@@ -198,9 +203,13 @@ Produce ONE self-contained question that captures what the user currently
 wants, by merging the pieces below. Resolve pronouns and references to the
 earlier exchange ("and for 2019?" -> the full question), and fold any answered
 clarifications into the question itself (a clarified "championship points"
-replaces a bare "points"). Change NOTHING else: do not interpret terms nobody
-clarified, do not add definitions, do not answer. If the latest message
-already stands alone and nothing was clarified, return it verbatim.
+replaces a bare "points"). Earlier questions, when listed, are reference
+material only: the user may be jumping back to one of them ("back to the
+podiums one") — resolve against whichever question the latest message
+actually points at, and never merge them in unprompted. Change NOTHING else:
+do not interpret terms nobody clarified, do not add definitions, do not
+answer. If the latest message already stands alone and nothing was clarified,
+return it verbatim.
 
 Return ONE JSON object and nothing else:
 {"question": string}
@@ -213,9 +222,23 @@ def build_curate_input(
     prev_answer: str = "",
     raw_question: str = "",
     qa: list[dict[str, str]] | None = None,
+    earlier_questions: Any = (),
 ) -> str:
-    """The rewrite prompt for :func:`curate_question` (pure, testable)."""
+    """The rewrite prompt for :func:`curate_question` (pure, testable).
+
+    ``earlier_questions`` (the curated questions BEFORE the previous one,
+    oldest first, at most 2) widen the rewrite's resolution context: a
+    fragment jumping back past the immediately previous topic still resolves
+    to the right question instead of being force-merged into the wrong one.
+    """
     parts: list[str] = [_CURATE_CONTRACT]
+    earlier = [q for q in (earlier_questions or ()) if q]
+    if earlier:
+        parts.append(
+            "\n== EARLIER QUESTIONS IN THIS CONVERSATION "
+            "(oldest first, before the previous one) =="
+        )
+        parts.extend(earlier)
     if prev_question:
         parts += ["\n== THE PREVIOUS QUESTION (already self-contained) ==", prev_question]
     if prev_answer:
@@ -242,6 +265,7 @@ def curate_question(
     prev_answer: str = "",
     raw_question: str = "",
     qa: list[dict[str, str]] | None = None,
+    earlier_questions: Any = (),
 ) -> str:
     """One minimal-effort rewrite call → the curated question ("" = failed).
 
@@ -258,6 +282,7 @@ def curate_question(
                         prev_answer=prev_answer,
                         raw_question=raw_question,
                         qa=qa,
+                        earlier_questions=earlier_questions,
                     ),
                 )
             ]
@@ -579,6 +604,36 @@ def _policy_glue_map(ddb, table: str) -> dict[str, tuple[str, str]]:
             ":s": {"S": "DATASET#"},
         },
     }
+    # Enumerate the mapping rows via the by-entity GSI (Query, not Scan — a
+    # scan reads the whole table, harvest/report rows included) and apply the
+    # policy-bearing filter in code. The GSI only contains rows stamped with
+    # its keys, so it is consulted ONLY once the backfill's readiness marker
+    # says every row is stamped (okf_aws.registry_entity) — on a
+    # partially-stamped registry a result-shape heuristic would map only the
+    # fresh rows and silently disarm the checks for every pre-index dataset.
+    # No marker (or an index read error) → the original filtered scan, which
+    # is always correct, just table-sized.
+    from okf_aws import registry_entity
+
+    if registry_entity.entity_index_ready(ddb, table):
+        try:
+            items = registry_entity.query_entity_rows(
+                ddb, table, registry_entity.ENTITY_DATASET
+            )
+            for item in items:
+                # Same gate as the scan's attribute_exists(ar_build_status).
+                if not (item.get("ar_build_status") or {}).get("S"):
+                    continue
+                domain = _row_s(item, "pk").removeprefix("DOMAIN#")
+                dataset = _row_s(item, "sk").removeprefix("DATASET#")
+                glue = _row_s(item, "glue_database") or dataset
+                if domain and dataset:
+                    out[glue.lower()] = (domain, dataset)
+            return out
+        except Exception:  # noqa: BLE001 - marker without index => scan below
+            log.info("by-entity index unavailable — falling back to the scan")
+            out = {}
+
     while True:
         resp = ddb.scan(**kwargs)
         for item in resp.get("Items") or []:
@@ -1039,7 +1094,17 @@ class PolicyChecker:
             log.warning("policy answer write submit failed (non-fatal)", exc_info=True)
 
     def _write_answer(self, answer_text: str) -> None:
-        """Worker-side final-answer persist (write_policy_state never raises)."""
+        """Worker-side final-answer persist (write_policy_state never raises).
+
+        Also CLEARS ``history_last_raw``: that attribute is the same-turn
+        signal an ask_human fold's re-curation uses to REPLACE this turn's
+        history entry, and the turn is over the moment its final answer
+        lands (the server skips this write on an ask_human pause, so a
+        fold's re-curation always runs before it). Left set, a user
+        re-asking the IDENTICAL raw question next turn would match the fold
+        condition and silently overwrite this turn's history entry instead
+        of appending its own.
+        """
         from chat.threads import write_policy_state
 
         write_policy_state(
@@ -1048,6 +1113,7 @@ class PolicyChecker:
             user_sub=self._user_sub,
             thread_id=self._thread_id,
             last_answer=answer_text,
+            history_last_raw="",
         )
 
     def close(self) -> None:
@@ -1282,10 +1348,15 @@ class PolicyChecker:
         clarifications), persisted to the THREAD row when it lands so the
         next turn — days later, after a reload — picks up the chain.
         """
-        from chat.threads import read_policy_state, write_policy_state
+        from chat.threads import (
+            POLICY_HISTORY_KEEP,
+            read_policy_state,
+            write_policy_state,
+        )
 
         raw = self._question
-        prev_q = prev_a = ""
+        prev_q = prev_a = last_raw = ""
+        history: list[str] = []
         if self._user_sub and self._thread_id:
             state = read_policy_state(
                 self._ddb(),
@@ -1293,8 +1364,36 @@ class PolicyChecker:
                 user_sub=self._user_sub,
                 thread_id=self._thread_id,
             )
+            if state is None:
+                # UNREADABLE is not ABSENT: a transient read failure on a
+                # mid-conversation turn must not take the turn-1 branch and
+                # seed-write over a perfectly good rolling chain (the same
+                # no-persist rule as a failed rewrite below). This turn's
+                # evidence falls back to the raw question; the chain resumes
+                # untouched on the next readable turn.
+                log.info(
+                    "policy state unreadable — raw question this turn, "
+                    "persisting nothing: %.160s", raw,
+                )
+                return raw
             prev_q = state.get("curated_question") or ""
             prev_a = state.get("last_answer") or ""
+            last_raw = state.get("history_last_raw") or ""
+            history = [q for q in state.get("question_history") or [] if q]
+            if not history and prev_q:
+                # A pre-history thread row carries only the single curated
+                # question — seed the roll with it (it contributes nothing
+                # to `earlier` below: it IS the previous question).
+                history = [prev_q]
+        # The rewrite's extra resolution context: the stored questions BEFORE
+        # the previous one (at most 2 — the history keeps 3 including it), so
+        # a fragment jumping back past the previous topic still resolves. The
+        # previous question keeps its own labeled section either way. The
+        # keep-count guard matters: at POLICY_HISTORY_KEEP == 1 a bare
+        # `[-(KEEP - 1):]` would be `[-0:]` — the WHOLE list, not none.
+        keep_prior = POLICY_HISTORY_KEEP - 1
+        earlier = history[:-1] if history and history[-1] == prev_q else history
+        earlier = earlier[-keep_prior:] if keep_prior > 0 else []
         if not prev_q and not prev_a and not self._ask_qa:
             # Turn-1 semantics — a fresh thread, a pre-v3 thread, or the turn
             # where policy was first enabled MID-conversation (no state was
@@ -1310,6 +1409,8 @@ class PolicyChecker:
                     user_sub=self._user_sub,
                     thread_id=self._thread_id,
                     curated_question=raw,
+                    question_history=[raw],
+                    history_last_raw=raw,
                 )
             log.info(
                 "curated question seeded from the raw question (turn 1): %.160s",
@@ -1325,6 +1426,7 @@ class PolicyChecker:
             prev_answer=prev_a,
             raw_question=raw,
             qa=self._ask_qa,
+            earlier_questions=earlier,
         )
         if not curated:
             # The rewrite FAILED — fall back for THIS turn's evidence, but do
@@ -1339,12 +1441,31 @@ class PolicyChecker:
             return raw or prev_q
         log.info("curated question landed: %.160s", curated)
         if curated != prev_q and self._user_sub and self._thread_id:
+            base = history
+            if raw and last_raw == raw and history and history[-1] == prev_q:
+                # Re-curating the SAME turn (an ask_human fold re-runs the
+                # rewrite after this turn's pre-fold question already
+                # persisted — the stored raw matches ours, and a resume
+                # rebuilds the checker so this signal must be durable, not an
+                # object flag): REPLACE that entry — appending would burn two
+                # of the history's slots on one turn and resurface the
+                # unclarified variant as an "earlier question". last_raw only
+                # lives WITHIN a turn: the final-answer write clears it (see
+                # _write_answer), so a user re-asking the IDENTICAL raw
+                # question on a later turn appends normally instead of
+                # overwriting the previous turn's entry.
+                base = history[:-1]
             write_policy_state(
                 self._ddb(),
                 threads_table=self._cfg.threads_table,
                 user_sub=self._user_sub,
                 thread_id=self._thread_id,
                 curated_question=curated,
+                # Roll the history forward with this turn's question — it
+                # becomes "earlier" context only for FUTURE turns (the
+                # `earlier` slice above already excluded it).
+                question_history=(base + [curated])[-POLICY_HISTORY_KEEP:],
+                history_last_raw=raw,
             )
         return curated
 

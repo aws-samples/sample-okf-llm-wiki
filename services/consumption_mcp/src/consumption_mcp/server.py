@@ -68,8 +68,19 @@ def register_tools(mcp, tools: ConsumptionTools) -> None:
         return tools.read_me()
 
     @mcp.tool()
-    def list_domains() -> list[dict]:
-        """List the registered (data_domain, dataset) pairs available to read.
+    def list_domains(
+        domain: str | None = None,
+        query: str | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """Page through the registered (data_domain, dataset) pairs.
+
+        Returns {"datasets": [...], "next_cursor": ...} — pass a non-null
+        `next_cursor` back verbatim for the next page (~`limit` entries each).
+        `domain` narrows to one data domain; `query` is a case-insensitive
+        substring over "<data_domain>/<dataset>". Prefer `search_domains` /
+        `semantic_search` to FIND a dataset by meaning; list for the catalog.
 
         Each result includes the dataset's parent domain description (if declared)
         plus its cross-dataset reference signal: `cross_references` names datasets
@@ -77,7 +88,9 @@ def register_tools(mcp, tools: ConsumptionTools) -> None:
         and `cross_referenced_by` names datasets whose bundle holds pair docs about
         this one (read them at `<that dataset>/external/<this>/…`).
         """
-        return tools.list_domains()
+        return tools.list_domains(
+            domain=domain, query=query, cursor=cursor, limit=limit
+        )
 
     @mcp.tool()
     def list_declared_domains() -> list[dict]:

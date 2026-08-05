@@ -10,7 +10,9 @@ requires-python = ">=3.11"
 dependencies = [
     "okf-core",
     "okf-aws",
-    "mcp>=1.28",
+    # <2: mcp 2.0.0 removed mcp.server.fastmcp (FastMCP split out of the SDK);
+    # build_app() imports it, so an unpinned image build crash-loops the runtime.
+    "mcp>=1.28,<2",
     "boto3>=1.43",
     # Observability: ADOT SDK (no LangChain instrumentor — this server is FastMCP).
     "aws-opentelemetry-distro>=0.10.0",

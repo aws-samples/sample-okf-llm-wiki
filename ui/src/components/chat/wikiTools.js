@@ -183,9 +183,16 @@ export function parseToolResult(toolName, rawContent) {
 
   switch (toolName) {
     case "list_domains": {
-      const arr = Array.isArray(content) ? content : []
+      // Paginated shape {datasets, next_cursor}; a bare array is the legacy
+      // pre-pagination reply (old transcripts re-rendered after a deploy).
+      const arr = Array.isArray(content)
+        ? content
+        : Array.isArray(content?.datasets)
+          ? content.datasets
+          : []
+      const more = Boolean(content?.next_cursor)
       return {
-        summary: plural(arr.length, "dataset"),
+        summary: plural(arr.length, "dataset") + (more ? " (more pages)" : ""),
         kind: "table",
         columns: [
           { key: "data_domain", header: "Domain", mono: true },

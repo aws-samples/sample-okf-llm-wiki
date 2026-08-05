@@ -266,3 +266,82 @@ def test_author_prompt_speaks_yaml_and_id_stability():
     assert "action" in ap.POLICY_AUTHOR_PROMPT
     # Selectivity guidance survived the pivot.
     assert "BE SELECTIVE" in ap.POLICY_AUTHOR_PROMPT
+
+
+# --- the guardrails build lock (bundle-writing work defers to a live author) -----
+
+
+def test_build_lock_active_only_for_a_fresh_building_row(aws):
+    _, ddb = aws
+    # Registered, never authored — free.
+    assert not ap.build_lock_active(ddb, TABLE, data_domain=DOMAIN, dataset=DATASET)
+    # A fresh `building` flip (stamps ar_build_started_at = now) holds it.
+    ap.try_flip_building(
+        ddb, TABLE, data_domain=DOMAIN, dataset=DATASET, pending_hash="h"
+    )
+    assert ap.build_lock_active(ddb, TABLE, data_domain=DOMAIN, dataset=DATASET)
+    # Terminal states free it again.
+    ap.stamp_ready(ddb, TABLE, data_domain=DOMAIN, dataset=DATASET, fingerprint="h")
+    assert not ap.build_lock_active(ddb, TABLE, data_domain=DOMAIN, dataset=DATASET)
+
+
+def test_build_lock_goes_stale_after_the_escape_window(aws):
+    from datetime import datetime, timedelta, timezone
+
+    _, ddb = aws
+    ap.try_flip_building(
+        ddb, TABLE, data_domain=DOMAIN, dataset=DATASET, pending_hash="h"
+    )
+    # Backdate the flip past the escape window — an abandoned `building` row
+    # (dead author) must not wedge harvests until the reconcile reaps it.
+    old = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=ap.BUILD_LOCK_STALE_SECONDS + 60)
+    ).isoformat(timespec="seconds")
+    ddb.update_item(
+        TableName=TABLE,
+        Key=ap.registry_key(DOMAIN, DATASET),
+        UpdateExpression="SET ar_build_started_at = :t",
+        ExpressionAttributeValues={":t": {"S": old}},
+    )
+    assert not ap.build_lock_active(ddb, TABLE, data_domain=DOMAIN, dataset=DATASET)
+
+
+def test_build_lock_fails_open_on_read_errors():
+    class _Boom:
+        def get_item(self, **kw):
+            raise RuntimeError("ddb down")
+
+    assert not ap.build_lock_active(
+        _Boom(), TABLE, data_domain=DOMAIN, dataset=DATASET
+    )
+
+
+def test_flip_building_takes_over_a_stale_building_row(aws):
+    from datetime import datetime, timedelta, timezone
+
+    _, ddb = aws
+    assert ap.try_flip_building(
+        ddb, TABLE, data_domain=DOMAIN, dataset=DATASET, pending_hash="h1"
+    )
+    # A FRESH building row still wins against a second flip.
+    assert not ap.try_flip_building(
+        ddb, TABLE, data_domain=DOMAIN, dataset=DATASET, pending_hash="h2"
+    )
+    # Past the escape window the row is a dead author: readers already treat
+    # it as free, so the flip must take it over too (asymmetry would make
+    # every post-harvest build silently lose to the corpse until the reap).
+    old = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=ap.BUILD_LOCK_STALE_SECONDS + 60)
+    ).isoformat(timespec="seconds")
+    ddb.update_item(
+        TableName=TABLE,
+        Key=ap.registry_key(DOMAIN, DATASET),
+        UpdateExpression="SET ar_build_started_at = :t",
+        ExpressionAttributeValues={":t": {"S": old}},
+    )
+    assert ap.try_flip_building(
+        ddb, TABLE, data_domain=DOMAIN, dataset=DATASET, pending_hash="h3"
+    )
+    assert _attr(ddb, ap.ATTR_PENDING_SOURCE_HASH) == "h3"

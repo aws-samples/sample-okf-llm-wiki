@@ -13,6 +13,7 @@ rather than re-encoded here.
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -21,8 +22,16 @@ from typing import Any
 
 from datetime import timedelta
 
-from okf_aws import ar_policy
-from okf_aws import bundle_prefix, is_bundle_ready, parse_bundle_key, state_marker_key
+log = logging.getLogger(__name__)
+
+from okf_aws import ar_policy, registry_entity
+from okf_aws import (
+    bundle_marker_status,
+    bundle_prefix,
+    is_bundle_ready,
+    parse_bundle_key,
+    state_marker_key,
+)
 from okf_aws import s3_versions
 from okf_core import annotations as anno
 from okf_core import chat_threads as ct
@@ -307,23 +316,32 @@ def list_redshift_databases(
 # --------------------------------------------------------------------------- #
 
 
-def list_domains(ddb, *, registry_table: str) -> list[dict[str, Any]]:
-    """All domain->dataset mappings: registry items with ``pk`` begins_with DOMAIN#
-    AND ``sk`` begins_with DATASET# or XREF# (declared-domain META rows are still
-    excluded from the mapping list).
+def _registry_entity_rows(ddb, registry_table: str) -> list[dict[str, Any]]:
+    """All dataset-mapping + XREF rows, via the by-entity GSI when TRUSTABLE.
 
-    Uses Scan with a ``begins_with`` filter because the registry is tiny (a
-    handful of dataset mappings for the demo) and there is no GSI on the item
-    type. Returns the raw mapping attrs the UI needs, plus the CROSS-DATASET
-    reference signal: ``cross_references`` (datasets this one holds
-    ``external/`` pair docs for) and ``cross_referenced_by`` (datasets whose
-    bundle holds pair docs about this one). The signal comes from reindex-derived
-    ``XREF#`` rows, which live on the SAME ``DOMAIN#`` partitions this scan
-    already reads (see docs/CONVENTIONS.md) — one pass, no extra call.
+    Two small Queries (``entity="dataset"``, ``entity="xref"``) instead of a
+    full-table Scan. A GSI only contains rows stamped with its keys, so it is
+    consulted ONLY once the backfill's readiness marker says every row is
+    stamped (``okf_aws.registry_entity``) — on a partially-stamped registry a
+    result-shape heuristic would return the FRESH rows and silently hide every
+    pre-index dataset. No marker (or an index read error — e.g. the marker
+    stamped before the terraform apply) → the original filtered Scan, which is
+    always correct, just table-sized.
     """
-    items: list[dict[str, Any]] = []
-    references: dict[tuple[str, str], set[str]] = {}
-    referenced_by: dict[tuple[str, str], set[str]] = {}
+    if registry_entity.entity_index_ready(ddb, registry_table):
+        try:
+            rows: list[dict[str, Any]] = []
+            for entity in (
+                registry_entity.ENTITY_DATASET,
+                registry_entity.ENTITY_XREF,
+            ):
+                rows.extend(
+                    registry_entity.query_entity_rows(ddb, registry_table, entity)
+                )
+            return rows
+        except Exception:  # noqa: BLE001 - marker without index => scan below
+            log.info("by-entity index unavailable — falling back to the scan")
+    rows = []
     kwargs: dict[str, Any] = {
         "TableName": registry_table,
         "FilterExpression": (
@@ -337,7 +355,33 @@ def list_domains(ddb, *, registry_table: str) -> list[dict[str, Any]]:
     }
     while True:
         resp = ddb.scan(**kwargs)
-        for item in resp.get("Items", []):
+        rows.extend(resp.get("Items", []))
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+    return rows
+
+
+def list_domains(ddb, *, registry_table: str) -> list[dict[str, Any]]:
+    """All domain->dataset mappings: registry items with ``pk`` begins_with DOMAIN#
+    AND ``sk`` begins_with DATASET# or XREF# (declared-domain META rows are still
+    excluded from the mapping list).
+
+    Enumerates via the ``by-entity`` GSI (Query — a Scan reads the WHOLE
+    table, harvest/report rows included, so its cost grows with usage) with
+    the legacy filtered Scan as the fallback for deployments whose rows were
+    never stamped into the index (scripts/backfill_registry_entity.py).
+    Returns the raw mapping attrs the UI needs, plus the CROSS-DATASET
+    reference signal: ``cross_references`` (datasets this one holds
+    ``external/`` pair docs for) and ``cross_referenced_by`` (datasets whose
+    bundle holds pair docs about this one), from reindex-derived ``XREF#``
+    rows (``entity="xref"`` — see docs/CONVENTIONS.md).
+    """
+    items: list[dict[str, Any]] = []
+    references: dict[tuple[str, str], set[str]] = {}
+    referenced_by: dict[tuple[str, str], set[str]] = {}
+    for item in _registry_entity_rows(ddb, registry_table):
             if (_s(item.get("sk")) or "").startswith("XREF#"):
                 src = (
                     _s(item.get("source_data_domain")),
@@ -368,10 +412,6 @@ def list_domains(ddb, *, registry_table: str) -> list[dict[str, Any]]:
                     **_guidance_fields(item),
                 }
             )
-        start = resp.get("LastEvaluatedKey")
-        if not start:
-            break
-        kwargs["ExclusiveStartKey"] = start
     for m in items:
         pair_key = (m["data_domain"], m["dataset"])
         if pair_key in references:
@@ -411,13 +451,17 @@ def declare_domain(
             "SET data_domain = :dd, description = :desc, #ctx = :ctx, "
             "updated_at = :now"
             " , created_at = if_not_exists(created_at, :now)"
+            # by-entity GSI keys (CONVENTIONS.md "Registry entity index").
+            " , entity = :ent, #pr = :pair"
         ),
-        ExpressionAttributeNames={"#ctx": "context"},
+        ExpressionAttributeNames={"#ctx": "context", "#pr": "pair"},
         ExpressionAttributeValues={
             ":dd": {"S": data_domain},
             ":desc": {"S": description},
             ":ctx": {"S": context},
             ":now": {"S": now},
+            ":ent": {"S": "domain"},
+            ":pair": {"S": data_domain},
         },
     )
     return {
@@ -595,6 +639,10 @@ def upsert_domain_mapping(
     item: dict[str, Any] = {
         "pk": {"S": f"DOMAIN#{data_domain}"},
         "sk": {"S": f"DATASET#{dataset}"},
+        # by-entity GSI keys (CONVENTIONS.md "Registry entity index") — what
+        # lets listings Query instead of Scan.
+        "entity": {"S": "dataset"},
+        "pair": {"S": f"{data_domain}/{dataset}"},
         "data_domain": {"S": data_domain},
         "dataset": {"S": dataset},
         "source": {"M": source_map},
@@ -877,7 +925,15 @@ def delete_domain_mapping(
     ``s3``/``bundle_bucket``/``freshness_table`` are optional so existing callers
     and tests that only exercise the registry keep working; when omitted, the
     corresponding purge step is skipped (and reported in the result).
+
+    Refused while a FRESH guardrails author runs (the same 409 gate as the
+    lease acquirers): an author finishing mid-delete would re-materialize
+    ``policy/<d>/<ds>/`` objects after the purge. Deleting takes no lease, so
+    it calls the gate directly.
     """
+    refuse_if_guardrails_building(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
     purged_objects = 0
     purged_freshness = 0
 
@@ -2094,6 +2150,84 @@ def apply_report_annotations(
 # --------------------------------------------------------------------------- #
 
 
+def harvest_lease_held(
+    ddb, *, registry_table: str, data_domain: str, dataset: str
+) -> bool:
+    """Whether the per-dataset harvest lease is currently held (and fresh).
+
+    The read-side mirror of the ACQUIRERS' conditionals — the same active
+    statuses and ``HARVEST_LEASE_STALE_SECONDS`` escape as
+    :func:`acquire_harvest_lease`, AND :func:`acquire_repromote_lease`'s
+    extra takeover clause (a ``mode=repromote`` row still ``queued`` after
+    ``REPROMOTE_LEASE_STALE_SECONDS`` is a dead 30s-capped Lambda, stealable
+    immediately). Without that second escape a dead repromote would block
+    the Reasoning Sync for the full 8h even though a repromote retry could
+    take the lease right now. For callers that must NOT start work while a
+    harvest runs but take no lease of their own. Fail-open on read errors:
+    this gate is a courtesy; the building lease still serializes the authors
+    themselves.
+    """
+    try:
+        item = (
+            ddb.get_item(
+                TableName=registry_table,
+                Key={
+                    "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+                    "sk": {"S": "STATUS"},
+                },
+            ).get("Item")
+            or {}
+        )
+        status = _s(item.get("status"))
+        if status not in ("queued", "running"):
+            return False
+        stale_cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=HARVEST_LEASE_STALE_SECONDS)
+        ).isoformat()
+        started = _s(item.get("started_at"))
+        if not started or started < stale_cutoff:
+            return False
+        # The repromote twin (constants defined near acquire_repromote_lease).
+        if _s(item.get("mode")) == REPROMOTE_MODE and status == "queued":
+            repromote_cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=REPROMOTE_LEASE_STALE_SECONDS)
+            ).isoformat()
+            if started < repromote_cutoff:
+                return False
+        return True
+    except Exception:  # noqa: BLE001 - fail-open (see docstring)
+        log.warning("harvest lease read failed (treating as free)", exc_info=True)
+        return False
+
+
+def refuse_if_guardrails_building(
+    ddb, *, registry_table: str, data_domain: str, dataset: str
+) -> None:
+    """409 when the dataset's policy author currently holds the build lock.
+
+    The harvest status row goes terminal at the bundle commit, so an
+    in-flight guardrails authoring run is invisible to the harvest lease —
+    but it is still reading the just-committed wiki, so bundle-WRITING work
+    (harvest/annotation/cross starts, repromotes, dataset deletion) waits it
+    out. Freshness escape + fail-open live in
+    ``okf_aws.ar_policy.build_lock_active``. Called INSIDE
+    :func:`acquire_harvest_lease` / :func:`acquire_repromote_lease` — the
+    choke points every bundle-writing start already goes through — so a new
+    trigger path can never forget the gate (CONVENTIONS.md "Harvest status");
+    only non-lease writers (dataset deletion) call it directly.
+    """
+    if ar_policy.build_lock_active(
+        ddb, registry_table, data_domain=data_domain, dataset=dataset
+    ):
+        raise ApiError(
+            409,
+            f"guardrails are being authored for {data_domain}/{dataset}; "
+            "retry when the build finishes",
+        )
+
+
 def acquire_harvest_lease(
     ddb,
     *,
@@ -2120,8 +2254,15 @@ def acquire_harvest_lease(
 
     This is the SINGLE choke point every harvest trigger (Control API AND the
     incremental orchestrator / reconcile) must go through so concurrent harvests
-    of one dataset can never race on the shared bundle directory.
+    of one dataset can never race on the shared bundle directory. The
+    guardrails build lock is checked HERE for the same reason — a trigger
+    path that exists at all gets the gate for free (raises ApiError 409; the
+    incremental orchestrator's resource-API twin does its own check to keep
+    its distinct ``skipped_guardrails_building`` action).
     """
+    refuse_if_guardrails_building(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
     now = _now_iso()
     stale_cutoff = (
         datetime.now(timezone.utc) - timedelta(seconds=HARVEST_LEASE_STALE_SECONDS)
@@ -2398,7 +2539,8 @@ def trigger_harvest(
     pk = f"HARVEST#{data_domain}#{dataset}"
     # Acquire the per-dataset lease before invoking. Rejected (409) if a harvest
     # for this dataset is already in flight, so concurrent runs can't race on the
-    # shared bundle directory.
+    # shared bundle directory. A live guardrails authoring run blocks too (the
+    # gate lives inside the lease acquisition).
     if not acquire_harvest_lease(
         ddb,
         registry_table=registry_table,
@@ -2493,11 +2635,27 @@ def get_harvest_status(
             "cross_target": _s(item.get("cross_target")),
         }
     ready = is_bundle_ready(s3, bucket, data_domain, dataset)
+    # A live post-harvest guardrails authoring run (the mapping row's
+    # `building` flip, fresh) — the harvest row is terminal by then, so this
+    # is the UI's only signal that the follow-on step is running (and why a
+    # new harvest/repromote would 409 right now). Knowably false while the
+    # run itself is still in flight (the build only starts post-terminal, and
+    # a build in progress at start would have 409'd the lease), so the poll
+    # skips the extra GetItem for the whole — potentially hours-long — run.
+    in_flight = status.get("status") in ("queued", "running")
+    guardrails_building = (
+        False
+        if in_flight
+        else ar_policy.build_lock_active(
+            ddb, registry_table, data_domain=data_domain, dataset=dataset
+        )
+    )
     return {
         "data_domain": data_domain,
         "dataset": dataset,
         "status": status,
         "ready": ready,
+        "guardrails_building": guardrails_building,
     }
 
 
@@ -3080,7 +3238,13 @@ def acquire_repromote_lease(
     ``queued`` after :data:`REPROMOTE_LEASE_STALE_SECONDS` is a dead run (the
     writer is a 30s-capped Lambda), so a retry may steal it immediately instead
     of waiting out the 8h harvest staleness. Harvest rows are unaffected.
+    The guardrails build lock gates here too (inside the choke point, like
+    :func:`acquire_harvest_lease`) — the restore rewrites the wiki a live
+    author is reading.
     """
+    refuse_if_guardrails_building(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
     now = _now_iso()
     stale_cutoff = (
         datetime.now(timezone.utc) - timedelta(seconds=HARVEST_LEASE_STALE_SECONDS)
@@ -3222,7 +3386,7 @@ def _signal_policy_rebuild(
 #
 # Policy documents are ALWAYS ON per dataset (the v1-era `ar_enrolled` opt-in
 # is retired — the LLM-judge engine has no per-account policy cap to budget):
-# any dataset with a committed wiki authors automatically at harvest finalize
+# any dataset with a committed wiki authors automatically after each harvest
 # and re-authors on wiki changes. Pre-existing datasets are deliberately NOT
 # backfilled in bulk — their first document comes from the Sync button here,
 # their next harvest/increment, or a repromote.
@@ -3309,9 +3473,23 @@ def get_reasoning_status(
     status = _row_str(item, ar_policy.ATTR_BUILD_STATUS)
     stored_hash = _row_str(item, ar_policy.ATTR_SOURCE_HASH)
 
-    wiki_ready = is_bundle_ready(s3, bucket, data_domain, dataset)
+    # Read the marker's STATUS, not just the ready boolean: a harvest mid-run
+    # overwrites the marker with `in_progress` (mark_in_progress), and that
+    # is NOT "no wiki yet" — the previous wiki's authored guardrails still
+    # exist and must stay on screen; only the freshness verdict is moot (the
+    # sources are being rewritten under us, so a hash would be noise).
+    # "Rewriting" additionally requires a LIVE harvest lease: a failed or
+    # cancelled run leaves the marker at `in_progress` FOREVER (nothing
+    # restores it on the failure path), and without the cross-check the page
+    # would promise an auto re-author that is never coming.
+    marker = bundle_marker_status(s3, bucket, data_domain, dataset)
+    wiki_ready = marker == "complete"
+    wiki_dead_rewrite = marker == "in_progress" and not harvest_lease_held(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
+    wiki_rewriting = marker == "in_progress" and not wiki_dead_rewrite
     building = status == ar_policy.BUILD_BUILDING
-    if building:
+    if building or wiki_rewriting:
         # The UI polls every few seconds while a build runs, and the response
         # only needs the source PATHS then (freshness is moot mid-build — the
         # page shows the build state, not the fingerprint verdict). LIST-only
@@ -3324,7 +3502,9 @@ def get_reasoning_status(
         fresh_hash = ar_policy.hash_sources(sources)
 
     up_to_date: bool | None = None
-    if stored_hash and not building:
+    # No verdict mid-build/mid-rewrite — and none against a DEAD rewrite's
+    # half-written bundle either (its hash is noise, not a freshness signal).
+    if stored_hash and not building and not wiki_rewriting and not wiki_dead_rewrite:
         up_to_date = bool(fresh_hash) and fresh_hash == stored_hash
 
     policies: list[dict[str, Any]] = []
@@ -3350,7 +3530,23 @@ def get_reasoning_status(
         # design), and a wiki without policy-source files can sync but would
         # produce no rules — the page says so instead of showing a dead state.
         "wiki_ready": wiki_ready,
-        "reason": None if wiki_ready else "no wiki yet — run a harvest first",
+        # A harvest mid-write is its own state, never "no wiki yet".
+        "wiki_rewriting": wiki_rewriting,
+        "reason": (
+            None
+            if wiki_ready
+            else (
+                "a harvest is rewriting this wiki — guardrails re-author "
+                "automatically when it commits"
+                if wiki_rewriting
+                else (
+                    "the last harvest did not complete — run a new harvest "
+                    "(or restore a version) to publish the wiki"
+                    if wiki_dead_rewrite
+                    else "no wiki yet — run a harvest first"
+                )
+            )
+        ),
         "has_sources": bool(source_paths),
         "status": status,
         "built_at": _row_str(item, "ar_built_at"),
@@ -3383,11 +3579,26 @@ def trigger_reasoning_sync(
     silently did nothing (live 2026-08-03). An in-flight build still wins
     (the building lease is honored). Refused while no complete wiki exists:
     the policy is derived from the bundle, so there is nothing to author
-    from yet.
+    from yet. Also refused while the HARVEST lease is held — the reverse of
+    the build-lock gate on harvest starts: an author dispatched mid-harvest
+    would gather sources from a bundle being wiped and rewritten under it
+    (and its `building` flip would then 409 the operator's other work). The
+    finished harvest authors on its own anyway, so nothing is lost by
+    refusing.
     """
     _reasoning_row(ddb, registry_table, data_domain, dataset)  # 404 if unknown
     if events is None:
         raise ApiError(409, "reasoning is not enabled on this deployment")
+    # Lease check FIRST: mid-harvest the commit marker reads in_progress, so
+    # the bundle-ready check would misreport a rewrite as "no wiki yet".
+    if harvest_lease_held(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    ):
+        raise ApiError(
+            409,
+            f"a harvest for {data_domain}/{dataset} is in flight; it authors "
+            "the guardrails itself when it finishes",
+        )
     if not is_bundle_ready(s3, bucket, data_domain, dataset):
         raise ApiError(409, "no wiki yet — run a harvest first")
     queued = _publish_policy_rebuild(

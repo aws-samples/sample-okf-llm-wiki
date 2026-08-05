@@ -32,8 +32,10 @@ import {
 } from "@/components/ui/card"
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
@@ -138,6 +140,7 @@ export default function ReasoningView({ api, selection }) {
   // Poll through that window so the page catches the transition (and a fast
   // snapshot restore, which can complete between two polls).
   const [syncPending, setSyncPending] = useState(false)
+  const [confirmSyncOpen, setConfirmSyncOpen] = useState(false)
 
   const load = useCallback(async () => {
     if (!api || !hasSelection) return
@@ -149,11 +152,14 @@ export default function ReasoningView({ api, selection }) {
     }
   }, [api, domain, dataset, hasSelection])
 
-  // Reset + load on dataset change.
+  // Reset + load on dataset change. The confirm dialog must close too — the
+  // view is not remounted per selection, so an open dialog would survive a
+  // sidebar switch and offer its destructive button against the NEW dataset.
   useEffect(() => {
     setData(null)
     setError(null)
     setSourcesOpen(false)
+    setConfirmSyncOpen(false)
     setTypeFilter("all")
     load()
   }, [load])
@@ -199,6 +205,18 @@ export default function ReasoningView({ api, selection }) {
       await api.triggerReasoningSync(domain, dataset)
       setSyncPending(true)
     })
+  // Syncing over an ALREADY-AUTHORED set re-derives the document: entries can
+  // be rewritten, merged, or dropped (stable ids survive only where their
+  // source material is unchanged). That's worth a confirmation; a dataset
+  // with no guardrails yet syncs straight away — nothing to overwrite.
+  const requestSync = () => {
+    if ((data?.policies?.length || 0) > 0) setConfirmSyncOpen(true)
+    else sync()
+  }
+  const confirmSync = () => {
+    setConfirmSyncOpen(false)
+    sync()
+  }
 
   if (!hasSelection) return null
   if (!data && !error) {
@@ -235,7 +253,10 @@ export default function ReasoningView({ api, selection }) {
                   {domain}/{dataset}
                 </span>{" "}
                 are judged by a model fleet against guardrails derived from
-                its wiki. They re-author automatically when the wiki changes.
+                its wiki's guardrail-source pages (usage guardrails, enums,
+                metrics, recipes, known issues — see Source files). They
+                re-author automatically when THOSE pages change; other edits
+                (table docs, titles, joins) don't affect them.
               </CardDescription>
             </div>
             {data?.wiki_ready && data?.sources?.length ? (
@@ -254,7 +275,10 @@ export default function ReasoningView({ api, selection }) {
           {error ? (
             <p className="text-sm text-destructive">{error}</p>
           ) : null}
-          {!data?.wiki_ready ? (
+          {/* A harvest mid-write (`wiki_rewriting`) is NOT "no wiki yet" —
+              keep the authored guardrails on screen and add a notice below
+              instead of collapsing the page. */}
+          {!data?.wiki_ready && !data?.wiki_rewriting ? (
             <p className="text-sm text-muted-foreground">
               {data?.reason || "No wiki yet — run a harvest first."}
             </p>
@@ -303,6 +327,15 @@ export default function ReasoningView({ api, selection }) {
                   </span>
                 ) : null}
               </div>
+              {/* Freshness is moot while the wiki is being rewritten (the
+                  fingerprint would compare against a half-written tree), so
+                  the up_to_date lines stay hidden and this explains why. */}
+              {data?.wiki_rewriting ? (
+                <p className="text-muted-foreground">
+                  A harvest is rewriting this wiki — the guardrails below
+                  re-author automatically when it commits.
+                </p>
+              ) : null}
               {/* Building: the page polls; authoring IS completion (v3 — no
                   build workflow, no completion authority). Sync is DISABLED
                   while a build is in flight — it only runs from a settled row
@@ -314,9 +347,7 @@ export default function ReasoningView({ api, selection }) {
               {building ? (
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-muted-foreground">
-                    A build is running — this page updates automatically. Sync
-                    re-enables when it settles; a build that dies is reaped
-                    after about an hour.
+                    A build is running — this page updates automatically.
                   </span>
                   <Button size="sm" variant="ghost" disabled>
                     <RefreshCwIcon className="size-3.5" />
@@ -334,14 +365,15 @@ export default function ReasoningView({ api, selection }) {
               {data?.up_to_date === false && !building && !failed ? (
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-amber-700 dark:text-amber-400">
-                    Out of date — the wiki changed since these guardrails were
-                    built. Checks are paused until they rebuild.
+                    Out of date — the guardrail-source files changed since
+                    these guardrails were built. Checks are paused until they
+                    rebuild.
                   </span>
                   <Button
                     size="sm"
                     variant="outline"
                     disabled={busy || syncPending}
-                    onClick={sync}
+                    onClick={requestSync}
                   >
                     {busy ? (
                       <Spinner className="size-3.5" />
@@ -355,13 +387,14 @@ export default function ReasoningView({ api, selection }) {
               {data?.up_to_date === true && !building && !failed ? (
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-muted-foreground">
-                    Up to date with the latest wiki version.
+                    Up to date — the guardrail-source files are
+                    unchanged since the last authoring.
                   </span>
                   <Button
                     size="sm"
                     variant="ghost"
                     disabled={busy || syncPending}
-                    onClick={sync}
+                    onClick={requestSync}
                   >
                     {busy ? (
                       <Spinner className="size-3.5" />
@@ -387,7 +420,7 @@ export default function ReasoningView({ api, selection }) {
                     size="sm"
                     variant="outline"
                     disabled={busy || syncPending}
-                    onClick={sync}
+                    onClick={requestSync}
                   >
                     <RefreshCwIcon className="size-3.5" />
                     Retry build
@@ -453,6 +486,39 @@ export default function ReasoningView({ api, selection }) {
 
       {/* The source-file list, on demand instead of inline — it is context,
           not status, and can be dozens of paths. */}
+      {/* Overwrite confirmation — only reachable when authored guardrails
+          exist (requestSync syncs straight away otherwise). */}
+      <Dialog open={confirmSyncOpen} onOpenChange={setConfirmSyncOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Overwrite authored guardrails?</DialogTitle>
+            <DialogDescription>
+              <span className="font-medium text-foreground">
+                {domain}/{dataset}
+              </span>{" "}
+              already has {data?.policies?.length || 0} authored guardrail
+              {(data?.policies?.length || 0) === 1 ? "" : "s"}. Sync re-authors
+              the document from the current wiki: entries can be rewritten,
+              merged, or dropped.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline">Cancel</Button>
+            </DialogClose>
+            <Button
+              variant="destructive"
+              onClick={confirmSync}
+              // Same guard as every sync trigger: a dispatch already in
+              // flight while the dialog sat open must not double-fire.
+              disabled={busy || syncPending}
+            >
+              <RefreshCwIcon data-icon="inline-start" />
+              Sync and overwrite
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog open={sourcesOpen} onOpenChange={setSourcesOpen}>
         <DialogContent>
           <DialogHeader>
@@ -461,9 +527,7 @@ export default function ReasoningView({ api, selection }) {
               Source files
             </DialogTitle>
             <DialogDescription>
-              The wiki pages the guardrails are inferred from. Editing any of
-              these (or a harvest changing them) makes the guardrails out of
-              date.
+              The wiki pages the guardrails are inferred from.
             </DialogDescription>
           </DialogHeader>
           {/* Plain scroll div, NOT ScrollArea: Radix's viewport wraps children

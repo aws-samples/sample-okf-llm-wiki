@@ -443,9 +443,11 @@ data "aws_iam_policy_document" "consumption" {
   }
 
   statement {
-    sid       = "RegistryRead"
-    actions   = ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:Scan"]
-    resources = [local.d.registry_table_arn]
+    sid     = "RegistryRead"
+    actions = ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:Scan"]
+    # index/*: Query against a GSI (list_domains pages the by-entity index) is
+    # authorized on the INDEX sub-resource, not the table ARN.
+    resources = [local.d.registry_table_arn, "${local.d.registry_table_arn}/index/*"]
   }
 }
 
@@ -520,11 +522,12 @@ data "aws_iam_policy_document" "chat" {
     resources = [local.d.vector_index_arn, local.d.vector_bucket_arn]
   }
 
-  # Registry read for list_domains / list_declared_domains.
+  # Registry read for list_domains / list_declared_domains. index/*: the
+  # by-entity GSI Query authorizes on the index sub-resource (same as consumption).
   statement {
     sid       = "RegistryRead"
     actions   = ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:Scan"]
-    resources = [local.d.registry_table_arn]
+    resources = [local.d.registry_table_arn, "${local.d.registry_table_arn}/index/*"]
   }
 
   # policy_check's stale discovery (design §7.5): a fresh-hash mismatch flags

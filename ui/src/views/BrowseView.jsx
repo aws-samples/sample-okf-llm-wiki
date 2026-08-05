@@ -300,41 +300,31 @@ function FilesPane({
       {/* View header: dataset selector on the left, page-level actions pinned
           right on the same line — matching the Context Docs / Benchmark /
           Harvest views. The per-doc breadcrumb still lives in the doc pane.
-          mt-2.5 lines the picker's center up with the top strip's (~32px from
+          mt-2 lines the picker's center up with the top strip's (~32px from
           the inset top, the sidebar brand row's line): Browse is strip-less
-          (pt-2 region, h-7 picker → ~22px) so it needs the 10px the strip's
+          (pt-2 region, h-8 picker → ~24px) so it needs the 8px the strip's
           h-12/pt-4 geometry provides elsewhere. */}
-      <div className="mt-2.5 mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+      <div className="mt-2 mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
         <div className="flex min-w-0 items-center">{picker}</div>
         <div className="flex shrink-0 items-center gap-2">
           {versionMode ? (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setVersionMode(null)}
-            >
-              <XIcon className="size-3.5" />
+            <Button variant="outline" onClick={() => setVersionMode(null)}>
+              <XIcon />
               Close
             </Button>
           ) : (
             <>
-              {/* Compare/restore published bundle versions. */}
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setVersionMode({})}
-              >
-                <HistoryIcon className="size-3.5" />
+              {/* Compare/restore published bundle versions. Ghost, not
+                  filled: Annotations is the row's one primary action — two
+                  filled buttons side by side compete for attention. */}
+              <Button variant="ghost" onClick={() => setVersionMode({})}>
+                <HistoryIcon />
                 History
               </Button>
               {/* Open the annotations panel. The badge shows how many of the
                   caller's notes are still open (unresolved) for this dataset. */}
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setAnnotationsOpen(true)}
-              >
-                <MessageSquareTextIcon className="size-3.5" />
+              <Button onClick={() => setAnnotationsOpen(true)}>
+                <MessageSquareTextIcon />
                 Annotations
                 {openCount > 0 && (
                   <Badge variant="secondary" className="ml-1">
@@ -511,12 +501,12 @@ function FilesPane({
 
       {/* Annotations: a floating panel that slides in from the RIGHT. Floating
           (inset from the edges + rounded) rather than flush to the screen edge:
-          the inset-y / right offsets + rounded-2xl override the Sheet's default
+          the inset-y / right offsets + rounded-xl override the Sheet's default
           full-height flush styling, and w-auto lets the max-w cap the width. */}
       <Sheet open={annotationsOpen} onOpenChange={setAnnotationsOpen}>
         <SheetContent
           side="right"
-          className="data-[side=right]:inset-y-3 data-[side=right]:right-3 data-[side=right]:h-auto data-[side=right]:w-[92vw] data-[side=right]:rounded-2xl data-[side=right]:border data-[side=right]:sm:max-w-md"
+          className="data-[side=right]:inset-y-3 data-[side=right]:right-3 data-[side=right]:h-auto data-[side=right]:w-[92vw] data-[side=right]:rounded-xl data-[side=right]:border data-[side=right]:sm:max-w-md"
         >
           <SheetHeader className="border-b p-4">
             <SheetTitle className="flex items-center gap-2">

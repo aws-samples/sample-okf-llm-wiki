@@ -240,6 +240,11 @@ def _upsert_xref(ddb, *, registry_table: str, location: ConceptLocation) -> None
     table.put_item(
         Item={
             **_xref_key(location, pair),
+            # by-entity GSI keys (CONVENTIONS.md "Registry entity index"):
+            # a paged dataset listing can then fetch ALL xref rows in one
+            # small Query instead of scanning every DOMAIN# partition.
+            "entity": "xref",
+            "pair": f"{pair[0]}/{pair[1]}",
             "target_data_domain": pair[0],
             "target_dataset": pair[1],
             "source_data_domain": location.data_domain,

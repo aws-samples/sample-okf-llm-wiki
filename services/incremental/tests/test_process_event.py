@@ -20,6 +20,8 @@ ARN = "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/harvest-abc"
 
 
 def _call(detail, aws, glue, agentcore):
+    import boto3
+
     return process_event(
         detail,
         glue=glue,
@@ -30,6 +32,9 @@ def _call(detail, aws, glue, agentcore):
         registry_table=REGISTRY_TABLE,
         freshness_table=FRESHNESS_TABLE,
         harvest_runtime_arn=ARN,
+        # The build-lock gate speaks typed attributes — a LOW-LEVEL client,
+        # like production's clients["ddb_client"] (never resource.meta.client).
+        ddb_client=boto3.client("dynamodb", region_name="us-east-1"),
     )
 
 
@@ -254,6 +259,51 @@ def test_missing_db_or_table_field_skipped(aws):
 
 def _detail(db="f1_db", table="races"):
     return {"databaseName": db, "tableName": table, "changedPartitions": []}
+
+
+def test_incremental_defers_while_guardrails_author_runs(aws):
+    """A fresh `building` flip on the mapping row defers the re-harvest.
+
+    The harvest status row is terminal while the follow-on policy author
+    reads the committed wiki, so the lease alone can't see it. Same
+    no-version-recorded semantics as skipped_locked.
+    """
+    from datetime import datetime, timezone
+
+    seed_mapping(aws["ddb"], data_domain="sales", dataset="f1", glue_database="f1_db")
+    seed_ready_bundle(aws["s3"], data_domain="sales", dataset="f1")
+    tbl = make_table("races", [col("id", "bigint")], version_id="7")
+    glue = FakeGlue({"f1_db": {"races": [tbl]}})
+    agentcore = FakeAgentCore()
+
+    aws["ddb"].Table(REGISTRY_TABLE).update_item(
+        Key={"pk": "DOMAIN#sales", "sk": "DATASET#f1"},
+        UpdateExpression="SET ar_build_status = :b, ar_build_started_at = :t",
+        ExpressionAttributeValues={
+            ":b": "building",
+            ":t": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+    )
+
+    result = _call(_detail(), aws, glue, agentcore)
+    assert result["action"] == "skipped_guardrails_building"
+    assert agentcore.invocations == []
+
+    # Version NOT recorded -> the change survives for re-detection.
+    stored = store.get_stored_version(
+        aws["ddb"], FRESHNESS_TABLE, "sales", "f1", "races"
+    )
+    assert stored.version_id is None
+
+    # A STALE building row (dead author) no longer defers.
+    old = "2020-01-01T00:00:00+00:00"
+    aws["ddb"].Table(REGISTRY_TABLE).update_item(
+        Key={"pk": "DOMAIN#sales", "sk": "DATASET#f1"},
+        UpdateExpression="SET ar_build_started_at = :t",
+        ExpressionAttributeValues={":t": old},
+    )
+    result = _call(_detail(), aws, glue, agentcore)
+    assert result["action"] != "skipped_guardrails_building"
 
 
 def test_incremental_defers_when_harvest_already_in_flight(aws):

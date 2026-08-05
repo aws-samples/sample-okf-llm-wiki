@@ -208,25 +208,28 @@ parse, which flags the row stale and re-authors it — no code path needed.
 **Authoring lifecycle.** ALWAYS ON per dataset (the v1-era `ar_enrolled`
 opt-in is retired; the only switch left is the deploy-wide
 `OKF_POLICY_BUILD_ENABLED`). The triggers, not a flag, bound the work: the
-harvest finalize hook authors on every committed bundle change (full,
-incremental, annotation), `policy_rebuild` events cover the rest (the
+runner's post-complete follow-on build authors on every committed bundle
+change (full, incremental, annotation — AFTER the terminal status write; see
+"Harvest status"), `policy_rebuild` events cover the rest (the
 Reasoning page's manual Sync, the repromote accelerator — which also
 first-authors a dataset restored to a version without a document — and the
 chat check's stale discovery), and the nightly reconcile re-verifies ONLY
 datasets whose lifecycle has begun (`ar_build_status` present). A dataset
 predating the feature is therefore never bulk-backfilled: its first document
 comes from a manual Sync, its next harvest/increment, or a repromote.
-Authoring runs on the harvest runtime — at harvest finalize (best-effort,
-AFTER the commit marker) and on
+Authoring runs on the harvest runtime — as the runner's follow-on step
+(best-effort, AFTER the commit marker AND the terminal status write) and on
 `mode="ar_rules"` dispatches — as a small ReAct agent with full reasoning
 (`harvest.ar_author`): it reads the sources (with per-file unified diffs
 against the previous authoring's copies), then submits through a validating
 `write_policies` tool. The pipeline is short: gather sources →
 fingerprint-skip (unchanged sources + live document = zero model calls) →
-flip `building` (THE per-dataset lease; conditional UpdateItem, no stale
-escape hatch) → author → persist the document + author state → `stamp_ready`
-with the **gather-time** fingerprint (a wiki that moves mid-authoring yields
-a stale-on-arrival document, never a mislabelled one). Authoring IS
+flip `building` (THE per-dataset lease; conditional UpdateItem with a
+`BUILD_LOCK_STALE_SECONDS` takeover so a dead author's row cannot lock
+authoring out) → author → persist the document + author state → `stamp_ready`
+with the **gather-time** fingerprint, then one freshness re-check (a wiki
+that moved mid-authoring flags the row stale and queues a rebuild — never a
+mislabelled document). Authoring IS
 completion — there is no build workflow and no completion authority.
 
 **From-scratch runs are map-reduce** (first authoring + forced Sync — any run
@@ -366,9 +369,15 @@ hands the checkpoint's raw question + the Q&A to the fresh checker, which
 re-runs the rewrite) — the ask-first evidence lives in the behavioural steps
 track, and the computational judges need the clarified intent. Durability:
 the state lives on the THREAD row (`policy_curated_question`, written when
-the rewrite lands; `policy_last_answer`, ~2k chars, written at stream end),
-read with one lazy GetItem — so reloading a chat days later still chains
-context. Every piece is best-effort and fail-open: absent attributes mean
+the rewrite lands; `policy_last_answer`, ~2k chars, written at stream end;
+`policy_question_history`, the last 3 curated questions rolled forward with
+each landing), read with one lazy GetItem — so reloading a chat days later
+still chains context. The history widens the REWRITE's resolution context:
+the questions before the previous one (at most 2) render as an
+earlier-questions section in the rewrite input, so a fragment jumping back
+past the immediately previous topic still curates to the right question. The
+judges never see them — both tracks judge against the single current curated
+question. Every piece is best-effort and fail-open: absent attributes mean
 raw-question (turn-1) semantics.
 
 **The computational track** (the `run_sql` race):
@@ -582,7 +591,54 @@ provisioned cluster's `DBName` hint from `/redshift/clusters` — defaulting to
 
 **Harvest status.** `pk = "HARVEST#<data_domain>#<dataset>"`, `sk = "STATUS"`,
 attrs `{status: queued | running | complete | failed | cancelled, mode,
-started_at, updated_at, detail, runtime_session_id, model, effort}`. A
+started_at, updated_at, detail, runtime_session_id, model, effort}`. The
+harvest is DONE at the bundle commit marker: the runner flips the row
+terminal right after `finalize_bundle` returns, and the policy document then
+authors as its own follow-on step (still in the same runtime session, but a
+separate process semantically). The terminal `complete`/`failed` writes are
+conditional on the row still being in flight AND still being THIS run's
+(`runtime_session_id` must match when the runner knows its own — a hung
+run's late write must not clobber a successor that took the lease via the
+staleness escape, nor trigger a ghost policy build against its mid-write
+bundle). That step runs only when the terminal
+write actually landed (`report_status` returns False when a cancel won the
+race — no authoring for a cancelled run), is SKIPPED outright when the
+policy feature is off (`OKF_POLICY_BUILD_ENABLED` unset — no flush wait for
+a no-op), first WAITS for the bundle's S3
+flush to settle (the S3 Files mount's write-back can lag the terminal write
+by a minute — gathering early fingerprints a partial wiki and the fresh
+document immediately reads "out of date"; the wait polls for the commit
+marker plus a settle margin, bounded, and matches the marker's
+`completed_at` against the one THIS run's finalize wrote — on a re-harvest
+the PREVIOUS run's `complete` marker is still the visible object until the
+mount flushes), and is serialized by ITS OWN lock —
+the mapping row's `ar_build_status = "building"` flip with its
+`ar_build_started_at` stamp (`okf_aws.ar_policy.build_lock_active`; staleness
+escape `BUILD_LOCK_STALE_SECONDS` = 1h, honored symmetrically by the flip
+itself, so an abandoned `building` row neither wedges harvests nor locks
+authoring out — the reconcile still reaps it). The gate lives INSIDE the
+Control API's lease acquirers (`acquire_harvest_lease` /
+`acquire_repromote_lease` — every trigger path gets it for free) and answers
+with `409` ("guardrails are being authored…"); dataset deletion, which takes
+no lease, calls it directly; the incremental orchestrator checks the shared
+helper and returns `skipped_guardrails_building` without recording the new
+version (the change is re-detected once the build lands). The REVERSE gate
+also holds: the Reasoning page's Sync refuses (`409`) while the harvest
+lease is held — the finished harvest authors on its own (the lease-held
+mirror honors BOTH staleness escapes below, so a dead repromote frees Sync
+after 120s, not 8h). The Reasoning status GET reports `wiki_rewriting` only
+while the marker reads `in_progress` AND that lease is live — a failed run
+leaves the marker at `in_progress` forever, and without the cross-check the
+page would promise an auto re-author that is never coming (it reports "the
+last harvest did not complete" instead, with no freshness verdict). A follow-on build
+that loses the flip race leaves a `policy_rebuild` trigger behind, and every
+authoring run ends with a freshness re-check (a wiki that moved mid-build is
+flagged stale + re-queued), so the gate stays a courtesy, never a
+correctness requirement. The
+status GET exposes the live lock as a top-level `guardrails_building`
+boolean — knowably false (and not re-read) while the row itself is still
+`queued`/`running`, since the build only starts post-terminal and an active
+build would have refused the lease. A
 `mode = "cross"` row additionally carries `cross_target`
 (`"<domain>/<dataset>"`, stamped at lease time — the counterpart the discovery
 run is against, surfaced by the status GET so the UI shows WHO, not just the
@@ -768,8 +824,9 @@ alive.
 **Why it exists.** Pair docs live only in the initiating bundle, so a consumer
 scoped to the referenced dataset would otherwise never learn the relationship
 exists. `list_domains` (both the Control API's `GET /domains` and the
-consumption MCP tool) reads these rows in the SAME scan it already does over
-`DOMAIN#` partitions and adds two optional fields per dataset:
+consumption MCP tool) reads these rows alongside the mapping listing (one
+`entity="xref"` Query on the entity index — see "Registry entity index"
+below) and adds two optional fields per dataset:
 `cross_references` (datasets this one holds pair docs FOR) and
 `cross_referenced_by` (datasets whose bundle holds pair docs about this one —
 read them under `<that dataset>/external/<this_domain>/<this_dataset>/`). Both
@@ -786,11 +843,35 @@ is returned once at creation and never stored. This backs the credentials UI
 arbitrary app client, such as the public SPA login client, can't be deleted — and
 when a caller identity is present it must equal `created_by`.
 
-Listing: `list_domains` scans `pk begins_with "DOMAIN#"` with `sk begins_with
-"DATASET#"` (the mappings — so declared-domain `META` rows are excluded) OR
-`sk begins_with "XREF#"` (the derived cross-reference signal, folded into the
-same pass and returned as the `cross_references` / `cross_referenced_by`
-fields, never as mappings); `list_declared_domains` scans with `sk = "META"`;
+**Registry entity index.** Mapping rows, declared-domain `META` rows, and
+`XREF#` rows carry two extra attributes — `entity` (`"dataset"` | `"domain"`
+| `"xref"`) and `pair` (`"<domain>/<dataset>"`, or `"<domain>"` for META) —
+keying the `by-entity` GSI (projection ALL). Listings **Query** it instead of
+Scan-with-filter: a Scan reads the whole table (harvest status + `REPORT#`
+rows included), so its cost grows with usage rather than with the dataset
+count. Every writer stamps the attributes (`upsert_domain_mapping`,
+`declare_domain`, reindex's XREF upsert); rows written before the index
+existed need `scripts/backfill_registry_entity.py` (deploy.sh runs it after
+every durable apply — idempotent), whose LAST step writes the readiness
+marker row `pk = "REGISTRY"`, `sk = "ENTITY_INDEX_READY"`. Readers Query the
+index ONLY once that marker exists (`okf_aws.registry_entity` — the one
+shared read protocol) and use the legacy filtered Scan until then: a GSI
+only contains rows stamped with its keys, so on a partially-stamped registry
+any result-shape heuristic would return the fresh rows and silently hide
+every pre-index dataset. The only OTHER condition that may fall back to the
+Scan is "the index does not exist" (marker stamped before the terraform
+apply); mid-pagination errors must surface instead — a silent Scan there
+would re-return pages the caller already consumed. Consumers: the Control
+API's `list_domains`, the consumption MCP `list_domains`, and the chat
+policy check's `_policy_glue_map`.
+
+Listing: the consumption MCP `list_domains(domain?, query?, cursor?, limit?)`
+is PAGINATED — it returns `{"datasets": [...], "next_cursor": ...}` with a
+soft `limit` (default 100, max 500; DDB requests are Limit-bounded so tiny
+rows can't defeat the cap), an opaque base64 cursor, a `domain` partition
+filter (base-table Query) and a case-insensitive `query` substring filter
+over `"<domain>/<dataset>"`; the legacy-scan fallback returns everything with
+`next_cursor = null`. `list_declared_domains` scans with `sk = "META"`;
 `list_credentials` scans `pk begins_with "CRED#"`.
 
 ### `okf-chat` — conversation index (+ the policy checks' rolling context)
@@ -813,10 +894,19 @@ already carries one, because TTL is eventually consistent.
 The THREAD row also carries the policy checks' **rolling context** (see
 "Policy checks" above): `policy_curated_question` (the latest turn's curated
 standalone question, written when the rewrite lands and overwritten inline on
-an ask_human fold) and `policy_last_answer` (that turn's final answer, ~2k
-chars, written at stream end). Both optional, best-effort, no TTL (thread
-rows have none) — reloading a chat days later still chains context; absent
-attrs mean raw-question semantics (`chat.threads.read_policy_state` /
+an ask_human fold), `policy_last_answer` (that turn's final answer, ~2k
+chars, written at stream end), `policy_question_history` (a DynamoDB List
+of the last 3 curated questions, most recent last, rolled forward with each
+landing — the entries before the previous question feed the next rewrite as
+earlier-questions resolution context), and `policy_history_last_raw` (the
+RAW question whose curated form is the history's last entry — the durable
+same-turn signal an ask_human fold's re-curation uses to REPLACE that entry
+instead of appending; cleared to `""` by the stream-end answer write so it
+never outlives its turn, which is what lets an IDENTICAL question re-asked
+on a later turn append normally). All optional, best-effort, no TTL
+(thread rows have none) —
+reloading a chat days later still chains context; absent attrs mean
+raw-question semantics with no background (`chat.threads.read_policy_state` /
 `write_policy_state`).
 
 **Legacy: policy-check reports.** v2's post-turn panel persisted one
@@ -1260,7 +1350,7 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_HARVEST_BEDROCK_MAX_ATTEMPTS` | botocore `retries.max_attempts` in adaptive mode (default `5`); retries transient throttles and timeouts instead of failing the run |
 | `OKF_BENCHMARK_MAX_CONCURRENCY` | how many benchmark solver ReAct loops (and judge reviews) run at once in a Benchmark Studio run (default `10`). Its own `asyncio.Semaphore` — each solver is one in-flight model request at a time, so this is the peak concurrent Bedrock requests from the benchmark. Raise on generous quota, lower on `ThrottlingException`. `mode: "benchmark"` runs only. |
 | `OKF_BENCHMARK_ATHENA_CONCURRENCY` | how many benchmark grading queries (gold/predicted SQL EX executions) run against Athena at once (default `15`); size under the Athena workgroup's concurrent-DML limit. `mode: "benchmark"` runs only |
-| `OKF_POLICY_BUILD_ENABLED` | (harvest, incremental) `"true"` → author and refresh policy documents from the wiki (default `false`). The harvest finalize hook and the rebuild authority both no-op when unset — an ALREADY-authored document keeps being usable, since usability is decided by the row's `ar_build_status` + fingerprint, not by this flag. Set from `var.enable_policy_build` |
+| `OKF_POLICY_BUILD_ENABLED` | (harvest, incremental) `"true"` → author and refresh policy documents from the wiki (default `false`). The runner's post-complete follow-on build and the rebuild authority both no-op when unset — an ALREADY-authored document keeps being usable, since usability is decided by the row's `ar_build_status` + fingerprint, not by this flag. Set from `var.enable_policy_build` |
 | `OKF_USER_POOL_ID` | Cognito user pool id (the Control API vends and revokes M2M app clients in this pool) |
 | `OKF_MCP_SCOPE` | the custom scope (`okf-mcp/invoke`) granted to vended M2M clients; must match the consumption authorizer's `allowed_scopes` |
 | `OKF_HARVEST_LOG_GROUP` | the harvest runtime's CloudWatch log group the Control API reads to serve the live step feed (`GET /harvest/{domain}/{dataset}/events`). Derived by Terraform as `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT` (overridable via `var.harvest_log_group`). Unset/incorrect → the feed returns an empty batch; status polling is unaffected |

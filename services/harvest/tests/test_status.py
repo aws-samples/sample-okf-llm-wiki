@@ -187,6 +187,30 @@ def test_report_status_only_if_active_adds_condition():
     assert ":queued" in cond and ":running" in cond
     assert call["ExpressionAttributeValues"][":queued"] == {"S": "queued"}
     assert call["ExpressionAttributeValues"][":running"] == {"S": "running"}
+    # Without a session_id (tests, local runs) no run-identity clause exists.
+    assert "runtime_session_id" not in cond
+
+
+def test_report_status_only_if_active_pins_run_identity():
+    # A hung run's LATE terminal write must not land on a successor's
+    # queued/running row (the staleness escape lets a new run start over a
+    # dead one — status alone can't tell them apart). With the runner's
+    # session_id, the condition also requires the row to still be THIS run's.
+    ddb = _FakeDDB()
+    status.report_status(
+        (ddb, "t"),
+        data_domain="d",
+        dataset="ds",
+        status="complete",
+        only_if_active=True,
+        session_id="okf-d-ds-abc123",
+    )
+    call = ddb.calls[0]
+    cond = call["ConditionExpression"]
+    assert "runtime_session_id = :sid" in cond
+    # Rows written out-of-band without a session id are still writable.
+    assert "attribute_not_exists(runtime_session_id)" in cond
+    assert call["ExpressionAttributeValues"][":sid"] == {"S": "okf-d-ds-abc123"}
 
 
 def test_report_status_swallows_conditional_check_failure():

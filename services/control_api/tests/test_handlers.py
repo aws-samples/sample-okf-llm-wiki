@@ -245,6 +245,127 @@ def test_list_domains_derives_source_for_legacy_rows(cfg):
     assert legacy["source"] == {"type": "glue", "glue_database": "legacy"}
 
 
+def test_list_domains_partially_stamped_registry_keeps_every_row(cfg):
+    # A fresh registration stamps the by-entity keys, a pre-index row has
+    # none, and the backfill's readiness marker is absent: the listing must
+    # come from the SCAN (both rows visible). Trusting the index's non-empty
+    # result here silently hid every pre-index dataset (the GSI only contains
+    # stamped rows).
+    cfg.ddb.put_item(
+        TableName=REGISTRY,
+        Item={
+            "pk": {"S": "DOMAIN#sales"},
+            "sk": {"S": "DATASET#legacy"},
+            "data_domain": {"S": "sales"},
+            "dataset": {"S": "legacy"},
+            "glue_database": {"S": "legacy"},
+        },
+    )
+    handlers.upsert_domain_mapping(  # stamps entity/pair
+        cfg.ddb,
+        registry_table=REGISTRY,
+        data_domain="sales",
+        dataset="fresh",
+        glue_database="fresh_db",
+    )
+    rows = handlers.list_domains(cfg.ddb, registry_table=REGISTRY)
+    assert {r["dataset"] for r in rows} == {"legacy", "fresh"}
+
+    # With the marker but NO index (moto table has none — the marker-before-
+    # terraform-apply ordering), the reader still falls back to the scan.
+    from okf_aws import registry_entity
+
+    registry_entity.mark_entity_index_ready(cfg.ddb, REGISTRY)
+    rows = handlers.list_domains(cfg.ddb, registry_table=REGISTRY)
+    assert {r["dataset"] for r in rows} == {"legacy", "fresh"}
+
+
+def test_harvest_lease_held_frees_after_a_dead_repromote(cfg):
+    # acquire_repromote_lease's 120s queued-repromote takeover must be
+    # mirrored by the read-side check, or a dead repromote Lambda blocks the
+    # Reasoning Sync for the full 8h harvest staleness window.
+    from datetime import datetime, timedelta, timezone
+
+    def _seed(mode, status, age_s):
+        cfg.ddb.put_item(
+            TableName=REGISTRY,
+            Item={
+                "pk": {"S": "HARVEST#sales#orders"},
+                "sk": {"S": "STATUS"},
+                "status": {"S": status},
+                "mode": {"S": mode},
+                "started_at": {
+                    "S": (
+                        datetime.now(timezone.utc) - timedelta(seconds=age_s)
+                    ).isoformat()
+                },
+            },
+        )
+
+    held = lambda: handlers.harvest_lease_held(  # noqa: E731 - test brevity
+        cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders"
+    )
+    _seed("repromote", "queued", age_s=10)
+    assert held() is True  # live repromote still holds it
+    _seed("repromote", "queued", age_s=600)
+    assert held() is False  # dead repromote (>120s) is stealable => not held
+    _seed("full", "queued", age_s=600)
+    assert held() is True  # a real harvest only goes stale after 8h
+
+
+def test_get_harvest_status_reports_guardrails_only_post_terminal(cfg, agentcore):
+    # While the row is queued/running the build lock is knowably free (the
+    # build only starts post-terminal, and an active build 409s the lease) —
+    # the poll must not report a stale `building` flip as live during a run.
+    from okf_aws import ar_policy
+
+    handlers.trigger_harvest(
+        agentcore,
+        cfg.ddb,
+        registry_table=REGISTRY,
+        runtime_arn=HARVEST_ARN,
+        data_domain="sales",
+        dataset="orders",
+        mode="full",
+    )
+    cfg.ddb.update_item(
+        TableName=REGISTRY,
+        Key={"pk": {"S": "DOMAIN#sales"}, "sk": {"S": "DATASET#orders"}},
+        UpdateExpression="SET ar_build_status = :b, ar_build_started_at = :t",
+        ExpressionAttributeValues={
+            ":b": {"S": ar_policy.BUILD_BUILDING},
+            ":t": {"S": handlers._now_iso()},
+        },
+    )
+    st = handlers.get_harvest_status(
+        cfg.s3,
+        cfg.ddb,
+        bucket=BUCKET,
+        registry_table=REGISTRY,
+        data_domain="sales",
+        dataset="orders",
+    )
+    assert st["status"]["status"] == "queued"
+    assert st["guardrails_building"] is False  # in flight => knowably false
+
+    cfg.ddb.update_item(
+        TableName=REGISTRY,
+        Key={"pk": {"S": "HARVEST#sales#orders"}, "sk": {"S": "STATUS"}},
+        UpdateExpression="SET #s = :c",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":c": {"S": "complete"}},
+    )
+    st2 = handlers.get_harvest_status(
+        cfg.s3,
+        cfg.ddb,
+        bucket=BUCKET,
+        registry_table=REGISTRY,
+        data_domain="sales",
+        dataset="orders",
+    )
+    assert st2["guardrails_building"] is True  # terminal => the lock is read
+
+
 def test_upsert_overwrites_and_stores_exact_keys(cfg):
     handlers.upsert_domain_mapping(
         cfg.ddb,
@@ -415,6 +536,34 @@ def test_delete_domain_mapping_purges_bundle_and_freshness(cfg):
         TableName=FRESHNESS,
         Key={"pk": {"S": f"TABLE#{dd}#formula_1#races"}, "sk": {"S": "VERSION"}},
     )
+
+
+def test_delete_domain_mapping_refused_while_guardrails_author_runs(cfg):
+    # An author finishing mid-delete would re-materialize policy/<d>/<ds>/
+    # objects after the purge — deleting takes no lease, so it gates on the
+    # build lock directly.
+    from okf_aws import ar_policy as ap
+
+    handlers.upsert_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders",
+        glue_database="db",
+    )
+    ap.try_flip_building(
+        cfg.ddb, REGISTRY, data_domain="sales", dataset="orders", pending_hash="h"
+    )
+    with pytest.raises(ApiError) as ei:
+        handlers.delete_domain_mapping(
+            cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders"
+        )
+    assert ei.value.status == 409 and "guardrails" in str(ei.value)
+    # The build landing frees the delete.
+    ap.stamp_ready(
+        cfg.ddb, REGISTRY, data_domain="sales", dataset="orders", fingerprint="h"
+    )
+    out = handlers.delete_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders"
+    )
+    assert out["deleted"] is True
 
 
 def test_delete_domain_mapping_idempotent_when_nothing_exists(cfg):
@@ -897,6 +1046,51 @@ def test_trigger_harvest_rejects_concurrent_same_dataset_409(cfg, agentcore):
         )
     assert ei.value.status == 409
     # The second trigger never invoked the runtime.
+    assert len(agentcore.calls) == 1
+
+
+def test_trigger_harvest_blocked_while_guardrails_author_runs(cfg, agentcore):
+    """A fresh `building` flip on the mapping row 409s a new harvest start.
+
+    The harvest status row is TERMINAL while the follow-on policy author
+    reads the committed wiki, so the harvest lease alone cannot see it —
+    the build lock is the gate (CONVENTIONS.md "Harvest status").
+    """
+    from okf_aws import ar_policy as ap
+
+    cfg.ddb.put_item(
+        TableName=REGISTRY,
+        Item={**ap.registry_key("sales", "orders"), "data_domain": {"S": "sales"}},
+    )
+    ap.try_flip_building(
+        cfg.ddb, REGISTRY, data_domain="sales", dataset="orders", pending_hash="h"
+    )
+    with pytest.raises(ApiError) as ei:
+        handlers.trigger_harvest(
+            agentcore,
+            cfg.ddb,
+            registry_table=REGISTRY,
+            runtime_arn=HARVEST_ARN,
+            data_domain="sales",
+            dataset="orders",
+            mode="full",
+        )
+    assert ei.value.status == 409
+    assert "guardrails" in str(ei.value)
+    assert len(agentcore.calls) == 0
+    # The author landing (terminal build state) frees the gate.
+    ap.stamp_ready(
+        cfg.ddb, REGISTRY, data_domain="sales", dataset="orders", fingerprint="h"
+    )
+    handlers.trigger_harvest(
+        agentcore,
+        cfg.ddb,
+        registry_table=REGISTRY,
+        runtime_arn=HARVEST_ARN,
+        data_domain="sales",
+        dataset="orders",
+        mode="full",
+    )
     assert len(agentcore.calls) == 1
 
 

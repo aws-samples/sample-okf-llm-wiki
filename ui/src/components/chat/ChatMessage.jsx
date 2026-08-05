@@ -160,7 +160,7 @@ function ChatMessageImpl({
     <div className="flex flex-col gap-5">
       {/* User message — right-aligned bubble. */}
       <div className="flex justify-end">
-        <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl bg-primary px-3 py-2 text-sm text-primary-foreground">
+        <div className="max-w-[85%] whitespace-pre-wrap rounded-xl bg-primary px-3 py-2 text-sm text-primary-foreground">
           {turn.userMessage}
         </div>
       </div>

@@ -87,10 +87,37 @@ def state_marker_key(data_domain: str, dataset: str) -> str:
 
 def is_bundle_ready(s3, bucket: str, data_domain: str, dataset: str) -> bool:
     """True if the commit marker exists and reports ``status == complete``."""
+    return bundle_marker_status(s3, bucket, data_domain, dataset) == "complete"
+
+
+def bundle_marker_status(
+    s3, bucket: str, data_domain: str, dataset: str
+) -> str | None:
+    """The commit marker's ``status``, or None when absent/unreadable.
+
+    ``"complete"`` = consumable; ``"in_progress"`` = a harvest is mid-write
+    (``mark_in_progress`` overwrites the marker at run start) — callers that
+    must tell "never harvested" apart from "being re-harvested right now"
+    (the Guardrails page) read this instead of the boolean.
+    """
+    state = bundle_marker_state(s3, bucket, data_domain, dataset) or {}
+    status = state.get("status")
+    return str(status) if status else None
+
+
+def bundle_marker_state(
+    s3, bucket: str, data_domain: str, dataset: str
+) -> dict | None:
+    """The parsed commit marker document, or None when absent/unreadable.
+
+    For callers that need more than the status — e.g. the harvest runner's
+    flush wait matches ``completed_at`` against the marker it just wrote, so
+    a PREVIOUS run's still-cached ``complete`` marker can't satisfy it.
+    """
     key = state_marker_key(data_domain, dataset)
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         state = json.loads(obj["Body"].read())
-        return state.get("status") == "complete"
-    except Exception:  # noqa: BLE001 - missing/parse error => not ready
-        return False
+        return state if isinstance(state, dict) else None
+    except Exception:  # noqa: BLE001 - missing/parse error => no marker
+        return None

@@ -18,6 +18,7 @@ frozen storage decision (docs/CONVENTIONS.md, OKF_DESIGN §"What we store").
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -219,42 +220,148 @@ class ConsumptionTools:
         return MCP_PRIMER
 
     # -- list_domains ----------------------------------------------------
+    # (pagination + xref helpers for it sit at module level, below the class)
 
-    def list_domains(self) -> list[dict[str, Any]]:
-        """Every ``(data_domain, dataset)`` pair you can read.
+    def list_domains(
+        self,
+        domain: str | None = None,
+        query: str | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Pages of the ``(data_domain, dataset)`` pairs you can read.
 
-        Each carries its domain's description plus its CROSS-DATASET reference
-        signal:
+        Returns ``{"datasets": [...], "next_cursor": ...}`` — pass a non-null
+        ``next_cursor`` back verbatim for the next page (~``limit`` each).
+        ``domain`` narrows to one data domain; ``query`` is a case-insensitive
+        substring over ``"<domain>/<dataset>"``. Prefer ``search_domains`` /
+        ``semantic_search`` to FIND a dataset by meaning.
 
-        * ``cross_references`` — datasets this one holds pair docs FOR (read them
-          under this dataset's ``external/<d>/<ds>/``).
-        * ``cross_referenced_by`` — datasets whose bundle holds pair docs about
-          THIS one (read them under ``<that dataset>/external/<this>/…``).
-
-        Start here to find out what exists before drilling into a dataset.
+        Each entry carries its domain's description plus the cross-dataset
+        signal: ``cross_references`` — datasets this one holds pair docs FOR
+        (read them under this dataset's ``external/<d>/<ds>/``);
+        ``cross_referenced_by`` — the counterpart holds pair docs about THIS
+        one (read them under ``<that dataset>/external/<this>/…``).
         """
         # Implementation notes (deliberately not in the model-facing docstring):
         #
-        # Domain mapping items are pk="DOMAIN#<data_domain>", sk="DATASET#<dataset>"
-        # (docs/CONVENTIONS.md). We want pk begins_with "DOMAIN#", but the boto3
-        # resource `Table` does not support begins_with on the PARTITION key, so we
-        # scan with a filter — fine at demo scale, the registry is tiny.
+        # Mapping rows are pk="DOMAIN#<d>", sk="DATASET#<ds>" and carry the
+        # by-entity GSI keys (entity="dataset", pair="<d>/<ds>" — CONVENTIONS.md
+        # "Registry entity index"), so the catalog is a QUERY, never a Scan (a
+        # Scan reads the whole table — harvest status + report rows included —
+        # and grows with usage, not with datasets). A `domain` filter queries
+        # the base-table partition directly. The index is consulted ONLY once
+        # the backfill's readiness marker says every row is stamped
+        # (okf_aws.registry_entity) — a partially-stamped registry would Query
+        # back a partial catalog. No marker → the old full scan: unpaginated,
+        # exactly the pre-index behavior.
         #
-        # The `_domain` pseudo-dataset (the domain's own concept doc) is filtered
-        # out of the listing.
+        # `limit` is a SOFT cap: whole result pages are consumed, so a reply
+        # can run a few entries over. The `_domain` pseudo-dataset is hidden.
         #
-        # Cross-dataset references: pair docs authored by a cross harvest live in
-        # ONE bundle (the initiating dataset's, under
-        # external/<other_domain>/<other_dataset>/), so a consumer scoped to the
-        # OTHER side would never see them by browsing. The reindex worker derives
-        # XREF# rows from the bundle's object events (see docs/CONVENTIONS.md), and
-        # they sit on the same DOMAIN# partitions this scan already reads — so both
-        # directions are surfaced here for free.
+        # Cross-dataset references: pair docs live in ONE bundle (the
+        # initiating dataset's), so the counterpart's own bundle never reveals
+        # them; reindex-derived XREF# rows (entity="xref") surface both
+        # directions here, fetched in one small GSI query (xref rows are few).
+        from boto3.dynamodb.conditions import Key
+
+        from okf_aws import registry_entity
+
+        limit = max(1, min(int(limit or 100), 500))
+        needle = (query or "").strip().lower()
+        start_key = _decode_cursor(cursor)
+
+        mappings: list[dict[str, Any]] = []
+        next_key: dict[str, Any] | None = None
+        legacy = not registry_entity.entity_index_ready(self.ddb, resource=True)
+        # Limit each DDB request too: mapping rows are tiny, so without it a
+        # single 1MB result page holds THOUSANDS of rows and the soft cap
+        # would never bite (the whole catalog would return on page one).
+        page_kwargs: dict[str, Any] = {"Limit": limit}
+        if start_key:
+            page_kwargs["ExclusiveStartKey"] = start_key
+        if not legacy:
+            try:
+                while True:
+                    if domain:
+                        resp = self.ddb.query(
+                            KeyConditionExpression=Key("pk").eq(f"DOMAIN#{domain}")
+                            & Key("sk").begins_with("DATASET#"),
+                            **page_kwargs,
+                        )
+                    else:
+                        resp = self.ddb.query(
+                            IndexName=registry_entity.INDEX_NAME,
+                            KeyConditionExpression=Key("entity").eq(
+                                registry_entity.ENTITY_DATASET
+                            ),
+                            **page_kwargs,
+                        )
+                    for item in resp.get("Items", []):
+                        ds = item.get("dataset", "")
+                        dd = item.get("data_domain", "")
+                        if is_domain_dataset(ds):
+                            continue
+                        if needle and needle not in f"{dd}/{ds}".lower():
+                            continue
+                        mappings.append({"data_domain": dd, "dataset": ds})
+                    lek = resp.get("LastEvaluatedKey")
+                    if not lek:
+                        next_key = None
+                        break
+                    if len(mappings) >= limit:
+                        next_key = lek
+                        break
+                    page_kwargs["ExclusiveStartKey"] = lek
+            except Exception as e:  # noqa: BLE001 - triaged below, most re-raise
+                # ONLY "the index does not exist" may fall back to the scan
+                # (the marker was stamped before the terraform apply). Any
+                # other failure — a throttle mid-pagination, a cursor replayed
+                # against a different query shape — must SURFACE: a silent
+                # scan here would hand the caller the whole catalog again with
+                # next_cursor=null, duplicating the pages it already consumed.
+                if not registry_entity.is_missing_index_error(e):
+                    raise
+                legacy = True
+                mappings = []
+
+        if legacy:
+            mappings, meta_by_domain, references, referenced_by = (
+                self._scan_domains_legacy()
+            )
+            if domain:
+                mappings = [m for m in mappings if m["data_domain"] == domain]
+            if needle:
+                mappings = [
+                    m
+                    for m in mappings
+                    if needle in f"{m['data_domain']}/{m['dataset']}".lower()
+                ]
+            next_key = None
+        else:
+            meta_by_domain = self._domain_meta()
+            references, referenced_by = self._xref_maps()
+
+        # Enrich each mapping with domain-level description + the cross signal.
+        for m in mappings:
+            dom = m["data_domain"]
+            meta = meta_by_domain.get(dom)
+            if meta:
+                m["domain_description"] = meta.get("description", "")
+            pair_key = (dom, m["dataset"])
+            if pair_key in references:
+                m["cross_references"] = sorted(references[pair_key])
+            if pair_key in referenced_by:
+                m["cross_referenced_by"] = sorted(referenced_by[pair_key])
+
+        return {"datasets": mappings, "next_cursor": _encode_cursor(next_key)}
+
+    def _scan_domains_legacy(self):
+        """The pre-index full listing (one filtered scan): the fallback path."""
         from boto3.dynamodb.conditions import Attr
 
         mappings: list[dict[str, Any]] = []
         meta_by_domain: dict[str, dict[str, str]] = {}
-        # (domain, dataset) -> sorted "<d>/<ds>" of the counterpart side.
         references: dict[tuple[str, str], set[str]] = {}
         referenced_by: dict[tuple[str, str], set[str]] = {}
         kwargs: dict[str, Any] = {
@@ -265,8 +372,8 @@ class ConsumptionTools:
             for item in resp.get("Items", []):
                 sk = item.get("sk", "")
                 if sk == "META":
-                    domain = item.get("data_domain", "")
-                    meta_by_domain[domain] = {
+                    dom = item.get("data_domain", "")
+                    meta_by_domain[dom] = {
                         "description": item.get("description", ""),
                         "context": item.get("context", ""),
                     }
@@ -282,36 +389,80 @@ class ConsumptionTools:
                         }
                     )
                 elif sk.startswith("XREF#"):
-                    src = (
-                        item.get("source_data_domain", ""),
-                        item.get("source_dataset", ""),
-                    )
-                    tgt = (
-                        item.get("target_data_domain", ""),
-                        item.get("target_dataset", ""),
-                    )
-                    if not all(src) or not all(tgt):
-                        continue  # malformed row — ignore rather than half-report
-                    references.setdefault(src, set()).add(f"{tgt[0]}/{tgt[1]}")
-                    referenced_by.setdefault(tgt, set()).add(f"{src[0]}/{src[1]}")
+                    _fold_xref(item, references, referenced_by)
             token = resp.get("LastEvaluatedKey")
             if not token:
                 break
             kwargs["ExclusiveStartKey"] = token
+        return mappings, meta_by_domain, references, referenced_by
 
-        # Enrich each mapping with domain-level description + the cross signal.
-        for m in mappings:
-            domain = m["data_domain"]
-            meta = meta_by_domain.get(domain)
-            if meta:
-                m["domain_description"] = meta.get("description", "")
-            pair_key = (domain, m["dataset"])
-            if pair_key in references:
-                m["cross_references"] = sorted(references[pair_key])
-            if pair_key in referenced_by:
-                m["cross_referenced_by"] = sorted(referenced_by[pair_key])
+    def _domain_meta(self) -> dict[str, dict[str, str]]:
+        """Every declared domain's META blurb, in ONE indexed query.
 
-        return mappings
+        Domains are few (one small ``entity="domain"`` partition), so a single
+        Query replaces the serial per-domain GetItems a page used to pay.
+        Best-effort: a failed read just drops the blurbs.
+        """
+        from boto3.dynamodb.conditions import Key
+
+        from okf_aws import registry_entity
+
+        out: dict[str, dict[str, str]] = {}
+        try:
+            kwargs: dict[str, Any] = {
+                "IndexName": registry_entity.INDEX_NAME,
+                "KeyConditionExpression": Key("entity").eq(
+                    registry_entity.ENTITY_DOMAIN
+                ),
+            }
+            while True:
+                resp = self.ddb.query(**kwargs)
+                for item in resp.get("Items", []):
+                    dom = item.get("data_domain", "")
+                    if dom:
+                        out[dom] = {
+                            "description": item.get("description", ""),
+                            "context": item.get("context", ""),
+                        }
+                token = resp.get("LastEvaluatedKey")
+                if not token:
+                    break
+                kwargs["ExclusiveStartKey"] = token
+        except Exception:  # noqa: BLE001 - enrichment only
+            pass
+        return out
+
+    def _xref_maps(self):
+        """All cross-reference rows via the by-entity GSI (xref rows are few).
+
+        Best-effort: on a legacy deployment without the index the signal is
+        simply absent from paged replies (the full-scan fallback still carries
+        it).
+        """
+        from boto3.dynamodb.conditions import Key
+
+        from okf_aws import registry_entity
+
+        references: dict[tuple[str, str], set[str]] = {}
+        referenced_by: dict[tuple[str, str], set[str]] = {}
+        try:
+            kwargs: dict[str, Any] = {
+                "IndexName": registry_entity.INDEX_NAME,
+                "KeyConditionExpression": Key("entity").eq(
+                    registry_entity.ENTITY_XREF
+                ),
+            }
+            while True:
+                resp = self.ddb.query(**kwargs)
+                for item in resp.get("Items", []):
+                    _fold_xref(item, references, referenced_by)
+                token = resp.get("LastEvaluatedKey")
+                if not token:
+                    break
+                kwargs["ExclusiveStartKey"] = token
+        except Exception:  # noqa: BLE001 - enrichment only
+            pass
+        return references, referenced_by
 
     # -- list_declared_domains ----------------------------------------------
 
@@ -795,3 +946,38 @@ class ConsumptionTools:
         )
         result["versions"] = [m.descriptor() for m in markers]
         return result
+
+
+# -- list_domains plumbing (module level: pure, unit-testable) --------------------
+
+
+def _encode_cursor(key: dict[str, Any] | None) -> str | None:
+    """Opaque page cursor: base64(JSON(LastEvaluatedKey)). None = last page."""
+    if not key:
+        return None
+    return base64.urlsafe_b64encode(json.dumps(key).encode("utf-8")).decode("ascii")
+
+
+def _decode_cursor(cursor: str | None) -> dict[str, Any] | None:
+    if not cursor:
+        return None
+    try:
+        return json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+    except Exception as e:  # noqa: BLE001 - a garbled cursor is a caller error
+        raise ValueError("invalid cursor — pass next_cursor back verbatim") from e
+
+
+def _fold_xref(item: dict[str, Any], references: dict, referenced_by: dict) -> None:
+    """Fold one XREF row into the two direction maps (malformed rows ignored)."""
+    src = (
+        item.get("source_data_domain", ""),
+        item.get("source_dataset", ""),
+    )
+    tgt = (
+        item.get("target_data_domain", ""),
+        item.get("target_dataset", ""),
+    )
+    if not all(src) or not all(tgt):
+        return  # malformed row — ignore rather than half-report
+    references.setdefault(src, set()).add(f"{tgt[0]}/{tgt[1]}")
+    referenced_by.setdefault(tgt, set()).add(f"{src[0]}/{src[1]}")
