@@ -391,8 +391,10 @@
 /* ask_human results: the questions the agent asked paired with the user's
    answers. The form never echoes the selection into the transcript, so this is
    where the chosen answer becomes visible — the prompt reads as a muted label
-   and the answer stands out as the primary text below it. Same --card slab and
-   border as the source list so it reads as one card, one pair per row. */
+   and the answer stands out as the primary text below it. A foreground-alpha
+   tint, not --card: on the transcript (page bg) a white card slab read
+   LIGHTER than the page in light mode — the tint reads darker in light and
+   still lifts in dark. One card, one pair per row. */
 .tool-result-qa {
   display: flex;
   flex-direction: column;
@@ -400,7 +402,7 @@
   margin-top: 8px;
   max-width: 640px;
   border-radius: 10px;
-  background-color: var(--card);
+  background-color: color-mix(in oklch, var(--foreground) 5%, transparent);
   border: 1px solid var(--unified-border-color);
   padding: 4px;
 }

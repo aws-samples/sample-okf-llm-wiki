@@ -3029,16 +3029,28 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
         out["tool"] = rec.get("tool")
     if "ok" in rec:
         out["ok"] = bool(rec.get("ok"))
-    # Full agent-message markdown (agent events only) — the UI renders it in a
-    # modal when the truncated one-liner is expanded.
+    # Bounded failure snippet, present on a failed tool_result or an errored
+    # subagent event only — the UI surfaces it on the failed row/square.
+    if rec.get("error"):
+        out["error"] = rec.get("error")
+    # Full agent-message markdown (agent events) or a sub-agent dispatch's
+    # full brief (task tool_call / subagent start events) — the UI renders it
+    # in a modal / the fleet drill-in's Input tab.
     if rec.get("full"):
         out["full"] = rec.get("full")
+    # A sub-agent dispatch's final answer (task tool_result / subagent
+    # complete events), bounded by the emitter — the fleet drill-in's Output
+    # tab.
+    if rec.get("result"):
+        out["result"] = rec.get("result")
     # Correlation key pairing a tool_call with its tool_result (the UI folds them
     # into one row). Present on tool events only.
     if rec.get("call_id"):
         out["call_id"] = rec.get("call_id")
     # Sub-agent fleet fields (KIND_SUBAGENT): phase = start|complete|error,
-    # batch groups a fan-out (the eval id), sub_id is the per-square id.
+    # plus `update` (a mid-flight I/O patch carrying `full`/`result` for an
+    # existing square); batch groups a fan-out (the eval id), sub_id is the
+    # per-square id.
     for k in ("phase", "batch", "sub_id", "subagent_type"):
         if rec.get(k):
             out[k] = rec.get(k)
@@ -3046,6 +3058,11 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
     # run. Passed through verbatim as a dict so the UI can show a running total.
     if isinstance(rec.get("usage"), dict):
         out["usage"] = rec["usage"]
+    # The lint gate's structured report (successful lint_bundle tool_result
+    # only, bounded by the emitter) — the UI badges the feed row with its
+    # error/warning counts and renders the findings in a modal on click.
+    if isinstance(rec.get("lint"), dict):
+        out["lint"] = rec["lint"]
     return out
 
 

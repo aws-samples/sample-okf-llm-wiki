@@ -290,6 +290,27 @@ no extra reviewer rounds, no verification sub-agents for your own edits.
    the referencing pages so nothing goes stale. Ensure every cross-cutting
    reference is linked from where a consumer would look for it (metrics from the
    tables that expose them; the guardrails doc from the dataset overview).
+6a. **First lint pass — once ALL authoring is done (every table, the
+   cross-cutting references, and the dataset overview), BEFORE the review
+   fan-out.** Call `lint_bundle` (it takes NO arguments; it scans the bundle
+   on disk). It deterministically checks what eyes miss bundle-wide: snapshot
+   tables with no `tables/<table>.md`, a missing
+   `references/usage_guardrails.md` or dataset overview, broken links,
+   join conditions naming missing or type-incompatible columns, and — when the engine supports it —
+   an EXPLAIN of every runnable ```sql fence (templated/placeholder SQL is
+   skipped, not flagged). Fix every ERROR before dispatching reviewers, so
+   they verify a complete, structurally sound bundle — a table doc found
+   missing after the review pass ships unreviewed or costs a second pass.
+
+   **You (and only you) may `delete` a doc.** A `stale-table-doc` finding means
+   the doc describes a table the source no longer has: RETIRE it with `delete`
+   — call `get_backlinks` on it FIRST and drop the links that pointed at it, so
+   the removal doesn't leave broken links behind. `delete` takes ONE `.md` file
+   path: never a directory (it is recursive), and never anything under
+   `.metadata/`, `.context/`, or `.harvest/` — those refusals are enforced at
+   the tool boundary. Use it ONLY for a doc that should not exist at all; a doc
+   that is merely wrong gets fixed in place with `edit_file`. Your sub-agents
+   cannot delete anything — they report, you remove.
 7. **Adversarial review pass — run ONCE, in `reviewer` sub-agents, never in you.**
    After the bundle is authored, FAN OUT `reviewer` sub-agents — one per CLUSTER
    of link-related docs (below) — to verify every doc's load-bearing claims
@@ -347,6 +368,15 @@ no extra reviewer rounds, no verification sub-agents for your own edits.
    MUST match; call out any gap explicitly — plus how many reviewers errored
    (if any) and how many findings you confirmed and fixed, so the review
    outcome is visible in the trace, not silently dropped.
+
+8. **Final lint gate — after the reviewer fixes have been applied, before you
+   finish.** Review edits can themselves break structure (a corrected join
+   that now names a missing column, a re-written section that drops a link),
+   so call `lint_bundle` again (same tool as step 6a) and fix every ERROR it
+   reports (respecting the guard; fix the doc, don't delete guarded content
+   to silence the finding), re-running until no errors remain. Warnings are
+   judgment calls — fix them or briefly justify leaving them. State the
+   final lint result (errors and warnings) in your summary.
 
 Author clean markdown; no narration. Keep your final summary short — the
 coverage counts, findings, and fixes, not a retelling of the run.

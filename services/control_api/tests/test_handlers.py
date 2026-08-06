@@ -1678,6 +1678,78 @@ def test_get_harvest_events_returns_parsed_steps(cfg):
     assert res["done"] is False
 
 
+def test_get_harvest_events_preserves_subagent_io(cfg):
+    """A task dispatch's `full` brief and `result` answer survive the field
+    whitelist — the UI's fleet drill-in renders them in the square's sheet."""
+    sid = "sid-io"
+    _seed_status(cfg, session_id=sid)
+    logs = FakeLogs(
+        {
+            HARVEST_LOG_GROUP: [
+                _step_line(
+                    sid, 1, "tool_call", tool="task", label="Started table-author",
+                    call_id="c1", full="Author tables/races.\n\nBrief...",
+                ),
+                _step_line(
+                    sid, 2, "tool_result", ok=True, call_id="c1",
+                    result="## Authored tables/races",
+                ),
+            ]
+        }
+    )
+    res = handlers.get_harvest_events(
+        logs,
+        cfg.ddb,
+        registry_table=REGISTRY,
+        log_group=HARVEST_LOG_GROUP,
+        data_domain="sales",
+        dataset="orders",
+        since=0,
+    )
+    assert res["events"][0]["full"].startswith("Author tables/races.")
+    assert res["events"][1]["result"] == "## Authored tables/races"
+
+
+def test_get_harvest_events_preserves_lint_payload(cfg):
+    """A lint_bundle tool_result's `lint` report survives the field whitelist
+    (dict passthrough, like `usage`); a non-dict `lint` is dropped."""
+    sid = "sid-lint"
+    _seed_status(cfg, session_id=sid)
+    lint = {
+        "ok": False,
+        "errors": 1,
+        "warnings": 0,
+        "steps": [{"step": "coverage", "status": "issues", "errors": 1, "warnings": 0}],
+        "findings": [
+            {
+                "severity": "error",
+                "code": "missing-table-doc",
+                "path": "tables/races.md",
+                "message": "Source table `races` has no doc.",
+            }
+        ],
+    }
+    logs = FakeLogs(
+        {
+            HARVEST_LOG_GROUP: [
+                _step_line(sid, 1, "tool_result", ok=True, call_id="c1", lint=lint),
+                _step_line(sid, 2, "tool_result", ok=True, call_id="c2", lint="bogus"),
+            ]
+        }
+    )
+    res = handlers.get_harvest_events(
+        logs,
+        cfg.ddb,
+        registry_table=REGISTRY,
+        log_group=HARVEST_LOG_GROUP,
+        data_domain="sales",
+        dataset="orders",
+        since=0,
+    )
+    assert res["events"][0]["lint"] == lint
+    assert "lint" not in res["events"][1]
+
+
 def test_get_harvest_events_preserves_agent_full_markdown(cfg):
     """An agent event's `full` markdown survives parsing so the UI can render it
     in a modal; a short event without `full` stays lean."""
@@ -1957,6 +2029,51 @@ def test_get_harvest_events_preserves_subagent_fields(cfg):
     )
     assert evs[1]["phase"] == "complete" and evs[1]["sub_id"] == "ptc_a"
     assert evs[2]["phase"] == "error" and evs[2]["sub_id"] == "ptc_b"
+
+
+def test_get_harvest_events_preserves_error_snippet(cfg):
+    """The bounded `error` snippet on a failed tool_result / errored subagent
+    survives parsing — it's the only failure detail the feed carries, so the UI
+    can surface why a call or sub-agent died."""
+    sid = "sid-err"
+    _seed_status(cfg, session_id=sid)
+    logs = FakeLogs(
+        {
+            HARVEST_LOG_GROUP: [
+                _step_line(
+                    sid,
+                    1,
+                    "tool_result",
+                    ok=False,
+                    call_id="rid-1",
+                    error="Error code: 400 - bad request",
+                ),
+                _step_line(
+                    sid,
+                    2,
+                    "subagent",
+                    phase="error",
+                    batch="call_1",
+                    sub_id="ptc_a",
+                    error="BadRequestError: boom",
+                ),
+                _step_line(sid, 3, "tool_result", ok=True, call_id="rid-2"),
+            ]
+        }
+    )
+    res = handlers.get_harvest_events(
+        logs,
+        cfg.ddb,
+        registry_table=REGISTRY,
+        log_group=HARVEST_LOG_GROUP,
+        data_domain="sales",
+        dataset="orders",
+        since=0,
+    )
+    evs = res["events"]
+    assert evs[0]["error"] == "Error code: 400 - bad request"
+    assert evs[1]["error"] == "BadRequestError: boom"
+    assert "error" not in evs[2]  # success carries none
 
 
 def test_get_harvest_events_preserves_usage_snapshot(cfg):

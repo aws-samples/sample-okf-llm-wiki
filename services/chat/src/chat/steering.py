@@ -226,7 +226,19 @@ def detect(messages: list[Any]) -> Signal | None:
         if calls_since < COOLDOWN_CALLS:
             return None
 
-    # repetition — exact duplicate (tool, args) call within the turn.
+    # repetition — exact duplicate (tool, args) call within the turn. Only
+    # calls whose result SUCCEEDED seed the set: re-issuing a call that
+    # errored is course correction, not derailment (the guardrails gate
+    # denies a read_page until references/usage_guardrails is read — the
+    # retry after reading it is exactly what the denial instructed, and the
+    # denial is NOT "its result is above"). Identical FAILING retries are
+    # the futility signal's job below, not repetition's.
+    results_by_id: dict[str, Any] = {}
+    for m in window:
+        if isinstance(m, ToolMessage):
+            call_id = getattr(m, "tool_call_id", None)
+            if call_id:
+                results_by_id[call_id] = m
     seen_calls: set[tuple[str, str]] = set()
     for msg in window:
         if not isinstance(msg, AIMessage):
@@ -238,7 +250,9 @@ def detect(messages: list[Any]) -> Signal | None:
             key = (name, json.dumps(tc.get("args") or {}, sort_keys=True, default=str))
             if key in seen_calls and "repetition" not in fired_kinds:
                 return Signal("repetition", _repetition_text(name))
-            seen_calls.add(key)
+            result = results_by_id.get(tc.get("id") or "")
+            if result is None or not _is_error_result(result):
+                seen_calls.add(key)
 
     # futility — trailing streak of errored results from the same tool.
     streak_tool: str | None = None

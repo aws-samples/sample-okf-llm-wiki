@@ -322,12 +322,18 @@ function FilesPane({
                 History
               </Button>
               {/* Open the annotations panel. The badge shows how many of the
-                  caller's notes are still open (unresolved) for this dataset. */}
+                  caller's notes are still open (unresolved) for this dataset.
+                  Frosted primary-foreground tint, NOT variant="secondary":
+                  dark-mode --secondary is a near-black gray that reads as a
+                  black pill on the filled sky button. */}
               <Button onClick={() => setAnnotationsOpen(true)}>
                 <MessageSquareTextIcon />
                 Annotations
                 {openCount > 0 && (
-                  <Badge variant="secondary" className="ml-1">
+                  <Badge
+                    variant="secondary"
+                    className="ml-1 bg-primary-foreground/25 text-primary-foreground"
+                  >
                     {openCount}
                   </Badge>
                 )}

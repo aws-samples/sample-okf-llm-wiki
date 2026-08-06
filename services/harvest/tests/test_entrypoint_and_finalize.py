@@ -291,3 +291,30 @@ def test_mark_in_progress_then_complete(tmp_path):
     assert json.loads(marker.read_text())["status"] == "in_progress"
     finalize_bundle(tmp_path, data_domain="s", dataset="o", tables=[], timestamp="t1")
     assert json.loads(marker.read_text())["status"] == "complete"
+
+
+def test_finalize_heals_a_read_only_index_instead_of_failing(tmp_path):
+    """The live finalize failure: the S3 Files mount presents an existing
+    index.md read-only, so okf_core's RAW rewrite raised EACCES and took the
+    whole harvest down AFTER every doc was authored (seen on
+    references/enums/index.md). finalize injects fsutil's healing writer."""
+    from harvest.finalize import finalize_bundle
+
+    root = tmp_path / "ds"
+    (root / "tables").mkdir(parents=True)
+    (root / "tables" / "races.md").write_text(
+        "---\ntype: Glue Table\ntitle: Races\ndescription: d\ntimestamp: t\n---\n"
+    )
+    stale = root / "tables" / "index.md"
+    stale.write_text("old\n")
+    stale.chmod(0o444)  # the mount's read-only presentation
+
+    state = finalize_bundle(
+        root,
+        data_domain="sales",
+        dataset="f1",
+        tables=["races"],
+        timestamp="2026-01-01T00:00:00Z",
+    )
+    assert state["status"] == "complete"
+    assert "Races" in stale.read_text()  # healed + rewritten, not a crash

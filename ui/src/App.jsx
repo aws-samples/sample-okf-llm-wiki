@@ -34,10 +34,7 @@ import {
   isNewChatShortcut,
   NEW_CHAT_SHORTCUT_LABEL,
 } from "@/lib/platform"
-import {
-  loadRecentDatasets,
-  pushRecentDataset,
-} from "@/lib/recentDatasets"
+import { loadRecentDatasets, pushRecentDataset } from "@/lib/recentDatasets"
 import { useRouter } from "@/lib/route"
 import { cn } from "@/lib/utils"
 import { useTheme } from "@/components/theme-provider.jsx"
@@ -319,11 +316,13 @@ function UserMenu({ name, email, onSignOut }) {
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             {/* pl-2 pulls the avatar to the nav icons' left edge (the button's
-                default pl-3 only suits text rows). */}
+                default pl-3 only suits text rows). h-10 overrides lg's h-12:
+                with a size-6 avatar, the taller row left 12px of hover-pill
+                dead space above/below — 8px hugs the content. */}
             <SidebarMenuButton
               size="lg"
               tooltip="Account"
-              className="pl-2 data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
+              className="h-10 pl-2 data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
             >
               <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-sidebar-primary text-xs font-semibold text-sidebar-primary-foreground">
                 {initial}
@@ -629,7 +628,9 @@ function TopbarHeader({
       {/* Spacer where the toggle used to sit in flow — the trigger itself is
           now the persistent CollapsedTriggerOverlay floated at this exact spot,
           so the breadcrumb keeps its alignment without sliding under it. */}
-      {showToggle ? <div aria-hidden="true" className="size-8 shrink-0" /> : null}
+      {showToggle ? (
+        <div aria-hidden="true" className="size-8 shrink-0" />
+      ) : null}
       {/* Match the content column below: centered views cap the breadcrumb at
           max-w-6xl, full-width views at max-w-7xl (px-1 lines it up with the
           cards' ring inset). mx-auto absorbs the free space so the column
@@ -722,7 +723,12 @@ function ChatNav({ item, active, onNavigate, ctrl, tooltip = item.label }) {
 // the nav groups around. min-h-24 (~3 rows) is the floor: below it the group
 // stops shrinking and the whole sidebar scrolls instead (SidebarContent's own
 // overflow-auto). The popover reuse stays inline/unscrolled.
-function RecentDatasetsMenu({ recents, selectionKey, onSelect, scrollable = false }) {
+function RecentDatasetsMenu({
+  recents,
+  selectionKey,
+  onSelect,
+  scrollable = false,
+}) {
   if (!recents?.length) return null
   const menu = (
     <SidebarMenu>
@@ -965,7 +971,8 @@ function Console({ auth, api }) {
     setRecentDatasets(loadRecentDatasets(userSub))
   }, [userSub])
   useEffect(() => {
-    if (selectionKey) setRecentDatasets(pushRecentDataset(userSub, selectionKey))
+    if (selectionKey)
+      setRecentDatasets(pushRecentDataset(userSub, selectionKey))
   }, [selectionKey, userSub])
   // Opening a recent keeps a dataset-scoped section, else lands on Browse (the
   // natural reading view for "take me back to that dataset").
@@ -1118,6 +1125,29 @@ function Console({ auth, api }) {
               datasetsLoading={datasetsLoading}
             />
           </div>
+        ) : section === "harvest" ? (
+          // Harvest owns the WHOLE inset (the chat-page geometry): its
+          // sub-agent I/O panel must stand viewport-top-to-bottom, OUTSIDE
+          // the topbar+region stack — so the view re-renders the shared
+          // topbar inside its LEFT column and hosts the panel beside it.
+          <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+            <HarvestView
+              api={api}
+              selection={selection}
+              datasets={datasets}
+              autoOpenAnnotations={routeHarvestIntent === "annotations"}
+              topbar={
+                <TopbarHeader
+                  centered={centered}
+                  needsSelection={hasTopStrip}
+                  datasets={datasets}
+                  datasetsLoading={datasetsLoading}
+                  selectionKey={selectionKey}
+                  onSelectionChange={setSelectionKey}
+                />
+              }
+            />
+          </div>
         ) : (
           <>
             {/* The floating sidebar adds an 8px outer gap (p-2) above its header,
@@ -1234,14 +1264,6 @@ function Console({ auth, api }) {
                   {section === "context" && (
                     <ContextView api={api} selection={selection} />
                   )}
-                  {section === "harvest" && (
-                    <HarvestView
-                      api={api}
-                      selection={selection}
-                      datasets={datasets}
-                      autoOpenAnnotations={routeHarvestIntent === "annotations"}
-                    />
-                  )}
                   {section === "credentials" && (
                     <CredentialsView api={api} email={email} />
                   )}
@@ -1263,10 +1285,7 @@ export function App() {
   // instance on every silent renew (~hourly), and an api identity change
   // cascades into every view keyed on it — the benchmark report page, for
   // one, fully reset (skeleton, tab snap, traces refetch) mid-read.
-  const api = useMemo(
-    () => makeApi(auth.user?.id_token),
-    [auth.user?.id_token]
-  )
+  const api = useMemo(() => makeApi(auth.user?.id_token), [auth.user?.id_token])
 
   let body
   if (auth.isLoading) {

@@ -7,12 +7,19 @@ error ToolMessage (no disk write — the model self-corrects) or lets the write
 proceed (optionally with normalized frontmatter). Path containment is handled
 by the ``FilesystemBackend``'s ``virtual_mode``, not here.
 
-Two blanket refusals sit in front of the engine checks:
+Two refusals sit in front of the engine checks:
 
 * ``delete`` (the recursive filesystem tool deepagents ≥0.7 hands every agent
-  whose backend supports it) is ALWAYS refused — nothing in a bundle is ever
-  deleted by an agent; stale or wrong docs are corrected or annotated, and
-  deletions are a human decision outside the run.
+  whose backend supports it) is refused unless the guard was built with
+  ``allow_delete=True`` — which the agent builder does for the FULL-harvest
+  SUPERVISOR only. The supervisor owns bundle-level shape (it is the one told
+  to fix the lint gate's ``stale-table-doc`` findings), so it can retire a doc
+  whose source table is gone; an authoring sub-agent has no business deleting
+  anything, and the read-only ones certainly don't. Even when allowed, a
+  delete must be a single ``.md`` FILE outside every dot-dir (and inside the
+  cross-mode writable subtree): a recursive directory delete is the blast
+  radius this refusal originally existed to prevent, and ``.metadata/``,
+  ``.context/``, ``.harvest/`` are inputs/state, never the agent's to remove.
 * ``read_only=True`` builds a guard variant for the verify-and-report
   sub-agents (reviewer, context-extractor): every write/edit is refused, so
   "read-only" is enforced at the tool boundary rather than promised by the
@@ -68,6 +75,18 @@ def _is_readonly_path(file_path: str | None) -> bool:
     return _READONLY_DIR in parts
 
 
+def _has_dot_segment(file_path: str | None) -> bool:
+    """True if any path segment is dot-prefixed (``.metadata``, ``.context``,
+    ``.harvest``) — the run's inputs and state, never an agent's to delete.
+    Same rule ``fsutil.clean_authored_output`` uses to decide what to preserve."""
+    if not file_path:
+        return False
+    return any(
+        seg.startswith(".") and seg not in (".", "..")
+        for seg in _normalized_rel(str(file_path)).split("/")
+    )
+
+
 def _normalized_rel(file_path: str) -> str:
     """Normalize a tool ``file_path`` to a root-relative POSIX path.
 
@@ -98,6 +117,7 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         read_current: Callable[[str], str | None],
         writable_prefix: str | None = None,
         read_only: bool = False,
+        allow_delete: bool = False,
     ):
         super().__init__()
         self.engine = engine
@@ -108,6 +128,9 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         self._writable_prefix = writable_prefix.strip("/") + "/" if writable_prefix else None
         # Verify-and-report sub-agents: refuse every write/edit outright.
         self._read_only = read_only
+        # The full-harvest supervisor only (see the module docstring): may
+        # retire a single stale .md doc. Never set for sub-agents.
+        self._allow_delete = allow_delete and not read_only
 
     def wrap_tool_call(self, request, handler):  # type: ignore[override]
         """Sync path (invoke/stream)."""
@@ -146,18 +169,45 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
             return None
 
         # The delete tool (deepagents ≥0.7 exposes it whenever the backend
-        # supports it, and it is RECURSIVE) is never part of authoring: stale
-        # or wrong docs are corrected in place or annotated — removing bundle
-        # content is a human decision outside the run. Refused unconditionally,
-        # before any path/extension logic.
+        # supports it, and it is RECURSIVE). Only the full-harvest supervisor's
+        # guard allows it, and only for one .md file outside the dot-dirs —
+        # everything else keeps the original blanket refusal.
         if name == "delete":
-            return self._refuse(
-                request,
-                f"Refused: `delete` is not available in this run. Nothing in "
-                f"the bundle is ever deleted by an agent — correct the doc in "
-                f"place with `edit_file` (or supersede it) instead; `{file_path}` "
-                "was not touched.",
-            )
+            if not self._allow_delete:
+                return self._refuse(
+                    request,
+                    f"Refused: `delete` is not available to this agent. Correct "
+                    f"the doc in place with `edit_file` (or report it to the "
+                    f"supervisor, which owns bundle-level removals); "
+                    f"`{file_path}` was not touched.",
+                )
+            if _has_dot_segment(file_path):
+                return self._refuse(
+                    request,
+                    f"Refused: `{file_path}` is under a reserved dot-directory "
+                    f"(`{_READONLY_DIR}/` snapshot, `.context/` uploads, "
+                    f"`.harvest/` state). Those are this run's INPUTS and "
+                    "state — never delete them.",
+                )
+            if not _is_markdown(file_path):
+                return self._refuse(
+                    request,
+                    f"Refused: `delete` may remove ONE `.md` concept doc at a "
+                    f"time, and `{file_path}` is not one — `delete` is "
+                    f"RECURSIVE, so a directory path would take the whole "
+                    f"subtree with it. Delete the individual stale doc(s) "
+                    "instead; an emptied directory is harmless (its generated "
+                    "index.md is dropped at finalize).",
+                )
+            if self._writable_prefix and not _normalized_rel(file_path).startswith(
+                self._writable_prefix
+            ):
+                return self._refuse(
+                    request,
+                    f"Refused: `{file_path}` is outside this run's writable "
+                    f"subtree `{self._writable_prefix}`.",
+                )
+            return None
 
         # Read-only agents (reviewer / context-extractor): they verify and
         # REPORT — findings go in the reply, never on disk.

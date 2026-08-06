@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from harvest.fsutil import mkdirs, write_text
+from harvest.fsutil import mkdirs, remove_tree, write_text
 from okf_core.index_gen import regenerate_indexes
 
 _STATE_DIR = ".harvest"
@@ -46,8 +46,18 @@ def finalize_bundle(
     """
     root = Path(dataset_root)
 
-    # 1) Regenerate index.md files (progressive disclosure).
-    regenerate_indexes(root, synthesize=synthesize)
+    # 1) Regenerate index.md files (progressive disclosure). The writer/remover
+    # are fsutil's, not raw pathlib: these land on the S3 Files (NFS) mount,
+    # where an in-place rewrite of an existing index can come back EACCES —
+    # which used to fail the whole harvest HERE, after every doc was authored
+    # (seen live on `references/enums/index.md`). fsutil heals that by
+    # unlinking first, and retries transient ESTALE/EIO.
+    regenerate_indexes(
+        root,
+        synthesize=synthesize,
+        write_file=lambda path, text: write_text(path, text),
+        remove_file=remove_tree,
+    )
 
     # 2) Write the commit marker LAST.
     state = {

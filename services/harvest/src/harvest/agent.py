@@ -40,6 +40,7 @@ from typing import Any
 from harvest.fsutil import mkdirs
 from harvest.graph_tools import make_graph_tools
 from harvest.guard_engine import OKFGuardEngine
+from harvest.lint_tool import make_lint_tool
 from harvest.okf_guard import OKFGuardMiddleware, ToolErrorMiddleware
 from harvest.prompts import (
     build_context_extractor_prompt,
@@ -534,6 +535,21 @@ def build_harvest_agent(
         interpreter_mw = CodeInterpreterMiddleware()
     except Exception:  # noqa: BLE001 - dynamic dispatch is a nice-to-have
         interpreter_mw = None
+    if interpreter_mw is not None:
+        # The library's lifecycle events don't carry a dispatch's full brief or
+        # its final answer — shim its task() choke point so both ride the
+        # custom stream for the UI's fleet drill-in. Its own try: losing the
+        # drill-in's I/O must never cost the interpreter itself.
+        try:
+            from harvest.subagent_io import install_quickjs_io_forwarding
+
+            install_quickjs_io_forwarding()
+        except Exception:  # noqa: BLE001 - observability only
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Sub-agent I/O forwarding unavailable", exc_info=True
+            )
 
     # Adaptive thinking rides on the model instances. A scope-tagged
     # UsageForwarder on each MODEL INSTANCE meters token usage for every turn —
@@ -598,10 +614,31 @@ def build_harvest_agent(
             cross_target["data_domain"], cross_target["dataset"]
         )
 
+    # A FULL harvest is the only mode that owns bundle-level shape: it wipes and
+    # re-authors everything, runs the lint gate, and is the one told to fix its
+    # `stale-table-doc` findings. Scoped modes (annotation/incremental) and cross
+    # runs replace the supervisor prompt, so they'd carry the tool with no
+    # guidance on when to use it — the same reason the lint gate is gated here.
+    full_harvest = cross_target is None and supervisor_prompt is None
+
     guard = OKFGuardMiddleware(
         engine,
         read_current=_make_read_current(dataset_root),
         writable_prefix=writable_prefix,
+    )
+    # The SUPERVISOR's own guard: identical, plus `delete` for retiring a stale
+    # doc (one .md file, never a dot-dir or a directory — see okf_guard). The
+    # authoring sub-agents keep `guard` above, which still refuses delete: a
+    # table-author has no business removing anything.
+    main_guard = (
+        OKFGuardMiddleware(
+            engine,
+            read_current=_make_read_current(dataset_root),
+            writable_prefix=writable_prefix,
+            allow_delete=True,
+        )
+        if full_harvest
+        else guard
     )
     # The verify-and-report sub-agents' guard: refuses EVERY write/edit (and,
     # like the main guard, the recursive `delete` deepagents ≥0.7 exposes).
@@ -650,6 +687,20 @@ def build_harvest_agent(
 
         run_code_tool = make_run_code_tool(sandbox)
         all_tools.append(run_code_tool)
+
+    # Whole-bundle lint gate — FULL harvests only, MAIN AGENT ONLY. Scoped
+    # modes (annotation/incremental hand in supervisor_prompt) and cross runs
+    # can't perform its fix-to-zero workflow — cross writes are guard-confined
+    # to the pair subtree, so a bundle-wide error the tool reports would be
+    # unfixable there, and their prompts never mention the tool. Sub-agent
+    # specs below get all_tools (authors/reviewers work one doc/cluster at a
+    # time — a bundle-wide scan in their hands is wasted tokens). No-arg by
+    # design: expected tables come from the .metadata/ snapshot on disk and
+    # EXPLAIN availability from this run's source, so there is nothing for
+    # the model to pass (or get wrong).
+    main_tools = list(all_tools)
+    if full_harvest:
+        main_tools.append(make_lint_tool(source, dataset_root))
 
     # Containment: bundle files (bare paths like tables/races.md) go to the
     # dataset root on disk via the DEFAULT FilesystemBackend; deepagents'
@@ -812,7 +863,9 @@ def build_harvest_agent(
         "model": subagent_chat_model,
     }
 
-    main_middleware = [guard, tool_errors, prompt_cache, TodoListMiddleware()]
+    # main_guard (not guard): the supervisor's variant also permits `delete` on
+    # a single stale .md doc — see the guard construction above.
+    main_middleware = [main_guard, tool_errors, prompt_cache, TodoListMiddleware()]
     if interpreter_mw is not None:
         main_middleware.append(interpreter_mw)
 
@@ -852,7 +905,7 @@ def build_harvest_agent(
 
     agent = create_deep_agent(
         model=chat_model,
-        tools=all_tools,
+        tools=main_tools,
         system_prompt=system_prompt,
         middleware=main_middleware,
         subagents=subagents,

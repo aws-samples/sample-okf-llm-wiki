@@ -56,6 +56,74 @@ def test_retry_does_not_swallow_non_retryable(monkeypatch):
     assert e.value.errno == errno.EACCES
 
 
+def test_clean_recovers_from_transient_rmtree_permission_error(
+    tmp_path, monkeypatch
+):
+    """The live failure mode: rmtree stats each entry to classify it, and a
+    transient NFS hiccup on that stat makes CPython fall back to unlinking a
+    DIRECTORY — which surfaces as EACCES with the dir's path, masking the
+    transient root cause. The delete path must retry (a fresh rmtree
+    re-scandirs and classifies correctly), not fail the whole harvest."""
+    root = tmp_path / "ds"
+    (root / "references" / "recipes").mkdir(parents=True)
+    (root / "references" / "recipes" / "r.md").write_text("x")
+
+    real_rmtree = fsutil.shutil.rmtree
+    calls = {"n": 0}
+
+    def flaky_rmtree(target, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(
+                errno.EACCES, "Permission denied", str(target) + "/recipes"
+            )
+        return real_rmtree(target, *a, **kw)
+
+    monkeypatch.setattr(fsutil.shutil, "rmtree", flaky_rmtree)
+    monkeypatch.setattr(fsutil.time, "sleep", lambda *_: None)
+    removed = fsutil.clean_authored_output(root)
+    assert removed == ["references"]
+    assert not (root / "references").exists()
+    assert calls["n"] == 2  # failed once, succeeded on the retry
+
+
+def test_clean_gives_up_on_persistent_permission_error(tmp_path, monkeypatch):
+    """A genuine denial (IAM, mount config) must still fail loudly after the
+    bounded attempts — the wider retry set is resilience, not suppression."""
+    root = tmp_path / "ds"
+    (root / "references").mkdir(parents=True)
+    (root / "references" / "r.md").write_text("x")
+
+    def always_denied(*a, **kw):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(fsutil.shutil, "rmtree", always_denied)
+    monkeypatch.setattr(fsutil.time, "sleep", lambda *_: None)
+    with pytest.raises(PermissionError):
+        fsutil.clean_authored_output(root)
+
+
+def test_clean_retry_tolerates_a_partially_completed_attempt(
+    tmp_path, monkeypatch
+):
+    """If the failed attempt actually deleted the tree before erroring, the
+    retry must see 'already gone' as success, not raise FileNotFoundError."""
+    root = tmp_path / "ds"
+    (root / "tables").mkdir(parents=True)
+    (root / "tables" / "t.md").write_text("x")
+
+    real_rmtree = fsutil.shutil.rmtree
+
+    def rmtree_then_error(target, *a, **kw):
+        real_rmtree(target, *a, **kw)  # the work happened...
+        raise PermissionError(errno.EACCES, "Permission denied")  # ...then a blip
+
+    monkeypatch.setattr(fsutil.shutil, "rmtree", rmtree_then_error)
+    monkeypatch.setattr(fsutil.time, "sleep", lambda *_: None)
+    removed = fsutil.clean_authored_output(root)
+    assert removed == ["tables"]
+
+
 # --- clean_authored_output (full-harvest clean rebuild) ---------------------
 
 

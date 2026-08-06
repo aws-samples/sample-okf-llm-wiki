@@ -178,14 +178,14 @@ export function CitationGroup({
           {isWebSource(first) ? (
             <SourceIcon url={first} size={11} className="okf-cite-icon" />
           ) : (
-            // text-primary: the kind glyph joins the badge's sky family (cn
-            // merges it over DocIcon's muted default). Favicons keep their own
-            // colors — the site's mark IS the signal there. conceptIdOf strips a
-            // qualified id's domain/dataset prefix so the glyph keys on the kind.
+            // The kind glyph stays on DocIcon's muted default — the badge is a
+            // NEUTRAL pill now (favicons keep their own colors; the site's mark
+            // IS the signal there). conceptIdOf strips a qualified id's
+            // domain/dataset prefix so the glyph keys on the kind.
             <DocIcon
               conceptId={conceptIdOf(first)}
               size={11}
-              className="okf-cite-icon text-primary"
+              className="okf-cite-icon"
             />
           )}
           <span className="okf-cite-label">{shortLabel(first)}</span>

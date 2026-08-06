@@ -75,6 +75,43 @@ def test_different_args_are_not_repetition():
     assert detect(msgs) is None
 
 
+def test_errored_call_does_not_seed_repetition():
+    """A retry after an ERRORED result is course correction, not derailment —
+    e.g. the guardrails gate denies a read_page until the guardrails doc is
+    read, then the model re-issues the exact same call as the denial
+    instructed. Only a call that SUCCEEDED makes its repeat a repetition."""
+    args = {"concept_id": "tables/orders"}
+    denied = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "read_page", "args": args, "id": "c1", "type": "tool_call"}
+        ],
+    )
+    denial = ToolMessage(
+        content='{"status": "denied"}',
+        name="read_page",
+        tool_call_id="c1",
+        status="error",
+    )
+    retry = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "read_page", "args": args, "id": "c2", "type": "tool_call"}
+        ],
+    )
+    ok = ToolMessage(content="# page", name="read_page", tool_call_id="c2")
+    assert detect([_USER, denied, denial, retry, ok]) is None
+    # But a THIRD identical call — one HAS succeeded now — is a repetition.
+    third = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "read_page", "args": args, "id": "c3", "type": "tool_call"}
+        ],
+    )
+    sig = detect([_USER, denied, denial, retry, ok, third])
+    assert sig is not None and sig.kind == "repetition"
+
+
 def test_ask_human_is_exempt_from_repetition():
     call = ("ask_human", {"questions": ["q"]})
     msgs = [_USER, _ai([call]), _tool("ask_human"), _ai([call])]

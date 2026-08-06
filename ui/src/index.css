@@ -6,78 +6,80 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-    --font-heading: var(--font-sans);
-    --font-sans: 'Inter Variable', sans-serif;
-    --color-sidebar-ring: var(--sidebar-ring);
-    --color-sidebar-border: var(--sidebar-border);
-    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-    --color-sidebar-accent: var(--sidebar-accent);
-    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-    --color-sidebar-primary: var(--sidebar-primary);
-    --color-sidebar-foreground: var(--sidebar-foreground);
-    --color-sidebar: var(--sidebar);
-    --color-chart-10: var(--chart-10);
-    --color-chart-9: var(--chart-9);
-    --color-chart-8: var(--chart-8);
-    --color-chart-7: var(--chart-7);
-    --color-chart-6: var(--chart-6);
-    --color-chart-5: var(--chart-5);
-    --color-chart-4: var(--chart-4);
-    --color-chart-3: var(--chart-3);
-    --color-chart-2: var(--chart-2);
-    --color-chart-1: var(--chart-1);
-    --color-ring: var(--ring);
-    --color-input: var(--input);
-    --color-border: var(--border);
-    --color-destructive: var(--destructive);
-    --color-accent-foreground: var(--accent-foreground);
-    --color-accent: var(--accent);
-    --color-muted-foreground: var(--muted-foreground);
-    --color-muted: var(--muted);
-    --color-secondary-foreground: var(--secondary-foreground);
-    --color-secondary: var(--secondary);
-    --color-primary-foreground: var(--primary-foreground);
-    --color-primary: var(--primary);
-    --color-popover-foreground: var(--popover-foreground);
-    --color-popover: var(--popover);
-    --color-card-foreground: var(--card-foreground);
-    --color-card: var(--card);
-    --color-foreground: var(--foreground);
-    --color-background: var(--background);
-    --radius-sm: calc(var(--radius) * 0.6);
-    --radius-md: calc(var(--radius) * 0.8);
-    --radius-lg: var(--radius);
-    --radius-xl: calc(var(--radius) * 1.4);
-    --radius-2xl: calc(var(--radius) * 1.8);
-    --radius-3xl: calc(var(--radius) * 2.2);
-    --radius-4xl: calc(var(--radius) * 2.6);
+  --font-heading: var(--font-sans);
+  --font-sans: "Inter Variable", sans-serif;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-10: var(--chart-10);
+  --color-chart-9: var(--chart-9);
+  --color-chart-8: var(--chart-8);
+  --color-chart-7: var(--chart-7);
+  --color-chart-6: var(--chart-6);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
 }
 
 :root {
-    /* LIGHT-mode neutrals are shadcn STONE (warm gray, hue ~50-106). The
+  /* LIGHT-mode neutrals are shadcn STONE (warm gray, hue ~50-106). The
        soft-gray-page structure is kept: --background stays at the same
        lightness as always (page reads a step darker than the white cards),
        hue in the stone family. Light-mode ONLY — dark mode is pure
        achromatic neutral (see .dark). */
-    --background: oklch(0.9626 0.0021 106.4); /* #F3F3F1 — soft warm-gray page */
-    --foreground: oklch(0.147 0.004 49.25);
-    --card: oklch(1 0 0);
-    --card-foreground: oklch(0.147 0.004 49.25);
-    --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0.147 0.004 49.25);
-    --primary: oklch(0.5 0.134 242.749); /* sky-700 — the brand accent (was cyan-700) */
-    --primary-foreground: oklch(0.977 0.013 236.62); /* sky-50 */
-    --secondary: oklch(0.97 0.001 106.424);
-    --secondary-foreground: oklch(0.216 0.006 56.043);
-    --muted: oklch(0.963 0.002 106.4);
-    --muted-foreground: oklch(0.553 0.013 58.071);
-    --accent: oklch(0.963 0.002 106.4);
-    --accent-foreground: oklch(0.216 0.006 56.043);
-    --destructive: oklch(0.577 0.245 27.325);
-    --border: oklch(0.923 0.003 48.717);
-    --input: oklch(0.923 0.003 48.717);
-    --ring: oklch(0.709 0.01 56.259);
-    /* Chart palette for LIGHT mode — anchored on the app's BRAND SKY (--primary,
+  --background: oklch(0.9626 0.0021 106.4); /* #F3F3F1 — soft warm-gray page */
+  --foreground: oklch(0.147 0.004 49.25);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.147 0.004 49.25);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.147 0.004 49.25);
+  --primary: oklch(
+    0.5 0.134 242.749
+  ); /* sky-700 — the brand accent (was cyan-700) */
+  --primary-foreground: oklch(0.977 0.013 236.62); /* sky-50 */
+  --secondary: oklch(0.97 0.001 106.424);
+  --secondary-foreground: oklch(0.216 0.006 56.043);
+  --muted: oklch(0.963 0.002 106.4);
+  --muted-foreground: oklch(0.553 0.013 58.071);
+  --accent: oklch(0.963 0.002 106.4);
+  --accent-foreground: oklch(0.216 0.006 56.043);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.923 0.003 48.717);
+  --input: oklch(0.923 0.003 48.717);
+  --ring: oklch(0.709 0.01 56.259);
+  /* Chart palette for LIGHT mode — anchored on the app's BRAND SKY (--primary,
        hue ~242; the sidebar accent shares the family), so charts read as the
        Categorical (identity) hues, NOT a single-hue blue ramp: an all-blue chart
        spends only lightness to tell series apart, which collapses on a screen
@@ -106,60 +108,64 @@
        forms, where ANY two marks can sit side by side, only the first THREE
        slots clear the all-pairs gate — past three, fold to "Other" or facet
        rather than reaching for slot 4. */
-    --chart-1: oklch(0.556 0.108 242); /* sky (brand) — hue moved with the Aug-2026 cyan→sky rebrand; same L/C */
-    --chart-2: oklch(0.67 0.175 41); /* orange */
-    --chart-3: oklch(0.67 0.14 162); /* aqua-green */
-    --chart-4: oklch(0.76 0.16 75); /* amber */
-    --chart-5: oklch(0.72 0.14 357); /* magenta */
-    --chart-6: oklch(0.62 0.14 118); /* lime */
-    --chart-7: oklch(0.52 0.17 295); /* violet */
-    --chart-8: oklch(0.55 0.14 145); /* green */
-    --chart-9: oklch(0.55 0.16 262); /* blue */
-    --chart-10: oklch(0.58 0.19 20); /* red */
-    /* GraphView cross-dataset (external/) node cards: a faint brand-sky wash
+  --chart-1: oklch(
+    0.556 0.108 242
+  ); /* sky (brand) — hue moved with the Aug-2026 cyan→sky rebrand; same L/C */
+  --chart-2: oklch(0.67 0.175 41); /* orange */
+  --chart-3: oklch(0.67 0.14 162); /* aqua-green */
+  --chart-4: oklch(0.76 0.16 75); /* amber */
+  --chart-5: oklch(0.72 0.14 357); /* magenta */
+  --chart-6: oklch(0.62 0.14 118); /* lime */
+  --chart-7: oklch(0.52 0.17 295); /* violet */
+  --chart-8: oklch(0.55 0.14 145); /* green */
+  --chart-9: oklch(0.55 0.16 262); /* blue */
+  --chart-10: oklch(0.58 0.19 20); /* red */
+  /* GraphView cross-dataset (external/) node cards: a faint brand-sky wash
        on the white card surface. An explicit per-mode token (see .dark) rather
        than a runtime color-mix: mixing the brand accents with white IN OKLCH
        hue-rotates through rose (white's explicit hue is 0), which is exactly
        the pink-card bug this replaces. Keep in the brand sky family. */
-    --xref-node-bg: oklch(0.965 0.018 240);
-    --radius: 0.625rem;
-    /* Dark sidebar (#2E2E2E) against the light content area. Its sub-tokens are
+  --xref-node-bg: oklch(0.965 0.018 240);
+  --radius: 0.625rem;
+  /* Dark sidebar (#2E2E2E) against the light content area. Its sub-tokens are
        flipped to light-on-dark so nav text, hover/active states, and borders
        stay legible on the dark surface. */
-    --sidebar: oklch(0.3012 0 0); /* #2E2E2E */
-    --sidebar-foreground: oklch(0.97 0 0);
-    --sidebar-primary: oklch(0.685 0.169 237.323); /* sky, brightened for dark */
-    --sidebar-primary-foreground: oklch(0.977 0.013 236.62);
-    --sidebar-accent: oklch(0.37 0 0); /* hover/active: one step lighter */
-    --sidebar-accent-foreground: oklch(0.97 0 0);
-    --sidebar-border: oklch(1 0 0 / 10%);
-    --sidebar-ring: oklch(0.556 0 0);
+  --sidebar: oklch(0.3012 0 0); /* #2E2E2E */
+  --sidebar-foreground: oklch(0.97 0 0);
+  --sidebar-primary: oklch(0.685 0.169 237.323); /* sky, brightened for dark */
+  --sidebar-primary-foreground: oklch(0.977 0.013 236.62);
+  --sidebar-accent: oklch(0.37 0 0); /* hover/active: one step lighter */
+  --sidebar-accent-foreground: oklch(0.97 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
 }
 
 .dark {
-    /* Dark neutrals are pure ACHROMATIC NEUTRAL (chroma 0; replaced the
+  /* Dark neutrals are pure ACHROMATIC NEUTRAL (chroma 0; replaced the
        original cool cyan-tinted grays Aug 2026) at the same tuned lightness
-       steps: page 0.1477 < card 0.218 < muted 0.275. NOT the light theme's
+       steps: page 0.18 < card 0.218 < muted 0.275. NOT the light theme's
        mauve — the temperature split between modes is deliberate. */
-    --background: oklch(0.1477 0 0); /* #0B0B0B — page background */
-    --foreground: oklch(0.987 0 0);
-    --card: oklch(0.218 0 0);
-    --card-foreground: oklch(0.987 0 0);
-    --popover: oklch(0.218 0 0);
-    --popover-foreground: oklch(0.987 0 0);
-    --primary: oklch(0.588 0.158 241.966); /* sky-600 — brand accent, dark-stepped */
-    --primary-foreground: oklch(0.977 0.013 236.62); /* sky-50 */
-    --secondary: oklch(0.274 0 0);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.275 0 0);
-    --muted-foreground: oklch(0.723 0 0);
-    --accent: oklch(0.275 0 0);
-    --accent-foreground: oklch(0.987 0 0);
-    --destructive: oklch(0.704 0.191 22.216);
-    --border: oklch(1 0 0 / 10%);
-    --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.56 0 0);
-    /* Chart palette for DARK mode — same categorical HUES as :root (sky /
+  --background: oklch(0.18 0 0); /* #121212 — page background (lifted from #0B0B0B: pitch black read harsh; still a clear step below the #1A1A1A cards) */
+  --foreground: oklch(0.987 0 0);
+  --card: oklch(0.218 0 0);
+  --card-foreground: oklch(0.987 0 0);
+  --popover: oklch(0.218 0 0);
+  --popover-foreground: oklch(0.987 0 0);
+  --primary: oklch(
+    0.588 0.158 241.966
+  ); /* sky-600 — brand accent, dark-stepped */
+  --primary-foreground: oklch(0.977 0.013 236.62); /* sky-50 */
+  --secondary: oklch(0.274 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.275 0 0);
+  --muted-foreground: oklch(0.723 0 0);
+  --accent: oklch(0.275 0 0);
+  --accent-foreground: oklch(0.987 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.56 0 0);
+  /* Chart palette for DARK mode — same categorical HUES as :root (sky /
        orange / aqua-green / amber / magenta), independently stepped into the
        dark lightness band (OKLCH L 0.48-0.67) rather than just brightened —
        validate_palette.js passes both bands as separate ramps, not one ramp
@@ -169,43 +175,43 @@
        surface (dark mode needs no contrast relief, unlike light). Same ten
        hues and same slot order as :root — see the light block for why the
        order is what it is and for the scatter/bubble series cap. */
-    --chart-1: oklch(0.64 0.13 242); /* sky (brand, dark-stepped) */
-    --chart-2: oklch(0.62 0.17 40); /* orange */
-    --chart-3: oklch(0.62 0.13 163); /* aqua-green */
-    --chart-4: oklch(0.67 0.14 73); /* amber */
-    --chart-5: oklch(0.62 0.17 1); /* magenta */
-    --chart-6: oklch(0.65 0.14 118); /* lime */
-    --chart-7: oklch(0.55 0.17 295); /* violet */
-    --chart-8: oklch(0.58 0.13 145); /* green */
-    --chart-9: oklch(0.58 0.15 262); /* blue */
-    --chart-10: oklch(0.6 0.18 20); /* red */
-    /* GraphView cross-dataset node cards, dark variant: one step lighter than
+  --chart-1: oklch(0.64 0.13 242); /* sky (brand, dark-stepped) */
+  --chart-2: oklch(0.62 0.17 40); /* orange */
+  --chart-3: oklch(0.62 0.13 163); /* aqua-green */
+  --chart-4: oklch(0.67 0.14 73); /* amber */
+  --chart-5: oklch(0.62 0.17 1); /* magenta */
+  --chart-6: oklch(0.65 0.14 118); /* lime */
+  --chart-7: oklch(0.55 0.17 295); /* violet */
+  --chart-8: oklch(0.58 0.13 145); /* green */
+  --chart-9: oklch(0.58 0.15 262); /* blue */
+  --chart-10: oklch(0.6 0.18 20); /* red */
+  /* GraphView cross-dataset node cards, dark variant: one step lighter than
        --card (0.218) with a touch more sky chroma, so the wash reads on the
        dark surface without glowing. Same hue family as the light token. */
-    --xref-node-bg: oklch(0.27 0.028 240);
-    /* Darker sidebar (#161616) in dark mode — reads as a recessed panel against
+  --xref-node-bg: oklch(0.27 0.028 240);
+  /* Darker sidebar (#161616) in dark mode — reads as a recessed panel against
        the lighter content bg. Hover accent is a lighter gray so it stays
        visible on the near-black surface. */
-    --sidebar: oklch(0.2002 0 0); /* #161616 */
-    --sidebar-foreground: oklch(0.97 0 0);
-    --sidebar-primary: oklch(0.685 0.169 237.323);
-    --sidebar-primary-foreground: oklch(0.293 0.066 243.157);
-    --sidebar-accent: oklch(0.3 0 0);
-    --sidebar-accent-foreground: oklch(0.97 0 0);
-    --sidebar-border: oklch(1 0 0 / 10%);
-    --sidebar-ring: oklch(0.556 0 0);
+  --sidebar: oklch(0.2002 0 0); /* #161616 */
+  --sidebar-foreground: oklch(0.97 0 0);
+  --sidebar-primary: oklch(0.685 0.169 237.323);
+  --sidebar-primary-foreground: oklch(0.293 0.066 243.157);
+  --sidebar-accent: oklch(0.3 0 0);
+  --sidebar-accent-foreground: oklch(0.97 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
 }
 
 @layer base {
   * {
     @apply border-border outline-ring/50;
-    }
+  }
   body {
     @apply bg-background text-foreground;
-    }
+  }
   html {
     @apply font-sans;
-    }
+  }
 
   /* Tailwind v4's Preflight resets buttons/role=button to cursor:default (the
      raw browser default), unlike v3. Restore the pointer for enabled clickable
@@ -216,7 +222,7 @@
   label[for],
   summary {
     cursor: pointer;
-    }
+  }
 }
 
 /* Rendered concept-doc markdown. Hand-rolled (no @tailwindcss/typography dep)
@@ -225,21 +231,46 @@
   .okf-prose {
     @apply text-sm leading-relaxed text-foreground;
   }
-  .okf-prose > :first-child { @apply mt-0; }
-  .okf-prose h1 { @apply mt-6 mb-3 text-xl font-semibold tracking-tight; }
-  .okf-prose h2 { @apply mt-6 mb-2 border-b pb-1 text-lg font-semibold tracking-tight; }
-  .okf-prose h3 { @apply mt-5 mb-2 text-base font-semibold; }
-  .okf-prose h4 { @apply mt-4 mb-1 text-sm font-semibold; }
-  .okf-prose p { @apply my-3; }
-  .okf-prose ul { @apply my-3 list-disc pl-6; }
-  .okf-prose ol { @apply my-3 list-decimal pl-6; }
-  .okf-prose li { @apply my-1; }
-  .okf-prose li > ul, .okf-prose li > ol { @apply my-1; }
-  .okf-prose a { @apply font-medium text-primary underline-offset-4 hover:underline; }
+  .okf-prose > :first-child {
+    @apply mt-0;
+  }
+  .okf-prose h1 {
+    @apply mt-6 mb-3 text-xl font-semibold tracking-tight;
+  }
+  .okf-prose h2 {
+    @apply mt-6 mb-2 border-b pb-1 text-lg font-semibold tracking-tight;
+  }
+  .okf-prose h3 {
+    @apply mt-5 mb-2 text-base font-semibold;
+  }
+  .okf-prose h4 {
+    @apply mt-4 mb-1 text-sm font-semibold;
+  }
+  .okf-prose p {
+    @apply my-3;
+  }
+  .okf-prose ul {
+    @apply my-3 list-disc pl-6;
+  }
+  .okf-prose ol {
+    @apply my-3 list-decimal pl-6;
+  }
+  .okf-prose li {
+    @apply my-1;
+  }
+  .okf-prose li > ul,
+  .okf-prose li > ol {
+    @apply my-1;
+  }
+  .okf-prose a {
+    @apply font-medium text-primary underline-offset-4 hover:underline;
+  }
   .okf-prose blockquote {
     @apply my-3 border-l-2 border-border pl-4 text-muted-foreground italic;
   }
-  .okf-prose hr { @apply my-6; }
+  .okf-prose hr {
+    @apply my-6;
+  }
   .okf-prose code {
     /* A foreground-tint background (not bg-muted): in light mode --muted ≈
        --background, so bg-muted was invisible against the chat surface. A tint of
@@ -269,23 +300,34 @@
      now carry real FAVICONS, and a coloured wash muddied them. The icon is what
      signals the kind (favicon = web, glyph = wiki doc). */
   .okf-prose .okf-cite {
-    @apply mx-0.5 inline-flex cursor-pointer items-center gap-1 rounded-md border align-baseline font-medium whitespace-nowrap;
+    @apply mx-0.5 inline-flex cursor-pointer items-center gap-1 rounded-md align-baseline font-medium whitespace-nowrap;
     font-size: 0.72em;
     padding: 0.15em 0.42em;
-    /* The app's sky (primary) flavour, same recipe as the concept-id labels —
-       citations are part of the same source-reference color language, in both
-       modes. The primary-tinted mixes have real contrast against the page in
-       light AND dark (unlike --muted, which matches the light page's lightness). */
-    color: var(--primary);
-    background-color: color-mix(in oklch, var(--primary) 10%, transparent);
-    border-color: color-mix(in oklch, var(--primary) 22%, transparent);
+    /* NEUTRAL quiet-gray pill (was the primary/sky wash): citations are
+       provenance, not actions — the favicon/glyph carries the identity, so a
+       brand-colored chip overstated them. Borderless — the tint alone is the
+       shape. Foreground-alpha, NOT --muted: --muted matches the light page's
+       lightness, so a muted fill vanishes outside white cards (same recipe as
+       inline code above). Transparent mixes are hue-safe in oklch
+       (premultiplied alpha). */
+    color: var(--muted-foreground);
+    background-color: color-mix(in oklch, var(--foreground) 7%, transparent);
     line-height: 1.5;
   }
   .okf-prose .okf-cite:hover,
   .okf-prose .okf-cite:focus-visible {
-    background-color: color-mix(in oklch, var(--primary) 18%, transparent);
-    border-color: color-mix(in oklch, var(--primary) 32%, transparent);
+    color: var(--foreground);
+    background-color: color-mix(in oklch, var(--foreground) 12%, transparent);
     outline: none;
+  }
+  /* Keyboard focus must stay distinguishable from hover on this focusable
+     role=button pill (WCAG 2.4.7): the borderless restyle above made the two
+     states share one tint with the browser outline suppressed, so a tabbing
+     user got no visible indicator when the pill was already hovered. Ring
+     token, same as the kit's form controls. */
+  .okf-prose .okf-cite:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 1px;
   }
   /* The label truncates rather than wrapping: a long headline or concept path must
      not stretch the pill across the paragraph (the full text is in the card). */
@@ -295,18 +337,20 @@
     text-overflow: ellipsis;
   }
   /* "+2" — the other sources behind this claim, page through them in the card.
-     Slightly quieter than the label, but still in the sky family. */
+     One step quieter than the (muted-foreground) label — a transparent mix,
+     which is hue-safe in oklch, unlike gray/white/black mixes (the xref
+     pink-card trap). */
   .okf-prose .okf-cite-more {
     @apply font-semibold tabular-nums;
-    color: color-mix(in oklch, var(--primary) 65%, var(--muted-foreground));
+    color: color-mix(in oklch, var(--muted-foreground) 70%, transparent);
   }
   .okf-prose .okf-cite-icon {
     @apply align-middle;
   }
   /* NOTE: no `.okf-cite svg { color: … }` rule here — it would sit in @layer
      components and LOSE to the icon's text-muted-foreground utility (utilities
-     layer comes later; layer order beats specificity). The doc glyph's sky is
-     applied as `text-primary` at the component instead (Citation.jsx). */
+     layer comes later; layer order beats specificity). The doc glyph rides
+     that muted default, which matches the neutral pill (Citation.jsx). */
   /* Markdown's BARE fenced blocks only — CodeView brings its own chrome
      (header + scroll container), so its pre must not inherit this panel
      styling (the leak gave it rounded top corners under the header and a
@@ -367,13 +411,17 @@
     font-style: italic;
   }
   .okf-prose table {
-    @apply my-3 block w-full max-w-full overflow-x-auto border-collapse text-sm;
+    @apply my-3 block w-full max-w-full border-collapse overflow-x-auto text-sm;
   }
   .okf-prose th {
     @apply border bg-muted px-3 py-1.5 text-left font-medium;
   }
-  .okf-prose td { @apply border px-3 py-1.5 align-top; }
-  .okf-prose img { @apply my-3 max-w-full rounded-md border; }
+  .okf-prose td {
+    @apply border px-3 py-1.5 align-top;
+  }
+  .okf-prose img {
+    @apply my-3 max-w-full rounded-md border;
+  }
   /* ...but a citation badge's favicon is UI CHROME, not prose imagery. The rule
      above would give an 11px icon 12px of vertical margin plus a border ring,
      which inflates the badge's line box into a chunky block twice the height of
@@ -385,8 +433,12 @@
   /* Inline markdown for a single feed row: keep GFM inline formatting (bold,
      code, links) but flatten block structure so it stays on one line and can be
      truncated by the parent's `truncate`. */
-  .okf-inline-md { @apply inline; }
-  .okf-inline-md * { @apply inline; }
+  .okf-inline-md {
+    @apply inline;
+  }
+  .okf-inline-md * {
+    @apply inline;
+  }
   .okf-inline-md code {
     @apply rounded bg-muted px-1 py-0.5 font-mono text-[0.85em];
   }
@@ -394,17 +446,21 @@
     @apply font-medium text-primary underline-offset-4 hover:underline;
   }
   /* Collapse list markers / breaks that would otherwise force wrapping. */
-  .okf-inline-md ul, .okf-inline-md ol, .okf-inline-md li {
+  .okf-inline-md ul,
+  .okf-inline-md ol,
+  .okf-inline-md li {
     @apply list-none p-0;
   }
-  .okf-inline-md br { display: none; }
+  .okf-inline-md br {
+    display: none;
+  }
 
   /* Thin, transparent-track scrollbar for native overflow panes (the live feed).
      The default track paints an opaque bar that looks heavy against the card;
      make it transparent and give the thumb a subtle, theme-aware tint. */
   .okf-thin-scroll {
-    scrollbar-width: thin;                         /* Firefox */
-    scrollbar-color: var(--border) transparent;    /* thumb / track */
+    scrollbar-width: thin; /* Firefox */
+    scrollbar-color: var(--border) transparent; /* thumb / track */
   }
   .okf-thin-scroll::-webkit-scrollbar {
     width: 8px;
@@ -444,7 +500,11 @@
 .okf-graph {
   /* Edges use a muted-foreground tint (visible in both light and dark, unlike
      --border which is ~10% white in dark mode) and match the arrow markers. */
-  --xy-edge-stroke-default: color-mix(in oklch, var(--muted-foreground) 55%, transparent);
+  --xy-edge-stroke-default: color-mix(
+    in oklch,
+    var(--muted-foreground) 55%,
+    transparent
+  );
   --xy-edge-stroke-selected-default: var(--primary);
   --xy-attribution-background-color-default: transparent;
 }
@@ -470,7 +530,9 @@
   stroke-width: 1.5;
 }
 /* Dim edges/nodes not part of the current focus set. */
-.okf-graph .react-flow__edge.is-dimmed { opacity: 0.12; }
+.okf-graph .react-flow__edge.is-dimmed {
+  opacity: 0.12;
+}
 
 /* Agent avatar — a 3×3 grid of TINY uniform dots, the same grain size as the
    effort-slider dots (~2px on a 6px pitch). While answering, each dot LIGHTS UP
@@ -559,7 +621,9 @@
      every dot size as the swell scales them. */
   border-radius: 20%;
   background: currentColor;
-  transition: transform 0.18s linear, opacity 0.18s linear;
+  transition:
+    transform 0.18s linear,
+    opacity 0.18s linear;
 }
 
 /* Reasoning-effort slider — dotted track + a larger round thumb (the "Faster ↔
@@ -605,11 +669,14 @@
       /* Faster end = LIGHTER (primary lifted toward white); Smarter end = DARKER
          (primary pushed toward black). Full opacity — no transparent mix — so the
          light→dark swing is obvious in BOTH themes (mixing toward white/black,
-         not toward the near-black dark-mode track, is what makes it read). */
-      color-mix(in oklch, var(--primary) 60%, white) 0%,
-      color-mix(in oklch, var(--primary) 70%, white) 30%,
+         not toward the near-black dark-mode track, is what makes it read).
+         SRGB mixes: white/black carry an explicit oklch hue of 0, and oklch
+         interpolation hue-rotates the sky primary toward violet (the xref
+         pink-card trap). */
+      color-mix(in srgb, var(--primary) 60%, white) 0%,
+      color-mix(in srgb, var(--primary) 70%, white) 30%,
       var(--primary) 62%,
-      color-mix(in oklch, var(--primary) 62%, black) 100%
+      color-mix(in srgb, var(--primary) 62%, black) 100%
     );
   background-size:
     6px 6px,
@@ -650,28 +717,35 @@
 }
 /* WebKit / Blink (Chrome, Safari, Edge): slim, transparent track, pill thumb —
    the SAME width on hover (never thickens), just a stronger tint. */
-.okf-label-grid::-webkit-scrollbar { width: 8px; height: 8px; }
-.okf-label-grid::-webkit-scrollbar-track { background: transparent; }
+.okf-label-grid::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.okf-label-grid::-webkit-scrollbar-track {
+  background: transparent;
+}
 .okf-label-grid::-webkit-scrollbar-thumb {
   background-color: var(--border);
   border-radius: 9999px;
-  border: 2px solid transparent;   /* inset → reads as a slim pill */
+  border: 2px solid transparent; /* inset → reads as a slim pill */
   background-clip: padding-box;
 }
 .okf-label-grid::-webkit-scrollbar-thumb:hover {
   background-color: var(--muted-foreground);
   background-clip: padding-box;
 }
-.okf-label-grid::-webkit-scrollbar-corner { background: transparent; }
+.okf-label-grid::-webkit-scrollbar-corner {
+  background: transparent;
+}
 
 .okf-label-grid table {
   display: table;
   width: auto;
   min-width: 100%;
   margin: 0;
-  border-collapse: separate;   /* cells as separate blocks */
-  border-spacing: 2px;         /* the gaps between labels (x + y) */
-  overflow: visible;           /* the wrapper scrolls, not the table */
+  border-collapse: separate; /* cells as separate blocks */
+  border-spacing: 2px; /* the gaps between labels (x + y) */
+  overflow: visible; /* the wrapper scrolls, not the table */
   font-size: 0.75rem;
   line-height: 1.45;
 }
@@ -684,7 +758,7 @@
 .okf-label-grid th,
 .okf-label-grid td {
   border: 0;
-  border-radius: 4px;          /* small radius = smooth-edged label */
+  border-radius: 4px; /* small radius = smooth-edged label */
   padding: 6px 10px;
   text-align: left;
   vertical-align: top;
@@ -782,8 +856,12 @@
   animation: text-shimmer 2.8s ease-in-out infinite;
 }
 @keyframes text-shimmer {
-  0% { background-position: 150% 0; }
-  100% { background-position: -150% 0; }
+  0% {
+    background-position: 150% 0;
+  }
+  100% {
+    background-position: -150% 0;
+  }
 }
 
 /* The diff body (source AND rich views) is a self-contained scroll box: at
@@ -806,9 +884,21 @@
 .okf-diffview .diff-tailwindcss-wrapper[data-theme="dark"] .diff-style-root {
   --diff-border--: var(--border);
   --diff-plain-content--: transparent;
-  --diff-empty-content--: color-mix(in oklch, var(--foreground) 3%, transparent);
-  --diff-expand-content--: color-mix(in oklch, var(--foreground) 3%, transparent);
-  --diff-plain-lineNumber--: color-mix(in oklch, var(--foreground) 3%, transparent);
+  --diff-empty-content--: color-mix(
+    in oklch,
+    var(--foreground) 3%,
+    transparent
+  );
+  --diff-expand-content--: color-mix(
+    in oklch,
+    var(--foreground) 3%,
+    transparent
+  );
+  --diff-plain-lineNumber--: color-mix(
+    in oklch,
+    var(--foreground) 3%,
+    transparent
+  );
   --diff-expand-lineNumber--: color-mix(
     in oklch,
     var(--foreground) 3%,
@@ -817,7 +907,11 @@
   --diff-plain-lineNumber-color--: var(--muted-foreground);
   --diff-expand-lineNumber-color--: var(--muted-foreground);
   --diff-hunk-content--: color-mix(in oklch, var(--foreground) 5%, transparent);
-  --diff-hunk-lineNumber--: color-mix(in oklch, var(--foreground) 8%, transparent);
+  --diff-hunk-lineNumber--: color-mix(
+    in oklch,
+    var(--foreground) 8%,
+    transparent
+  );
   --diff-hunk-lineNumber-hover--: var(--primary);
   --diff-hunk-content-color--: var(--muted-foreground);
 }

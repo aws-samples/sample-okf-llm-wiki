@@ -389,7 +389,9 @@ const PolicyStep = memo(function PolicyStep({ step, isLast }) {
             {flags.map((f, i) => (
               <div
                 key={`${f.id}-${i}`}
-                className="rounded-md border border-border/60 bg-muted/30 px-2.5 py-2 text-[13px] leading-snug"
+                // Foreground-alpha, not bg-muted: these cards sit on the
+                // transcript (page bg), where light-mode --muted is invisible.
+                className="rounded-md border border-border/60 bg-foreground/5 px-2.5 py-2 text-[13px] leading-snug"
               >
                 <div className="mb-1 flex items-center gap-2">
                   <span className="font-mono text-[11px] text-muted-foreground">

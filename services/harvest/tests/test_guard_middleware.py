@@ -148,11 +148,11 @@ def test_edit_into_metadata_dir_also_refused(monkeypatch):
     assert "read-only" in result["content"]
 
 
-def test_delete_tool_always_refused(monkeypatch):
+def test_delete_tool_refused_without_allow_delete(monkeypatch):
     # deepagents ≥0.7 exposes a recursive `delete` fs tool to every agent whose
-    # backend supports it. Nothing in a bundle is ever deleted by an agent —
-    # the guard refuses it unconditionally, for ANY path or extension, before
-    # the engine is even consulted.
+    # backend supports it. The DEFAULT guard (authoring sub-agents) refuses it
+    # unconditionally, for ANY path or extension, before the engine is even
+    # consulted — only the supervisor's allow_delete variant may remove a doc.
     monkeypatch.setattr(
         okf_guard,
         "ToolMessage",
@@ -164,6 +164,108 @@ def test_delete_tool_always_refused(monkeypatch):
         result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
         assert isinstance(result, dict) and result["status"] == "error"
         assert "delete" in result["content"]
+
+
+def _delete_mw(**kw):
+    return OKFGuardMiddleware(
+        _AllowEngine(), read_current=lambda _p: None, allow_delete=True, **kw
+    )
+
+
+def test_allow_delete_permits_retiring_one_markdown_doc(monkeypatch):
+    # The supervisor's variant: a stale `.md` concept doc (a table dropped from
+    # the source) may be retired, so the handler actually runs.
+    _tm_standin(monkeypatch)
+    mw = _delete_mw()
+    req = _request(name="delete", file_path="tables/dropped_table.md")
+    assert mw.wrap_tool_call(req, lambda r: "DELETED") == "DELETED"
+
+
+def test_allow_delete_refuses_a_directory_path(monkeypatch):
+    # `delete` is RECURSIVE: a directory path would take the whole subtree.
+    # That blast radius is exactly what the blanket refusal existed to prevent,
+    # so even the supervisor may only name a single .md file.
+    _tm_standin(monkeypatch)
+    mw = _delete_mw()
+    for path in ("tables", "references/joins", "notes.txt", ""):
+        req = _request(name="delete", file_path=path)
+        result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+        assert isinstance(result, dict) and result["status"] == "error", path
+        assert "ONE `.md`" in result["content"]
+
+
+def test_allow_delete_refuses_dot_directories(monkeypatch):
+    # .metadata/ (snapshot), .context/ (user uploads) and .harvest/ (state) are
+    # the run's INPUTS — never the agent's to remove, even with delete allowed.
+    _tm_standin(monkeypatch)
+    mw = _delete_mw()
+    for path in (
+        ".metadata/tables/races.md",
+        ".context/spec.md",
+        ".harvest/state.json",
+        "/.metadata/index.md",
+        "tables/../.context/notes.md",
+    ):
+        req = _request(name="delete", file_path=path)
+        result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+        assert isinstance(result, dict) and result["status"] == "error", path
+        assert "dot-directory" in result["content"]
+
+
+def test_read_only_beats_allow_delete(monkeypatch):
+    # A read-only sub-agent can never delete, whatever flags it was built with.
+    _tm_standin(monkeypatch)
+    mw = OKFGuardMiddleware(
+        _AllowEngine(),
+        read_current=lambda _p: None,
+        read_only=True,
+        allow_delete=True,
+    )
+    req = _request(name="delete", file_path="tables/races.md")
+    result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+    assert isinstance(result, dict) and result["status"] == "error"
+
+
+def test_allow_delete_still_honors_the_writable_prefix(monkeypatch):
+    # Cross-mode confinement applies to deletes too, not just writes.
+    _tm_standin(monkeypatch)
+    mw = _delete_mw(writable_prefix="external/crm/customers")
+    inside = _request(name="delete", file_path="external/crm/customers/joins/a__b.md")
+    assert mw.wrap_tool_call(inside, lambda r: "DELETED") == "DELETED"
+    outside = _request(name="delete", file_path="tables/races.md")
+    result = mw.wrap_tool_call(outside, lambda r: "SHOULD NOT RUN")
+    assert isinstance(result, dict) and result["status"] == "error"
+    assert "outside this run's writable subtree" in result["content"]
+
+
+def test_delete_is_wired_to_the_supervisor_guard_only():
+    import inspect
+
+    from harvest import agent as ag
+
+    src = inspect.getsource(ag.build_harvest_agent)
+    # A separate guard instance carries allow_delete, used by the MAIN
+    # middleware only; sub-agent specs keep the plain `guard`.
+    assert "allow_delete=True," in src
+    assert "main_middleware = [main_guard," in src
+    assert src.count('"middleware": [guard, tool_errors, prompt_cache]') >= 2
+    # Full harvests only (scoped/cross prompts never mention the tool).
+    assert "full_harvest = cross_target is None and supervisor_prompt is None" in src
+
+
+def test_supervisor_prompt_explains_when_to_delete():
+    from harvest import prompts
+
+    p = prompts.SUPERVISOR_PROMPT
+    assert "`delete`" in p
+    norm = " ".join(p.split())
+    # It is the stale-doc remedy, backlinks first, one .md file, never a dir.
+    assert "stale-table-doc" in norm
+    assert "get_backlinks" in norm
+    assert "never a directory" in norm
+    # Sub-agents' prompts must NOT advertise a tool they cannot use.
+    for other in (prompts.TABLE_AUTHOR_PROMPT, prompts.REVIEWER_PROMPT):
+        assert "`delete`" not in other
 
 
 def test_read_only_guard_refuses_all_writes(monkeypatch):
