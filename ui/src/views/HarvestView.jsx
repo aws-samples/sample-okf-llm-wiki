@@ -892,18 +892,6 @@ export default function HarvestView({
     }
   }
 
-  if (!hasSelection) {
-    return (
-      <Alert>
-        <CircleDashedIcon />
-        <AlertTitle>Select a dataset first</AlertTitle>
-        <AlertDescription>
-          Pick a dataset from the sidebar to start and watch a harvest.
-        </AlertDescription>
-      </Alert>
-    )
-  }
-
   const inner = status?.status || {}
   const currentStatus = inner.status || null
   const ready = status?.ready
@@ -923,6 +911,10 @@ export default function HarvestView({
   // running…" forever — its completion lands in freshly merged rows the
   // snapshot never sees. Re-derive by id from the current events each poll;
   // the snapshot stays as the fallback (close animation, selection switch).
+  // NOTE: this hook (and everything above it) must stay ABOVE the
+  // no-selection early return — App mounts this view unkeyed, so a selection
+  // change re-renders the same instance, and a hook that only runs on one
+  // side of the return breaks React's hook-order invariant (crashes the view).
   const liveSquare = useMemo(() => {
     if (!square?.id) return null
     for (const row of mergeRows(events, aborted)) {
@@ -934,6 +926,18 @@ export default function HarvestView({
     }
     return null
   }, [events, aborted, square])
+
+  if (!hasSelection) {
+    return (
+      <Alert>
+        <CircleDashedIcon />
+        <AlertTitle>Select a dataset first</AlertTitle>
+        <AlertDescription>
+          Pick a dataset from the sidebar to start and watch a harvest.
+        </AlertDescription>
+      </Alert>
+    )
+  }
 
   // Full harvest is destructive when a bundle already exists (it wipes + rebuilds
   // every doc, discarding any prior authoring incl. applied annotations). Confirm

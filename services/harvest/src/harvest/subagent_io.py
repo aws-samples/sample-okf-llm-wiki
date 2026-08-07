@@ -144,21 +144,30 @@ class _TaskToolShim:
                     },
                 )
         result = await self._inner.arun(payload, **kwargs)
-        if isinstance(sub_id, str) and sub_id:
-            try:
-                text = _result_text(result)
-            except Exception:  # noqa: BLE001 — never break the dispatch
-                text = ""
-            if text.strip():
-                _emit(
-                    runtime,
-                    {
-                        "type": "subagent",
-                        "phase": "result",
-                        "id": sub_id,
-                        "result": text,
-                    },
-                )
+        try:
+            text = _result_text(result)
+        except Exception:  # noqa: BLE001 — never break the dispatch
+            text = ""
+        # A context-extractor's digest is ALSO persisted to .harvest/context/
+        # for run_review's fidelity phase (record() filters by type and is
+        # fail-soft) — this shim is the fan-out path every extractor rides.
+        try:
+            from harvest.context_digests import record
+
+            brief = payload.get("description") if isinstance(payload, dict) else None
+            record(sub_type, brief if isinstance(brief, str) else None, text)
+        except Exception:  # noqa: BLE001 — observability must not break dispatch
+            logger.debug("Failed to record extractor digest", exc_info=True)
+        if isinstance(sub_id, str) and sub_id and text.strip():
+            _emit(
+                runtime,
+                {
+                    "type": "subagent",
+                    "phase": "result",
+                    "id": sub_id,
+                    "result": text,
+                },
+            )
         return result
 
 

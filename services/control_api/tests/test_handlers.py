@@ -1680,7 +1680,7 @@ def test_get_harvest_events_returns_parsed_steps(cfg):
 
 def test_get_harvest_events_preserves_subagent_io(cfg):
     """A task dispatch's `full` brief and `result` answer survive the field
-    whitelist — the UI's fleet drill-in renders them in the square's sheet."""
+    allowlist — the UI's fleet drill-in renders them in the square's sheet."""
     sid = "sid-io"
     _seed_status(cfg, session_id=sid)
     logs = FakeLogs(
@@ -1711,7 +1711,7 @@ def test_get_harvest_events_preserves_subagent_io(cfg):
 
 
 def test_get_harvest_events_preserves_lint_payload(cfg):
-    """A lint_bundle tool_result's `lint` report survives the field whitelist
+    """A lint_bundle tool_result's `lint` report survives the field allowlist
     (dict passthrough, like `usage`); a non-dict `lint` is dropped."""
     sid = "sid-lint"
     _seed_status(cfg, session_id=sid)

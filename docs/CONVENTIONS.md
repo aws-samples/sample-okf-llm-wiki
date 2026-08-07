@@ -63,13 +63,25 @@ the dataset listing by `is_domain_dataset()`. Vector key:
   `status == "complete"`.
 - `.harvest/review/` holds the review workflow's state: `clusters.json` (the
   persisted clustering with stable ids — a `run_review(cluster_ids=[...])`
-  retry re-runs those clusters on THIS clustering, never a recomputed one) and
+  retry re-runs those clusters on THIS clustering, never a recomputed one;
+  when the run recorded context digests it also carries a `context` section
+  pairing them into `x1..xN` groups under the same retry contract) and
   one `report-<id>.md` per `run_review` call (unique name, nothing
   overwritten) with every reviewer/fixer transcript. Like the rest of
   `.harvest/`, it is state — never published, indexed, or embedded. A FULL
   harvest wipes `.harvest/review/` at start (alongside the authored-output
   wipe): a clustering from a previous run describes docs the run is about to
   rebuild, so nothing may retry against it.
+- `.harvest/context/` holds `digest-NN.md` — the verbatim output (dispatch
+  brief + returned digest) of every `context-extractor` dispatch, recorded
+  automatically as each completes (`harvest/context_digests.py`, fed from the
+  QuickJS shim and the static `task` path). `run_review`'s context-fidelity
+  phase audits the bundle against these after all cluster fixes; no digests
+  means the phase is skipped. Run-scoped on both ends: `finalize_bundle`
+  deletes the dir right AFTER the commit marker (the audit is over; a run
+  that fails earlier keeps them for debugging), and a full harvest wipes it
+  at start anyway — the guard for a predecessor that crashed before its own
+  cleanup.
 
 **Derived artifacts live OFF the mount prefix.** Two sibling top-level prefixes
 sit next to `okf/` in the same bucket and are deliberately NOT under it, so
@@ -739,7 +751,7 @@ per step: `OKF_STEP <json>` where the JSON is
 `kind` ∈ `agent | tool_call | tool_result | subagent | usage`; `seq` is a 1-based
 monotonic counter; `label` is a human phrase (tool calls are shaped, e.g.
 "Reading `tables/races`", "Started `table-author`: …") — tool RESPONSE bodies are
-never emitted, only success/failure, with THREE exceptions, each with its own bound (~500 chars for the error snippet, ~8KB for the lint report and agent `full`, ~24KB for sub-agent dispatch I/O): a FAILED `tool_result`
+never emitted, only success/failure, with THREE exceptions, each with its own bound (~500 chars for the error snippet, ~8KB for the lint report and agent `full`, ~64KB for sub-agent dispatch I/O): a FAILED `tool_result`
 (`ok: false`) carries **`error`**, a whitespace-collapsed snippet of the failure
 text (bounded ~500 chars). That text exists nowhere else (it goes back to the
 model, not the logs), so without it a failed call — e.g. a provider 400 killing
@@ -749,7 +761,7 @@ a sub-agent — is undiagnosable after the run. And a SUCCESSFUL `lint_bundle`
 emitter drops tail findings past the budget into a `hidden` count; error/warning
 totals come from the per-step counters so they survive truncation). The UI
 badges the feed row with the counts and opens the findings in a modal on click.
-And a SUB-AGENT DISPATCH carries its I/O (bounded ~24KB each, not 8 — a
+And a SUB-AGENT DISPATCH carries its I/O (bounded ~64KB each, not 8 — a
 table-author brief carries its context-digest slice and routinely exceeds 8KB;
 each event is one CloudWatch line, hard limit 256KB): the `task` tool_call (and a `subagent`
 start event) carries **`full`** — the complete dispatch brief, where the label

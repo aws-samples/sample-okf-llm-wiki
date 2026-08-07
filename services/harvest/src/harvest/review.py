@@ -28,6 +28,20 @@ whole workflow deterministically:
    unique name per call, nothing is overwritten) and the tool returns a
    BOUNDED summary: per-cluster status, failed clusters with their uncovered
    docs, propagation notes, report path.
+6. **Context-fidelity phase — after every cluster fix has completed.** When
+   the run recorded context-extractor digests (``.harvest/context/`` — see
+   :mod:`harvest.context_digests`), they are paired two-per-reviewer into
+   ``x1..xN`` groups (persisted next to the clusters, so the same
+   ``cluster_ids`` retry contract covers them) and one read-only
+   ``context-reviewer`` per pair audits whether the BUNDLE fairly represents
+   each extracted fact — semantic loss, dropped codes, weakened caveats, a
+   fact that never landed. Findings pipe into a ``fix-author`` whose
+   allowlist is every authored doc EXCEPT the supervisor-owned hubs. The
+   phase runs in TWO stages: all pair reviewers in parallel (each reads the
+   same settled, post-cluster-fix bundle), THEN the fixes strictly one at a
+   time — unlike cluster fixers' disjoint allowlists, context fixers share
+   one editable set, so interleaving them (or running them beside a still-
+   reading reviewer) would race. Skipped entirely when no extractor ran.
 
 Failure semantics: a cluster whose review or fix dispatch fails (raises,
 times out, or returns no text) is recorded and the OTHER clusters proceed —
@@ -49,9 +63,10 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
+from harvest.context_digests import digest_paths
 from harvest.fsutil import write_text
 from harvest.subagent_io import _result_text
-from okf_core.paths import GUARDRAILS_CONCEPT_ID
+from okf_core.paths import GUARDRAILS_CONCEPT_ID, is_reserved_rel_segments
 
 # Module-level (not factory-local) because the tool function's `runtime`
 # annotation must resolve against this module's globals when langchain builds
@@ -79,6 +94,12 @@ _DEFAULT_DISPATCH_TIMEOUT_S = 1800.0
 # (below), and they were what made larger clusters incoherent — without them a
 # cluster is a table and its own spokes, which one reviewer can hold.
 _DEFAULT_CLUSTER_SIZE = 7
+
+# Extractor digests per context-fidelity reviewer (the "1 agent per 2 context
+# outputs" pairing): a digest can be long (full enum legends), so two per
+# reviewer keeps the audit thorough without drowning one agent in every
+# digest at once.
+_DIGESTS_PER_REVIEWER = 2
 
 # Supervisor-owned docs, EXCLUDED from review clusters (they'd also poison the
 # clustering: these hubs link to everything, so they seed clusters of
@@ -179,12 +200,24 @@ def _propagation_notes(fixer_text: str) -> list[str]:
     if start is None:
         return []
     notes: list[str] = []
+    open_note = False
     for line in lines[start + 1 :]:
         stripped = line.strip()
         if stripped.startswith(("- ", "* ")):
             item = stripped[2:].strip()
-            if item and item.lower() not in ("none", "none.", "n/a"):
+            open_note = bool(item) and item.lower() not in ("none", "none.", "n/a")
+            if open_note:
                 notes.append(item)
+        elif stripped and open_note and not stripped.startswith("#"):
+            # A wrapped bullet: the prompt invites multi-line "exact change
+            # needed" text, and the supervisor applies notes VERBATIM — a
+            # note silently cut at its first physical line becomes a wrong
+            # edit. Fold continuation lines into the open note.
+            notes[-1] += f" {stripped}"
+        elif not stripped:
+            # A blank line ends the bullet (markdown paragraph break) — a
+            # trailing sign-off after the list must not glue onto a note.
+            open_note = False
     return notes
 
 
@@ -206,18 +239,64 @@ def _emit(writer: Any, event: dict[str, Any]) -> None:
         log.debug("Failed to emit review fleet event", exc_info=True)
 
 
-def _load_clusters(root: Path) -> dict[str, list[str]] | None:
+def _load_clusters(
+    root: Path,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]] | None:
+    """``(clusters, context_groups)`` from the persisted state, or None.
+
+    ``context_groups`` (``x1..xN`` → digest file paths) rides the same file as
+    the ``c*`` clusters so ONE retry contract (``cluster_ids``) covers both;
+    state written before the context phase existed simply loads with no
+    groups.
+    """
     path = root / _REVIEW_DIR / _CLUSTERS_FILE
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return {c["id"]: list(c["docs"]) for c in data["clusters"]}
+        clusters = {c["id"]: list(c["docs"]) for c in data["clusters"]}
+        context = {c["id"]: list(c["docs"]) for c in data.get("context", [])}
+        return clusters, context
     except Exception:  # noqa: BLE001 — missing/corrupt = no prior clustering
         return None
 
 
-def _persist_clusters(root: Path, clusters: dict[str, list[str]]) -> None:
-    payload = {"clusters": [{"id": cid, "docs": docs} for cid, docs in clusters.items()]}
+def _persist_clusters(
+    root: Path,
+    clusters: dict[str, list[str]],
+    context: dict[str, list[str]],
+) -> None:
+    payload: dict[str, Any] = {
+        "clusters": [{"id": cid, "docs": docs} for cid, docs in clusters.items()]
+    }
+    if context:
+        payload["context"] = [
+            {"id": xid, "docs": docs} for xid, docs in context.items()
+        ]
     write_text(root / _REVIEW_DIR / _CLUSTERS_FILE, json.dumps(payload, indent=1))
+
+
+def _fixable_docs(root: Path) -> frozenset[str]:
+    """Every authored doc a CONTEXT fixer may edit (root-relative ``.md`` paths).
+
+    The whole bundle minus generated files, reserved dirs, and the
+    supervisor-owned hubs — a context finding can land anywhere the digest
+    routed a fact, so the cluster fixers' per-cluster confinement doesn't fit;
+    hub corrections still travel as propagation notes (same rule as always).
+    Enumerated fresh per dispatch: docs created since the clustering are
+    editable too.
+    """
+    out: set[str] = set()
+    if root.is_dir():
+        for path in root.rglob("*.md"):
+            rel = path.relative_to(root)
+            if path.name in ("index.md", "log.md"):
+                continue
+            if is_reserved_rel_segments(rel.parts):
+                continue
+            rel_posix = rel.as_posix()
+            if _is_supervisor_owned(rel_posix[: -len(".md")]):
+                continue
+            out.add(rel_posix)
+    return frozenset(out)
 
 
 def _write_report(
@@ -226,8 +305,10 @@ def _write_report(
     """Dump the full per-cluster transcript; returns the root-relative path."""
     lines = [f"# Review report `{review_id}`", ""]
     for e in entries:
-        lines.append(f"## Cluster `{e['cluster']}` — {e['status'].upper()}")
-        lines.append(f"Docs: {', '.join(e['docs'])}")
+        is_context = e.get("kind") == "context"
+        title = "Context pair" if is_context else "Cluster"
+        lines.append(f"## {title} `{e['cluster']}` — {e['status'].upper()}")
+        lines.append(f"{'Digests' if is_context else 'Docs'}: {', '.join(e['docs'])}")
         # Keyed on the STATUS, not the error text: a failure whose reason
         # came back blank must still print its line and the NOT-covered
         # warning (the old `if e.get("error")` guard dropped both).
@@ -303,36 +384,77 @@ def make_run_review_tool(
                 "on this runtime; report this failure in your summary.",
             }
 
-        # Fresh call: recompute + persist the clustering. Retry call: reuse
-        # the persisted one so the ids the supervisor quotes stay meaningful.
-        if cluster_ids:
-            clusters = _load_clusters(root)
-            if clusters is None:
+        # Fresh call: recompute + persist the clustering (and pair up any
+        # recorded context digests). Retry call: reuse the persisted state so
+        # the ids the supervisor quotes stay meaningful — c* and x* alike.
+        # `is not None`, NOT truthiness: an empty list is a natural literalism
+        # when the result's `failed` list is empty, and falling into the
+        # fresh-call branch would re-cluster and re-dispatch the WHOLE review.
+        if cluster_ids is not None and len(cluster_ids) == 0:
+            return {
+                "ok": True,
+                "note": "cluster_ids was an empty list — nothing to retry, "
+                "nothing was run. Omit the argument entirely to start a fresh "
+                "full review.",
+            }
+        if cluster_ids is not None:
+            state = _load_clusters(root)
+            if state is None:
                 return {
                     "ok": False,
                     "error": "cluster_ids given but no prior clustering exists — "
                     "call run_review with no arguments first.",
                 }
-            unknown = [c for c in cluster_ids if c not in clusters]
+            clusters, context_groups = state
+            known = {**clusters, **context_groups}
+            unknown = [c for c in cluster_ids if c not in known]
             if unknown:
                 return {
                     "ok": False,
                     "error": f"unknown cluster ids {unknown}; "
-                    f"known ids: {sorted(clusters)}",
+                    f"known ids: {sorted(known)}",
                 }
-            targets = {cid: clusters[cid] for cid in dict.fromkeys(cluster_ids)}
+            wanted = dict.fromkeys(cluster_ids)
+            targets = {cid: clusters[cid] for cid in wanted if cid in clusters}
+            context_targets = {
+                cid: context_groups[cid] for cid in wanted if cid in context_groups
+            }
+            persist_error = None  # retries never rewrite the state file
         else:
             raw = link_graph.cluster(
                 max_size=cluster_size, exclude=_is_supervisor_owned
             )
             clusters = {f"c{i + 1}": list(ids) for i, ids in enumerate(raw)}
-            _persist_clusters(root, clusters)
+            # The context-fidelity phase's inputs: every extractor digest the
+            # run recorded, paired _DIGESTS_PER_REVIEWER per reviewer. No
+            # digests = no extractor ran = the phase is skipped.
+            digests = digest_paths(root)
+            context_targets = {
+                f"x{i + 1}": digests[
+                    i * _DIGESTS_PER_REVIEWER : (i + 1) * _DIGESTS_PER_REVIEWER
+                ]
+                for i in range(
+                    (len(digests) + _DIGESTS_PER_REVIEWER - 1)
+                    // _DIGESTS_PER_REVIEWER
+                )
+            }
+            # Persist failure degrades (retries won't resolve ids) but must
+            # not abort the review itself — the never-raises contract.
+            try:
+                _persist_clusters(root, clusters, context_targets)
+                persist_error = None
+            except Exception as e:  # noqa: BLE001 — reviews outrank the state file
+                persist_error = _describe_error(e, _DEFAULT_DISPATCH_TIMEOUT_S)
+                log.warning(
+                    "run_review could not persist its clustering: %s", persist_error
+                )
             targets = clusters
 
         review_id = uuid.uuid4().hex[:8]
         call_id = getattr(runtime, "tool_call_id", None) or f"review-{review_id}"
         review_batch = f"{call_id}:review"
         fix_batch = f"{call_id}:fix"
+        context_batch = f"{call_id}:context"
         sem = asyncio.Semaphore(max(1, int(concurrency)))
 
         async def _dispatch(
@@ -391,15 +513,32 @@ def make_run_review_tool(
             finally:
                 _FIX_ALLOWLIST.reset(token)
             text = _result_text(result)
-            event: dict[str, Any] = {
-                "type": "subagent",
-                "phase": "complete",
-                "id": sub_id,
-                "batch": batch,
-            }
-            if text.strip():
-                event["result"] = text
-            _emit(writer, event)
+            if not text.strip():
+                # An empty answer IS a failure (the caller records the entry
+                # as failed) — emit the error square, not a green `complete`:
+                # a done square for a cluster the result reports failed would
+                # contradict the feed.
+                _emit(
+                    writer,
+                    {
+                        "type": "subagent",
+                        "phase": "error",
+                        "id": sub_id,
+                        "batch": batch,
+                        "error": f"{subagent_type} returned no text",
+                    },
+                )
+                raise RuntimeError(f"{subagent_type} returned no text")
+            _emit(
+                writer,
+                {
+                    "type": "subagent",
+                    "phase": "complete",
+                    "id": sub_id,
+                    "batch": batch,
+                    "result": text,
+                },
+            )
             return text
 
         async def _run_cluster(cid: str, ids: list[str]) -> dict[str, Any]:
@@ -418,8 +557,6 @@ def make_run_review_tool(
                         ),
                         allowlist=None,
                     )
-                    if not review_text.strip():
-                        raise RuntimeError("reviewer returned no text")
                 except Exception as e:  # noqa: BLE001 — recorded, never propagated
                     entry.update(
                         status="failed",
@@ -444,8 +581,6 @@ def make_run_review_tool(
                         ),
                         allowlist=frozenset(f"{i}.md" for i in ids),
                     )
-                    if not fix_text.strip():
-                        raise RuntimeError("fixer returned no text")
                 except Exception as e:  # noqa: BLE001 — recorded, never propagated
                     entry.update(
                         status="failed",
@@ -458,10 +593,106 @@ def make_run_review_tool(
                 entry["status"] = "fixed"
                 return entry
 
+        async def _review_pair(xid: str, digests: list[str]) -> dict[str, Any]:
+            """Stage 1 of a digest pair: the fidelity review (read-only).
+            Returns the entry; a missing `status` means findings await a fix."""
+            entry: dict[str, Any] = {
+                "cluster": xid,
+                "docs": list(digests),
+                "kind": "context",
+            }
+            paths = ", ".join(digests)
+            async with sem:
+                try:
+                    review_text = await _dispatch(
+                        sub_id=f"ctx-{xid}-{review_id}",
+                        batch=context_batch,
+                        subagent_type="context-reviewer",
+                        label=f"{xid} · {len(digests)} digest(s)",
+                        brief=(
+                            "Audit how faithfully the bundle represents the "
+                            "extracted context facts. Read these digest files "
+                            f"IN FULL first: {paths}"
+                        ),
+                        allowlist=None,
+                    )
+                except Exception as e:  # noqa: BLE001 — recorded, never propagated
+                    entry.update(
+                        status="failed",
+                        stage="context-review",
+                        error=_describe_error(e, timeout),
+                    )
+                    return entry
+            entry["review"] = review_text
+            if _reviewer_is_clean(review_text):
+                entry["status"] = "clean"
+            return entry
+
+        async def _fix_pair(entry: dict[str, Any]) -> None:
+            """Stage 2: apply one pair's findings. Called SEQUENTIALLY (see
+            below) — context fixers share one bundle-wide editable set, so
+            unlike the disjoint cluster fixers they may not run in parallel."""
+            xid = entry["cluster"]
+            try:
+                async with sem:
+                    fix_text = await _dispatch(
+                        sub_id=f"ctxfix-{xid}-{review_id}",
+                        batch=context_batch,
+                        subagent_type="fix-author",
+                        label=f"{xid} · fix",
+                        brief=(
+                            "Apply the context-fidelity reviewer's "
+                            "confirmed findings. Your editable file set is "
+                            "EVERY authored bundle doc EXCEPT the dataset "
+                            "overview docs (datasets/*) and "
+                            "references/usage_guardrails.md — corrections "
+                            "for those two go under PROPAGATION NOTES. "
+                            "Edit ONLY the docs the findings name.\n\n"
+                            f"Reviewer findings:\n{entry['review']}"
+                        ),
+                        allowlist=_fixable_docs(root),
+                    )
+            except Exception as e:  # noqa: BLE001 — recorded, never propagated
+                entry.update(
+                    status="failed",
+                    stage="context-fix",
+                    error=_describe_error(e, timeout),
+                )
+                return
+            entry["fix"] = fix_text
+            entry["notes"] = _propagation_notes(fix_text)
+            entry["status"] = "fixed"
+
         entries = list(
             await asyncio.gather(*(_run_cluster(c, ids) for c, ids in targets.items()))
         )
-        report_path = _write_report(root, review_id, entries)
+        # The context-fidelity phase starts strictly AFTER every cluster fix
+        # has landed (the gather above is the barrier), and runs in TWO
+        # stages: every pair reviewer in parallel first — they all read the
+        # same settled, post-cluster-fix bundle — then the fixes strictly one
+        # at a time. Interleaving them (the old per-pair pipeline) let pair
+        # A's fixer edit a doc pair B's reviewer was mid-reading (read skew),
+        # and a fix waiting on a shared lock while holding its semaphore slot
+        # could starve later reviews outright.
+        context_entries = list(
+            await asyncio.gather(
+                *(_review_pair(x, d) for x, d in context_targets.items())
+            )
+        )
+        for entry in context_entries:
+            if "status" not in entry:
+                await _fix_pair(entry)
+        all_entries = entries + context_entries
+        # One persistent write error here must not discard 30+ minutes of
+        # completed dispatches (the module contract says the tool never
+        # raises): degrade to a result without a report file.
+        try:
+            report_path = _write_report(root, review_id, all_entries)
+            report_error = None
+        except Exception as e:  # noqa: BLE001 — results outrank the transcript
+            report_path = None
+            report_error = _describe_error(e, timeout)
+            log.warning("run_review could not write its report file: %s", report_error)
 
         failed = [
             {
@@ -470,7 +701,7 @@ def make_run_review_tool(
                 "stage": e.get("stage", "?"),
                 "error": e.get("error", ""),
             }
-            for e in entries
+            for e in all_entries
             if e["status"] == "failed"
         ]
         # A truncated note must SAY so (the supervisor applies notes
@@ -479,15 +710,19 @@ def make_run_review_tool(
             entry = {"cluster": cluster, "note": _snip(note, _NOTE_CHARS)}
             if len(" ".join(note.split())) > _NOTE_CHARS:
                 entry["truncated"] = True
-                entry["note"] += (
-                    f" [TRUNCATED — read the full note in {report_path} "
-                    "before applying]"
+                where = (
+                    f"read the full note in {report_path} before applying"
+                    if report_path
+                    else "the report file could not be written, so the full "
+                    "text is unavailable — re-run this cluster id instead of "
+                    "applying an incomplete note"
                 )
+                entry["note"] += f" [TRUNCATED — {where}]"
             return entry
 
         notes = [
             _note_entry(e["cluster"], n)
-            for e in entries
+            for e in all_entries
             for n in e.get("notes", [])
         ]
         hidden_notes = max(0, len(notes) - _MAX_NOTES)
@@ -502,6 +737,32 @@ def make_run_review_tool(
             "propagation_notes": notes[:_MAX_NOTES],
             "report_path": report_path,
         }
+        if report_error:
+            result["report_error"] = (
+                f"the report file could not be written ({report_error}); the "
+                "statuses and notes above are complete — do not re-run for "
+                "the report's sake."
+            )
+        if persist_error:
+            result["persist_error"] = (
+                f"the clustering could not be persisted ({persist_error}) — "
+                "cluster_ids retries will NOT resolve for this run; if a "
+                "retry is needed, call run_review with no arguments."
+            )
+        if context_targets:
+            result["context"] = {
+                "pairs": len(context_targets),
+                "clean": [
+                    e["cluster"] for e in context_entries if e["status"] == "clean"
+                ],
+                "fixed": [
+                    e["cluster"] for e in context_entries if e["status"] == "fixed"
+                ],
+            }
+        elif not cluster_ids:
+            result["context"] = {
+                "skipped": "no context-extractor ran this harvest — nothing to audit"
+            }
         if hidden_notes:
             result["hidden_propagation_notes"] = hidden_notes
             result["note"] = (
@@ -534,10 +795,17 @@ def make_run_review_tool(
         docs outside the finding's cluster, including your overview/guardrails
         docs), and the report file path with every reviewer/fixer transcript.
 
-        If the result lists failed clusters, call this again with
-        `cluster_ids` set to EXACTLY those ids — only they are re-run, on the
-        same clustering. Do not review or fix docs yourself beyond applying
-        the returned propagation notes.
+        When context-extractors ran this harvest, a CONTEXT-FIDELITY phase
+        follows automatically after all cluster fixes: their recorded digests
+        are audited (`x1..xN` ids in the result's `context` section) against
+        the bundle for semantic loss — facts dropped, weakened, or
+        mis-routed — and confirmed losses are fixed the same way. You do NOT
+        dispatch anything for this; it is skipped when no extractor ran.
+
+        If the result lists failed ids (clusters or `x*` context pairs), call
+        this again with `cluster_ids` set to EXACTLY those ids — only they are
+        re-run, on the same persisted state. Do not review or fix docs
+        yourself beyond applying the returned propagation notes.
         """
         # SYNC tool, deliberately: the harvest drives the agent through the
         # sync `agent.stream(...)`, where an async-only StructuredTool raises
@@ -552,9 +820,20 @@ def make_run_review_tool(
         # failure). Blocking on the future is safe from the sync tool path
         # (this thread hosts no loop; under an async driver ToolNode runs
         # sync tools in an executor thread).
-        return asyncio.run_coroutine_threadsafe(
-            _review_workflow(cluster_ids, runtime), _review_loop()
-        ).result()
+        # Last-resort catch: the module contract is "the tool itself never
+        # raises" — anything escaping the workflow (a clustering crash, a
+        # loop failure) becomes a reportable error, not a lost tool call.
+        try:
+            return asyncio.run_coroutine_threadsafe(
+                _review_workflow(cluster_ids, runtime), _review_loop()
+            ).result()
+        except Exception as e:  # noqa: BLE001 — report, never raise
+            log.exception("run_review workflow crashed")
+            return {
+                "ok": False,
+                "error": f"run_review crashed: {type(e).__name__}: "
+                f"{_snip(e)} — report this failure in your summary.",
+            }
 
     return run_review
 

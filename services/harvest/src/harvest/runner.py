@@ -364,6 +364,15 @@ def run_full_harvest(
         # preserves .harvest/ wholesale for the commit marker, but a clustering
         # from a PREVIOUS harvest describes docs this run is about to rebuild —
         # a retry against it would review the wrong groups.
+        # Same for the recorded context-extractor digests (.harvest/context/):
+        # this run re-extracts from the CURRENT .context/ uploads, and a stale
+        # digest would feed the fidelity phase facts nobody extracted this run.
+        if remove_tree(Path(dataset_root) / ".harvest" / "context"):
+            log.info(
+                "Full harvest %s/%s: cleared prior context digests",
+                data_domain,
+                dataset,
+            )
         if remove_tree(Path(dataset_root) / ".harvest" / "review"):
             log.info(
                 "Full harvest %s/%s: cleared prior review state", data_domain, dataset
@@ -468,6 +477,38 @@ def run_full_harvest(
             config = _invoke_config(recursion_limit, emitter)
             _run_agent(built.agent, prompt, config, emitter)
 
+        # MECHANICAL lint backstop. The supervisor prompt prescribes the
+        # fix-to-zero lint gate, but a prompt is advice (same rationale that
+        # made chat's guardrails gate mechanical): a truncated or
+        # recursion-clipped run can skip step 8 and still reach finalize. The
+        # offline half of the gate is pure and cheap, so measure the bundle
+        # as shipped and surface the counts on the status row — a bundle
+        # published with lint errors must be visible, never silent. It does
+        # NOT block publish (the bundle is still better than no bundle);
+        # best-effort, never fails the run.
+        lint_detail = None
+        try:
+            from okf_core.lint import lint_bundle as _offline_lint
+
+            _rep = _offline_lint(Path(dataset_root))
+            _errs = sum(1 for f in _rep.findings if f.severity == "error")
+            _warns = sum(1 for f in _rep.findings if f.severity == "warning")
+            if _errs:
+                lint_detail = (
+                    f"published with lint findings: {_errs} error(s), "
+                    f"{_warns} warning(s)"
+                )
+                log.warning(
+                    "Post-run lint backstop for %s/%s: %d error(s), %d "
+                    "warning(s) — the supervisor did not fix to zero",
+                    data_domain,
+                    dataset,
+                    _errs,
+                    _warns,
+                )
+        except Exception:  # noqa: BLE001 - the backstop must never fail the run
+            log.warning("Post-run lint backstop failed", exc_info=True)
+
         state = finalize_bundle(
             dataset_root,
             data_domain=data_domain,
@@ -496,6 +537,7 @@ def run_full_harvest(
         data_domain=data_domain,
         dataset=dataset,
         status="complete",
+        detail=lint_detail,
         only_if_active=True,
         session_id=session_id,
         run_started_at=run_started_at,

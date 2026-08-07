@@ -129,7 +129,14 @@ class LintReport:
 # SQL fence collection (shared with the harvest tool's EXPLAIN step)
 # ---------------------------------------------------------------------------
 
-_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*([A-Za-z0-9_+\-]*)\s*$")
+# Any fence marker, any indentation, with WHATEVER follows captured raw.
+# Deliberately looser than CommonMark's 0-3-space rule: an opener this scan
+# fails to track flips fence PARITY for the rest of the doc (its closing ```
+# reads as an opener), and one off-template line — a multi-word info string
+# ("```sql title=x"), a list-nested fence at 4 spaces — then hides every
+# later real ```sql fence from the EXPLAIN gate. Over-tracking is the safe
+# failure mode; the info-string rules are applied in code below.
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 
 # Authoring-template placeholders that make SQL non-runnable as written:
 # <table>-style angle tokens (but not Hive/Trino generic types), {{jinja}},
@@ -184,13 +191,22 @@ def _sql_fences_in(body: str) -> list[str]:
             # then EXPLAINed as runnable SQL (false gate errors). Inside a
             # tracked non-sql fence, an info-string line is just content.
             if m:
+                info = m.group(2).strip()
+                # CommonMark: a backtick fence's info string may not contain
+                # backticks — that's a prose line with inline code, not an
+                # opener ("```x``` is a fence" must not flip parity either).
+                if m.group(1)[0] == "`" and "`" in info:
+                    continue
                 open_marker = m.group(1)
-                is_sql = bool(m.group(2)) and m.group(2).lower() == "sql"
+                # The language is the info string's FIRST word — a titled
+                # fence ("```sql title=x") is still SQL.
+                lang = info.split()[0].lower() if info else ""
+                is_sql = lang == "sql"
                 lines = []
         else:
             closes = (
                 m is not None
-                and not m.group(2)
+                and not m.group(2).strip()
                 and m.group(1)[0] == open_marker[0]
                 and len(m.group(1)) >= len(open_marker)
             )
@@ -340,7 +356,14 @@ def _collect_fences(ctx: "_Context") -> list[SqlFence]:
 
 _INT_TYPES = frozenset({"tinyint", "smallint", "int", "integer", "bigint"})
 _DECIMAL_TYPES = frozenset({"float", "double", "real", "decimal", "numeric"})
-_TEXT_TYPES = frozenset({"string", "varchar", "char", "character"})
+# BOTH vocabularies, kept in sync with harvest/profile.py's
+# _PROFILABLE_PREFIXES: Hive/Trino (Glue) and the Postgres spellings
+# Redshift's SVV_ALL_COLUMNS emits (text/bpchar/nchar/nvarchar/character
+# varying). Missing a spelling doesn't just miss one column — _type_family
+# returns None and the whole join type-compat check silently skips.
+_TEXT_TYPES = frozenset(
+    {"string", "varchar", "char", "character", "text", "bpchar", "nchar", "nvarchar"}
+)
 _BINARY_TYPES = frozenset({"binary", "varbinary"})
 
 
@@ -349,7 +372,7 @@ def _type_family(hive_type: str) -> str | None:
 
     Covers both snapshot vocabularies: Hive/Trino (Glue sources) and the
     Postgres spellings a Redshift snapshot carries (``character varying``,
-    ``double precision``, ``timestamp without time zone``)."""
+    ``double precision``, ``time[stamp] with/without time zone``)."""
     base = hive_type.strip().lower().split("(")[0].split("<")[0].strip()
     if base in _INT_TYPES:
         return "integer"
@@ -363,6 +386,8 @@ def _type_family(hive_type: str) -> str | None:
         return "date"
     if base.startswith("timestamp"):
         return "timestamp"
+    if base.startswith("time"):  # time / timetz / time without time zone
+        return "time"
     if base in _BINARY_TYPES:
         return "binary"
     return None

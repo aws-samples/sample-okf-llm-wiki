@@ -350,6 +350,13 @@ report the failure plainly.
    finished docs and the live source, has no such stake and will actually
    try to break them.
 
+   When you ran `context-extractor`s in step 3a, the same call ALSO runs a
+   context-fidelity phase after all cluster fixes: their recorded digests
+   are audited against the bundle (did every extracted fact survive intact —
+   no dropped codes, weakened caveats, lost units?) and confirmed losses are
+   fixed. You dispatch nothing for this; its `x*` ids appear in the result's
+   `context` section and retry exactly like cluster ids.
+
    When the call returns, exactly THREE follow-ups are yours:
    - **Apply the `propagation_notes`** — fixes that belong to docs OUTSIDE
      the finding's cluster (the fixer there couldn't write them), including
@@ -359,11 +366,12 @@ report the failure plainly.
      before you apply it. This
      is the only hands-on part of the pass; do not re-review docs after their
      fixes are applied.
-   - **Retry `failed` clusters** — call `run_review` again passing
-     `cluster_ids` with EXACTLY the failed ids from the result (it re-runs
-     only those, on the same clustering). If a cluster still fails after one
-     retry, report it plainly in your summary — do not review those docs
-     yourself and do not present them as reviewed.
+   - **Retry `failed` ids** — call `run_review` again passing
+     `cluster_ids` with EXACTLY the failed ids from the result (`c*` clusters
+     and `x*` context pairs alike; it re-runs only those, on the same
+     persisted state). If one still fails after one retry, report it plainly
+     in your summary — do not review those docs yourself and do not present
+     them as reviewed.
    - **Report the counts** from the tool result in your final summary:
      clusters and docs reviewed, clean/fixed/failed, propagation notes
      applied. The full reviewer/fixer transcripts are in the report file the
@@ -679,17 +687,18 @@ a query is not a finding. You write NOTHING to disk; fixes are applied by others
 """  # nosec B608 - a natural-language prompt template, not a SQL query; the SELECT/COUNT text inside is example guidance shown to the model, never executed.
 
 _FIXER_BODY = """
-## Your job (fix-author — apply a reviewer's confirmed findings to ONE cluster)
+## Your job (fix-author — apply a reviewer's confirmed findings)
 
-You are given a CLUSTER of related concept ids and the adversarial
-reviewer's findings for them, verbatim. Apply exactly those findings — no
-more, no less. You did not write these docs and you are not re-reviewing
-them: the reviewer already proved each finding with a query, so your job is
-surgical correction, not fresh investigation.
+You are given a reviewer's findings verbatim, plus the file set you may edit
+(usually ONE review cluster of related concept ids; a context-fidelity
+dispatch instead names the whole authored bundle minus the supervisor-owned
+docs). Apply exactly those findings — no more, no less. You did not write
+these docs and you are not re-reviewing them: the reviewer already proved
+each finding, so your job is surgical correction, not fresh investigation.
 
-**Your write access is HARD-LIMITED to your cluster's files** — the guard
-refuses every other path. That is by design: other clusters have their own
-fixers running in parallel.
+**Your write access is HARD-LIMITED to your dispatch's file set** — the guard
+refuses every other path. That is by design: other fixers may be running in
+parallel on their own sets.
 
 1. `read_file` each doc named in the findings. Apply each finding with
    `edit_file` — the smallest edit that makes the doc state the corrected
@@ -700,14 +709,14 @@ fixers running in parallel.
    down the corrected fact — but do not re-verify findings wholesale, and do
    not go hunting for new ones.
 3. After your edits, call `get_backlinks` on each doc you changed. A
-   referencing doc INSIDE your cluster that now contradicts the fix: edit it
-   too. A referencing doc OUTSIDE your cluster: do NOT touch it (the guard
+   referencing doc INSIDE your file set that now contradicts the fix: edit it
+   too. A referencing doc OUTSIDE it: do NOT touch it (the guard
    will refuse anyway) — record it as a propagation note instead.
 4. End your reply with two sections, in this order:
    - a short summary: each finding and the edit that resolved it (or why you
      left it — e.g. the reviewer's proof didn't survive your probe);
-   - `## PROPAGATION NOTES` — one `- ` bullet per OUT-OF-CLUSTER doc that
-     needs a follow-up edit, each self-contained: the doc id, the exact
+   - `## PROPAGATION NOTES` — one `- ` bullet per doc OUTSIDE your file set
+     that needs a follow-up edit, each self-contained: the doc id, the exact
      change needed, and why. Write `- none` when there are none. This
      section must be LAST — it is machine-extracted.
 """
@@ -760,6 +769,53 @@ You write NOTHING to disk — no bundle docs, no scratch files; the supervisor a
 table-authors do the writing from your digest. If your assigned docs yield no
 usable facts, say so plainly.
 """  # nosec B608 - a natural-language prompt template; the run_sql/SELECT references are example guidance to the model, never executed.
+
+_CONTEXT_REVIEWER_BODY = """
+## Your job (context-fidelity reviewer — READ-ONLY, you do NOT write files)
+
+You audit whether the BUNDLE faithfully represents the knowledge that was
+extracted from the user's uploaded `.context/` docs. You are dispatched by the
+`run_review` workflow AFTER the cluster review + fixes: your dispatch names
+one or two digest files under `.harvest/context/` — each is the verbatim
+output of a context-extractor (a routed fact digest: enum legends, joins,
+metrics, grain, caveats, each tagged with a target concept id + section).
+The digests are your ground truth here: their facts were already verified
+against live data at extraction time, so your question is NOT "is the fact
+true" but **"did the fact survive into the bundle intact?"**
+
+1. **Read your assigned digest files IN FULL** (`read_file`), then, for EVERY
+   fact each digest routes, open the target doc and compare. Use
+   `read_file`/`grep`/`glob` over the bundle; you rarely need live queries —
+   run one only when the doc and the digest disagree and only the data can
+   arbitrate.
+2. **Classify each fact:**
+   - **Faithful** — the doc states it with the same meaning and force.
+   - **Semantic loss** — present but weakened or distorted: a hard rule
+     softened to a suggestion, a caveat's scope narrowed, a unit or scale
+     dropped, a sentinel value unflagged, an enum decoded partially (codes
+     missing vs the digest's full legend), a definition paraphrased into a
+     different meaning.
+   - **Missing** — the fact landed nowhere: not in the routed target, not in
+     any sensible alternative home.
+   - **Mis-routed** — recorded somewhere a consumer won't look (e.g. a
+     dataset-wide rule buried in one table's gotchas with no guardrails
+     mention).
+   A fact the extractor marked contradicted-by-data is faithful when the doc
+   records the CONTRADICTION (that was the point), not the doc claim.
+3. **Report.** The FIRST line of your reply must be a verdict, alone:
+   `CLEAN` when every fact is faithfully represented (follow with nothing
+   more than a one-line confirmation), or `FINDINGS`. After a `FINDINGS`
+   verdict, group findings BY CONCEPT ID; each must be self-contained and
+   actionable for a fix agent who has not read the digests: the fact (quoted
+   or tightly summarized from the digest, with its source `.context/<file>`),
+   what the bundle currently says (quote the passage, name the doc), what was
+   lost, and the corrective edit. Plain markdown prose, no JSON.
+
+Do not re-litigate facts (the extraction already verified them), do not flag
+stylistic paraphrase that preserves meaning, and do not invent facts the
+digests don't contain — silence about a topic is only a finding when a digest
+routed a fact there. You write NOTHING to disk; fixes are applied by others.
+"""
 
 _ANNOTATION_BODY = """
 ## Your job (annotation reviewer + applier)
@@ -1265,6 +1321,24 @@ def build_context_extractor_prompt(
     )
 
 
+def build_context_reviewer_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
+    """The context-fidelity reviewer's prompt for ``profile``'s source.
+
+    Dispatched only by the ``run_review`` tool's context phase, one per pair
+    of recorded extractor digests. READ-ONLY (no ``_AUTHORING_TMPL`` — it
+    writes nothing); findings pipe into a ``fix-author``.
+    """
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _CONTEXT_REVIEWER_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
+    )
+
+
 def build_table_author_prompt(
     profile: SourcePromptProfile | None = None, *, gpt: bool = False
 ) -> str:
@@ -1298,6 +1372,7 @@ _RUNTIME = _fill(_RUNTIME_TMPL, GlueAthenaSource.prompt_profile)
 SUPERVISOR_PROMPT = build_supervisor_prompt()
 REVIEWER_PROMPT = build_reviewer_prompt()
 CONTEXT_EXTRACTOR_PROMPT = build_context_extractor_prompt()
+CONTEXT_REVIEWER_PROMPT = build_context_reviewer_prompt()
 ANNOTATION_PROMPT = _fill(
     _RUNTIME_TMPL + _AUTHORING_TMPL + _ANNOTATION_BODY, GlueAthenaSource.prompt_profile
 )

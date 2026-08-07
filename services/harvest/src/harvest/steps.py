@@ -153,12 +153,14 @@ _LINT_EVENT_BUDGET = 8000
 # sub-agents get the same two texts via the harvest.subagent_io shim's
 # input/result enrichment events (forwarded as a `phase:"update"` feed event),
 # because the library's own lifecycle events carry neither.
-# 24KB, not the 8KB the other bounded texts use: a table-author brief carries
-# its context-digest slice and routinely exceeds 8KB, and a truncated brief
-# defeats the drill-in's purpose. Each event is one CloudWatch log line
-# (hard limit 256KB), so 24KB stays comfortably bounded.
+# 64KB, not the 8KB the other bounded texts use: a table-author brief carries
+# its context-digest slice and an extractor's returned digest carries full
+# enum legends — both routinely exceed the smaller caps, and a truncated
+# brief/answer defeats the drill-in's purpose. Each event is one CloudWatch
+# log line (hard limit 256KB) and one field rides per event, so 64KB stays
+# comfortably bounded (and FilterLogEvents' 1MB pages still hold ~15 events).
 _TASK_TOOL = "task"
-_SUBAGENT_IO_MAX = 24000
+_SUBAGENT_IO_MAX = 64000
 
 
 def _bounded_text(value: Any, cap: int = _SUBAGENT_IO_MAX) -> str:
@@ -510,6 +512,10 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         # call_id -> tool name. Membership answers "did we emit this call?";
         # the name lets on_tool_end recognise the lint gate's result.
         self._emitted_calls: dict[str, str] = {}
+        # call_id -> (subagent_type, raw brief) for static `task` dispatches.
+        # on_tool_end uses it to persist a context-extractor's digest verbatim
+        # (harvest.context_digests) — the type/brief only ride the START.
+        self._task_meta: dict[str, tuple[Any, Any]] = {}
         # run_ids of MODEL turns that started inside a sub-agent (nested langgraph
         # namespace at on_chat_model_start). on_llm_end carries NO metadata, so it
         # can't re-classify itself — it looks the run_id up here. Same reason as
@@ -759,6 +765,11 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
             brief = _bounded_text((inputs or {}).get("description"))
             if brief:
                 event["full"] = brief
+            with self._lock:
+                self._task_meta[cid] = (
+                    (inputs or {}).get("subagent_type"),
+                    (inputs or {}).get("description"),
+                )
         self._emit(event)
 
     def _emitted_call(self, run_id: Any) -> bool:
@@ -815,6 +826,21 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
                 from harvest.subagent_io import _result_text
 
                 text = _result_text(output) or _extract_ai_text(output)
+                # A context-extractor's digest is persisted VERBATIM for the
+                # review's fidelity phase (record() filters by type, fail-soft;
+                # the feed keeps its bounded copy below).
+                with self._lock:
+                    sub_type, raw_brief = self._task_meta.get(cid, (None, None))
+                try:
+                    from harvest.context_digests import record
+
+                    record(
+                        sub_type if isinstance(sub_type, str) else None,
+                        raw_brief if isinstance(raw_brief, str) else None,
+                        text,
+                    )
+                except Exception:  # noqa: BLE001 — observability only
+                    log.debug("Failed to record extractor digest", exc_info=True)
                 if text:
                     event["result"] = _bounded_text(text)
         self._emit(event)

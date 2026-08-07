@@ -189,3 +189,25 @@ def test_cluster_exclude_removes_docs_before_clusters_form(tmp_path):
     assert any(
         b["id"] == "references/usage_guardrails" for b in g.get_backlinks("tables/a")
     )
+
+
+def test_doc_stem_matching_a_scratch_dir_name_stays_in_the_graph(tmp_path):
+    # The reserved rule names DIRECTORIES (deepagents scratch, dot-dirs) — a
+    # table legitimately named `conversation_history` must not silently
+    # vanish from the graph (no backlinks, no review cluster) while lint
+    # still demands its doc. Parents-only, exactly as lint applies it.
+    _write(tmp_path, "tables/conversation_history.md", "Conv", "History.\n")
+    _write(
+        tmp_path,
+        "tables/events.md",
+        "Events",
+        "See [conv](conversation_history.md).\n",
+    )
+    _write(tmp_path, "conversation_history/scratch.md", "S", "runtime leak\n")
+    g = LinkGraph(tmp_path)
+    g.rebuild()
+    assert "tables/conversation_history" in g.graph
+    assert "conversation_history/scratch" not in g.graph
+    assert [b["id"] for b in g.get_backlinks("tables/conversation_history")] == [
+        "tables/events"
+    ]

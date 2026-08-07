@@ -255,3 +255,33 @@ def test_install_forwards_through_the_real_library():
         assert events[0]["label"] == "reviewer wave 1"
     finally:
         _repl.call_subagent_task_tool = original
+
+
+def test_shim_records_context_extractor_digests(tmp_path):
+    # The quickjs path is the ONE place an eval-borne extractor's digest is
+    # observable — the shim persists it for run_review's fidelity phase.
+    from harvest import context_digests as cd
+
+    cd.configure(tmp_path)
+    try:
+        rt = SimpleNamespace(tool_call_id="ptc_task_x1", stream_writer=None)
+        inner = _Inner("## tables/races\n- the extracted fact")
+        shim = _TaskToolShim(inner)
+        asyncio.run(
+            shim.arun(
+                {
+                    "description": "Extract facts from dict.md",
+                    "subagent_type": "context-extractor",
+                    "runtime": rt,
+                }
+            )
+        )
+        # A non-extractor dispatch records nothing.
+        asyncio.run(shim.arun(_payload(rt)))
+        paths = cd.digest_paths(tmp_path)
+        assert paths == [".harvest/context/digest-01.md"]
+        text = (tmp_path / paths[0]).read_text(encoding="utf-8")
+        assert "Extract facts from dict.md" in text
+        assert "- the extracted fact" in text
+    finally:
+        cd.configure(None)

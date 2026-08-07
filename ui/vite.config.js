@@ -17,7 +17,7 @@ export default defineConfig({
     },
   },
   // Local dev server. The port is PINNED (strictPort) because the Cognito app
-  // client only whitelists http://localhost:5173/callback.html and
+  // client only allows http://localhost:5173/callback.html and
   // http://localhost:5173/ as OAuth redirect/logout URLs — if Vite silently
   // fell back to 5174 the login redirect would be rejected. Fail loudly instead.
   server: {

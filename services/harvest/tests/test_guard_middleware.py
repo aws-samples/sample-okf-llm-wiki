@@ -498,3 +498,51 @@ def test_guard_refusal_carries_error_status(monkeypatch):
     result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
     assert result["status"] == "error"
     assert "nope" in result["content"]
+
+
+def test_writes_into_any_dot_dir_are_refused(monkeypatch):
+    # .harvest/ (review clustering, recorded digests, the commit marker) and
+    # .context/ (user uploads) are workflow state/inputs — a write into either
+    # (ANY extension: clusters.json is not markdown) must be refused like
+    # .metadata/, not silently allowed past the .md-only checks.
+    monkeypatch.setattr(
+        okf_guard,
+        "ToolMessage",
+        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
+    )
+    mw = _mw(_AllowEngine())
+    for name, extra in (
+        ("write_file", {"content": "{}"}),
+        ("edit_file", {"old_string": "a", "new_string": "b"}),
+    ):
+        for path in (
+            ".harvest/review/clusters.json",
+            ".harvest/context/digest-01.md",
+            ".harvest/state.json",
+            ".context/spec.md",
+            "tables/../.harvest/state.json",
+        ):
+            req = _request(name=name, file_path=path, **extra)
+            result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+            assert isinstance(result, dict) and result["status"] == "error", (name, path)
+            assert "reserved dot-directory" in result["content"]
+
+
+def test_allow_delete_refuses_a_directory_named_like_a_doc(tmp_path, monkeypatch):
+    # The name check alone doesn't prove "one .md FILE": the backend mkdirs
+    # parents on write, so `tables/x.md` can EXIST as a directory — and delete
+    # is recursive. The guard stats the path through the engine's link-graph
+    # root and refuses directories regardless of their name.
+    _tm_standin(monkeypatch)
+    (tmp_path / "tables" / "x.md").mkdir(parents=True)  # a DIRECTORY named x.md
+    engine = _AllowEngine()
+    engine.link_graph = types.SimpleNamespace(root=tmp_path)
+    mw = OKFGuardMiddleware(engine, read_current=lambda _p: None, allow_delete=True)
+    req = _request(name="delete", file_path="tables/x.md")
+    result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+    assert isinstance(result, dict) and result["status"] == "error"
+    assert "DIRECTORY" in result["content"]
+    # A real file of the same shape still deletes.
+    (tmp_path / "tables" / "y.md").write_text("---\ntype: T\n---\n")
+    req = _request(name="delete", file_path="tables/y.md")
+    assert mw.wrap_tool_call(req, lambda r: "DELETED") == "DELETED"

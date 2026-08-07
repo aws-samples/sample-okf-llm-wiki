@@ -352,3 +352,44 @@ def test_signal_texts_share_the_step_back_posture():
     ):
         assert "the user" in signal.text
         assert "IGNORE" not in signal.text and "STOP" not in signal.text
+
+
+def test_gate_denials_for_different_pages_do_not_fire_the_trailing_streak():
+    """The guardrails gate's normal first contact: several read_page DENIALS
+    for DIFFERENT pages before the guardrails read. Each denial already names
+    the fix, so a 'your calls keep erroring' nudge is wrong guidance (and its
+    cooldown would suppress a genuine signal right after). Identical denied
+    calls still fire via the per-call error count."""
+    msgs = [_USER]
+    for i in range(steering.ERROR_STREAK):
+        msgs.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_page",
+                        "args": {"concept_id": f"tables/t{i}"},
+                        "id": f"d{i}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        )
+        msgs.append(
+            ToolMessage(
+                content='{"status": "denied", "error": "Read denied: read the usage guardrails first"}',
+                name="read_page",
+                tool_call_id=f"d{i}",
+                status="error",
+            )
+        )
+    assert detect(msgs) is None
+    # Plain (non-denial) errors of the same shape still fire the streak.
+    plain = [_USER]
+    for i in range(steering.ERROR_STREAK):
+        plain += [
+            _ai([("run_sql", {"sql": f"SELECT {i}"})]),
+            _tool("run_sql", "Error: boom", "error"),
+        ]
+    sig = detect(plain)
+    assert sig is not None and sig.kind == "futility"

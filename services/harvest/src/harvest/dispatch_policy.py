@@ -16,7 +16,7 @@ one-line instructive error.
 
 from __future__ import annotations
 
-WORKFLOW_ONLY_SUBAGENTS = frozenset({"fix-author"})
+WORKFLOW_ONLY_SUBAGENTS = frozenset({"fix-author", "context-reviewer"})
 
 WORKFLOW_ONLY_DISPATCH_MSG = (
     "Refused: `{sub}` is dispatched by the `run_review` tool only — never "

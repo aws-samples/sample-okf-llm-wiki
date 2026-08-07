@@ -1244,3 +1244,44 @@ def test_emit_status_narrates_pre_agent_phases():
     assert all(e["kind"] == KIND_AGENT for e in events)
     assert "profiling columns" in events[0]["label"]
     assert events[1]["label"] == "Column profiles: 10 profiled, 2 reused from cache"
+
+
+def test_static_task_path_records_context_extractor_digest(tmp_path):
+    # The static `task` dispatch path (no QuickJS shim in the way): the
+    # emitter pairs the start's (subagent_type, brief) with the end's result
+    # text and persists a context-extractor's digest verbatim.
+    from harvest import context_digests as cd
+
+    cd.configure(tmp_path)
+    try:
+        events, sink = _collect()
+        em = StepEmitter(sink)
+        em.on_tool_start(
+            {"name": "task"},
+            "",
+            run_id="t-ctx",
+            inputs={
+                "subagent_type": "context-extractor",
+                "description": "Extract facts from spec.pdf",
+            },
+        )
+        em.on_tool_end("## tables/orders\n- fact from the pdf", run_id="t-ctx")
+        # A non-extractor task dispatch records nothing.
+        em.on_tool_start(
+            {"name": "task"},
+            "",
+            run_id="t-author",
+            inputs={"subagent_type": "table-author", "description": "author x"},
+        )
+        em.on_tool_end("wrote tables/x.md", run_id="t-author")
+
+        paths = cd.digest_paths(tmp_path)
+        assert paths == [".harvest/context/digest-01.md"]
+        text = (tmp_path / paths[0]).read_text(encoding="utf-8")
+        assert "Extract facts from spec.pdf" in text
+        assert "- fact from the pdf" in text
+        # The feed behavior is unchanged: the result still rides the event.
+        results = [e for e in events if e.get("kind") == "tool_result"]
+        assert results[0]["result"].startswith("## tables/orders")
+    finally:
+        cd.configure(None)

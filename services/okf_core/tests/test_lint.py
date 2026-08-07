@@ -478,3 +478,41 @@ def test_link_to_generated_index_is_not_a_broken_link(tmp_path):
     report = lint_bundle(root)
     broken = [f.message for f in report.findings if f.code == "broken-link"]
     assert not any("index.md" in m or "log.md" in m for m in broken)
+
+
+def test_fence_parity_survives_offtemplate_openers():
+    # A multi-word info string ("```sql title=x") or a 4-space-indented fence
+    # must still be TRACKED: an untracked opener's closing ``` used to open a
+    # phantom fence, and every later real ```sql fence escaped the gate.
+    from okf_core.lint import _sql_fences_in
+
+    body = (
+        "```sql title=demo\n"
+        "SELECT 1\n"
+        "```\n\n"
+        "```sql\n"
+        "SELECT 2\n"
+        "```\n"
+    )
+    assert _sql_fences_in(body) == ["SELECT 1", "SELECT 2"]
+
+    nested = "- a list item:\n\n    ```sql\n    SELECT 3\n    ```\n"
+    assert [f.strip() for f in _sql_fences_in(nested)] == ["SELECT 3"]
+
+    # Inline triple-backtick prose (info string containing a backtick) is NOT
+    # an opener per CommonMark — it must not flip parity either.
+    prose = "```x``` is a fence marker\n\n```sql\nSELECT 4\n```\n"
+    assert _sql_fences_in(prose) == ["SELECT 4"]
+
+
+def test_type_families_cover_redshift_spellings():
+    # SVV_ALL_COLUMNS emits Postgres spellings; a missing one doesn't just
+    # miss a column — _type_family returns None and the whole join
+    # type-compat check silently skips.
+    from okf_core.lint import _families_comparable, _type_family
+
+    for t in ("text", "bpchar", "nchar(8)", "nvarchar(64)", "character varying(255)"):
+        assert _type_family(t) == "text", t
+    assert _type_family("time without time zone") == "time"
+    assert _type_family("timestamp with time zone") == "timestamp"
+    assert not _families_comparable(_type_family("text"), _type_family("bigint"))

@@ -48,6 +48,7 @@ from harvest.okf_guard import (
 )
 from harvest.prompts import (
     build_context_extractor_prompt,
+    build_context_reviewer_prompt,
     build_cross_author_prompt,
     build_cross_reviewer_prompt,
     build_cross_supervisor_prompt,
@@ -603,6 +604,13 @@ def build_harvest_agent(
     dataset_root = Path(dataset_root)
     mkdirs(dataset_root)  # NFS-resilient (tolerates transient ESTALE on the mount)
 
+    # Pin the run's dataset root for the context-digest recorder: the capture
+    # sites (the QuickJS shim and the step feed) see extractor dispatches but
+    # don't know where the bundle lives. See harvest.context_digests.
+    from harvest.context_digests import configure as _configure_digest_recorder
+
+    _configure_digest_recorder(dataset_root)
+
     link_graph = LinkGraph(dataset_root)
     engine = OKFGuardEngine(link_graph)
 
@@ -839,15 +847,38 @@ def build_harvest_agent(
         "name": "reviewer",
         "description": (
             "Adversarially verify a CLUSTER of related authored OKF concept docs "
-            "(1-5 ids, grouped by the cluster_concepts tool) against live data. "
-            "Pass the concept ids (e.g. 'tables/races, references/joins/"
-            "circuits__races') and what to scrutinize. Returns confirmed findings "
-            "grouped by doc (wrong grain, bad join key, mis-stated gotcha, "
-            "cross-doc contradiction, SQL that errors/returns wrong rows) with "
-            "the query that proves each — or 'no issues found'."
+            "against live data (dispatched by the run_review tool, one per link "
+            "cluster). Pass the concept ids (e.g. 'tables/races, references/"
+            "joins/circuits__races') and what to scrutinize. Replies with a "
+            "first-line verdict — CLEAN, or FINDINGS grouped by doc (wrong "
+            "grain, bad join key, mis-stated gotcha, cross-doc contradiction, "
+            "SQL that errors/returns wrong rows), each with the query that "
+            "proves it."
         ),
         "system_prompt": build_reviewer_prompt(prompt_profile, gpt=reviewer_gpt),
         "tools": all_tools,  # source + graph tools; read_file comes from the backend
+        "middleware": [readonly_guard, tool_errors, prompt_cache],
+        "model": reviewer_chat_model,
+    }
+
+    # Context-fidelity reviewer — READ-ONLY, dispatched ONLY by run_review's
+    # context phase (after all cluster fixes), one per pair of recorded
+    # context-extractor digests (.harvest/context/). Audits whether the bundle
+    # faithfully represents each extracted fact (semantic loss, dropped codes,
+    # weakened caveats, mis-routed rules); confirmed losses pipe into a
+    # fix-author. Rides the reviewer model instance — it IS review spend.
+    context_reviewer = {
+        "name": "context-reviewer",
+        "description": (
+            "Audit how faithfully the bundle represents the facts in recorded "
+            "context-extraction digests. Dispatched by the run_review tool "
+            "only — do not dispatch it directly. READ-ONLY — returns "
+            "plain-text findings, writes nothing."
+        ),
+        "system_prompt": build_context_reviewer_prompt(
+            prompt_profile, gpt=reviewer_gpt
+        ),
+        "tools": all_tools,  # bundle reads via the backend; live probes if needed
         "middleware": [readonly_guard, tool_errors, prompt_cache],
         "model": reviewer_chat_model,
     }
@@ -967,6 +998,7 @@ def build_harvest_agent(
             table_author,
             reference_author,
             reviewer,
+            context_reviewer,
             fix_author,
             context_extractor,
         ]

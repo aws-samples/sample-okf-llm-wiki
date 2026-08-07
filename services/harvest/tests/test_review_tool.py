@@ -57,30 +57,40 @@ class FakeTaskTool:
 
     name = "task"
 
-    def __init__(self, review_texts=None, fix_texts=None):
+    def __init__(self, review_texts=None, fix_texts=None, context_texts=None):
         self.review_texts = review_texts or {}
         self.fix_texts = fix_texts or {}
+        self.context_texts = context_texts or {}
         self.dispatches = []
         self.running = 0
         self.max_running = 0
+        self.running_by_type = {}
+        self.max_running_by_type = {}
 
     def _text_for(self, payload):
         desc = payload["description"]
-        table = (
-            self.review_texts
-            if payload["subagent_type"] == "reviewer"
-            else self.fix_texts
-        )
+        sub = payload["subagent_type"]
+        if sub == "reviewer":
+            table = self.review_texts
+        elif sub == "context-reviewer":
+            table = self.context_texts
+        else:
+            table = self.fix_texts
         for key, value in table.items():
             if key in desc:
                 return value
-        return CLEAN if payload["subagent_type"] == "reviewer" else FIX_DONE
+        return CLEAN if sub in ("reviewer", "context-reviewer") else FIX_DONE
 
     async def arun(self, payload, **kwargs):
+        sub = payload["subagent_type"]
         self.running += 1
         self.max_running = max(self.max_running, self.running)
+        self.running_by_type[sub] = self.running_by_type.get(sub, 0) + 1
+        self.max_running_by_type[sub] = max(
+            self.max_running_by_type.get(sub, 0), self.running_by_type[sub]
+        )
         record = {
-            "subagent_type": payload["subagent_type"],
+            "subagent_type": sub,
             "description": payload["description"],
             "tool_call_id": payload["runtime"].tool_call_id,
             "allowlist": current_fix_allowlist(),
@@ -88,6 +98,7 @@ class FakeTaskTool:
         self.dispatches.append(record)
         await asyncio.sleep(0)  # let siblings interleave
         self.running -= 1
+        self.running_by_type[sub] -= 1
         value = self._text_for(payload)
         if isinstance(value, Exception):
             raise value
@@ -561,3 +572,239 @@ def test_supervisor_prompt_prescribes_the_tool_not_the_fanout():
     # rules just fights the guard); the read-only reviewer must NOT carry it.
     assert "## Authoring (write path + guard)" in fix
     assert "## Authoring (write path + guard)" not in rev
+
+
+# ---------------------------------------------------------------------------
+# context-fidelity phase
+# ---------------------------------------------------------------------------
+
+CTX_FINDINGS = (
+    "FINDINGS\n- `tables/races`: the digest's sentinel code `99` (means "
+    "unknown) is not flagged in the schema row."
+)
+
+
+def _write_digests(root, n):
+    d = root / ".harvest" / "context"
+    d.mkdir(parents=True, exist_ok=True)
+    out = []
+    for i in range(1, n + 1):
+        (d / f"digest-{i:02d}.md").write_text(f"# digest {i}", encoding="utf-8")
+        out.append(f".harvest/context/digest-{i:02d}.md")
+    return out
+
+
+def _write_doc(root, rel):
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("---\ntype: T\n---\nbody\n", encoding="utf-8")
+
+
+def test_context_phase_skipped_when_no_extractor_ran(tmp_path):
+    graph = FakeGraph([["tables/a"]])
+    fake = FakeTaskTool()
+    tool = make_run_review_tool(
+        link_graph=graph, dataset_root=tmp_path, concurrency=4, timeout_s=5
+    )
+    result = _run(tool, _runtime(fake))
+    assert "skipped" in result["context"]
+    assert all(d["subagent_type"] != "context-reviewer" for d in fake.dispatches)
+
+
+def test_context_phase_pairs_digests_and_persists_x_ids(tmp_path):
+    digests = _write_digests(tmp_path, 3)
+    graph = FakeGraph([["tables/a"]])
+    fake = FakeTaskTool()
+    tool = make_run_review_tool(
+        link_graph=graph, dataset_root=tmp_path, concurrency=4, timeout_s=5
+    )
+    events = []
+    result = _run(tool, _runtime(fake, events))
+
+    # 3 digests -> two pairs (2 + 1), one context-reviewer each, briefs
+    # naming exactly that pair's digest files.
+    ctx = [d for d in fake.dispatches if d["subagent_type"] == "context-reviewer"]
+    assert len(ctx) == 2
+    assert digests[0] in ctx[0]["description"] and digests[1] in ctx[0]["description"]
+    assert digests[2] in ctx[1]["description"]
+    assert result["context"] == {"pairs": 2, "clean": ["x1", "x2"], "fixed": []}
+
+    # The pairing is persisted next to the clusters (same retry contract).
+    persisted = json.loads((tmp_path / ".harvest/review/clusters.json").read_text())
+    assert persisted["context"] == [
+        {"id": "x1", "docs": digests[:2]},
+        {"id": "x2", "docs": digests[2:]},
+    ]
+
+    # The context dispatches ride their own fleet batch, and the report
+    # renders them as context pairs.
+    ctx_events = [e for e in events if e.get("batch") == "call_review_1:context"]
+    assert any(e["phase"] == "start" for e in ctx_events)
+    report = (tmp_path / result["report_path"]).read_text()
+    assert "Context pair `x1`" in report
+
+
+def test_context_findings_pipe_into_bundle_wide_confined_fixer(tmp_path):
+    _write_digests(tmp_path, 1)
+    for rel in (
+        "tables/races.md",
+        "references/enums/status.md",
+        "datasets/f1.md",
+        "references/usage_guardrails.md",
+    ):
+        _write_doc(tmp_path, rel)
+    (tmp_path / "tables" / "index.md").write_text("idx", encoding="utf-8")
+
+    graph = FakeGraph([["tables/races"]])
+    fake = FakeTaskTool(context_texts={"digest-01": CTX_FINDINGS})
+    tool = make_run_review_tool(
+        link_graph=graph, dataset_root=tmp_path, concurrency=4, timeout_s=5
+    )
+    result = _run(tool, _runtime(fake))
+
+    # The cluster pass was clean (default), so the ONLY fixer is the context
+    # one — its allowlist is the whole authored bundle MINUS the hubs,
+    # generated files, and reserved dirs (the digests themselves live under
+    # .harvest/ and must never be editable).
+    fixers = [d for d in fake.dispatches if d["subagent_type"] == "fix-author"]
+    assert len(fixers) == 1
+    allow = fixers[0]["allowlist"]
+    assert "tables/races.md" in allow
+    assert "references/enums/status.md" in allow
+    assert "datasets/f1.md" not in allow
+    assert "references/usage_guardrails.md" not in allow
+    assert not any(p.startswith(".harvest/") for p in allow)
+    assert not any(p.endswith("index.md") for p in allow)
+    # The findings travel verbatim, and the result reports the fixed pair.
+    assert CTX_FINDINGS.splitlines()[1] in fixers[0]["description"]
+    assert result["context"] == {"pairs": 1, "clean": [], "fixed": ["x1"]}
+
+
+def test_failed_context_pair_is_retryable_by_x_id(tmp_path):
+    _write_digests(tmp_path, 1)
+    graph = FakeGraph([["tables/a"]])
+    fake = FakeTaskTool(context_texts={"digest-01": RuntimeError("model choked")})
+    tool = make_run_review_tool(
+        link_graph=graph, dataset_root=tmp_path, concurrency=4, timeout_s=5
+    )
+    result = _run(tool, _runtime(fake))
+    assert result["ok"] is False
+    assert [f["cluster"] for f in result["failed"]] == ["x1"]
+    assert result["failed"][0]["stage"] == "context-review"
+    assert "x1" in result["retry_hint"]
+
+    # Retry EXACTLY the failed pair: no cluster re-runs, same digest files.
+    fake2 = FakeTaskTool()
+    result2 = _run(tool, _runtime(fake2), cluster_ids=["x1"])
+    assert result2["ok"] is True
+    assert [d["subagent_type"] for d in fake2.dispatches] == ["context-reviewer"]
+    assert result2["clusters"] == 0
+    assert result2["context"] == {"pairs": 1, "clean": ["x1"], "fixed": []}
+
+
+def test_context_fixers_are_serialized_reviewers_are_not(tmp_path):
+    # Context fixers share one editable file set, so two pairs with findings
+    # must fix ONE AT A TIME (the lock) even though their reviewers ran in
+    # parallel.
+    _write_digests(tmp_path, 4)  # -> x1 (01, 02) and x2 (03, 04)
+    graph = FakeGraph([])
+    fake = FakeTaskTool(
+        context_texts={"digest-01": CTX_FINDINGS, "digest-03": CTX_FINDINGS}
+    )
+    tool = make_run_review_tool(
+        link_graph=graph, dataset_root=tmp_path, concurrency=8, timeout_s=5
+    )
+    result = _run(tool, _runtime(fake))
+    assert result["context"]["fixed"] == ["x1", "x2"]
+    assert fake.max_running_by_type["context-reviewer"] == 2
+    assert fake.max_running_by_type["fix-author"] == 1
+
+
+def test_context_fixer_propagation_notes_reach_the_supervisor(tmp_path):
+    _write_digests(tmp_path, 1)
+    graph = FakeGraph([])
+    fake = FakeTaskTool(
+        context_texts={"digest-01": CTX_FINDINGS},
+        fix_texts={
+            "context-fidelity": (
+                "Fixed the sentinel note.\n\n## PROPAGATION NOTES\n"
+                "- `datasets/f1`: mention the sentinel in the overview"
+            )
+        },
+    )
+    tool = make_run_review_tool(
+        link_graph=graph, dataset_root=tmp_path, concurrency=4, timeout_s=5
+    )
+    result = _run(tool, _runtime(fake))
+    assert result["propagation_notes"] == [
+        {"cluster": "x1", "note": "`datasets/f1`: mention the sentinel in the overview"}
+    ]
+
+
+def test_empty_cluster_ids_is_a_noop_not_a_fresh_review(tmp_path):
+    # run_review(cluster_ids=[]) is a natural literalism when `failed` is
+    # empty — it must NOT fall into the fresh-call branch (recompute, re-run
+    # every reviewer, overwrite the persisted clustering).
+    graph = FakeGraph([["tables/a"]])
+    fake = FakeTaskTool()
+    tool = make_run_review_tool(
+        link_graph=graph, dataset_root=tmp_path, concurrency=2, timeout_s=5
+    )
+    result = _run(tool, _runtime(fake), cluster_ids=[])
+    assert result["ok"] is True and "nothing to retry" in result["note"]
+    assert fake.dispatches == [] and graph.calls == 0
+
+
+def test_empty_dispatch_text_emits_error_square_not_complete(tmp_path):
+    # An empty answer is recorded as a FAILED cluster — the fleet square must
+    # agree (phase error), not render a green `complete` the result contradicts.
+    graph = FakeGraph([["tables/a"]])
+    fake = FakeTaskTool(review_texts={"tables/a": "   "})
+    tool = make_run_review_tool(
+        link_graph=graph, dataset_root=tmp_path, concurrency=2, timeout_s=5
+    )
+    events = []
+    result = _run(tool, _runtime(fake, events))
+    assert [f["cluster"] for f in result["failed"]] == ["c1"]
+    phases = [e["phase"] for e in events if e.get("id") == f"rev-c1-{result['review_id']}"]
+    assert phases == ["start", "error"]
+    assert "returned no text" in result["failed"][0]["error"]
+
+
+def test_report_write_failure_degrades_without_losing_results(tmp_path, monkeypatch):
+    # The module contract: the tool never raises. A persistent report-write
+    # error after every dispatch completed must return the statuses/notes,
+    # not discard 30 minutes of review.
+    import harvest.review as rv
+
+    def boom(*_a, **_k):
+        raise OSError("mount went away")
+
+    monkeypatch.setattr(rv, "_write_report", boom)
+    graph = FakeGraph([["tables/a"]])
+    fake = FakeTaskTool(review_texts={"tables/a": FINDINGS})
+    tool = make_run_review_tool(
+        link_graph=graph, dataset_root=tmp_path, concurrency=2, timeout_s=5
+    )
+    result = _run(tool, _runtime(fake))
+    assert result["fixed"] == ["c1"]  # the review results survived
+    assert result["report_path"] is None
+    assert "could not be written" in result["report_error"]
+
+
+def test_propagation_notes_keep_wrapped_bullet_continuations():
+    # The supervisor applies notes VERBATIM — a wrapped bullet must not be
+    # silently cut at its first physical line (a blank line still ends it, so
+    # a trailing sign-off never glues on).
+    text = (
+        "Fixed.\n\n## PROPAGATION NOTES\n"
+        "- `datasets/overview`: replace \"X is unique per race\"\n"
+        "  with \"X is unique per (race, driver)\"\n"
+        "- `tables/b`: single-line note\n"
+        "\n"
+        "That is all.\n"
+    )
+    assert _propagation_notes(text) == [
+        '`datasets/overview`: replace "X is unique per race" with "X is unique per (race, driver)"',
+        "`tables/b`: single-line note",
+    ]

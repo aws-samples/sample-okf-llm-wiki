@@ -82,13 +82,6 @@ def _is_markdown(file_path: str | None) -> bool:
     return bool(file_path) and str(file_path).endswith(".md")
 
 
-def _is_readonly_path(file_path: str | None) -> bool:
-    if not file_path:
-        return False
-    parts = str(file_path).replace("\\", "/").split("/")
-    return _READONLY_DIR in parts
-
-
 def _has_dot_segment(file_path: str | None) -> bool:
     """True if any path segment is dot-prefixed (``.metadata``, ``.context``,
     ``.harvest``) — the run's inputs and state, never an agent's to delete.
@@ -232,6 +225,27 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
                     "instead; an emptied directory is harmless (its generated "
                     "index.md is dropped at finalize).",
                 )
+            # The name check alone doesn't prove "one .md FILE": the backend
+            # mkdirs parents on write, so a path ending in .md can exist as a
+            # DIRECTORY (a write to `tables/x.md/y.md` creates dir
+            # `tables/x.md`) — and delete is recursive. Stat it.
+            try:
+                root = getattr(
+                    getattr(self.engine, "link_graph", None), "root", None
+                )
+                if (
+                    root is not None
+                    and (Path(root) / _normalized_rel(file_path)).is_dir()
+                ):
+                    return self._refuse(
+                        request,
+                        f"Refused: `{file_path}` is a DIRECTORY, not a doc — "
+                        "`delete` is recursive and would take the whole "
+                        "subtree. Delete the individual stale `.md` docs "
+                        "inside it instead.",
+                    )
+            except OSError:  # pragma: no cover - a stat error must not crash the guard
+                pass
             if self._writable_prefix and not _normalized_rel(file_path).startswith(
                 self._writable_prefix
             ):
@@ -252,14 +266,21 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
                 "finding in your reply instead (the supervisor applies fixes).",
             )
 
-        # The .metadata/ snapshot is read-only: refuse any write into it,
-        # regardless of extension, before the .md-only OKF checks below.
-        if _is_readonly_path(file_path):
+        # EVERY dot-directory is off-limits to write/edit, regardless of
+        # extension — same rule the delete branch enforces. `.metadata/` is
+        # the read-only snapshot, `.context/` the user's uploads, and
+        # `.harvest/` the run's own state (commit marker, review clustering,
+        # recorded context digests): a write into any of them corrupts an
+        # input or breaks a workflow contract (e.g. clobbering
+        # `.harvest/review/clusters.json` silently kills the documented
+        # cluster_ids retry path).
+        if _has_dot_segment(file_path):
             return self._refuse(
                 request,
-                f"Refused: `{file_path}` is under the read-only `{_READONLY_DIR}/` "
-                "Glue metadata snapshot. It is an input to READ (via read_file / "
-                "grep / glob), never to write. Author bundle docs under "
+                f"Refused: `{file_path}` is under a reserved dot-directory "
+                f"(`{_READONLY_DIR}/` snapshot, `.context/` uploads, "
+                "`.harvest/` run state). Those are this run's INPUTS and "
+                "state — read-only for you. Author bundle docs under "
                 "datasets/, tables/, references/ instead.",
             )
 

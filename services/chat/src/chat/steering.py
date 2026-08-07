@@ -189,6 +189,16 @@ def _is_error_result(msg: Any) -> bool:
     return isinstance(content, str) and content.startswith("Error:")
 
 
+def _is_gate_denial(msg: Any) -> bool:
+    """A tool-boundary DENIAL (the guardrails gate's short-circuit payload).
+
+    A denial is an instructive refusal — its body names the exact corrective
+    action — not a failing attempt, so the trailing futility streak must not
+    read a run of denials (each for a different page) as flailing."""
+    content = getattr(msg, "content", None)
+    return isinstance(content, str) and '"denied"' in content
+
+
 def turn_slice(messages: list[Any]) -> list[Any]:
     """The messages of the CURRENT turn: from the last genuine user message on.
 
@@ -268,14 +278,25 @@ def detect(messages: list[Any]) -> Signal | None:
                 ):
                     return Signal("futility", _futility_text(name, errored_counts[key]))
 
-    # futility — trailing streak of errored results from the same tool.
+    # futility — trailing streak of errored results from the same tool
+    # (different args allowed: N differently-flailing run_sql attempts in a
+    # row IS futility). Gate DENIALS are exempt here: the guardrails gate's
+    # normal first contact is several read_page denials for DIFFERENT pages
+    # before the guardrails read, and each denial already names the fix — a
+    # "re-derive your approach" nudge over those is wrong guidance (and its
+    # cooldown then suppresses a genuine signal). An IDENTICAL denied call
+    # re-issued over and over still fires via errored_counts above.
     streak_tool: str | None = None
     streak = 0
     for msg in reversed(window):
         if not isinstance(msg, ToolMessage):
             continue
         name = getattr(msg, "name", None) or ""
-        if not _is_error_result(msg) or (streak_tool is not None and name != streak_tool):
+        if (
+            not _is_error_result(msg)
+            or _is_gate_denial(msg)
+            or (streak_tool is not None and name != streak_tool)
+        ):
             break
         streak_tool = name
         streak += 1

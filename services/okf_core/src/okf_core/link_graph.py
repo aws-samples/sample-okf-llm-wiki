@@ -69,13 +69,17 @@ class LinkGraph:
                 if md_path.name in (_INDEX_NAME, _LOG_NAME):
                     continue
                 rel = md_path.relative_to(self.root).with_suffix("")
-                if is_reserved_rel_segments(rel.parts):
+                if is_reserved_rel_segments(rel.parts[:-1]):
                     # Dot-dirs (.metadata/.context/.harvest) are authoring
                     # inputs and deepagents scratch dirs are runtime leakage —
                     # neither is a bundle concept, so keep them out of the
                     # graph (backlinks and review clusters only name real
-                    # docs). Shared rule: okf_core.paths (lint + index_gen
-                    # apply the same one).
+                    # docs). PARENTS only ([:-1]), exactly as lint applies the
+                    # shared rule: a table legitimately named
+                    # `conversation_history` must not vanish from the graph
+                    # (no backlinks, no review cluster) while lint demands
+                    # its doc — the reserved names are directories, never a
+                    # judgment on a doc's own stem.
                     continue
                 concept_id = "/".join(rel.parts)
                 try:
