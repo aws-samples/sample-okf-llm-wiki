@@ -1,5 +1,6 @@
 import {
   Fragment,
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -917,6 +918,23 @@ export default function HarvestView({
   // each other, so show Updated only when terminal to avoid a redundant row.
   const showUpdated = inner.updated_at && TERMINAL_STATUSES.has(currentStatus)
 
+  // The drill-in panel must track the LIVE square, not the click-time
+  // snapshot: a square opened while running would otherwise show "Still
+  // running…" forever — its completion lands in freshly merged rows the
+  // snapshot never sees. Re-derive by id from the current events each poll;
+  // the snapshot stays as the fallback (close animation, selection switch).
+  const liveSquare = useMemo(() => {
+    if (!square?.id) return null
+    for (const row of mergeRows(events, aborted)) {
+      if (row.kind !== "fleet") continue
+      // mergeRows materialises each fleet row's squares as an ARRAY (not the
+      // Map it accumulates into), so look up by the square's own id.
+      const live = row.squares.find((sq) => sq.id === square.id)
+      if (live) return live
+    }
+    return null
+  }, [events, aborted, square])
+
   // Full harvest is destructive when a bundle already exists (it wipes + rebuilds
   // every doc, discarding any prior authoring incl. applied annotations). Confirm
   // in that case; on a first-ever harvest (no bundle yet) start straight away.
@@ -1694,7 +1712,7 @@ export default function HarvestView({
           style={{ width: squarePanelWidth }}
         >
           <SubagentPanel
-            square={square}
+            square={liveSquare || square}
             onClose={() => setSquarePanelOpen(false)}
             onResizeStart={startSquarePanelResize}
             resizing={squarePanelDragging}
@@ -1955,7 +1973,10 @@ function FleetRow({ row, onOpenSquare }) {
 // Markdown-rendered pane for the sub-agent sheet. Same wrap rules as
 // AgentMessageDialog: long fenced code must wrap inside the panel, never
 // grow its intrinsic width.
-function MarkdownPane({ text, empty }) {
+// memo(): mounted inside the drag-resizable panel, which re-renders at
+// pointermove frequency — re-parsing the (up to 24KB) markdown per frame is
+// the drag jank; the text prop only changes when the square's I/O does.
+const MarkdownPane = memo(function MarkdownPane({ text, empty }) {
   if (!text) {
     return <p className="text-sm text-muted-foreground">{empty}</p>
   }
@@ -1971,7 +1992,7 @@ function MarkdownPane({ text, empty }) {
       </ReactMarkdown>
     </div>
   )
-}
+})
 
 // One sub-agent dispatch's I/O, opened by clicking its fleet square — the
 // chat citation panel's surface: an inset, rounded card that PUSHES the view
@@ -2023,7 +2044,7 @@ function SubagentPanel({ square, onClose, onResizeStart, resizing }) {
         </TabsList>
         <TabsContent
           value="output"
-          className="okf-thin-scroll min-h-0 flex-1 overflow-y-auto"
+          className="okf-thin-scroll min-h-0 flex-1 overflow-y-auto pr-2"
         >
           {sq.error ? (
             <p className="mb-3 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs break-words">
@@ -2043,7 +2064,7 @@ function SubagentPanel({ square, onClose, onResizeStart, resizing }) {
         </TabsContent>
         <TabsContent
           value="input"
-          className="okf-thin-scroll min-h-0 flex-1 overflow-y-auto"
+          className="okf-thin-scroll min-h-0 flex-1 overflow-y-auto pr-2"
         >
           <MarkdownPane
             text={sq.input}
@@ -2853,7 +2874,10 @@ function UsagePill({ usage }) {
 // to the bottom on new events only when the user is already pinned there (so
 // scrolling up to read history isn't yanked away). Uses a native overflow div —
 // shadcn ScrollArea exposes no viewport ref, which the auto-follow needs.
-function HarvestFeed({
+// memo(): the parent re-renders at pointermove frequency while the sub-agent
+// panel drags (width state lives in HarvestView) — every prop here is stable
+// between feed polls, so the whole merge + markdown subtree can skip those.
+const HarvestFeed = memo(function HarvestFeed({
   events,
   running,
   aborted,
@@ -2876,8 +2900,10 @@ function HarvestFeed({
     stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
   }
 
-  const rows = mergeRows(events, aborted)
-  const usage = latestUsage(events)
+  // Memoized on the events snapshot: the merge walks every event and the
+  // usage scan is O(n) — recomputing them on unrelated re-renders is waste.
+  const rows = useMemo(() => mergeRows(events, aborted), [events, aborted])
+  const usage = useMemo(() => latestUsage(events), [events])
 
   return (
     // min-h-0 flex-1: grow to fill the card's remaining height (the parent chain
@@ -2932,4 +2958,4 @@ function HarvestFeed({
       </div>
     </div>
   )
-}
+})

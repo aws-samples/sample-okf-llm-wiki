@@ -359,6 +359,15 @@ def run_full_harvest(
                 dataset,
                 ", ".join(removed),
             )
+        # Also reset the review workflow's state (.harvest/review/ — the
+        # persisted clustering + past run_review reports). clean_authored_output
+        # preserves .harvest/ wholesale for the commit marker, but a clustering
+        # from a PREVIOUS harvest describes docs this run is about to rebuild —
+        # a retry against it would review the wrong groups.
+        if remove_tree(Path(dataset_root) / ".harvest" / "review"):
+            log.info(
+                "Full harvest %s/%s: cleared prior review state", data_domain, dataset
+            )
 
         # Resolve the effective model config up front so we can both build the
         # agent with it AND record the resolved model/effort on the status row.

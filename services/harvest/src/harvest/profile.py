@@ -98,7 +98,7 @@ class ProfileConfig:
     topk: int = 20
     max_enum_queries: int = 15
     max_columns: int = 100
-    budget_s: int = 600
+    budget_s: int = 1800
     query_timeout_s: int = 60
 
     @classmethod
@@ -115,7 +115,7 @@ class ProfileConfig:
             topk=_env_int("OKF_HARVEST_PROFILE_TOPK", 20),
             max_enum_queries=_env_int("OKF_HARVEST_PROFILE_MAX_ENUM_QUERIES", 15),
             max_columns=_env_int("OKF_HARVEST_PROFILE_MAX_COLUMNS", 100),
-            budget_s=_env_int("OKF_HARVEST_PROFILE_BUDGET_S", 600),
+            budget_s=_env_int("OKF_HARVEST_PROFILE_BUDGET_S", 1800),
             query_timeout_s=_env_int("OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S", 60),
         )
 

@@ -112,6 +112,61 @@ def test_errored_call_does_not_seed_repetition():
     assert sig is not None and sig.kind == "repetition"
 
 
+def test_identical_errored_call_repeated_fires_futility_despite_interleaving():
+    """The SAME failing call re-issued over and over IS derailment even when
+    successful calls of another tool interleave — the successes break the
+    trailing-error-streak check, and errored calls never seed the repetition
+    set, so without a per-call error count this loop ran un-nudged forever
+    (deny → semantic_search → identical deny → …)."""
+    args = {"concept_id": "tables/orders"}
+    msgs = [_USER]
+    for i in range(steering.ERROR_STREAK):
+        msgs.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_page",
+                        "args": args,
+                        "id": f"e{i}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        )
+        msgs.append(
+            ToolMessage(
+                content='{"status": "denied"}',
+                name="read_page",
+                tool_call_id=f"e{i}",
+                status="error",
+            )
+        )
+        # An interleaved SUCCESS of another tool — breaks the trailing streak.
+        msgs.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "semantic_search",
+                        "args": {"q": f"try {i}"},
+                        "id": f"s{i}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        )
+        msgs.append(
+            ToolMessage(content="hits", name="semantic_search", tool_call_id=f"s{i}")
+        )
+    sig = detect(msgs)
+    assert sig is not None and sig.kind == "futility"
+    assert "`read_page`" in sig.text
+    # One error short of the threshold stays quiet (the instructed retry
+    # after a denial must not be nudged).
+    assert detect(msgs[: -4]) is None
+
+
 def test_ask_human_is_exempt_from_repetition():
     call = ("ask_human", {"questions": ["q"]})
     msgs = [_USER, _ai([call]), _tool("ask_human"), _ai([call])]

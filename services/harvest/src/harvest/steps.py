@@ -153,8 +153,12 @@ _LINT_EVENT_BUDGET = 8000
 # sub-agents get the same two texts via the harvest.subagent_io shim's
 # input/result enrichment events (forwarded as a `phase:"update"` feed event),
 # because the library's own lifecycle events carry neither.
+# 24KB, not the 8KB the other bounded texts use: a table-author brief carries
+# its context-digest slice and routinely exceeds 8KB, and a truncated brief
+# defeats the drill-in's purpose. Each event is one CloudWatch log line
+# (hard limit 256KB), so 24KB stays comfortably bounded.
 _TASK_TOOL = "task"
-_SUBAGENT_IO_MAX = 8000
+_SUBAGENT_IO_MAX = 24000
 
 
 def _bounded_text(value: Any, cap: int = _SUBAGENT_IO_MAX) -> str:
@@ -803,10 +807,14 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
             elif tool == _TASK_TOOL:
                 # A task dispatch's final answer (the sub-agent's return text,
                 # never its internal steps) — the fleet drill-in's Output tab.
-                text = _extract_ai_text(output)
-                if not text:
-                    content = getattr(output, "content", output)
-                    text = content if isinstance(content, str) else ""
+                # _result_text handles EVERY shape the task tool returns:
+                # deepagents' Command(update={"messages": [ToolMessage(...)]})
+                # (which reaches on_tool_end unchanged), a bare message, or a
+                # plain string — _extract_ai_text alone misses the Command
+                # envelope and left static-path dispatches with no result.
+                from harvest.subagent_io import _result_text
+
+                text = _result_text(output) or _extract_ai_text(output)
                 if text:
                     event["result"] = _bounded_text(text)
         self._emit(event)
@@ -876,12 +884,23 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         ):
             return
         sub_id = event.get("id") or ""
+        # An event carrying an explicit `batch` names its own fleet row — the
+        # run_review tool emits its dispatches this way (":review" / ":fix"
+        # waves keyed by ITS tool_call_id), because the eval-batch heuristic
+        # below would fold them into whatever eval() ran last. Library events
+        # never carry the key, so their grouping is unchanged.
+        explicit_batch = event.get("batch") or ""
         with self._lock:
             if phase == PHASE_START:
                 # Pin this sub-agent to the wave that's currently dispatching. Fall
                 # back to the raw eval_id if no top-level eval was seen (defensive:
                 # e.g. the static `task` path), so a batch is never empty.
-                batch = self._current_eval_batch or event.get("eval_id") or ""
+                batch = (
+                    explicit_batch
+                    or self._current_eval_batch
+                    or event.get("eval_id")
+                    or ""
+                )
                 if sub_id:
                     self._fleet_batch_of[sub_id] = batch
             elif phase in (PHASE_INPUT, PHASE_RESULT):
@@ -889,12 +908,22 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
                 # pinned batch WITHOUT popping it (complete/error still needs it).
                 batch = self._fleet_batch_of.get(sub_id)
                 if batch is None:
-                    batch = self._current_eval_batch or event.get("eval_id") or ""
+                    batch = (
+                        explicit_batch
+                        or self._current_eval_batch
+                        or event.get("eval_id")
+                        or ""
+                    )
             else:
                 # Terminal: reuse the batch pinned at start; fall back to current.
                 batch = self._fleet_batch_of.pop(sub_id, None)
                 if batch is None:
-                    batch = self._current_eval_batch or event.get("eval_id") or ""
+                    batch = (
+                        explicit_batch
+                        or self._current_eval_batch
+                        or event.get("eval_id")
+                        or ""
+                    )
         out: dict[str, Any] = {
             "kind": KIND_SUBAGENT,
             "phase": phase,

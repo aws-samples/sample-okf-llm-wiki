@@ -43,6 +43,8 @@ import json
 import os
 from typing import Annotated, Any, NotRequired
 
+from okf_core.paths import GUARDRAILS_CONCEPT_ID as _GUARDRAILS_CONCEPT_ID
+
 try:  # langchain/langgraph are present in the runtime image + the unit venv
     from langchain.agents.middleware import AgentMiddleware, AgentState
     from langchain_core.messages import ToolMessage
@@ -59,7 +61,9 @@ except Exception:  # pragma: no cover - only when langchain is absent
 _READ_TOOL = "read_page"
 
 #: The one concept id the gate is about (no .md — read_page's arg convention).
-GUARDRAILS_CONCEPT_ID = "references/usage_guardrails"
+#: The value's ONE owner is okf_core.paths — shared with the harvest (which
+#: authors and lint-requires the doc) so the two services can't drift.
+GUARDRAILS_CONCEPT_ID = _GUARDRAILS_CONCEPT_ID
 
 #: The checkpointed state channel: {"<domain>/<dataset>": True, ...}.
 STATE_KEY = "guardrails_read"

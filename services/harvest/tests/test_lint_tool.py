@@ -174,13 +174,20 @@ def test_lint_gate_is_wired_to_the_main_agent_of_full_harvests_only():
 def test_explain_crash_does_not_discard_the_offline_report(tmp_path, monkeypatch):
     """Step isolation: a crash in the EXPLAIN phase reports a failed step but
     keeps every offline finding — and the result is NOT ok."""
+    from okf_core import lint as core_lint
+
     from harvest import lint_tool as lt
 
     root = _fence_bundle(tmp_path)
 
-    def boom(_root):
+    def boom(*_a, **_k):
         raise OSError("mount went away")
 
+    # Break BOTH fence sources: the shared in-report collection (lint_bundle
+    # swallows this and leaves sql_fences None) and the tool's fallback
+    # re-collection — the failure then lands as a failed explain STEP while
+    # the offline report survives intact.
+    monkeypatch.setattr(core_lint, "_collect_fences", boom)
     monkeypatch.setattr(lt, "collect_sql_fences", boom)
     result = make_lint_tool(_ExplainSource(), root).invoke({})
     step = _step(result, "explain_sql")
@@ -210,8 +217,52 @@ def test_explain_wall_clock_budget_stops_the_engine_calls(tmp_path, monkeypatch)
     monkeypatch.setattr(lt, "time", _Clock())
     result = make_lint_tool(src, root).invoke({})
     assert src.queries == []  # nothing ran
-    note = _step(result, "explain_sql")["note"]
-    assert "TIME BUDGET HIT: 2 statement(s)" in note
+    step = _step(result, "explain_sql")
+    assert "TIME BUDGET HIT: 2 statement(s)" in step["note"]
+    # A gate that stopped checking must not claim it passed: budget-skipped
+    # statements make the step INCOMPLETE and the report not-ok, with the
+    # note pointing at the resume path (the per-run success cache).
+    assert step["status"] == "incomplete"
+    assert step["unvalidated"] == 2
+    assert result["ok"] is False
+    assert "re-run lint_bundle" in step["note"]
+
+
+def test_explain_statement_cap_also_blocks_ok_and_rerun_converges(
+    tmp_path, monkeypatch
+):
+    from harvest import lint_tool as lt
+
+    # A clean two-statement bundle (the shared fixture's badtable statement
+    # would rightly keep ok False on the re-run for a different reason).
+    root = tmp_path / "sales" / "f1"
+    _write(
+        root,
+        "tables/races.md",
+        _fm("Glue Table") + '```sql\nSELECT raceid FROM "f1"."races"\n```\n',
+    )
+    _write(
+        root,
+        "tables/results.md",
+        _fm("Glue Table") + '```sql\nSELECT resultid FROM "f1"."results"\n```\n',
+    )
+    monkeypatch.setattr(lt, "_MAX_EXPLAIN_STATEMENTS", 1)
+    src = _ExplainSource()
+    tool = make_lint_tool(src, root)
+    first = tool.invoke({})
+    step = _step(first, "explain_sql")
+    assert step["status"] == "incomplete"
+    assert step["unvalidated"] == 1
+    assert first["ok"] is False
+    # The re-run the note prescribes resumes via the per-run success cache:
+    # the already-validated statement costs nothing, the remainder runs, and
+    # the explain step converges to ok with nothing left unvalidated. (The
+    # bundle still has offline findings — missing guardrails/overview — so
+    # overall ok stays False for THAT reason, not the explain step's.)
+    second = tool.invoke({})
+    step2 = _step(second, "explain_sql")
+    assert step2["status"] == "ok"
+    assert "unvalidated" not in step2
 
 
 def test_supervisor_prompt_prescribes_the_lint_gate_twice():
@@ -225,7 +276,7 @@ def test_supervisor_prompt_prescribes_the_lint_gate_twice():
     # the reviewer fixes are applied.
     norm = " ".join(p.split())
     assert "BEFORE the review fan-out" in norm
-    assert "after the reviewer fixes have been applied" in norm
+    assert "after the review pass (and your propagation-note edits)" in norm
     # Errors must be fixed and lint re-run; warnings are judgment calls.
     low = norm.lower()
     assert "re-run" in low and "warnings" in low

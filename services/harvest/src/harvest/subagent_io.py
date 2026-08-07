@@ -102,11 +102,33 @@ class _TaskToolShim:
     def __init__(self, inner: Any) -> None:
         self._inner = inner
 
+    def __getattr__(self, attr: str) -> Any:
+        # Full passthrough: today the library touches only .name and .arun,
+        # but langchain-quickjs is pinned with no upper bound — a future
+        # release reading any other tool attribute must hit the real tool,
+        # not an AttributeError that breaks every dispatch. (Only called for
+        # attributes not defined on the shim itself.)
+        return getattr(self._inner, attr)
+
     @property
     def name(self) -> str:
         return self._inner.name
 
     async def arun(self, payload: Any, **kwargs: Any) -> Any:
+        # Workflow-only sub-agent types (fix-author) cannot be dispatched from
+        # eval task() — this shim is the ONE interception point for that path
+        # (agent middleware never sees eval-borne dispatches). run_review's
+        # dispatches call the task tool directly, bypassing this shim. The
+        # raise surfaces to the JS promise as an instructive error.
+        from harvest.dispatch_policy import (
+            WORKFLOW_ONLY_DISPATCH_MSG,
+            WORKFLOW_ONLY_SUBAGENTS,
+        )
+
+        sub_type = payload.get("subagent_type") if isinstance(payload, dict) else None
+        if sub_type in WORKFLOW_ONLY_SUBAGENTS:
+            raise RuntimeError(WORKFLOW_ONLY_DISPATCH_MSG.format(sub=sub_type))
+
         runtime = payload.get("runtime") if isinstance(payload, dict) else None
         sub_id = getattr(runtime, "tool_call_id", None)
         if isinstance(payload, dict) and isinstance(sub_id, str) and sub_id:

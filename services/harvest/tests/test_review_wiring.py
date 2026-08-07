@@ -15,71 +15,78 @@ def test_reviewer_prompt_is_read_only_and_adversarial():
     # Adversarial + evidence-based.
     assert "REFUTE" in p
     assert "run_sql" in p
-    assert "no issues found" in p
+    # The machine-parsed verdict line (run_review keys the fixer dispatch on it).
+    assert "CLEAN" in p
+    assert "FINDINGS" in p
     # Verifies the load-bearing claims.
     for claim in ("Grain", "Schema", "join", "Gotchas"):
         assert claim in p
 
 
-def test_supervisor_runs_review_pass_via_task_fanout():
+def test_supervisor_runs_review_pass_via_the_run_review_tool():
+    # The review pass is ONE deterministic tool call — the supervisor never
+    # computes clusters, dispatches reviewers/fixers, or applies per-doc fixes
+    # itself (the megacontext + xhigh-thinking fix loop this design retired).
     p = prompts.SUPERVISOR_PROMPT
-    assert "review" in p.lower()
-    # Instructs the dynamic-subagent fan-out with the reviewer.
-    assert "reviewer" in p
-    assert "task(" in p
-    assert "subagentType" in p
-    # Fix only confirmed findings.
-    assert "CONFIRMED" in p or "confirmed" in p
+    assert "run_review" in p
+    assert "NO arguments" in p
+    # Confirmed-findings discipline still stated.
+    assert "confirmed" in p.lower()
+    # The old model-driven review orchestration is gone.
+    assert "clusters.map" not in p
+    assert "cluster_concepts" not in _step7(p)
+
+
+def _step7(p: str) -> str:
+    """The review-pass step text (step 7 up to step 8)."""
+    body = p.split("Adversarial review + fix pass")[1]
+    return body.split("Final lint gate")[0]
 
 
 def test_supervisor_review_must_run_in_subagents_not_the_executor():
-    # Adversarial review must go through the dynamic `reviewer` sub-agents, never
+    # Adversarial review must go through the tool's reviewer sub-agents, never
     # the supervisor itself — an author reviewing its own work carries the
     # author's bias. The prompt must explicitly forbid self-review and name the
     # bias rationale so the independence isn't optimized away.
     p = prompts.SUPERVISOR_PROMPT
-    assert "Never review the docs yourself" in p
+    assert "Never review or fix the docs yourself" in p
     assert "bias" in p.lower()
 
 
-def test_supervisor_review_covers_whole_bundle_not_a_subset():
-    # The review pass must be exhaustive: the supervisor is told to DISCOVER every
-    # authored doc (not review from memory / a sample) and dispatch one reviewer
-    # per doc for the complete set. A spot check is explicitly not a review.
-    p = prompts.SUPERVISOR_PROMPT
-    low = p.lower()
-    assert "whole bundle" in low or "complete set" in low
-    assert "subset" in low or "spot check" in low
-    assert "not from memory" in low or "discover" in low
-    # Enumerates on disk rather than a hand-typed partial list.
-    assert "glob" in low
-    # Coverage must be reported (docs existing == docs reviewed).
-    assert "must match" in low or "these MUST match" in p
+def test_supervisor_review_coverage_and_retry_contract():
+    # Coverage is by construction in the tool; the supervisor's obligations
+    # are the three follow-ups: propagation notes, failed-cluster retries
+    # (by EXACT cluster ids), and reporting the counts from the tool result.
+    p = " ".join(prompts.SUPERVISOR_PROMPT.split())
+    assert "full coverage by construction" in p
+    assert "propagation_notes" in p
+    assert "cluster_ids" in p
+    assert "failed ids" in p.lower()
+    # A cluster that still fails is reported, never quietly self-reviewed.
+    assert "do not review those docs yourself" in p.lower()
 
 
-def test_supervisor_reviews_in_link_clusters_not_per_doc():
-    # The fan-out is one reviewer per link-cluster (≤5 docs, grouped by the
-    # cluster_concepts tool), not one per doc — fewer subagents, and a reviewer
-    # holding the related set can catch cross-doc contradictions.
-    p = prompts.SUPERVISOR_PROMPT
-    assert "cluster_concepts" in p
-    assert "per cluster" in p.lower()
-    assert "AT MOST 5" in p or "at most 5" in p.lower()
-    # The JS example dispatches over clusters, not a flat doc list.
-    assert "clusters.map" in p
+def test_supervisor_step7_names_the_cluster_confined_fixer():
+    # The fixer's write confinement is stated so the supervisor understands
+    # why out-of-cluster corrections come back as propagation notes — and the
+    # supervisor-owned hubs (overview docs, usage_guardrails) are named as
+    # excluded from clustering, reachable only via those notes.
+    step7 = _step7(prompts.SUPERVISOR_PROMPT)
+    assert "fix-author" in step7
+    assert "hard-limited" in step7.lower()
+    assert "usage_guardrails" in step7
+    assert "never" in step7.lower() and "clustered" in step7.lower()
 
 
-def test_supervisor_eval_is_task_only_clusters_come_from_a_direct_tool_call():
-    # A live run showed eval() exposes ONLY the task() global — the old JS
-    # example called glob(...) inside eval and it didn't exist, forcing the
-    # agent to improvise. The prompt must state the task-only rule, and the
-    # example must NOT call tools from JS: cluster_concepts is called directly
-    # (step 1) and its result inlined as a literal (step 2).
+def test_supervisor_eval_fanout_rules_still_carried_for_authoring():
+    # The eval/task() operational rules (task-only global, no responseSchema,
+    # no .catch swallowing) were learned from live failures and still govern
+    # the AUTHORING fan-outs — retiring the model-driven review pass must not
+    # retire them.
     p = prompts.SUPERVISOR_PROMPT
     assert "ONLY the `task()` global" in p
     assert "await cluster_concepts" not in p
     assert "await glob" not in p
-    assert "VERBATIM" in p  # the inlined literal is the tool's output, complete
 
 
 def test_reviewer_reviews_a_cluster_with_cross_doc_checks():
@@ -121,16 +128,16 @@ def test_runtime_carries_essence_and_context_convergence_bars():
 def test_supervisor_forbids_response_schema_on_task():
     # responseSchema drives langchain's AutoStrategy -> ProviderStrategy, which
     # emits native output_config.format alongside adaptive thinking. Bedrock's
-    # Claude rejects that combination, failing every reviewer. The supervisor
-    # must be told NOT to pass it.
+    # Claude rejects that combination, failing every dispatch. The supervisor
+    # must be told NOT to pass it (authoring fan-outs still ride task()).
     p = prompts.SUPERVISOR_PROMPT
     assert "responseSchema" in p
     assert "output_config.format" in p  # names the exact rejected field
 
 
-def test_supervisor_forbids_swallowing_reviewer_errors():
+def test_supervisor_forbids_swallowing_dispatch_errors():
     # A .catch() that turns a failed task() into an empty result makes a broken
-    # review pass look clean (the exact failure mode we hit: clean:0, issues:[]).
+    # fan-out look clean (the exact failure mode we hit: clean:0, issues:[]).
     p = prompts.SUPERVISOR_PROMPT
     assert ".catch(" in p
     assert "swallow" in p.lower()

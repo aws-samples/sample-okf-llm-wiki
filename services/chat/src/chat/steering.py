@@ -240,6 +240,13 @@ def detect(messages: list[Any]) -> Signal | None:
             if call_id:
                 results_by_id[call_id] = m
     seen_calls: set[tuple[str, str]] = set()
+    # Identical calls that ERRORED don't seed the repetition set (the retry a
+    # denial instructs is course correction, not derailment) — but the SAME
+    # failing call re-issued over and over IS derailment, and interleaved
+    # successes of other tools break the trailing-streak futility check
+    # below. Count identical errored calls across the whole turn so the
+    # deny → other tool → identical deny alternation still gets a nudge.
+    errored_counts: dict[tuple[str, str], int] = {}
     for msg in window:
         if not isinstance(msg, AIMessage):
             continue
@@ -253,6 +260,13 @@ def detect(messages: list[Any]) -> Signal | None:
             result = results_by_id.get(tc.get("id") or "")
             if result is None or not _is_error_result(result):
                 seen_calls.add(key)
+            else:
+                errored_counts[key] = errored_counts.get(key, 0) + 1
+                if (
+                    errored_counts[key] >= ERROR_STREAK
+                    and "futility" not in fired_kinds
+                ):
+                    return Signal("futility", _futility_text(name, errored_counts[key]))
 
     # futility — trailing streak of errored results from the same tool.
     streak_tool: str | None = None

@@ -52,7 +52,7 @@ def _explain_key(stmt: str) -> str:
 
 
 def _explain_step(
-    source: Source, root: Path, explained_ok: set[str]
+    source: Source, fences: list[SqlFence], explained_ok: set[str]
 ) -> tuple[dict[str, Any], list[LintFinding]]:
     """Run ``EXPLAIN`` for every runnable, non-templated ```sql statement.
 
@@ -81,7 +81,6 @@ def _explain_step(
         return step, []
 
     deadline = time.monotonic() + _EXPLAIN_TIME_BUDGET_S
-    fences: list[SqlFence] = collect_sql_fences(root)
     findings: list[LintFinding] = []
     ran = cached = templated = external = capped = timed_out = 0
     for fence in fences:
@@ -131,6 +130,7 @@ def _explain_step(
         notes.append(f"skipped {templated} templated (placeholder) statement(s)")
     if external:
         notes.append(f"skipped {external} external/ statement(s) (outside this run's engine session)")
+    unvalidated = capped + timed_out
     if capped:
         notes.append(f"CAP HIT: {capped} statement(s) beyond {_MAX_EXPLAIN_STATEMENTS} not validated")
     if timed_out:
@@ -138,13 +138,27 @@ def _explain_step(
             f"TIME BUDGET HIT: {timed_out} statement(s) not validated "
             f"(budget {int(_EXPLAIN_TIME_BUDGET_S)}s)"
         )
+    if unvalidated:
+        notes.append(
+            "re-run lint_bundle to validate the remainder — already-validated "
+            "statements are cached for this run and cost nothing"
+        )
+    # Cap/budget skips make the step INCOMPLETE, and the report below refuses
+    # ok:true for it — a gate that stopped checking must not claim it passed.
+    # Convergence is via the success cache: each re-run validates another
+    # budget's worth, so repeated calls (the workflow already prescribes
+    # fix-and-re-run) finish the job instead of re-treading it.
     step = {
         "step": "explain_sql",
-        "status": "issues" if findings else "ok",
+        "status": (
+            "issues" if findings else ("incomplete" if unvalidated else "ok")
+        ),
         "errors": len(findings),
         "warnings": 0,
         "note": "; ".join(notes),
     }
+    if unvalidated:
+        step["unvalidated"] = unvalidated
     return step, findings
 
 
@@ -174,10 +188,15 @@ def make_lint_tool(source: Source, dataset_root: Path) -> Any:
         reviewers verify a complete bundle) and again before finishing, after
         the reviewer fixes are applied. Fix every ERROR it reports and re-run
         until none remain; warnings are judgment calls (fix or justify).
-        `ok: true` means no errors and no failed steps.
+        `ok: true` means no errors, no failed steps, and no statements left
+        unvalidated by the EXPLAIN cap/time budget (a re-run resumes where it
+        stopped — validated statements are cached for the run).
         """
         try:
-            report = _lint_offline(root)
+            # collect_fences=True: the report and the EXPLAIN step share ONE
+            # parsed-bundle context instead of re-walking and re-parsing every
+            # doc a second time per gate call.
+            report = _lint_offline(root, collect_fences=True)
             steps: list[dict[str, Any]] = []
             for s in report.steps:
                 entry: dict[str, Any] = {
@@ -195,8 +214,13 @@ def make_lint_tool(source: Source, dataset_root: Path) -> Any:
             # already-computed offline findings — the docstring promises
             # step isolation, so honor it.
             try:
+                fences = (
+                    report.sql_fences
+                    if report.sql_fences is not None
+                    else collect_sql_fences(root)  # collection failed: retry here
+                )
                 explain_entry, explain_findings = _explain_step(
-                    source, root, explained_ok
+                    source, fences, explained_ok
                 )
             except Exception as e:  # noqa: BLE001 — failed step, not a lost report
                 explain_findings = []
@@ -220,6 +244,10 @@ def make_lint_tool(source: Source, dataset_root: Path) -> Any:
                     report.ok
                     and not explain_findings
                     and explain_entry["status"] != "failed"
+                    # Cap/budget-skipped statements = the gate didn't finish;
+                    # ok would falsely bless SQL it never looked at. The note
+                    # tells the model a re-run resumes via the success cache.
+                    and not explain_entry.get("unvalidated")
                 ),
                 "steps": steps,
                 "findings": shown,

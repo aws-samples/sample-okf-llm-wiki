@@ -110,6 +110,20 @@ def test_shim_emits_input_then_result_with_the_ptc_id():
     ]
 
 
+def test_shim_passes_unknown_attributes_through_to_the_wrapped_tool():
+    """langchain-quickjs is pinned with no upper bound — a future release
+    touching any attribute beyond .name/.arun must reach the real tool, not
+    AttributeError every dispatch."""
+    inner = _Inner(_Cmd({"messages": [_Msg("x")]}))
+    inner.description = "dispatch a subagent"
+    inner.args_schema = {"description": str}
+    shim = _TaskToolShim(inner)
+    assert shim.description == "dispatch a subagent"
+    assert shim.args_schema == {"description": str}
+    with pytest.raises(AttributeError):
+        _ = shim.does_not_exist_anywhere
+
+
 def test_shim_without_id_or_writer_is_silent():
     events: list[dict] = []
     inner = _Inner(_Cmd({"messages": [_Msg("answer")]}))
@@ -142,6 +156,24 @@ def test_shim_skips_empty_texts():
     rt = SimpleNamespace(tool_call_id="ptc_task_x", stream_writer=events.append)
     asyncio.run(_TaskToolShim(inner).arun(_payload(rt, description="  ")))
     assert events == []
+
+
+def test_shim_blocks_workflow_only_dispatches_from_eval():
+    """fix-author cannot be dispatched from eval task() — the shim is the one
+    interception point for that path (agent middleware never sees it). The
+    refusal raises BEFORE any dispatch or event."""
+    events: list[dict] = []
+    inner = _Inner(_Cmd({"messages": [_Msg("should never run")]}))
+    rt = SimpleNamespace(tool_call_id="ptc_task_x", stream_writer=events.append)
+    payload = {
+        "description": "fix tables/a",
+        "subagent_type": "fix-author",
+        "runtime": rt,
+    }
+    with pytest.raises(RuntimeError, match="run_review"):
+        asyncio.run(_TaskToolShim(inner).arun(payload))
+    assert inner.payloads == []  # never dispatched
+    assert events == []  # no lifecycle noise for a refused dispatch
 
 
 def test_shim_propagates_inner_errors_after_input_event():

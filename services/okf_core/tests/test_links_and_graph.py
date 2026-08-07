@@ -147,3 +147,45 @@ def test_cluster_is_deterministic(tmp_path):
     first = g.cluster(max_size=2)
     g.mark_dirty()
     assert g.cluster(max_size=2) == first
+
+
+def test_cluster_exclude_removes_docs_before_clusters_form(tmp_path):
+    # An excluded hub must not just vanish from the OUTPUT — it must not
+    # participate in cluster FORMATION either. The guardrails doc links to
+    # every table (highest degree), so if it merely got filtered afterwards it
+    # would still have seeded a cluster of unrelated tables and stolen them
+    # from their own spokes.
+    _write(
+        tmp_path,
+        "references/usage_guardrails.md",
+        "Guardrails",
+        "[a](../tables/a.md) [b](../tables/b.md) [c](../tables/c.md)\n",
+    )
+    _write(tmp_path, "tables/a.md", "A", "[ea](../references/enums/ea.md)\n")
+    _write(tmp_path, "references/enums/ea.md", "EA", "[a](../../tables/a.md)\n")
+    _write(tmp_path, "tables/b.md", "B", "[eb](../references/enums/eb.md)\n")
+    _write(tmp_path, "references/enums/eb.md", "EB", "[b](../../tables/b.md)\n")
+    _write(tmp_path, "tables/c.md", "C", "no links\n")
+
+    def owned(concept_id):
+        return concept_id == "references/usage_guardrails"
+
+    clusters = LinkGraph(tmp_path).cluster(max_size=2, exclude=owned)
+    flat = [c for cluster in clusters for c in cluster]
+    assert "references/usage_guardrails" not in flat
+    assert sorted(flat) == [
+        "references/enums/ea",
+        "references/enums/eb",
+        "tables/a",
+        "tables/b",
+        "tables/c",
+    ]
+    # With the hub gone, each table clusters with ITS OWN enum — the pairing
+    # the hub would have broken by grabbing the tables as its neighbors.
+    assert ["tables/a", "references/enums/ea"] in [sorted(c, reverse=True) for c in clusters]
+    assert ["tables/b", "references/enums/eb"] in [sorted(c, reverse=True) for c in clusters]
+    # Backlinks are untouched — exclusion is a review-partition concern only.
+    g = LinkGraph(tmp_path)
+    assert any(
+        b["id"] == "references/usage_guardrails" for b in g.get_backlinks("tables/a")
+    )

@@ -35,9 +35,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from okf_core.paths import GUARDRAILS_DOC_PATH
+
 #: The operating-contract page: shared context for every extractor and an
 #: isolated cluster of its own.
-CONTRACT_PATH = "references/usage_guardrails.md"
+# The value's ONE owner is okf_core.paths (shared with lint, the review
+# workflow, and the chat gate).
+CONTRACT_PATH = GUARDRAILS_DOC_PATH
 
 #: Packing caps. Token counts are the cheap bytes/4 estimate — the caps bound
 #: attention dilution, they are not billing math.

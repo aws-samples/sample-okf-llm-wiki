@@ -447,3 +447,34 @@ def test_unclosed_fence_at_eof_still_counts(tmp_path):
     _write(root, "tables/t.md", _fm("Glue Table") + "```sql\nSELECT 1\n")
     (fence,) = collect_sql_fences(root)
     assert fence.statements == ["SELECT 1"]
+
+
+def test_sql_fence_quoted_inside_a_plain_fence_is_not_collected(tmp_path):
+    # A bare ``` fence must be TRACKED: when it went untracked, a literal
+    # ```sql line quoted inside it opened a phantom SQL fence and the quoted
+    # example was EXPLAINed as runnable SQL (false gate errors).
+    root = tmp_path / "b"
+    _write(
+        root,
+        "tables/t.md",
+        _fm("Glue Table")
+        + "How to document a query:\n\n"
+        + "```\nwrite a fence like this:\n```sql\nSELECT quoted_example FROM x\n```\n\n"
+        + "```sql\nSELECT real FROM t\n```\n",
+    )
+    fences = collect_sql_fences(root)
+    texts = [f.text for f in fences]
+    assert all("quoted_example" not in t for t in texts)
+    assert any("SELECT real FROM t" in t for t in texts)
+
+
+def test_link_to_generated_index_is_not_a_broken_link(tmp_path):
+    # index.md/log.md are wiped at full-harvest start and only re-created by
+    # finalize — AFTER both lint gates — and the guard refuses agent writes
+    # to them. A legitimate link to one must not be an unfixable gate error.
+    root = _bundle(tmp_path)
+    with (root / "tables/races.md").open("a", encoding="utf-8") as f:
+        f.write("\nSee [all tables](index.md) and [the run log](../log.md).\n")
+    report = lint_bundle(root)
+    broken = [f.message for f in report.findings if f.code == "broken-link"]
+    assert not any("index.md" in m or "log.md" in m for m in broken)

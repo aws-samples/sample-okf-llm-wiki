@@ -247,7 +247,7 @@ def test_delete_is_wired_to_the_supervisor_guard_only():
     # A separate guard instance carries allow_delete, used by the MAIN
     # middleware only; sub-agent specs keep the plain `guard`.
     assert "allow_delete=True," in src
-    assert "main_middleware = [main_guard," in src
+    assert "main_middleware = [ main_guard," in " ".join(src.split())
     assert src.count('"middleware": [guard, tool_errors, prompt_cache]') >= 2
     # Full harvests only (scoped/cross prompts never mention the tool).
     assert "full_harvest = cross_target is None and supervisor_prompt is None" in src
@@ -289,9 +289,120 @@ def test_read_only_guard_refuses_all_writes(monkeypatch):
         req = _request(name=name, **args)
         result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
         assert isinstance(result, dict) and result["status"] == "error"
+    # The read-only delete refusal must NOT tell the agent to use edit_file —
+    # that instruction would just earn a second refusal from the read-only
+    # branch. It says report-in-reply instead.
+    req = _request(name="delete")
+    result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+    assert "edit_file" not in result["content"]
+    assert "READ-ONLY" in result["content"]
+    assert "reply" in result["content"]
     # Non-guarded tools (reads) are untouched.
     req = _request(name="read_file")
     assert mw.wrap_tool_call(req, lambda r: "READ") == "READ"
+
+
+# --------------------------------------------------------------------------- #
+# write_allowlist — the fix-author variant: writes only to the paths of the
+# review cluster bound to the CURRENT dispatch (run_review's contextvar), and
+# FAIL CLOSED when nothing is bound.
+# --------------------------------------------------------------------------- #
+
+
+def test_write_allowlist_confines_the_fixer(monkeypatch):
+    monkeypatch.setattr(
+        okf_guard,
+        "ToolMessage",
+        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
+    )
+    allowed = {"value": frozenset({"tables/races.md"})}
+    mw = OKFGuardMiddleware(
+        _AllowEngine(),
+        read_current=lambda _p: None,
+        write_allowlist=lambda: allowed["value"],
+    )
+    # In-cluster write proceeds (and still runs the engine's OKF checks).
+    req = _request(file_path="tables/races.md", content="x")
+    assert mw.wrap_tool_call(req, lambda r: "WROTE") == "WROTE"
+    assert req.tool_call["args"]["content"].endswith("<normalized>")
+
+    # Out-of-cluster write refused with the propagation-note instruction —
+    # including a non-.md path (a fixer writes nothing outside its cluster)
+    # and a dot-segment path aimed at an allowed doc.
+    for path in ("tables/results.md", "notes.txt", "tables/../datasets/x.md"):
+        req = _request(name="edit_file", file_path=path, old_string="a", new_string="b")
+        result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+        assert isinstance(result, dict) and result["status"] == "error"
+        assert "PROPAGATION NOTES" in result["content"]
+
+    # Fail closed: no cluster bound (the contextvar default) = every write
+    # refused, with a message that says why.
+    allowed["value"] = None
+    req = _request(file_path="tables/races.md", content="x")
+    result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+    assert result["status"] == "error"
+    assert "no review cluster is bound" in result["content"]
+
+    # Reads are untouched either way.
+    req = _request(name="read_file", file_path="tables/results.md")
+    assert mw.wrap_tool_call(req, lambda r: "READ") == "READ"
+
+
+# --------------------------------------------------------------------------- #
+# SubagentDispatchGuard — the model may not dispatch workflow-only sub-agent
+# types (fix-author) itself; run_review's direct task-tool calls bypass this
+# middleware by construction.
+# --------------------------------------------------------------------------- #
+
+from harvest.okf_guard import SubagentDispatchGuard  # noqa: E402
+
+
+def test_dispatch_guard_refuses_fix_author_sync_and_async(monkeypatch):
+    monkeypatch.setattr(
+        okf_guard,
+        "ToolMessage",
+        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
+    )
+    mw = SubagentDispatchGuard()
+    req = types.SimpleNamespace(
+        tool_call={
+            "name": "task",
+            "args": {"subagent_type": "fix-author", "description": "fix stuff"},
+            "id": "call-1",
+        }
+    )
+    result = mw.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+    assert result["status"] == "error"
+    assert "run_review" in result["content"]
+    assert "edit_file" in result["content"]
+
+    async def handler(r):
+        return "SHOULD NOT RUN"
+
+    result = asyncio.run(mw.awrap_tool_call(req, handler))
+    assert result["status"] == "error"
+
+
+def test_dispatch_guard_passes_other_dispatches_and_tools():
+    mw = SubagentDispatchGuard()
+    for name, args in (
+        ("task", {"subagent_type": "reviewer"}),
+        ("task", {"subagent_type": "table-author"}),
+        ("write_file", {"file_path": "tables/x.md"}),
+    ):
+        req = types.SimpleNamespace(
+            tool_call={"name": name, "args": args, "id": "call-1"}
+        )
+        assert mw.wrap_tool_call(req, lambda r: "RAN") == "RAN"
+
+
+def test_dispatch_guard_is_wired_to_the_main_agent():
+    import inspect
+
+    from harvest import agent as ag
+
+    src = inspect.getsource(ag.build_harvest_agent)
+    assert "SubagentDispatchGuard()," in src
 
 
 # --------------------------------------------------------------------------- #

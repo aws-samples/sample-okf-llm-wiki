@@ -208,8 +208,13 @@ def test_task_dispatch_carries_brief_and_final_answer():
     (`full` — the label keeps only a teaser) and its success RESULT carries
     the sub-agent's final answer (`result`), both bounded. Never the
     sub-agent's internal steps — those stay filtered."""
+    from harvest.steps import _SUBAGENT_IO_MAX
+
     events, sink = _collect()
     em = StepEmitter(sink)
+    # A realistic table-author brief (context-digest slice) fits UNTRUNCATED —
+    # a 9KB brief used to be cut at the old 8KB cap, which defeated the
+    # drill-in's purpose.
     brief = "Author tables/races.\n\nGrounding digest:\n- " + "x" * 9000
     em.on_tool_start(
         {"name": "task"},
@@ -218,15 +223,47 @@ def test_task_dispatch_carries_brief_and_final_answer():
         inputs={"subagent_type": "table-author", "description": brief},
     )
     start = events[-1]
-    assert start["full"].startswith("Author tables/races.")
-    assert len(start["full"]) <= 8000  # bounded
+    assert start["full"] == brief  # 9KB fits whole
+    # A runaway text is still bounded at the cap.
+    em.on_tool_start(
+        {"name": "task"},
+        "",
+        run_id="t2",
+        inputs={"subagent_type": "table-author", "description": "z" * 40000},
+    )
+    assert len(events[-1]["full"]) <= _SUBAGENT_IO_MAX
 
     answer = "## Authored tables/races\n\n- grain verified\n" + "y" * 9000
     em.on_tool_end(_FakeMessage(answer, status="success"), run_id="t1")
     end = events[-1]
     assert end["ok"] is True
-    assert end["result"].startswith("## Authored tables/races")
-    assert len(end["result"]) <= 8000  # bounded
+    assert end["result"] == answer  # 9KB fits whole
+    em.on_tool_end(_FakeMessage("w" * 40000, status="success"), run_id="t2")
+    assert len(events[-1]["result"]) <= _SUBAGENT_IO_MAX
+
+
+def test_task_result_unwraps_the_command_envelope():
+    """deepagents' task tool returns Command(update={'messages':
+    [ToolMessage(answer)]}) and langchain's on_tool_end receives it UNCHANGED
+    — the extraction must unwrap that envelope, or every static-path dispatch
+    shows an empty Output tab (the live bug: only message-shaped fakes were
+    tested)."""
+
+    class _FakeCommand:
+        def __init__(self, text):
+            self.update = {"messages": [_FakeMessage(text, status="success")]}
+
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start(
+        {"name": "task"},
+        "",
+        run_id="t9",
+        inputs={"subagent_type": "table-author", "description": "Author tables/x"},
+    )
+    em.on_tool_end(_FakeCommand("done: tables/x verified"), run_id="t9")
+    assert events[-1]["ok"] is True
+    assert events[-1]["result"] == "done: tables/x verified"
 
 
 def test_non_task_success_still_carries_no_result():
@@ -331,6 +368,39 @@ def test_emit_subagent_io_enrichment_forwards_as_update():
     assert events[-1]["batch"] == "b"
 
 
+def test_emit_subagent_explicit_batch_beats_the_eval_heuristic():
+    """run_review emits its dispatches with an explicit `batch` (two waves
+    keyed by ITS call id). That must win over the current-eval heuristic —
+    otherwise a review square would fold into whatever eval() ran last."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    # A prior eval left a current batch behind.
+    em.on_tool_start({"name": "eval"}, "", run_id="eval-1", inputs={"code": "x"})
+    em.emit_subagent_event(
+        {
+            "type": "subagent",
+            "phase": "start",
+            "id": "rev-c1",
+            "batch": "call_9:review",
+            "subagent_type": "reviewer",
+            "label": "c1 · 3 docs",
+            "description": "Adversarially verify: tables/a, tables/b",
+        }
+    )
+    start = events[-1]
+    assert start["batch"] == "call_9:review"
+    assert start["full"].startswith("Adversarially verify")
+    # Terminal reuses the pinned explicit batch.
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "complete", "id": "rev-c1", "result": "CLEAN"}
+    )
+    assert events[-1]["batch"] == "call_9:review"
+    assert events[-1]["result"] == "CLEAN"
+    # Library events (no explicit batch) keep the eval heuristic.
+    em.emit_subagent_event({"type": "subagent", "phase": "start", "id": "s9"})
+    assert events[-1]["batch"] == "eval-1"
+
+
 def test_emit_subagent_io_enrichment_is_bounded_and_skips_empty():
     """An enrichment with no usable text emits nothing (there is nothing to
     patch); an overlong one is bounded like every other I/O text."""
@@ -346,11 +416,13 @@ def test_emit_subagent_io_enrichment_is_bounded_and_skips_empty():
     em.emit_subagent_event({"type": "subagent", "phase": "result", "id": "s1"})
     assert len(events) == n
 
+    from harvest.steps import _SUBAGENT_IO_MAX
+
     em.emit_subagent_event(
-        {"type": "subagent", "phase": "result", "id": "s1", "result": "y" * 20000}
+        {"type": "subagent", "phase": "result", "id": "s1", "result": "y" * 40000}
     )
     assert events[-1]["phase"] == "update"
-    assert len(events[-1]["result"]) <= 8000
+    assert len(events[-1]["result"]) <= _SUBAGENT_IO_MAX
 
 
 def _lint_report(n_findings=2, message="Doc `tables/x.md` is missing."):

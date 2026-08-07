@@ -24,6 +24,11 @@ Two refusals sit in front of the engine checks:
   sub-agents (reviewer, context-extractor): every write/edit is refused, so
   "read-only" is enforced at the tool boundary rather than promised by the
   prompt (deepagents hands every sub-agent the backend's write tools).
+* ``write_allowlist=`` builds the ``fix-author`` variant: writes are allowed
+  ONLY to the exact paths the callable returns — run_review binds it to the
+  dispatch's review cluster via a contextvar (see ``harvest.review``), which
+  is what makes parallel fixers unable to touch each other's files. Fails
+  closed: no binding = every write refused.
 
 ``ToolErrorMiddleware`` converts any exception a tool RAISES into a
 ``ToolMessage(status="error")`` so a single failing call (a ``PermissionError``
@@ -56,6 +61,15 @@ except Exception:  # pragma: no cover - exercised only when langchain is absent
     _HAVE_LANGCHAIN = False
 
 _GUARDED_TOOLS = {"write_file", "edit_file", "delete"}
+
+# Sub-agent types ONLY the run_review workflow may dispatch (and the refusal
+# text) live in harvest.dispatch_policy — a dependency-free module, because
+# the OTHER enforcement point (the harvest.subagent_io shim, covering the
+# QuickJS task() path) must stay importable without okf_core/langchain.
+from harvest.dispatch_policy import (  # noqa: E402
+    WORKFLOW_ONLY_DISPATCH_MSG,
+    WORKFLOW_ONLY_SUBAGENTS,
+)
 
 # The read-only Glue metadata snapshot (see metadata_export.py). Any write/edit
 # whose path lands in this dir is refused: the snapshot is an INPUT the agent
@@ -118,6 +132,7 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         writable_prefix: str | None = None,
         read_only: bool = False,
         allow_delete: bool = False,
+        write_allowlist: Callable[[], frozenset[str] | None] | None = None,
     ):
         super().__init__()
         self.engine = engine
@@ -131,6 +146,13 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         # The full-harvest supervisor only (see the module docstring): may
         # retire a single stale .md doc. Never set for sub-agents.
         self._allow_delete = allow_delete and not read_only
+        # The `fix-author` variant: a CALLABLE returning the exact set of
+        # root-relative paths this dispatch may write (bound per dispatch by
+        # run_review via a contextvar — see harvest.review). Evaluated on
+        # every write so parallel dispatches each see their own cluster.
+        # FAILS CLOSED: None/empty (no cluster bound to this call chain, e.g.
+        # a manual task() dispatch) refuses every write.
+        self._write_allowlist = write_allowlist
 
     def wrap_tool_call(self, request, handler):  # type: ignore[override]
         """Sync path (invoke/stream)."""
@@ -174,6 +196,17 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         # everything else keeps the original blanket refusal.
         if name == "delete":
             if not self._allow_delete:
+                # Tailor the guidance to what THIS agent can actually do: a
+                # read-only agent told to "use edit_file instead" just earns
+                # a second refusal from the read-only branch below.
+                if self._read_only:
+                    return self._refuse(
+                        request,
+                        f"Refused: `delete` is not available to this agent, "
+                        f"and this agent is READ-ONLY. Report the stale doc "
+                        f"in your reply instead — the supervisor owns "
+                        f"removals; `{file_path}` was not touched.",
+                    )
                 return self._refuse(
                     request,
                     f"Refused: `delete` is not available to this agent. Correct "
@@ -230,6 +263,30 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
                 "datasets/, tables/, references/ instead.",
             )
 
+        # Fixer confinement: a run_review fix dispatch may write ONLY the doc
+        # paths of its own cluster (bound per dispatch — parallel fixers can
+        # never touch each other's files). Anything else — including when NO
+        # cluster is bound to this call chain — is refused with instructions
+        # to report the change instead.
+        if self._write_allowlist is not None:
+            allowed = self._write_allowlist() or frozenset()
+            rel = _normalized_rel(file_path) if file_path else ""
+            if rel not in allowed:
+                scope = (
+                    ", ".join(f"`{p}`" for p in sorted(allowed))
+                    if allowed
+                    else "none — no review cluster is bound to this dispatch"
+                )
+                return self._refuse(
+                    request,
+                    f"Refused: `{file_path}` is not in this fix dispatch's "
+                    f"cluster (writable files: {scope}). Do NOT edit files "
+                    "outside your cluster — finish your in-cluster fixes and "
+                    "list the needed out-of-cluster change under a "
+                    "`PROPAGATION NOTES` section in your reply; the "
+                    "supervisor applies those serially.",
+                )
+
         # Cross-dataset confinement: this run may write ONLY under its pair
         # subtree; everything else in the bundle is read-only context.
         if self._writable_prefix and file_path:
@@ -270,6 +327,43 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         # (and the step feed's tool_result row shows ok=False).
         return ToolMessage(
             content=msg, tool_call_id=request.tool_call["id"], status="error"
+        )
+
+
+class SubagentDispatchGuard(AgentMiddleware):  # type: ignore[misc]
+    """Refuse model-driven ``task`` dispatches of workflow-only sub-agent types.
+
+    Attached to the MAIN agent's middleware in every mode. Covers the static
+    ``task`` tool path (this middleware wraps the supervisor's ToolNode); the
+    QuickJS ``task()`` path is covered by the same blocklist inside the
+    ``harvest.subagent_io`` shim, because eval-borne dispatches never reach
+    agent middleware. ``run_review``'s own dispatches call the task tool
+    object directly and are intentionally NOT intercepted by either.
+    """
+
+    def wrap_tool_call(self, request, handler):  # type: ignore[override]
+        refusal = self._check(request)
+        if refusal is not None:
+            return refusal
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):  # type: ignore[override]
+        refusal = self._check(request)
+        if refusal is not None:
+            return refusal
+        return await handler(request)
+
+    def _check(self, request):
+        tool_call = request.tool_call
+        if tool_call["name"] != "task":
+            return None
+        sub = (tool_call.get("args") or {}).get("subagent_type")
+        if sub not in WORKFLOW_ONLY_SUBAGENTS:
+            return None
+        return ToolMessage(
+            content=WORKFLOW_ONLY_DISPATCH_MSG.format(sub=sub),
+            tool_call_id=tool_call["id"],
+            status="error",
         )
 
 

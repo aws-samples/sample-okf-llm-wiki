@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from okf_core.document import OKFDocument
+from okf_core.paths import is_reserved_rel_segments
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +47,8 @@ def _build_index_text(entries: list[tuple[str, str, str, str]]) -> str:
 # Directory names that are never OKF concept dirs and must not get an index.md
 # or contribute entries: dot-prefixed reserved dirs (.harvest, .context) and
 # deepagents' internal scratch dirs (defense-in-depth in case any leak to disk).
-_INTERNAL_DIRS = {"large_tool_results", "conversation_history"}
+# The reserved-directory rule (dot-dirs + deepagents scratch) is shared —
+# okf_core.paths.is_reserved_rel_segments — with lint and the link graph.
 
 
 def _is_ignored_rel(bundle_root: Path, path: Path) -> bool:
@@ -55,7 +57,7 @@ def _is_ignored_rel(bundle_root: Path, path: Path) -> bool:
         rel = path.relative_to(bundle_root)
     except ValueError:
         return False
-    return any(seg.startswith(".") or seg in _INTERNAL_DIRS for seg in rel.parts)
+    return is_reserved_rel_segments(rel.parts)
 
 
 def _directories_to_index(bundle_root: Path) -> list[Path]:

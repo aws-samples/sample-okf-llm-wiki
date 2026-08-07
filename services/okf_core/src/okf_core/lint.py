@@ -54,19 +54,23 @@ from pathlib import Path
 
 from okf_core.document import OKFDocument
 from okf_core.links import extract_links
+from okf_core.paths import GUARDRAILS_DOC_PATH, is_reserved_rel_segments
 
 # The snapshot dir name is harvest's contract (harvest.metadata_export.
 # METADATA_DIR); okf_core cannot import harvest, so the literal is repeated.
 _METADATA_DIR = ".metadata"
 _COLUMNS_TSV = "columns.tsv"
 
-GUARDRAILS_PATH = "references/usage_guardrails.md"
+# Re-exported under lint's historical name; the value's ONE owner is
+# okf_core.paths (shared with the review workflow and the chat gate).
+GUARDRAILS_PATH = GUARDRAILS_DOC_PATH
 
-# Reserved/generated names and internal dirs — mirror link_graph/index_gen:
-# generated index.md carries no frontmatter and log.md is free-form, so
-# neither is a lintable concept doc (but both may be LINK TARGETS).
+# Reserved/generated names — generated index.md carries no frontmatter and
+# log.md is free-form, so neither is a lintable concept doc (but both may be
+# LINK TARGETS). The reserved-DIRECTORY rule (dot-dirs, deepagents scratch)
+# is okf_core.paths.is_reserved_rel_segments, shared with index_gen and the
+# link graph.
 _RESERVED_BASENAMES = {"index.md", "log.md"}
-_INTERNAL_DIRS = {"large_tool_results", "conversation_history"}
 
 
 @dataclass
@@ -101,6 +105,13 @@ class LintStep:
 @dataclass
 class LintReport:
     steps: list[LintStep] = field(default_factory=list)
+    # Populated by ``lint_bundle(..., collect_fences=True)``: the classified
+    # ```sql fences, gathered from the SAME parsed-bundle context the steps
+    # used — so a caller that needs both (the harvest gate's EXPLAIN phase)
+    # doesn't re-walk and re-parse every doc a second time. None when not
+    # requested (or when collection failed; the caller may then fall back to
+    # :func:`collect_sql_fences`).
+    sql_fences: list[SqlFence] | None = None
 
     @property
     def findings(self) -> list[LintFinding]:
@@ -167,9 +178,14 @@ def _sql_fences_in(body: str) -> list[str]:
     for line in body.splitlines():
         m = _FENCE_OPEN_RE.match(line)
         if open_marker is None:
-            if m and m.group(2):
+            # EVERY fence opens tracking, info string or not: a bare ```
+            # fence that went untracked let a literal ```sql line quoted
+            # INSIDE it open a phantom SQL fence, and the quoted example was
+            # then EXPLAINed as runnable SQL (false gate errors). Inside a
+            # tracked non-sql fence, an info-string line is just content.
+            if m:
                 open_marker = m.group(1)
-                is_sql = m.group(2).lower() == "sql"
+                is_sql = bool(m.group(2)) and m.group(2).lower() == "sql"
                 lines = []
         else:
             closes = (
@@ -304,7 +320,10 @@ def collect_sql_fences(bundle_root: str | Path) -> list[SqlFence]:
     """Every published doc's ```sql fences, classified. Never raises per-doc:
     unparseable docs contribute nothing (the ``frontmatter`` step reports
     them)."""
-    ctx = _Context(Path(bundle_root))
+    return _collect_fences(_Context(Path(bundle_root)))
+
+
+def _collect_fences(ctx: "_Context") -> list[SqlFence]:
     out: list[SqlFence] = []
     for rel in ctx.doc_paths:
         doc = ctx.parsed.get(rel)
@@ -359,7 +378,7 @@ def _families_comparable(a: str, b: str) -> bool:
 
 
 def _is_reserved_rel(rel_parts: tuple[str, ...]) -> bool:
-    if any(p.startswith(".") or p in _INTERNAL_DIRS for p in rel_parts[:-1]):
+    if is_reserved_rel_segments(rel_parts[:-1]):
         return True
     return rel_parts[-1] in _RESERVED_BASENAMES
 
@@ -577,10 +596,7 @@ def _check_links(ctx: _Context) -> LintStep:
             # harvest mount but the published wiki never serves it (the MCP
             # tools hide dot-prefixed segments) — a link every consumer will
             # find dead, which is exactly what this check exists to catch.
-            if any(
-                p.startswith(".") or p in _INTERNAL_DIRS
-                for p in target.split("/")
-            ):
+            if is_reserved_rel_segments(target.split("/")):
                 findings.append(
                     LintFinding(
                         "error",
@@ -594,6 +610,14 @@ def _check_links(ctx: _Context) -> LintStep:
                 )
                 continue
             if not (ctx.root / f"{target}.md").is_file():
+                # Generated files (index.md per directory, log.md) don't exist
+                # while lint runs — they're wiped at full-harvest start and
+                # only re-created by finalize, AFTER both gates — and the
+                # guard refuses agent writes to them. Erroring here would make
+                # a legitimate link to a soon-to-exist index unfixable except
+                # by deleting it.
+                if target.rsplit("/", 1)[-1] in ("index", "log"):
+                    continue
                 findings.append(
                     LintFinding(
                         "error",
@@ -744,8 +768,16 @@ _STEPS = (
 )
 
 
-def lint_bundle(bundle_root: str | Path) -> LintReport:
-    """Run every offline lint step against the bundle at ``bundle_root``."""
+def lint_bundle(
+    bundle_root: str | Path, *, collect_fences: bool = False
+) -> LintReport:
+    """Run every offline lint step against the bundle at ``bundle_root``.
+
+    ``collect_fences=True`` also gathers the classified ```sql fences on
+    ``report.sql_fences`` from the same parsed context (see LintReport) —
+    best-effort: a collection failure leaves it None rather than costing the
+    report.
+    """
     ctx = _Context(Path(bundle_root))
     report = LintReport()
     for name, fn in _STEPS:
@@ -754,4 +786,9 @@ def lint_bundle(bundle_root: str | Path) -> LintReport:
         except Exception as e:  # noqa: BLE001 — one broken step must not hide the rest
             step = LintStep(name, "failed", note=f"{type(e).__name__}: {e}")
         report.steps.append(step)
+    if collect_fences:
+        try:
+            report.sql_fences = _collect_fences(ctx)
+        except Exception:  # noqa: BLE001 — the caller can fall back/refail
+            report.sql_fences = None
     return report
