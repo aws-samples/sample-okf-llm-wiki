@@ -77,6 +77,12 @@ from harvest.dispatch_policy import (  # noqa: E402
 # slash or nesting doesn't slip past.
 _READONLY_DIR = ".metadata"
 
+# The ONE dot-dir path an agent legitimately writes: the annotation run's
+# verdict file. Mirrors harvest.runner.ANNOTATION_RESULTS_REL — the literal is
+# repeated because runner imports agent imports this module (a runner import
+# here would be circular); test_guard_middleware pins the two in sync.
+_ANNOTATION_RESULTS_REL = ".harvest/annotation_results.json"
+
 
 def _is_markdown(file_path: str | None) -> bool:
     return bool(file_path) and str(file_path).endswith(".md")
@@ -273,8 +279,15 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         # recorded context digests): a write into any of them corrupts an
         # input or breaks a workflow contract (e.g. clobbering
         # `.harvest/review/clusters.json` silently kills the documented
-        # cluster_ids retry path).
-        if _has_dot_segment(file_path):
+        # cluster_ids retry path). ONE exception: the annotation run's verdict
+        # file, which the annotation supervisor is REQUIRED to write (its
+        # prompt says "write it via write_file to that exact path") and the
+        # runner then reconciles to DynamoDB — refusing it would silently
+        # revert every annotation back to open.
+        if (
+            _has_dot_segment(file_path)
+            and _normalized_rel(file_path) != _ANNOTATION_RESULTS_REL
+        ):
             return self._refuse(
                 request,
                 f"Refused: `{file_path}` is under a reserved dot-directory "

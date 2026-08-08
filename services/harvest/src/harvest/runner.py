@@ -1026,8 +1026,17 @@ def _reconcile_annotation_results(
     best-effort: the S3 bundle is already the durable result; a write-back hiccup
     must not fail the harvest.
     """
-    tally = {"applied": 0, "rejected": 0, "reverted": 0}
+    tally = {"applied": 0, "rejected": 0, "reverted": 0, "write_failed": 0}
     if client_table is None:
+        # No annotations table configured: every survivor stays in_review
+        # (which the UI shows as still-pending) with no explanation anywhere.
+        # Count them as write failures so the status detail says so.
+        log.warning(
+            "Annotations client unconfigured; %d verdict(s) cannot be "
+            "written back",
+            len(survivors),
+        )
+        tally["write_failed"] = len(survivors)
         return tally
 
     verdicts: dict[str, dict[str, Any]] = {}
@@ -1065,7 +1074,7 @@ def _reconcile_annotation_results(
             tally["reverted"] += 1
             continue
         outcome = verdict.get("outcome", "")
-        resolve_annotation(
+        ok = resolve_annotation(
             client_table,
             data_domain=data_domain,
             dataset=dataset,
@@ -1075,8 +1084,14 @@ def _reconcile_annotation_results(
             outcome=outcome,
             comment=verdict.get("comment", ""),
         )
-        # resolve_annotation coerces any non-"applied" outcome to rejected.
-        tally["applied" if outcome == "applied" else "rejected"] += 1
+        # Count what actually LANDED: a failed UpdateItem leaves the row
+        # in_review (still-pending in the UI), and a tally that claims it was
+        # applied turns that into an invisible failure.
+        if ok:
+            # resolve_annotation coerces any non-"applied" outcome to rejected.
+            tally["applied" if outcome == "applied" else "rejected"] += 1
+        else:
+            tally["write_failed"] += 1
     return tally
 
 
@@ -1249,7 +1264,7 @@ def run_annotation_harvest(
     # Reconcile the agent's verdicts back to DynamoDB (resolve/revert per note).
     # Best-effort: a reconcile hiccup must not fail an already-finalized bundle nor
     # skip the terminal status write below (which would wedge the row at `running`).
-    tally = {"applied": 0, "rejected": 0, "reverted": 0}
+    tally = {"applied": 0, "rejected": 0, "reverted": 0, "write_failed": 0}
     try:
         tally = _reconcile_annotation_results(
             anno_client,
@@ -1275,6 +1290,11 @@ def run_annotation_harvest(
         f"annotations: {tally['applied']} applied, "
         f"{tally['rejected']} rejected, {tally['reverted']} returned to open"
     )
+    if tally.get("write_failed"):
+        detail += (
+            f", {tally['write_failed']} verdict write-back(s) FAILED "
+            "(notes remain in review — check the harvest logs)"
+        )
     completed = report_status(
         registry,
         data_domain=data_domain,

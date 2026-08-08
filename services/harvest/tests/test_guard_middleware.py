@@ -546,3 +546,31 @@ def test_allow_delete_refuses_a_directory_named_like_a_doc(tmp_path, monkeypatch
     (tmp_path / "tables" / "y.md").write_text("---\ntype: T\n---\n")
     req = _request(name="delete", file_path="tables/y.md")
     assert mw.wrap_tool_call(req, lambda r: "DELETED") == "DELETED"
+
+
+def test_annotation_results_file_is_the_one_writable_dot_path(monkeypatch):
+    # The annotation supervisor is REQUIRED to write its verdict file under
+    # .harvest/ (the runner reconciles it to DynamoDB) — the dot-dir write
+    # refusal must exempt exactly that path, or every annotation run would
+    # silently revert its notes to open. Pinned to the runner's constant so
+    # the two literals can't drift.
+    from harvest.runner import ANNOTATION_RESULTS_REL
+
+    assert okf_guard._ANNOTATION_RESULTS_REL == ANNOTATION_RESULTS_REL
+    monkeypatch.setattr(
+        okf_guard,
+        "ToolMessage",
+        lambda content, tool_call_id, status="success": {"content": content, "id": tool_call_id, "status": status},
+    )
+    mw = _mw(_AllowEngine())
+    req = _request(
+        name="write_file",
+        file_path=ANNOTATION_RESULTS_REL,
+        content='[{"annotation_id": "a1"}]',
+    )
+    # Not markdown, not refused: passes through to the handler.
+    assert mw.wrap_tool_call(req, lambda r: "WROTE") == "WROTE"
+    # Read-only agents still cannot write it.
+    ro = OKFGuardMiddleware(_AllowEngine(), read_current=lambda _p: None, read_only=True)
+    result = ro.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
+    assert isinstance(result, dict) and result["status"] == "error"
