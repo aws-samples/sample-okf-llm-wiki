@@ -26,14 +26,26 @@ _RETRYABLE = {errno.ESTALE, errno.EIO}  # 116, 5
 _ATTEMPTS = 5
 _BASE_SLEEP = 0.3
 
+# DELETE paths retry a WIDER set. shutil.rmtree classifies each entry with a
+# stat, and when a transient NFS hiccup makes that stat raise, CPython falls
+# back to "treat it as a file" and unlinks — unlinking a directory then
+# surfaces as EACCES/EPERM, masking the transient root cause (seen live: a
+# full-harvest wipe dying on `references/recipes` while a concurrent harvest
+# churned the mount). A fresh rmtree re-scandirs and classifies correctly, so
+# EACCES/EPERM are retryable HERE — and only here: a genuine denial still
+# fails after the bounded attempts, and write_text keeps its own deliberate
+# PermissionError handling (unlink + rewrite), which widening _RETRYABLE
+# would have short-circuited.
+_RM_RETRYABLE = _RETRYABLE | {errno.EACCES, errno.EPERM}  # + 13, 1
 
-def _retry(fn, *, what: str):
+
+def _retry(fn, *, what: str, retryable: set[int] = _RETRYABLE):
     last: OSError | None = None
     for attempt in range(_ATTEMPTS):
         try:
             return fn()
         except OSError as e:
-            if e.errno not in _RETRYABLE or attempt == _ATTEMPTS - 1:
+            if e.errno not in retryable or attempt == _ATTEMPTS - 1:
                 raise
             last = e
             time.sleep(_BASE_SLEEP * (2**attempt))
@@ -83,7 +95,14 @@ def write_text(path: str | Path, text: str) -> None:
     try:
         _retry(lambda: p.write_text(text, encoding="utf-8"), what=f"write {p}")
     except PermissionError:
-        p.unlink(missing_ok=True)
+        # The unlink itself gets the delete-path retry set: on this mount a
+        # stat/lease blip can surface as EACCES here too, and losing the heal
+        # would fail the caller for a transient reason.
+        _retry(
+            lambda: p.unlink(missing_ok=True),
+            what=f"unlink {p}",
+            retryable=_RM_RETRYABLE,
+        )
         _retry(lambda: p.write_text(text, encoding="utf-8"), what=f"rewrite {p}")
 
 
@@ -99,12 +118,14 @@ def remove_tree(path: str | Path) -> bool:
         return False
 
     def _rm() -> None:
+        if not p.exists():
+            return  # a prior (partially successful) attempt finished the job
         if p.is_dir() and not p.is_symlink():
             shutil.rmtree(p)
         else:
-            p.unlink()
+            p.unlink(missing_ok=True)
 
-    _retry(_rm, what=f"rm {p}")
+    _retry(_rm, what=f"rm {p}", retryable=_RM_RETRYABLE)
     return True
 
 
@@ -125,7 +146,10 @@ def clean_authored_output(dataset_root: str | Path) -> list[str]:
     does not start with ``.``.
 
     Returns the sorted names removed (for logging). Missing root = nothing to do.
-    NFS-resilient: each removal retries transient ESTALE/EIO.
+    NFS-resilient: each removal retries the transient set PLUS EACCES/EPERM
+    (see ``_RM_RETRYABLE`` — rmtree reports a flaky stat as a permission error
+    on the directory), and is idempotent so a partially completed attempt
+    doesn't fail its own retry.
     """
     root = Path(dataset_root)
     if not root.exists():
@@ -137,11 +161,13 @@ def clean_authored_output(dataset_root: str | Path) -> list[str]:
             continue  # preserve .context/ (user input) + .harvest/ (state)
 
         def _rm(target: Path = child) -> None:
+            if not target.exists():
+                return  # a prior (partially successful) attempt finished the job
             if target.is_dir() and not target.is_symlink():
                 shutil.rmtree(target)
             else:
-                target.unlink()
+                target.unlink(missing_ok=True)
 
-        _retry(_rm, what=f"rm {child}")
+        _retry(_rm, what=f"rm {child}", retryable=_RM_RETRYABLE)
         removed.append(child.name)
     return removed

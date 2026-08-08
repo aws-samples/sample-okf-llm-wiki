@@ -61,6 +61,27 @@ the dataset listing by `is_domain_dataset()`. Vector key:
   sheet.
 - A bundle is consumable only once `.harvest/state.json` exists with
   `status == "complete"`.
+- `.harvest/review/` holds the review workflow's state: `clusters.json` (the
+  persisted clustering with stable ids — a `run_review(cluster_ids=[...])`
+  retry re-runs those clusters on THIS clustering, never a recomputed one;
+  when the run recorded context digests it also carries a `context` section
+  pairing them into `x1..xN` groups under the same retry contract) and
+  one `report-<id>.md` per `run_review` call (unique name, nothing
+  overwritten) with every reviewer/fixer transcript. Like the rest of
+  `.harvest/`, it is state — never published, indexed, or embedded. A FULL
+  harvest wipes `.harvest/review/` at start (alongside the authored-output
+  wipe): a clustering from a previous run describes docs the run is about to
+  rebuild, so nothing may retry against it.
+- `.harvest/context/` holds `digest-NN.md` — the verbatim output (dispatch
+  brief + returned digest) of every `context-extractor` dispatch, recorded
+  automatically as each completes (`harvest/context_digests.py`, fed from the
+  QuickJS shim and the static `task` path). `run_review`'s context-fidelity
+  phase audits the bundle against these after all cluster fixes; no digests
+  means the phase is skipped. Run-scoped on both ends: `finalize_bundle`
+  deletes the dir right AFTER the commit marker (the audit is over; a run
+  that fails earlier keeps them for debugging), and a full harvest wipes it
+  at start anyway — the guard for a predecessor that crashed before its own
+  cleanup.
 
 **Derived artifacts live OFF the mount prefix.** Two sibling top-level prefixes
 sit next to `okf/` in the same bucket and are deliberately NOT under it, so
@@ -726,17 +747,41 @@ runtime narrates its progress at message granularity. As the agent runs, a
 LangChain callback (`harvest.steps.StepEmitter`, attached via
 `config["callbacks"]` so it also observes every sub-agent) emits one stdout line
 per step: `OKF_STEP <json>` where the JSON is
-`{ts, data_domain, dataset, session_id, seq, kind, label, agent, tool?, ok?, full?}`.
+`{ts, data_domain, dataset, session_id, seq, kind, label, agent, tool?, ok?, error?, full?, result?}`.
 `kind` ∈ `agent | tool_call | tool_result | subagent | usage`; `seq` is a 1-based
 monotonic counter; `label` is a human phrase (tool calls are shaped, e.g.
 "Reading `tables/races`", "Started `table-author`: …") — tool RESPONSE bodies are
-never emitted, only success/failure. An `agent` event also carries **`full`**
+never emitted, only success/failure, with THREE exceptions, each with its own bound (~500 chars for the error snippet, ~8KB for the lint report and agent `full`, ~64KB for sub-agent dispatch I/O): a FAILED `tool_result`
+(`ok: false`) carries **`error`**, a whitespace-collapsed snippet of the failure
+text (bounded ~500 chars). That text exists nowhere else (it goes back to the
+model, not the logs), so without it a failed call — e.g. a provider 400 killing
+a sub-agent — is undiagnosable after the run. And a SUCCESSFUL `lint_bundle`
+`tool_result` carries **`lint`**, the lint gate's structured report
+`{ok, errors, warnings, steps, findings, hidden?, note?}` (bounded ~8KB — the
+emitter drops tail findings past the budget into a `hidden` count; error/warning
+totals come from the per-step counters so they survive truncation). The UI
+badges the feed row with the counts and opens the findings in a modal on click.
+And a SUB-AGENT DISPATCH carries its I/O (bounded ~64KB each, not 8 — a
+table-author brief carries its context-digest slice and routinely exceeds 8KB;
+each event is one CloudWatch line, hard limit 256KB): the `task` tool_call (and a `subagent`
+start event) carries **`full`** — the complete dispatch brief, where the label
+keeps only a teaser — and its successful `tool_result` carries **`result`**, the
+sub-agent's FINAL answer. QuickJS `task()` squares get the same two texts via
+`subagent` events with `phase: "update"` (a mid-flight patch carrying `full`
+right after start and `result` right before complete, correlated by `sub_id`):
+the library's own lifecycle events truncate the brief to 200 chars and never
+carry the answer, so `harvest.subagent_io` shims the dispatch choke point to
+emit them. Never the sub-agent's internal steps — those stay
+filtered. The UI opens both in the fleet square's drill-in sheet (Output/Input
+tabs). An `agent` event also carries **`full`**
 (the complete markdown of the AIMessage, whitespace preserved, bounded ~8KB) when
 it exceeds the one-line `label`; the UI renders `label` as inline markdown and
 opens `full` in a modal on click. `tool_call`/`tool_result` share a `call_id`
 so the UI folds them into one row. **`subagent`** events power the UI's fleet
 squares (the dynamic reviewer/table-author fan-out): they carry
-`{phase: start|complete|error, batch, sub_id, subagent_type?}` where `batch` is
+`{phase: start|complete|error|update, batch, sub_id, subagent_type?, error?, full?, result?}` (an
+`error`-phase event carries the same bounded `error` snippet — the
+langchain_quickjs `SubagentErrorEvent`'s failure string) where `batch` is
 the top-level `eval` tool-call id grouping one fan-out wave (NOT the event's own
 `eval_id`, a REPL-local counter that resets to `call_0` on every `eval()` and so
 can't tell one wave from the next — the emitter correlates each sub-agent to the
@@ -1378,14 +1423,16 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_HARVEST_MANTLE_READ_TIMEOUT` / `OKF_HARVEST_MANTLE_MAX_ATTEMPTS` | httpx read timeout (s) and retry budget for the `ChatOpenAI` Mantle client (defaults `600` / `5`, mirroring the Converse knobs). The botocore `OKF_HARVEST_BEDROCK_*` knobs do NOT apply to the GPT path |
 | `OKF_HARVEST_EFFORT` | reasoning effort. On Converse, passed verbatim to Bedrock `output_config.effort` (default `xhigh`; valid values are model-specific). On the GPT path it maps onto OpenAI's `reasoning_effort` scale — verbatim on GPT-5.6 (which added `max` above `xhigh`), so `low`/`medium`/`high`/`xhigh`/`max` all pass through unchanged. Which efforts a given model accepts is model-specific (an older GPT id rejects `max`); the model catalog is the trust boundary that only offers a level a model supports |
 | `OKF_HARVEST_MAX_TOKENS` | harvest model max output tokens. Default is provider-aware when unset: `128000` for Converse (Opus 4.8), `32000` for GPT. An explicit value always wins |
-| `OKF_HARVEST_MAX_SUBAGENT_CONCURRENCY` | how many dynamic subagents run at once on a `task()` fan-out (default `5`). This lowers langchain_quickjs's per-REPL `task()` semaphore, so a `Promise.all` keeps at most this many crawls in flight and queues the rest. It is not `config.max_concurrency` — the fan-out is a QuickJS `Promise.all`, not a LangGraph batch, so only the semaphore bounds it. |
+| `OKF_HARVEST_MAX_SUBAGENT_CONCURRENCY` | how many dynamic subagents run at once on a `task()` fan-out (default `5`). This lowers langchain_quickjs's per-REPL `task()` semaphore, so a `Promise.all` keeps at most this many crawls in flight and queues the rest. It is not `config.max_concurrency` — the fan-out is a QuickJS `Promise.all`, not a LangGraph batch, so only the semaphore bounds it. The same value bounds the `run_review` tool's in-flight cluster pipelines. |
+| `OKF_HARVEST_REVIEW_DISPATCH_TIMEOUT_S` | wall-clock cap per `run_review` dispatch (one reviewer or one fixer; default `1800`). On timeout the dispatch is cancelled and its cluster is recorded as `failed` — retryable via `run_review(cluster_ids=[...])`. |
+| `OKF_HARVEST_REVIEW_CLUSTER_SIZE` | docs per `run_review` review cluster (default `7`). The supervisor-owned hubs — `datasets/*` overview docs and `references/usage_guardrails` — are excluded from clustering entirely (they'd hub-steal unrelated spokes, and only the supervisor may edit them; corrections reach it as propagation notes). |
 | `OKF_HARVEST_BEDROCK_READ_TIMEOUT` | botocore read timeout in seconds for the harvest bedrock-runtime client (default `600`). Botocore's 60s default is too low: one xhigh Opus 4.8 turn can generate for minutes, and a slow Converse response would otherwise raise `ReadTimeoutError` and fail the harvest. |
 | `OKF_HARVEST_SQL_MAX_ROWS` | soft row cap on the agent-facing `run_sql` tool's result (default `200`). Collection stops at the cap and the tool reports `truncated: true` — a hint to the agent to add a LIMIT or aggregate — instead of buffering an unbounded result into its context. Distinct from the benchmark grader's hard `OKF_BENCHMARK_GRADER_MAX_ROWS` (which raises: a truncated set can't be equality-graded) |
 | `OKF_HARVEST_PROFILE_ENABLED` | `"0"` disables the snapshot-time column profiles (`.metadata/profile/<table>.md` — null share, ~distinct, min/max, top-K values; see `harvest/profile.py`). Default on. Profiles are best-effort: any failure downgrades to a manifest note, never fails the snapshot |
 | `OKF_HARVEST_PROFILE_SAMPLE_ABOVE_BYTES` | byte-size threshold above which a table is profiled from a sample instead of a full scan (default 1 GiB). The size comes from the catalog's size hint; a table with NO hint is treated as large. Sampled sheets are stamped INDICATIVE — value lists from a sample are never treated as closed enums |
 | `OKF_HARVEST_PROFILE_TARGET_SAMPLE_BYTES` | the scan budget one sampled profile aims for (default 256 MiB) — the sample percent is `target/size`, clamped to 0.01–100 |
 | `OKF_HARVEST_PROFILE_ENUM_MAX_DISTINCT` / `OKF_HARVEST_PROFILE_TOPK` / `OKF_HARVEST_PROFILE_MAX_ENUM_QUERIES` | value-list bounds: only columns with ~distinct ≤ the first (default `50`) get a value list, capped at TOPK values (default `20`), at most MAX_ENUM_QUERIES per table (default `15`, most enum-like first). Higher-cardinality columns report the count only ("not enumerated") |
-| `OKF_HARVEST_PROFILE_MAX_COLUMNS` / `OKF_HARVEST_PROFILE_BUDGET_S` / `OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S` | remaining cost caps: columns profiled per table (default `100`), overall wall-clock budget for the whole profiling pass (default `600`s — tables past it are `skipped-budget` in the manifest), and per-query timeout (default `60`s). Reuse makes re-runs cheap: profiles persist on the mount and are fingerprint-keyed (catalog update time + version + column set), so incremental runs re-profile only the changed table and cross runs only mismatches; a full harvest always re-profiles |
+| `OKF_HARVEST_PROFILE_MAX_COLUMNS` / `OKF_HARVEST_PROFILE_BUDGET_S` / `OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S` | remaining cost caps: columns profiled per table (default `100`), overall wall-clock budget for the whole profiling pass (default `1800`s — tables past it are `skipped-budget` in the manifest), and per-query timeout (default `60`s). Reuse makes re-runs cheap: profiles persist on the mount and are fingerprint-keyed (catalog update time + version + column set), so incremental runs re-profile only the changed table and cross runs only mismatches; a full harvest always re-profiles |
 | `OKF_HARVEST_BEDROCK_CONNECT_TIMEOUT` | botocore connect timeout in seconds (default `10`) |
 | `OKF_HARVEST_BEDROCK_MAX_ATTEMPTS` | botocore `retries.max_attempts` in adaptive mode (default `5`); retries transient throttles and timeouts instead of failing the run |
 | `OKF_BENCHMARK_MAX_CONCURRENCY` | how many benchmark solver ReAct loops (and judge reviews) run at once in a Benchmark Studio run (default `10`). Its own `asyncio.Semaphore` — each solver is one in-flight model request at a time, so this is the peak concurrent Bedrock requests from the benchmark. Raise on generous quota, lower on `ThrottlingException`. `mode: "benchmark"` runs only. |
@@ -1401,6 +1448,7 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_WEB_SEARCH_REGION` | region the gateway lives in, i.e. the region `web_search`'s SigV4 is signed for (default `us-east-1`). **Independent of `AWS_REGION`** — the web-search connector is only offered in us-east-1, so a query leaves the deployment's region (it never leaves AWS) |
 | `OKF_WEB_SEARCH_TOOL_NAME` | the gateway-side tool name, `<target-name>___WebSearch` (AgentCore prefixes every tool with its target's name, joined by THREE underscores). Set by Terraform to save a round trip; empty → the runtime discovers it via `tools/list` and caches it |
 | `OKF_WEB_SEARCH_MAX_RESULTS` | default results per search when the agent doesn't pick a count via the tool's `max_results` arg (default `10`; 1–25). There is no date parameter — the connector ranks by relevance and the agent steers time through the query text, reading each result's `publishedDate` |
+| `OKF_CHAT_GUARDRAILS_GATE_ENABLED` | (chat runtime, env-read — not Terraform-plumbed) default `true` → `read_page` on any page of a dataset is DENIED at the tool boundary until that dataset's `references/usage_guardrails` has been read in the thread (`chat.guardrails_gate.GuardrailsGateMiddleware`). Per-dataset marks live in CHECKPOINTED agent state (`guardrails_read` channel, dict-merge reducer), so resumes remember; the guardrails read itself always passes and marks on any completed attempt (a guardrails-less legacy bundle can't lock out). Browse/search tools are never gated. `"false"`/`"0"`/`"no"`/`"off"` disables |
 | `OKF_CHAT_POLICY_CHECK_ENABLED` | (chat runtime) `"true"` → the mid-turn policy checks may be armed per run via `features: ["sql", "policy:*"]` (default `false`). Unset → no checker is ever constructed, whatever the client sends — the master gate above the per-run opt-in, set from `var.enable_policy_checks` |
 | `OKF_CHAT_POLICY_CHECK_MODEL` | (chat runtime) the policy checks' model id, serving BOTH the curated-question rewrite (no reasoning pass — extraction) and the JUDGE fleets. Default `global.anthropic.claude-sonnet-5` — judges run classifier-style on every family (thinking off + temperature 0 on Anthropic, reasoning `"none"` on openai.* ids like `openai.gpt-5.6-terra`, forced `report_violations` either way); from `var.chat_policy_check_model`, which also drives the chat role's Mantle grants, so an openai.* value needs no extra wiring. Code-level companions (env-read, not Terraform-plumbed): `OKF_CHAT_POLICY_SHARD_SIZE` (default `10` — policies per mini-judge), `OKF_CHAT_POLICY_QUERY_TIMEOUT_S` (default `60` — residual wait after the query returns) and `OKF_CHAT_POLICY_QUERY_MAX_PER_TURN` (default `3` — judged analytical queries per turn). Deploy-time only — deliberately NOT validated against `OKF_CHAT_MODEL_CATALOG`, which is the trust boundary for CLIENT-supplied models |
 | `OKF_POLICY_PREPROCESS_MODEL` | (harvest runtime) model id for the `policies.yaml` AUTHORING AGENT (`harvest.ar_author` — full reasoning; policy distillation is judgment work). Default `global.anthropic.claude-sonnet-5`, from `var.policy_preprocess_model`, which also drives the harvest role's Mantle grants. Code-level companions (env-read, not Terraform-plumbed): `OKF_POLICY_AUTHOR_EFFORT` (default `high`), `OKF_POLICY_AUTHOR_THINKING_BUDGET` (pre-adaptive models like Haiku 4.5 — e.g. `48000`), and `OKF_POLICY_MAX_RULES` (default `60` — the author gate's policy-count BACKSTOP against enumeration pathology; the prompt's proportionality guidance, not this cap, is what sizes a document to its dataset). The incremental Lambda runs NO models: authoring dispatches to the runtime |

@@ -359,6 +359,24 @@ def run_full_harvest(
                 dataset,
                 ", ".join(removed),
             )
+        # Also reset the review workflow's state (.harvest/review/ — the
+        # persisted clustering + past run_review reports). clean_authored_output
+        # preserves .harvest/ wholesale for the commit marker, but a clustering
+        # from a PREVIOUS harvest describes docs this run is about to rebuild —
+        # a retry against it would review the wrong groups.
+        # Same for the recorded context-extractor digests (.harvest/context/):
+        # this run re-extracts from the CURRENT .context/ uploads, and a stale
+        # digest would feed the fidelity phase facts nobody extracted this run.
+        if remove_tree(Path(dataset_root) / ".harvest" / "context"):
+            log.info(
+                "Full harvest %s/%s: cleared prior context digests",
+                data_domain,
+                dataset,
+            )
+        if remove_tree(Path(dataset_root) / ".harvest" / "review"):
+            log.info(
+                "Full harvest %s/%s: cleared prior review state", data_domain, dataset
+            )
 
         # Resolve the effective model config up front so we can both build the
         # agent with it AND record the resolved model/effort on the status row.
@@ -459,6 +477,38 @@ def run_full_harvest(
             config = _invoke_config(recursion_limit, emitter)
             _run_agent(built.agent, prompt, config, emitter)
 
+        # MECHANICAL lint backstop. The supervisor prompt prescribes the
+        # fix-to-zero lint gate, but a prompt is advice (same rationale that
+        # made chat's guardrails gate mechanical): a truncated or
+        # recursion-clipped run can skip step 8 and still reach finalize. The
+        # offline half of the gate is pure and cheap, so measure the bundle
+        # as shipped and surface the counts on the status row — a bundle
+        # published with lint errors must be visible, never silent. It does
+        # NOT block publish (the bundle is still better than no bundle);
+        # best-effort, never fails the run.
+        lint_detail = None
+        try:
+            from okf_core.lint import lint_bundle as _offline_lint
+
+            _rep = _offline_lint(Path(dataset_root))
+            _errs = sum(1 for f in _rep.findings if f.severity == "error")
+            _warns = sum(1 for f in _rep.findings if f.severity == "warning")
+            if _errs:
+                lint_detail = (
+                    f"published with lint findings: {_errs} error(s), "
+                    f"{_warns} warning(s)"
+                )
+                log.warning(
+                    "Post-run lint backstop for %s/%s: %d error(s), %d "
+                    "warning(s) — the supervisor did not fix to zero",
+                    data_domain,
+                    dataset,
+                    _errs,
+                    _warns,
+                )
+        except Exception:  # noqa: BLE001 - the backstop must never fail the run
+            log.warning("Post-run lint backstop failed", exc_info=True)
+
         state = finalize_bundle(
             dataset_root,
             data_domain=data_domain,
@@ -487,6 +537,7 @@ def run_full_harvest(
         data_domain=data_domain,
         dataset=dataset,
         status="complete",
+        detail=lint_detail,
         only_if_active=True,
         session_id=session_id,
         run_started_at=run_started_at,
@@ -975,8 +1026,17 @@ def _reconcile_annotation_results(
     best-effort: the S3 bundle is already the durable result; a write-back hiccup
     must not fail the harvest.
     """
-    tally = {"applied": 0, "rejected": 0, "reverted": 0}
+    tally = {"applied": 0, "rejected": 0, "reverted": 0, "write_failed": 0}
     if client_table is None:
+        # No annotations table configured: every survivor stays in_review
+        # (which the UI shows as still-pending) with no explanation anywhere.
+        # Count them as write failures so the status detail says so.
+        log.warning(
+            "Annotations client unconfigured; %d verdict(s) cannot be "
+            "written back",
+            len(survivors),
+        )
+        tally["write_failed"] = len(survivors)
         return tally
 
     verdicts: dict[str, dict[str, Any]] = {}
@@ -1014,7 +1074,7 @@ def _reconcile_annotation_results(
             tally["reverted"] += 1
             continue
         outcome = verdict.get("outcome", "")
-        resolve_annotation(
+        ok = resolve_annotation(
             client_table,
             data_domain=data_domain,
             dataset=dataset,
@@ -1024,8 +1084,14 @@ def _reconcile_annotation_results(
             outcome=outcome,
             comment=verdict.get("comment", ""),
         )
-        # resolve_annotation coerces any non-"applied" outcome to rejected.
-        tally["applied" if outcome == "applied" else "rejected"] += 1
+        # Count what actually LANDED: a failed UpdateItem leaves the row
+        # in_review (still-pending in the UI), and a tally that claims it was
+        # applied turns that into an invisible failure.
+        if ok:
+            # resolve_annotation coerces any non-"applied" outcome to rejected.
+            tally["applied" if outcome == "applied" else "rejected"] += 1
+        else:
+            tally["write_failed"] += 1
     return tally
 
 
@@ -1198,7 +1264,7 @@ def run_annotation_harvest(
     # Reconcile the agent's verdicts back to DynamoDB (resolve/revert per note).
     # Best-effort: a reconcile hiccup must not fail an already-finalized bundle nor
     # skip the terminal status write below (which would wedge the row at `running`).
-    tally = {"applied": 0, "rejected": 0, "reverted": 0}
+    tally = {"applied": 0, "rejected": 0, "reverted": 0, "write_failed": 0}
     try:
         tally = _reconcile_annotation_results(
             anno_client,
@@ -1224,6 +1290,11 @@ def run_annotation_harvest(
         f"annotations: {tally['applied']} applied, "
         f"{tally['rejected']} rejected, {tally['reverted']} returned to open"
     )
+    if tally.get("write_failed"):
+        detail += (
+            f", {tally['write_failed']} verdict write-back(s) FAILED "
+            "(notes remain in review — check the harvest logs)"
+        )
     completed = report_status(
         registry,
         data_domain=data_domain,

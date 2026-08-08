@@ -691,6 +691,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     from chat.ask_human_middleware import AskHumanMiddleware
     from chat.charts import make_chart_tool
     from chat.config import build_chat_model
+    from chat.guardrails_gate import GuardrailsGateMiddleware, guardrails_gate_enabled
     from chat.graph import (
         SQL_BLOCK,
         SQL_REDSHIFT_BLOCK,
@@ -889,6 +890,15 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # SteeringMiddleware injects derailment <system-reminder>s (repetition /
         # futility / silence — see chat.steering); env kill switch, default on.
         middleware = [BedrockPromptCachingMiddleware(), AskHumanMiddleware()]
+        # Guardrails-first read gate: read_page on a dataset is DENIED until
+        # that dataset's references/usage_guardrails has been read in this
+        # thread — tracked per dataset in CHECKPOINTED state, so resumes and
+        # later turns remember. Browse/search tools stay free; the guardrails
+        # read itself always passes. Env kill switch, default on. Needs the
+        # @-scope: scoped runs inject data_domain/dataset inside the tool
+        # wrappers, so the middleware can't see them in the call args.
+        if guardrails_gate_enabled():
+            middleware.append(GuardrailsGateMiddleware(scope=scope))
         if steering_enabled():
             middleware.append(SteeringMiddleware())
         # The behavioural policy track: batched steps-so-far evaluation via a

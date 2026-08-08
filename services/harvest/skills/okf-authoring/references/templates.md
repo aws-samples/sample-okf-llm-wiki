@@ -234,7 +234,10 @@ joined by a double underscore. Owns the concrete `ON` clause — with any requir
 normalization (cast/`TRIM`/`UPPER`) baked in, never left implicit. Both sides
 link to it from their `# Joins` section. State what you MEASURED this run: the
 cardinality, the orphan behavior (inner- vs left-join advice), and any key
-normalization — the same bar cross-dataset joins meet. A self-join (a hierarchy's
+normalization — the same bar cross-dataset joins meet. Express the evidence as
+proportions plus the mechanism ("~3% of orders are guest checkouts with no
+customer row"), never the probe's absolute row counts — those are current-load
+snapshots, stale after the next reload. A self-join (a hierarchy's
 `parent_id` → its own key) uses this same shape, named `<t>__<t>.md`.
 
 ```markdown
@@ -255,8 +258,9 @@ orders.customer_id = customers.id
 
 - **Cardinality (measured):** N:1 — many orders per customer; `customer_id` is
   unique in `customers`.
-- **Orphans:** some orders carry a `customer_id` with no `customers` row (guest
-  checkouts) — LEFT JOIN to keep them; an INNER JOIN silently drops them.
+- **Orphans:** a small share of orders (~3%) carry a `customer_id` with no
+  `customers` row (guest checkouts) — LEFT JOIN to keep them; an INNER JOIN
+  silently drops them.
 - **Normalization:** none needed. <!-- When keys match only through a cast or
   TRIM/UPPER, bake it into the ON clause above and say so here — an undocumented
   cast is a silent empty join for the next consumer. -->

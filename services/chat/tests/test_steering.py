@@ -75,6 +75,98 @@ def test_different_args_are_not_repetition():
     assert detect(msgs) is None
 
 
+def test_errored_call_does_not_seed_repetition():
+    """A retry after an ERRORED result is course correction, not derailment —
+    e.g. the guardrails gate denies a read_page until the guardrails doc is
+    read, then the model re-issues the exact same call as the denial
+    instructed. Only a call that SUCCEEDED makes its repeat a repetition."""
+    args = {"concept_id": "tables/orders"}
+    denied = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "read_page", "args": args, "id": "c1", "type": "tool_call"}
+        ],
+    )
+    denial = ToolMessage(
+        content='{"status": "denied"}',
+        name="read_page",
+        tool_call_id="c1",
+        status="error",
+    )
+    retry = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "read_page", "args": args, "id": "c2", "type": "tool_call"}
+        ],
+    )
+    ok = ToolMessage(content="# page", name="read_page", tool_call_id="c2")
+    assert detect([_USER, denied, denial, retry, ok]) is None
+    # But a THIRD identical call — one HAS succeeded now — is a repetition.
+    third = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "read_page", "args": args, "id": "c3", "type": "tool_call"}
+        ],
+    )
+    sig = detect([_USER, denied, denial, retry, ok, third])
+    assert sig is not None and sig.kind == "repetition"
+
+
+def test_identical_errored_call_repeated_fires_futility_despite_interleaving():
+    """The SAME failing call re-issued over and over IS derailment even when
+    successful calls of another tool interleave — the successes break the
+    trailing-error-streak check, and errored calls never seed the repetition
+    set, so without a per-call error count this loop ran un-nudged forever
+    (deny → semantic_search → identical deny → …)."""
+    args = {"concept_id": "tables/orders"}
+    msgs = [_USER]
+    for i in range(steering.ERROR_STREAK):
+        msgs.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_page",
+                        "args": args,
+                        "id": f"e{i}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        )
+        msgs.append(
+            ToolMessage(
+                content='{"status": "denied"}',
+                name="read_page",
+                tool_call_id=f"e{i}",
+                status="error",
+            )
+        )
+        # An interleaved SUCCESS of another tool — breaks the trailing streak.
+        msgs.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "semantic_search",
+                        "args": {"q": f"try {i}"},
+                        "id": f"s{i}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        )
+        msgs.append(
+            ToolMessage(content="hits", name="semantic_search", tool_call_id=f"s{i}")
+        )
+    sig = detect(msgs)
+    assert sig is not None and sig.kind == "futility"
+    assert "`read_page`" in sig.text
+    # One error short of the threshold stays quiet (the instructed retry
+    # after a denial must not be nudged).
+    assert detect(msgs[: -4]) is None
+
+
 def test_ask_human_is_exempt_from_repetition():
     call = ("ask_human", {"questions": ["q"]})
     msgs = [_USER, _ai([call]), _tool("ask_human"), _ai([call])]
@@ -260,3 +352,44 @@ def test_signal_texts_share_the_step_back_posture():
     ):
         assert "the user" in signal.text
         assert "IGNORE" not in signal.text and "STOP" not in signal.text
+
+
+def test_gate_denials_for_different_pages_do_not_fire_the_trailing_streak():
+    """The guardrails gate's normal first contact: several read_page DENIALS
+    for DIFFERENT pages before the guardrails read. Each denial already names
+    the fix, so a 'your calls keep erroring' nudge is wrong guidance (and its
+    cooldown would suppress a genuine signal right after). Identical denied
+    calls still fire via the per-call error count."""
+    msgs = [_USER]
+    for i in range(steering.ERROR_STREAK):
+        msgs.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_page",
+                        "args": {"concept_id": f"tables/t{i}"},
+                        "id": f"d{i}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        )
+        msgs.append(
+            ToolMessage(
+                content='{"status": "denied", "error": "Read denied: read the usage guardrails first"}',
+                name="read_page",
+                tool_call_id=f"d{i}",
+                status="error",
+            )
+        )
+    assert detect(msgs) is None
+    # Plain (non-denial) errors of the same shape still fire the streak.
+    plain = [_USER]
+    for i in range(steering.ERROR_STREAK):
+        plain += [
+            _ai([("run_sql", {"sql": f"SELECT {i}"})]),
+            _tool("run_sql", "Error: boom", "error"),
+        ]
+    sig = detect(plain)
+    assert sig is not None and sig.kind == "futility"

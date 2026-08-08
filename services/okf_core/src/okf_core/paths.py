@@ -22,6 +22,29 @@ _SEGMENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*")
 # rest of the bundle).
 EXTERNAL_DIR = "external"
 
+# The ONE behavioural-contract doc every consumer reads before querying. Its
+# id is a cross-service contract (the harvest authors it, lint requires it,
+# the review workflow reserves it for the supervisor, and the chat agent's
+# guardrails gate keys its read-tracking on it) — import it, don't retype it.
+GUARDRAILS_CONCEPT_ID = "references/usage_guardrails"
+GUARDRAILS_DOC_PATH = GUARDRAILS_CONCEPT_ID + ".md"
+
+# Directory names deepagents uses for internal scratch (offloaded large tool
+# results / conversation history). Routed to an ephemeral backend at runtime,
+# but every bundle surface still refuses to treat a leak as concept docs.
+INTERNAL_SCRATCH_DIRS = frozenset({"large_tool_results", "conversation_history"})
+
+
+def is_reserved_rel_segments(segments: "tuple[str, ...] | list[str]") -> bool:
+    """True when any path segment marks a NON-CONCEPT path: dot-prefixed
+    (``.metadata``/``.context``/``.harvest`` — run inputs and state) or a
+    deepagents internal scratch dir. The one rule shared by index generation,
+    lint, and the link graph — a doc one surface hides and another indexes is
+    an integration bug."""
+    return any(
+        seg.startswith(".") or seg in INTERNAL_SCRATCH_DIRS for seg in segments
+    )
+
 
 def external_pair_prefix(data_domain: str, dataset: str) -> str:
     """The concept-id prefix of the cross-dataset subtree for one counterpart.

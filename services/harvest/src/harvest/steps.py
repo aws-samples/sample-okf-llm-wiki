@@ -20,7 +20,19 @@ Design constraints (from the investigation):
 
 * **Status, not content.** We emit tool NAMES shaped into labels and tool-call
   success/failure — never tool response bodies (they run to ~60KB) and only a
-  short summary of AIMessage text. Keeps the event payload tiny.
+  short summary of AIMessage text. Keeps the event payload tiny. THREE
+  exceptions, each bounded: a FAILED tool call / errored sub-agent carries an
+  ``error`` snippet, because without it a transient provider failure (e.g. a
+  Mantle 400 killing a reviewer) is undiagnosable from the feed — the body
+  never reaches the logs; a successful ``lint_bundle`` result carries a
+  ``lint`` report (already structured and self-capped by the tool), because
+  the lint gate's findings ARE the content the UI must surface on the feed
+  row; and a sub-agent DISPATCH carries its I/O — the full brief (``full``)
+  and the final answer (``result``), on the start/result events of a static
+  ``task`` call or as ``phase:"update"`` patches for a QuickJS ``task()``
+  square (whose library events carry neither; see ``harvest.subagent_io``) —
+  because those two texts are the whole story of a fleet square (the
+  sub-agent's internal steps stay filtered; see ``_is_subagent``).
 * **Best-effort.** Like ``report_status``, an emission failure must NEVER break a
   harvest — the sink is wrapped so any exception is swallowed + logged.
 * **Tool failure is a message field, not an exception.** The agent's ToolNode
@@ -34,6 +46,7 @@ cleanly for unit tests without langchain installed.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import threading
@@ -99,9 +112,23 @@ SCOPE_REVIEWER = "reviewer"
 PHASE_START = "start"  # dispatched and running
 PHASE_COMPLETE = "complete"
 PHASE_ERROR = "error"
+# I/O enrichment events from OUR shim (harvest.subagent_io), not the library:
+# `input` carries the full dispatch brief (the library's start truncates it),
+# `result` the final answer (the library's complete never carries it). Both
+# are forwarded to the feed as ONE outbound phase, `update`, that patches the
+# existing square — the UI folds `full`/`result` into it without touching the
+# start/complete/error state machine.
+PHASE_INPUT = "input"
+PHASE_RESULT = "result"
+PHASE_UPDATE = "update"
 
 # Cap the AIMessage one-line summary (the feed `label`). A short teaser only.
 _AGENT_SUMMARY_MAX = 200
+
+# Cap the `error` snippet carried by a failed tool_result / errored subagent
+# event. Long enough for a provider error body (an openai BadRequestError's
+# str() with its JSON payload fits), short enough to keep the line tiny.
+_ERROR_SNIPPET_MAX = 500
 
 # Cap the FULL agent text carried alongside the summary (the `full` field the UI
 # renders as markdown in a modal when the row is expanded). Bounded so one log
@@ -109,6 +136,37 @@ _AGENT_SUMMARY_MAX = 200
 # authoring/decision message. Structure (newlines, lists) is PRESERVED here —
 # unlike `label`, which collapses whitespace for the one-liner.
 _AGENT_FULL_MAX = 8000
+
+# The one tool whose SUCCESS body rides the feed: the lint gate's structured
+# report, carried as a `lint` field on its tool_result so the UI can badge the
+# row and open the findings in a modal. Same size philosophy as _AGENT_FULL_MAX
+# — findings past the budget are dropped from the tail (the tool orders errors
+# first) and counted in `hidden`, never silently.
+_LINT_TOOL = "lint_bundle"
+_LINT_EVENT_BUDGET = 8000
+
+# Sub-agent dispatch I/O for the fleet drill-in: a `task` dispatch's START
+# carries the FULL brief (`full` — the same field the agent modal uses) and
+# its RESULT carries the sub-agent's final answer (`result`). NEVER the
+# sub-agent's internal steps — that firehose stays filtered (see
+# _is_subagent); this is two bounded texts per dispatch. QuickJS-fanned
+# sub-agents get the same two texts via the harvest.subagent_io shim's
+# input/result enrichment events (forwarded as a `phase:"update"` feed event),
+# because the library's own lifecycle events carry neither.
+# 64KB, not the 8KB the other bounded texts use: a table-author brief carries
+# its context-digest slice and an extractor's returned digest carries full
+# enum legends — both routinely exceed the smaller caps, and a truncated
+# brief/answer defeats the drill-in's purpose. Each event is one CloudWatch
+# log line (hard limit 256KB) and one field rides per event, so 64KB stays
+# comfortably bounded (and FilterLogEvents' 1MB pages still hold ~15 events).
+_TASK_TOOL = "task"
+_SUBAGENT_IO_MAX = 64000
+
+
+def _bounded_text(value: Any, cap: int = _SUBAGENT_IO_MAX) -> str:
+    text = value if isinstance(value, str) else str(value or "")
+    text = text.strip()
+    return text if len(text) <= cap else text[: cap - 1].rstrip() + "…"
 
 
 def _first_arg(args: dict[str, Any], *keys: str) -> str | None:
@@ -231,6 +289,109 @@ def _summarize_ai_text(text: str) -> str:
     return line
 
 
+def _error_snippet(text: Any) -> str:
+    """A short single-line snippet of an error, for a failed step event."""
+    line = " ".join(str(text or "").split())
+    if len(line) > _ERROR_SNIPPET_MAX:
+        return line[: _ERROR_SNIPPET_MAX - 1].rstrip() + "…"
+    return line
+
+
+def _tool_error_snippet(output: Any) -> str:
+    """The error text off a failed ToolMessage, bounded to a snippet.
+
+    ToolNode puts the error string in ``content`` (usually a plain string;
+    some providers wrap it in text blocks). Falls back to ``str`` of whatever
+    arrived so a failure is never silently label-less.
+    """
+    text = _extract_ai_text(output)
+    if not text:
+        content = getattr(output, "content", output)
+        text = content if isinstance(content, str) else str(content or "")
+    return _error_snippet(text)
+
+
+def _lint_event_payload(output: Any) -> dict[str, Any] | None:
+    """The lint report off a successful ``lint_bundle`` ToolMessage, bounded.
+
+    The tool returns a dict, but what reaches ``on_tool_end`` depends on the
+    framework's ToolMessage formatting: a dict, a JSON string, or a Python
+    ``str(dict)`` repr. Parse best-effort (json first, ``ast.literal_eval``
+    fallback — the report is all literals) and return None when the shape
+    isn't a lint report; the event then simply carries no ``lint`` field.
+    Error/warning totals come from the per-step counters, so they stay
+    accurate even when the findings list is truncated to the budget.
+    """
+    content = getattr(output, "content", output)
+    if isinstance(content, list):  # provider text-block form
+        content = "".join(
+            b.get("text", "") if isinstance(b, dict) else str(b) for b in content
+        )
+    data: Any = content
+    if isinstance(content, str):
+        text = content.strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            data = json.loads(text)
+        except ValueError:
+            try:
+                data = ast.literal_eval(text)
+            except (ValueError, SyntaxError):
+                return None
+    if not isinstance(data, dict):
+        return None
+    steps = data.get("steps")
+    findings = data.get("findings")
+    if not isinstance(steps, list) or not isinstance(findings, list):
+        return None
+
+    def _count(key: str) -> int:
+        total = 0
+        for s in steps:
+            if isinstance(s, dict):
+                try:
+                    total += int(s.get(key) or 0)
+                except (TypeError, ValueError):
+                    pass
+        return total
+
+    def _capped_note(value: Any) -> str:
+        note = str(value)
+        return note if len(note) <= 300 else note[:299] + "…"
+
+    # Notes ride the event too, so they get their own bound — a failed step's
+    # note embeds an exception string, and a multi-KB boto error body would
+    # bust the budget the findings are trimmed to fit.
+    slim_steps = [
+        {**s, "note": _capped_note(s["note"])}
+        if isinstance(s, dict) and s.get("note")
+        else s
+        for s in steps
+    ]
+    payload: dict[str, Any] = {
+        "ok": bool(data.get("ok")),
+        "errors": _count("errors"),
+        "warnings": _count("warnings"),
+        "steps": slim_steps,
+        "findings": [],
+    }
+    if data.get("note"):
+        payload["note"] = _capped_note(data["note"])
+    used = len(json.dumps(payload, separators=(",", ":"), default=str))
+    kept = 0
+    for f in findings:
+        used += len(json.dumps(f, separators=(",", ":"), default=str)) + 1
+        if used > _LINT_EVENT_BUDGET:
+            break
+        payload["findings"].append(f)
+        kept += 1
+    hidden = len(findings) - kept
+    if hidden > 0:
+        payload["hidden"] = hidden
+    return payload
+
+
 def _extract_ai_text(message: Any) -> str:
     """Best-effort plain text of an AIMessage across content shapes.
 
@@ -348,7 +509,13 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         # against the installed langchain_core). So the subagent discriminator can
         # only be evaluated at start; the end must be paired to it by run_id.
         # Pairing by call_id is authoritative: no emitted call => drop the result.
-        self._emitted_calls: set[str] = set()
+        # call_id -> tool name. Membership answers "did we emit this call?";
+        # the name lets on_tool_end recognise the lint gate's result.
+        self._emitted_calls: dict[str, str] = {}
+        # call_id -> (subagent_type, raw brief) for static `task` dispatches.
+        # on_tool_end uses it to persist a context-extractor's digest verbatim
+        # (harvest.context_digests) — the type/brief only ride the START.
+        self._task_meta: dict[str, tuple[Any, Any]] = {}
         # run_ids of MODEL turns that started inside a sub-agent (nested langgraph
         # namespace at on_chat_model_start). on_llm_end carries NO metadata, so it
         # can't re-classify itself — it looks the run_id up here. Same reason as
@@ -578,21 +745,32 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         shaped = shape_step(name, inputs)
         cid = self._call_id(run_id)
         with self._lock:
-            self._emitted_calls.add(cid)
+            self._emitted_calls[cid] = shaped["tool"]
             # An ``eval`` (the QuickJS fan-out dispatcher) opens a NEW fleet batch:
             # its globally-unique call_id groups the sub-agents it spawns. Recorded
             # here (top-level, so it's not filtered) and read by emit_subagent_event
             # to give each wave its own row instead of all sharing REPL ``call_0``.
             if shaped["tool"] == "eval":
                 self._current_eval_batch = cid
-        self._emit(
-            {
-                "kind": KIND_TOOL_CALL,
-                "tool": shaped["tool"],
-                "label": shaped["label"],
-                "call_id": cid,
-            }
-        )
+        event: dict[str, Any] = {
+            "kind": KIND_TOOL_CALL,
+            "tool": shaped["tool"],
+            "label": shaped["label"],
+            "call_id": cid,
+        }
+        # A task dispatch's full brief rides the start event (the label keeps
+        # only the description's first line) — the UI's fleet drill-in shows
+        # it in the square's Input tab.
+        if shaped["tool"] == _TASK_TOOL:
+            brief = _bounded_text((inputs or {}).get("description"))
+            if brief:
+                event["full"] = brief
+            with self._lock:
+                self._task_meta[cid] = (
+                    (inputs or {}).get("subagent_type"),
+                    (inputs or {}).get("description"),
+                )
+        self._emit(event)
 
     def _emitted_call(self, run_id: Any) -> bool:
         """Did we emit the tool_call for this run? A result whose call we dropped
@@ -604,42 +782,85 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
             return cid in self._emitted_calls
 
     def on_tool_end(self, output: Any, *, run_id: Any = None, **kwargs: Any) -> None:
-        """A tool returned — emit success/failure ONLY (no response body).
+        """A tool returned — emit success/failure (no response body on success).
 
         Tool errors are surfaced as ``ToolMessage(status="error")`` rather than
-        raised, so we classify from the output's ``status`` when present. Carries
+        raised, so we classify from the output's ``status`` when present. A
+        failure ALSO carries a bounded ``error`` snippet of the message content —
+        that text exists nowhere else (it goes back to the model, not the logs),
+        so without it a failed call is undiagnosable after the run. Carries
         the same ``call_id`` as its ``on_tool_start`` so the UI pairs them. Emitted
         ONLY if we emitted the matching tool_call (drops sub-agent-internal
         results, whose call was filtered out).
         """
         if not self._emitted_call(run_id):
             return
-        ok = True
-        status = getattr(output, "status", None)
-        if status == "error":
-            ok = False
-        self._emit(
-            {
-                "kind": KIND_TOOL_RESULT,
-                "ok": ok,
-                "call_id": self._call_id(run_id),
-            }
-        )
+        cid = self._call_id(run_id)
+        event: dict[str, Any] = {
+            "kind": KIND_TOOL_RESULT,
+            "ok": True,
+            "call_id": cid,
+        }
+        if getattr(output, "status", None) == "error":
+            event["ok"] = False
+            snippet = _tool_error_snippet(output)
+            if snippet:
+                event["error"] = snippet
+        else:
+            with self._lock:
+                tool = self._emitted_calls.get(cid, "")
+            if tool == _LINT_TOOL:
+                # The lint gate's report rides its result event (bounded) so
+                # the UI can badge the row and open the findings in a modal.
+                payload = _lint_event_payload(output)
+                if payload is not None:
+                    event["lint"] = payload
+            elif tool == _TASK_TOOL:
+                # A task dispatch's final answer (the sub-agent's return text,
+                # never its internal steps) — the fleet drill-in's Output tab.
+                # _result_text handles EVERY shape the task tool returns:
+                # deepagents' Command(update={"messages": [ToolMessage(...)]})
+                # (which reaches on_tool_end unchanged), a bare message, or a
+                # plain string — _extract_ai_text alone misses the Command
+                # envelope and left static-path dispatches with no result.
+                from harvest.subagent_io import _result_text
+
+                text = _result_text(output) or _extract_ai_text(output)
+                # A context-extractor's digest is persisted VERBATIM for the
+                # review's fidelity phase (record() filters by type, fail-soft;
+                # the feed keeps its bounded copy below).
+                with self._lock:
+                    sub_type, raw_brief = self._task_meta.get(cid, (None, None))
+                try:
+                    from harvest.context_digests import record
+
+                    record(
+                        sub_type if isinstance(sub_type, str) else None,
+                        raw_brief if isinstance(raw_brief, str) else None,
+                        text,
+                    )
+                except Exception:  # noqa: BLE001 — observability only
+                    log.debug("Failed to record extractor digest", exc_info=True)
+                if text:
+                    event["result"] = _bounded_text(text)
+        self._emit(event)
 
     def on_tool_error(
         self, error: BaseException, *, run_id: Any = None, **kwargs: Any
     ) -> None:
         """A tool raised (error handling disabled) — emit a failure result (only
-        if we emitted the matching tool_call)."""
+        if we emitted the matching tool_call), with a bounded error snippet."""
         if not self._emitted_call(run_id):
             return
-        self._emit(
-            {
-                "kind": KIND_TOOL_RESULT,
-                "ok": False,
-                "call_id": self._call_id(run_id),
-            }
-        )
+        event: dict[str, Any] = {
+            "kind": KIND_TOOL_RESULT,
+            "ok": False,
+            "call_id": self._call_id(run_id),
+        }
+        snippet = _error_snippet(error)
+        if snippet:
+            event["error"] = snippet
+        self._emit(event)
 
     # -- sub-agent fleet (driven from the custom stream, not callbacks) ------ #
     #
@@ -666,7 +887,9 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         """Emit one real sub-agent lifecycle event from the custom stream.
 
         ``event`` is a langchain_quickjs ``SubagentStreamEvent``
-        (``{type:'subagent', phase, id, eval_id?, subagent_type?, label?, ...}``).
+        (``{type:'subagent', phase, id, eval_id?, subagent_type?, label?, ...}``)
+        OR one of OUR shim's I/O enrichment events (``phase: input|result`` —
+        see :mod:`harvest.subagent_io`), which forward as ``phase: update``.
         We forward only the fields the fleet view needs, keyed by ``batch``
         (the fan-out group) and the per-dispatch ``sub_id`` (the event ``id``).
 
@@ -678,34 +901,106 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         a late terminal event lands in the right row even after a new eval opened.
         """
         phase = event.get("phase")
-        if phase not in (PHASE_START, PHASE_COMPLETE, PHASE_ERROR):
+        if phase not in (
+            PHASE_START,
+            PHASE_COMPLETE,
+            PHASE_ERROR,
+            PHASE_INPUT,
+            PHASE_RESULT,
+        ):
             return
         sub_id = event.get("id") or ""
+        # An event carrying an explicit `batch` names its own fleet row — the
+        # run_review tool emits its dispatches this way (":review" / ":fix"
+        # waves keyed by ITS tool_call_id), because the eval-batch heuristic
+        # below would fold them into whatever eval() ran last. Library events
+        # never carry the key, so their grouping is unchanged.
+        explicit_batch = event.get("batch") or ""
         with self._lock:
             if phase == PHASE_START:
                 # Pin this sub-agent to the wave that's currently dispatching. Fall
                 # back to the raw eval_id if no top-level eval was seen (defensive:
                 # e.g. the static `task` path), so a batch is never empty.
-                batch = self._current_eval_batch or event.get("eval_id") or ""
+                batch = (
+                    explicit_batch
+                    or self._current_eval_batch
+                    or event.get("eval_id")
+                    or ""
+                )
                 if sub_id:
                     self._fleet_batch_of[sub_id] = batch
+            elif phase in (PHASE_INPUT, PHASE_RESULT):
+                # Mid-flight enrichment: the square is still running, so read the
+                # pinned batch WITHOUT popping it (complete/error still needs it).
+                batch = self._fleet_batch_of.get(sub_id)
+                if batch is None:
+                    batch = (
+                        explicit_batch
+                        or self._current_eval_batch
+                        or event.get("eval_id")
+                        or ""
+                    )
             else:
                 # Terminal: reuse the batch pinned at start; fall back to current.
                 batch = self._fleet_batch_of.pop(sub_id, None)
                 if batch is None:
-                    batch = self._current_eval_batch or event.get("eval_id") or ""
+                    batch = (
+                        explicit_batch
+                        or self._current_eval_batch
+                        or event.get("eval_id")
+                        or ""
+                    )
         out: dict[str, Any] = {
             "kind": KIND_SUBAGENT,
             "phase": phase,
             "batch": batch,
             "sub_id": sub_id,
         }
-        if phase == PHASE_START:
+        if phase in (PHASE_INPUT, PHASE_RESULT):
+            # Enrichment from OUR shim (harvest.subagent_io): the full dispatch
+            # brief right after start, the final answer right before complete.
+            # Forwarded as ONE outbound phase — `update` — carrying the same
+            # `full`/`result` fields the static-`task` path uses; the UI patches
+            # the existing square. Dropped when the text is missing (nothing to
+            # patch) so the feed never grows an empty event.
+            out["phase"] = PHASE_UPDATE
+            key = "full" if phase == PHASE_INPUT else "result"
+            value = event.get("input") if phase == PHASE_INPUT else event.get("result")
+            if not (isinstance(value, str) and value.strip()):
+                return
+            out[key] = _bounded_text(value)
+        elif phase == PHASE_START:
             out["label"] = shape_subagent_label(
                 event.get("subagent_type"), event.get("label")
             )
             if event.get("subagent_type"):
                 out["subagent_type"] = event.get("subagent_type")
+            # Until the shim's `input` enrichment lands (milliseconds later),
+            # the best start-time brief is the library's own `description`
+            # teaser (200 chars), then the raw label when it says more than
+            # the shaped one. Bounded either way.
+            raw = event.get("description") or event.get("label")
+            if isinstance(raw, str) and raw.strip() and raw.strip() != out["label"]:
+                out["full"] = _bounded_text(raw)
+        elif phase == PHASE_COMPLETE:
+            # Forward the sub-agent's final answer when the stream event
+            # carries one (field name probed defensively — older
+            # langchain_quickjs versions may omit it, and the UI copes).
+            for key in ("result", "output", "text", "content"):
+                value = event.get(key)
+                if isinstance(value, str) and value.strip():
+                    out["result"] = _bounded_text(value)
+                    break
+        elif phase == PHASE_ERROR:
+            # langchain_quickjs's SubagentErrorEvent carries the failure string
+            # (str() of the raised exception — e.g. the provider's 400 body).
+            # Forward a bounded snippet: this is the ONLY place the failure text
+            # surfaces (the exception is consumed by the task() promise, so it
+            # never reaches the logs), and without it an errored square is
+            # undiagnosable after the run.
+            snippet = _error_snippet(event.get("error"))
+            if snippet:
+                out["error"] = snippet
         self._emit(out)
 
 

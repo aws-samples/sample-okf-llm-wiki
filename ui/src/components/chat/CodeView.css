@@ -10,7 +10,12 @@
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background-color: var(--muted);
+  /* Foreground-mix, NOT --muted: in light mode --muted ≈ the page/card whites,
+     so a muted fill vanishes and the code body reads as bare card (same trap
+     index.css documents for hovers). A 6% foreground tint over the card gives a
+     visible soft-gray panel in light mode and lands on the same lifted panel
+     --muted produced in dark mode. */
+  background-color: color-mix(in oklch, var(--foreground) 6%, var(--card));
 }
 
 /* Full-width variant — fills the container instead of shrinking to the code's

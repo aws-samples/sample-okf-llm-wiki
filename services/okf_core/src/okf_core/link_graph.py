@@ -23,12 +23,13 @@ agent can't touch, and no walk of the whole ``okf/`` mount.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import networkx as nx
 
 from okf_core.document import OKFDocument, OKFDocumentError
 from okf_core.links import extract_links_with_headings
+from okf_core.paths import is_reserved_rel_segments
 
 _INDEX_NAME = "index.md"
 _LOG_NAME = "log.md"
@@ -68,10 +69,17 @@ class LinkGraph:
                 if md_path.name in (_INDEX_NAME, _LOG_NAME):
                     continue
                 rel = md_path.relative_to(self.root).with_suffix("")
-                if any(part.startswith(".") for part in rel.parts):
+                if is_reserved_rel_segments(rel.parts[:-1]):
                     # Dot-dirs (.metadata/.context/.harvest) are authoring
-                    # inputs, not bundle concepts — keep them out of the graph
-                    # so backlinks and review clusters only ever name real docs.
+                    # inputs and deepagents scratch dirs are runtime leakage —
+                    # neither is a bundle concept, so keep them out of the
+                    # graph (backlinks and review clusters only name real
+                    # docs). PARENTS only ([:-1]), exactly as lint applies the
+                    # shared rule: a table legitimately named
+                    # `conversation_history` must not vanish from the graph
+                    # (no backlinks, no review cluster) while lint demands
+                    # its doc — the reserved names are directories, never a
+                    # judgment on a doc's own stem.
                     continue
                 concept_id = "/".join(rel.parts)
                 try:
@@ -135,7 +143,11 @@ class LinkGraph:
             out.append(self._node_info(source, edata.get("heading", "")))
         return out
 
-    def cluster(self, max_size: int = 5) -> list[list[str]]:
+    def cluster(
+        self,
+        max_size: int = 5,
+        exclude: Callable[[str], bool] | None = None,
+    ) -> list[list[str]]:
         """Partition every concept doc into link-based clusters of ≤ ``max_size``.
 
         The review fan-out's grouping query: instead of one reviewer per doc,
@@ -145,11 +157,21 @@ class LinkGraph:
         — and leftover small groups are packed together so the cluster count
         stays low. Every non-reserved doc lands in exactly one cluster; the
         result is deterministic for a given bundle state.
+
+        ``exclude`` drops docs from the partition BEFORE clusters form (a
+        predicate on the concept id) — not just from the output: an excluded
+        hub (the dataset overview, ``usage_guardrails``) links to everything,
+        so leaving it in would seed a cluster of unrelated spokes and steal
+        neighbors from their own tables. Excluded docs still exist in the
+        graph (backlinks/links unaffected); they are simply nobody's review
+        assignment. The caller owns the policy (see harvest.review).
         """
         max_size = max(1, int(max_size))
         self.ensure_fresh()
         und = self.graph.to_undirected(as_view=False)
         unassigned = set(und.nodes)
+        if exclude is not None:
+            unassigned = {n for n in unassigned if not exclude(n)}
 
         def rank(node: str) -> tuple[int, str]:
             # Hubs first (a table before its spoke references); id breaks ties

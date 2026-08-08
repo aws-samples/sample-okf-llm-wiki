@@ -175,6 +175,7 @@ def test_emitter_tool_error_status_marks_not_ok():
     assert events[-1]["kind"] == KIND_TOOL_RESULT
     assert events[-1]["ok"] is False
     assert events[-1]["call_id"] == "r2"
+    assert events[-1]["error"] == "boom"
 
 
 def test_emitter_on_tool_error_marks_not_ok():
@@ -187,7 +188,384 @@ def test_emitter_on_tool_error_marks_not_ok():
         "kind": KIND_TOOL_RESULT,
         "ok": False,
         "call_id": "r3",
+        "error": "nope",
     }
+
+
+def test_emitter_success_result_carries_no_error():
+    """The `error` field is a failure-only exception to "status, not content" —
+    a successful result must not leak any of the response body."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "run_sql"}, "", run_id="r4", inputs={})
+    em.on_tool_end(_FakeMessage("42 rows", status="success"), run_id="r4")
+    assert events[-1]["ok"] is True
+    assert "error" not in events[-1]
+
+
+def test_task_dispatch_carries_brief_and_final_answer():
+    """The fleet drill-in's two texts: a task START carries the full brief
+    (`full` — the label keeps only a teaser) and its success RESULT carries
+    the sub-agent's final answer (`result`), both bounded. Never the
+    sub-agent's internal steps — those stay filtered."""
+    from harvest.steps import _SUBAGENT_IO_MAX
+
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    # A realistic table-author brief (context-digest slice) fits UNTRUNCATED —
+    # a 9KB brief used to be cut at the old 8KB cap, which defeated the
+    # drill-in's purpose.
+    brief = "Author tables/races.\n\nGrounding digest:\n- " + "x" * 9000
+    em.on_tool_start(
+        {"name": "task"},
+        "",
+        run_id="t1",
+        inputs={"subagent_type": "table-author", "description": brief},
+    )
+    start = events[-1]
+    assert start["full"] == brief  # 9KB fits whole
+    # A runaway text is still bounded at the cap.
+    em.on_tool_start(
+        {"name": "task"},
+        "",
+        run_id="t2",
+        inputs={"subagent_type": "table-author", "description": "z" * 40000},
+    )
+    assert len(events[-1]["full"]) <= _SUBAGENT_IO_MAX
+
+    answer = "## Authored tables/races\n\n- grain verified\n" + "y" * 9000
+    em.on_tool_end(_FakeMessage(answer, status="success"), run_id="t1")
+    end = events[-1]
+    assert end["ok"] is True
+    assert end["result"] == answer  # 9KB fits whole
+    em.on_tool_end(_FakeMessage("w" * 40000, status="success"), run_id="t2")
+    assert len(events[-1]["result"]) <= _SUBAGENT_IO_MAX
+
+
+def test_task_result_unwraps_the_command_envelope():
+    """deepagents' task tool returns Command(update={'messages':
+    [ToolMessage(answer)]}) and langchain's on_tool_end receives it UNCHANGED
+    — the extraction must unwrap that envelope, or every static-path dispatch
+    shows an empty Output tab (the live bug: only message-shaped fakes were
+    tested)."""
+
+    class _FakeCommand:
+        def __init__(self, text):
+            self.update = {"messages": [_FakeMessage(text, status="success")]}
+
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start(
+        {"name": "task"},
+        "",
+        run_id="t9",
+        inputs={"subagent_type": "table-author", "description": "Author tables/x"},
+    )
+    em.on_tool_end(_FakeCommand("done: tables/x verified"), run_id="t9")
+    assert events[-1]["ok"] is True
+    assert events[-1]["result"] == "done: tables/x verified"
+
+
+def test_non_task_success_still_carries_no_result():
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "run_sql"}, "", run_id="q9", inputs={"query": "x"})
+    em.on_tool_end(_FakeMessage("42 rows", status="success"), run_id="q9")
+    assert "result" not in events[-1]
+
+
+def test_quickjs_start_carries_full_brief_and_complete_forwards_result():
+    """The eval-fanned path: the raw start label IS the task() description —
+    forwarded as `full` when it says more than the shaped teaser — and a
+    complete event's result text is forwarded when the stream provides one
+    (absent on older langchain_quickjs: the event simply lacks the field)."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.emit_subagent_event(
+        {
+            "type": "subagent",
+            "phase": "start",
+            "id": "s1",
+            "eval_id": "b",
+            "subagent_type": "reviewer",
+            "label": "Adversarially verify these related docs: tables/races, "
+            + "z" * 500,
+        }
+    )
+    assert events[-1]["full"].startswith("Adversarially verify")
+
+    em.emit_subagent_event(
+        {
+            "type": "subagent",
+            "phase": "complete",
+            "id": "s1",
+            "eval_id": "b",
+            "result": "no issues found",
+        }
+    )
+    assert events[-1]["result"] == "no issues found"
+
+    # A complete WITHOUT any result field stays lean (older stream shape).
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "start", "id": "s2", "eval_id": "b"}
+    )
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "complete", "id": "s2", "eval_id": "b"}
+    )
+    assert "result" not in events[-1]
+
+
+def test_emit_subagent_io_enrichment_forwards_as_update():
+    """The subagent_io shim's input/result enrichment events forward as ONE
+    outbound phase (`update`) carrying the same `full`/`result` fields the
+    static-task path uses, pinned to the square's batch WITHOUT popping it
+    (the terminal complete still needs the pin)."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.emit_subagent_event(
+        {
+            "type": "subagent",
+            "phase": "start",
+            "id": "s1",
+            "eval_id": "b",
+            "subagent_type": "table-author",
+            "label": "table-author cards",
+        }
+    )
+    em.emit_subagent_event(
+        {
+            "type": "subagent",
+            "phase": "input",
+            "id": "s1",
+            "input": "Author tables/cards.md.\n\nContext digest: uuids join sets…",
+        }
+    )
+    upd = events[-1]
+    assert upd["kind"] == "subagent"
+    assert upd["phase"] == "update"
+    assert upd["sub_id"] == "s1"
+    assert upd["batch"] == "b"
+    assert upd["full"].startswith("Author tables/cards.md")
+    assert "result" not in upd
+
+    em.emit_subagent_event(
+        {
+            "type": "subagent",
+            "phase": "result",
+            "id": "s1",
+            "result": "Doc written: tables/cards.md — grain verified.",
+        }
+    )
+    upd = events[-1]
+    assert upd["phase"] == "update"
+    assert upd["result"].startswith("Doc written")
+    assert "full" not in upd
+
+    # The enrichment reads the batch pin without popping it: the terminal
+    # complete still lands in the batch pinned at start.
+    em.emit_subagent_event({"type": "subagent", "phase": "complete", "id": "s1"})
+    assert events[-1]["phase"] == "complete"
+    assert events[-1]["batch"] == "b"
+
+
+def test_emit_subagent_explicit_batch_beats_the_eval_heuristic():
+    """run_review emits its dispatches with an explicit `batch` (two waves
+    keyed by ITS call id). That must win over the current-eval heuristic —
+    otherwise a review square would fold into whatever eval() ran last."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    # A prior eval left a current batch behind.
+    em.on_tool_start({"name": "eval"}, "", run_id="eval-1", inputs={"code": "x"})
+    em.emit_subagent_event(
+        {
+            "type": "subagent",
+            "phase": "start",
+            "id": "rev-c1",
+            "batch": "call_9:review",
+            "subagent_type": "reviewer",
+            "label": "c1 · 3 docs",
+            "description": "Adversarially verify: tables/a, tables/b",
+        }
+    )
+    start = events[-1]
+    assert start["batch"] == "call_9:review"
+    assert start["full"].startswith("Adversarially verify")
+    # Terminal reuses the pinned explicit batch.
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "complete", "id": "rev-c1", "result": "CLEAN"}
+    )
+    assert events[-1]["batch"] == "call_9:review"
+    assert events[-1]["result"] == "CLEAN"
+    # Library events (no explicit batch) keep the eval heuristic.
+    em.emit_subagent_event({"type": "subagent", "phase": "start", "id": "s9"})
+    assert events[-1]["batch"] == "eval-1"
+
+
+def test_emit_subagent_io_enrichment_is_bounded_and_skips_empty():
+    """An enrichment with no usable text emits nothing (there is nothing to
+    patch); an overlong one is bounded like every other I/O text."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "start", "id": "s1", "eval_id": "b"}
+    )
+    n = len(events)
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "input", "id": "s1", "input": "   "}
+    )
+    em.emit_subagent_event({"type": "subagent", "phase": "result", "id": "s1"})
+    assert len(events) == n
+
+    from harvest.steps import _SUBAGENT_IO_MAX
+
+    em.emit_subagent_event(
+        {"type": "subagent", "phase": "result", "id": "s1", "result": "y" * 40000}
+    )
+    assert events[-1]["phase"] == "update"
+    assert len(events[-1]["result"]) <= _SUBAGENT_IO_MAX
+
+
+def _lint_report(n_findings=2, message="Doc `tables/x.md` is missing."):
+    return {
+        "ok": False,
+        "steps": [
+            {"step": "coverage", "status": "issues", "errors": 1, "warnings": 0},
+            {"step": "links", "status": "issues", "errors": 1, "warnings": 1},
+            {"step": "explain_sql", "status": "skipped", "errors": 0, "warnings": 0},
+        ],
+        "findings": [
+            {
+                "severity": "error",
+                "code": "missing-table-doc",
+                "path": f"tables/t{i}.md",
+                "message": message,
+            }
+            for i in range(n_findings)
+        ],
+    }
+
+
+def test_lint_result_rides_the_feed_as_a_bounded_payload():
+    """The lint gate is the ONE tool whose success body the feed carries: its
+    structured report lands as `lint` on the tool_result, with error/warning
+    totals computed from the per-step counters."""
+    import json as _json
+
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "lint_bundle"}, "", run_id="L1", inputs={})
+    em.on_tool_end(
+        _FakeMessage(_json.dumps(_lint_report()), status="success"), run_id="L1"
+    )
+    lint = events[-1]["lint"]
+    assert events[-1]["ok"] is True
+    assert lint["ok"] is False
+    assert lint["errors"] == 2 and lint["warnings"] == 1
+    assert [s["step"] for s in lint["steps"]][:2] == ["coverage", "links"]
+    assert len(lint["findings"]) == 2
+    assert "hidden" not in lint
+
+
+def test_lint_result_parses_python_repr_content():
+    """ToolMessage content may be `str(dict)` (single quotes) rather than JSON —
+    the literal_eval fallback still recovers the report."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "lint_bundle"}, "", run_id="L2", inputs={})
+    em.on_tool_end(_FakeMessage(str(_lint_report()), status="success"), run_id="L2")
+    assert events[-1]["lint"]["errors"] == 2
+
+
+def test_lint_payload_budget_drops_tail_findings_into_hidden():
+    """Findings past the ~8KB budget are dropped from the tail and COUNTED —
+    the totals stay accurate because they come from the step counters."""
+    import json as _json
+
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "lint_bundle"}, "", run_id="L3", inputs={})
+    report = _lint_report(n_findings=60, message="m" * 400)
+    em.on_tool_end(_FakeMessage(_json.dumps(report), status="success"), run_id="L3")
+    lint = events[-1]["lint"]
+    assert 0 < len(lint["findings"]) < 60
+    assert lint["hidden"] == 60 - len(lint["findings"])
+    assert lint["errors"] == 2  # from step counters, not the truncated list
+    line = _json.dumps(lint, separators=(",", ":"))
+    assert len(line) < 10000  # comfortably inside one CloudWatch event
+
+
+def test_lint_payload_notes_are_bounded_too():
+    """Step notes and the top-level note embed exception strings — they must
+    be capped like the findings, or one boto error body busts the ~8KB line
+    budget the findings were trimmed to fit."""
+    import json as _json
+
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "lint_bundle"}, "", run_id="L6", inputs={})
+    report = _lint_report()
+    report["steps"][0]["note"] = "x" * 2000
+    report["note"] = "y" * 2000
+    em.on_tool_end(_FakeMessage(_json.dumps(report), status="success"), run_id="L6")
+    lint = events[-1]["lint"]
+    assert len(lint["steps"][0]["note"]) <= 300
+    assert len(lint["note"]) <= 300
+
+
+def test_lint_payload_only_for_the_lint_tool_and_only_on_success():
+    """Other tools never leak a success body, and a FAILED lint_bundle carries
+    the error snippet, not a report."""
+    import json as _json
+
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "run_sql"}, "", run_id="q1", inputs={})
+    em.on_tool_end(
+        _FakeMessage(_json.dumps(_lint_report()), status="success"), run_id="q1"
+    )
+    assert "lint" not in events[-1]
+
+    em.on_tool_start({"name": "lint_bundle"}, "", run_id="L4", inputs={})
+    em.on_tool_end(_FakeMessage("boom", status="error"), run_id="L4")
+    assert "lint" not in events[-1]
+    assert events[-1]["error"] == "boom"
+
+
+def test_lint_payload_unparseable_content_is_skipped_not_fatal():
+    """Content that isn't a lint report (plain text, wrong shape) yields a
+    normal ok result with no `lint` field — never a crash."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "lint_bundle"}, "", run_id="L5", inputs={})
+    em.on_tool_end(_FakeMessage("not a dict at all", status="success"), run_id="L5")
+    assert events[-1]["ok"] is True
+    assert "lint" not in events[-1]
+
+
+def test_emitter_error_snippet_is_bounded_and_single_line():
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "run_sql"}, "", run_id="r5", inputs={})
+    em.on_tool_end(
+        _FakeMessage("Error code: 400 -\n  " + "x" * 2000, status="error"),
+        run_id="r5",
+    )
+    err = events[-1]["error"]
+    assert len(err) <= 500
+    assert "\n" not in err
+    assert err.startswith("Error code: 400 - x")  # whitespace collapsed
+
+
+def test_emitter_error_snippet_from_block_content():
+    """A failed ToolMessage whose content is a block list still yields text."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.on_tool_start({"name": "run_sql"}, "", run_id="r6", inputs={})
+    em.on_tool_end(
+        _FakeMessage([{"type": "text", "text": "boom from blocks"}], status="error"),
+        run_id="r6",
+    )
+    assert events[-1]["error"] == "boom from blocks"
 
 
 def test_emitter_drops_result_without_matching_call():
@@ -707,6 +1085,35 @@ def test_emit_subagent_complete_and_error():
     )
     assert events[0]["phase"] == PHASE_COMPLETE and events[0]["sub_id"] == "x"
     assert events[1]["phase"] == PHASE_ERROR and events[1]["sub_id"] == "y"
+    assert "error" not in events[0]  # complete carries no failure text
+
+
+def test_emit_subagent_error_forwards_bounded_snippet():
+    """langchain_quickjs's SubagentErrorEvent carries `error` (str(exc)); the
+    emitter forwards a bounded single-line snippet — the only place the failure
+    text of a dead sub-agent (e.g. a provider 400) surfaces."""
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.emit_subagent_event(
+        {
+            "type": "subagent",
+            "phase": "error",
+            "id": "y",
+            "eval_id": "b",
+            "error": "Error code: 400 -\n {'message':" + " 'x'" * 400 + "}",
+        }
+    )
+    err = events[0]["error"]
+    assert err.startswith("Error code: 400 - {'message':")  # collapsed
+    assert len(err) <= 500 and "\n" not in err
+
+
+def test_emit_subagent_error_without_text_omits_field():
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    em.emit_subagent_event({"type": "subagent", "phase": "error", "id": "y"})
+    assert events[0]["phase"] == PHASE_ERROR
+    assert "error" not in events[0]
 
 
 def test_emit_subagent_ignores_unknown_phase():
@@ -837,3 +1244,44 @@ def test_emit_status_narrates_pre_agent_phases():
     assert all(e["kind"] == KIND_AGENT for e in events)
     assert "profiling columns" in events[0]["label"]
     assert events[1]["label"] == "Column profiles: 10 profiled, 2 reused from cache"
+
+
+def test_static_task_path_records_context_extractor_digest(tmp_path):
+    # The static `task` dispatch path (no QuickJS shim in the way): the
+    # emitter pairs the start's (subagent_type, brief) with the end's result
+    # text and persists a context-extractor's digest verbatim.
+    from harvest import context_digests as cd
+
+    cd.configure(tmp_path)
+    try:
+        events, sink = _collect()
+        em = StepEmitter(sink)
+        em.on_tool_start(
+            {"name": "task"},
+            "",
+            run_id="t-ctx",
+            inputs={
+                "subagent_type": "context-extractor",
+                "description": "Extract facts from spec.pdf",
+            },
+        )
+        em.on_tool_end("## tables/orders\n- fact from the pdf", run_id="t-ctx")
+        # A non-extractor task dispatch records nothing.
+        em.on_tool_start(
+            {"name": "task"},
+            "",
+            run_id="t-author",
+            inputs={"subagent_type": "table-author", "description": "author x"},
+        )
+        em.on_tool_end("wrote tables/x.md", run_id="t-author")
+
+        paths = cd.digest_paths(tmp_path)
+        assert paths == [".harvest/context/digest-01.md"]
+        text = (tmp_path / paths[0]).read_text(encoding="utf-8")
+        assert "Extract facts from spec.pdf" in text
+        assert "- fact from the pdf" in text
+        # The feed behavior is unchanged: the result still rides the event.
+        results = [e for e in events if e.get("kind") == "tool_result"]
+        assert results[0]["result"].startswith("## tables/orders")
+    finally:
+        cd.configure(None)

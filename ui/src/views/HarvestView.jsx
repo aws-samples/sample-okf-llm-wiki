@@ -1,4 +1,12 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import {
+  Fragment,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import { toast } from "sonner"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
@@ -20,6 +28,7 @@ import {
   SlidersHorizontalIcon,
   SparklesIcon,
   TerminalIcon,
+  TriangleAlertIcon,
   UsersIcon,
   WrenchIcon,
   XCircleIcon,
@@ -73,7 +82,10 @@ import {
   PopoverTitle,
   PopoverTrigger,
 } from "@/components/ui/popover"
+import { PanelShell } from "@/components/chat/PanelShell"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { usePanelWidth } from "@/hooks/usePanelWidth"
 import {
   Sheet,
   SheetContent,
@@ -163,6 +175,10 @@ export default function HarvestView({
   selection,
   datasets = [],
   autoOpenAnnotations = false,
+  // The shared TopbarHeader element, re-rendered INSIDE this view's left
+  // column (see App.jsx): harvest owns the whole inset so the sub-agent I/O
+  // panel can stand viewport-top-to-bottom beside topbar + content alike.
+  topbar = null,
 }) {
   const [status, setStatus] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -211,6 +227,25 @@ export default function HarvestView({
   // explicitly (the backend also has a deploy-time default, but sending it makes
   // the choice visible/auditable).
   const [settingsOpen, setSettingsOpen] = useState(false)
+  // The sub-agent drill-in panel (the chat citation-panel pattern): `square`
+  // holds the clicked square's snapshot and PERSISTS through the close slide
+  // so the panel doesn't blank mid-animation; `squarePanelOpen` drives the
+  // width-animated clip. Width is drag-resizable and persisted.
+  const [square, setSquare] = useState(null)
+  const [squarePanelOpen, setSquarePanelOpen] = useState(false)
+  const {
+    width: squarePanelWidth,
+    dragging: squarePanelDragging,
+    startResize: startSquarePanelResize,
+  } = usePanelWidth({
+    storageKey: "okf.harvest.subagentPanelWidth",
+    min: 340,
+    defaultWidth: 448,
+  })
+  const openSquare = useCallback((sq) => {
+    setSquare(sq)
+    setSquarePanelOpen(true)
+  }, [])
   const [pref] = useState(loadPreference)
   const [model, setModel] = useState(pref.model)
   const [effort, setEffortState] = useState(pref.effort)
@@ -552,7 +587,9 @@ export default function HarvestView({
     // on its very first status read.
     terminalIdleSinceRef.current = null
     // Reset the feed whenever the selection changes so a prior dataset's steps
-    // don't bleed into the new one (also invalidates any in-flight poll).
+    // don't bleed into the new one (also invalidates any in-flight poll). The
+    // sub-agent panel closes too — its square belongs to the old dataset.
+    setSquarePanelOpen(false)
     resetFeed()
     if (!hasSelection) return undefined
     poll({ withSpinner: true })
@@ -855,18 +892,6 @@ export default function HarvestView({
     }
   }
 
-  if (!hasSelection) {
-    return (
-      <Alert>
-        <CircleDashedIcon />
-        <AlertTitle>Select a dataset first</AlertTitle>
-        <AlertDescription>
-          Pick a dataset from the sidebar to start and watch a harvest.
-        </AlertDescription>
-      </Alert>
-    )
-  }
-
   const inner = status?.status || {}
   const currentStatus = inner.status || null
   const ready = status?.ready
@@ -880,6 +905,39 @@ export default function HarvestView({
   // (report_status writes updated_at on transitions). While running they mirror
   // each other, so show Updated only when terminal to avoid a redundant row.
   const showUpdated = inner.updated_at && TERMINAL_STATUSES.has(currentStatus)
+
+  // The drill-in panel must track the LIVE square, not the click-time
+  // snapshot: a square opened while running would otherwise show "Still
+  // running…" forever — its completion lands in freshly merged rows the
+  // snapshot never sees. Re-derive by id from the current events each poll;
+  // the snapshot stays as the fallback (close animation, selection switch).
+  // NOTE: this hook (and everything above it) must stay ABOVE the
+  // no-selection early return — App mounts this view unkeyed, so a selection
+  // change re-renders the same instance, and a hook that only runs on one
+  // side of the return breaks React's hook-order invariant (crashes the view).
+  const liveSquare = useMemo(() => {
+    if (!square?.id) return null
+    for (const row of mergeRows(events, aborted)) {
+      if (row.kind !== "fleet") continue
+      // mergeRows materialises each fleet row's squares as an ARRAY (not the
+      // Map it accumulates into), so look up by the square's own id.
+      const live = row.squares.find((sq) => sq.id === square.id)
+      if (live) return live
+    }
+    return null
+  }, [events, aborted, square])
+
+  if (!hasSelection) {
+    return (
+      <Alert>
+        <CircleDashedIcon />
+        <AlertTitle>Select a dataset first</AlertTitle>
+        <AlertDescription>
+          Pick a dataset from the sidebar to start and watch a harvest.
+        </AlertDescription>
+      </Alert>
+    )
+  }
 
   // Full harvest is destructive when a bundle already exists (it wipes + rebuilds
   // every doc, discarding any prior authoring incl. applied annotations). Confirm
@@ -928,7 +986,8 @@ export default function HarvestView({
   const toggleAllAnno = () => {
     setAnnoSelected((prev) => {
       const next = new Set(prev)
-      if (allAnnoSelected) visibleAnno.forEach((n) => next.delete(n.annotation_id))
+      if (allAnnoSelected)
+        visibleAnno.forEach((n) => next.delete(n.annotation_id))
       else visibleAnno.forEach((n) => next.add(n.annotation_id))
       return next
     })
@@ -944,627 +1003,726 @@ export default function HarvestView({
   const crossReferencedBy = selfMapping?.cross_referenced_by || []
 
   return (
-    // h-full: fill the content region (which is bounded by the viewport / the
-    // floating sidebar's bottom gap), so the card — and its live feed — grow to
-    // the max height available instead of a fixed cap. The region is
-    // overflow-y-auto, so on a very short viewport the card still scrolls.
-    <div className="flex h-full flex-col gap-4">
-      <Card className="min-h-0 flex-1">
-        <CardHeader className="border-b">
-          <CardTitle className="flex items-center gap-2">
-            <PlayIcon className="size-4" />
-            Harvest
-          </CardTitle>
-          <div className="col-start-2 row-span-2 row-start-1 flex items-center gap-2 self-start justify-self-end">
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={() => setSettingsOpen(true)}
-              title="Harvest settings (model + dataset guidance)"
-              aria-label="Harvest settings"
-              // Always clickable — dataset guidance lives in the panel now and
-              // must stay editable mid-run; only the model selects lock inside.
-              className="relative"
-            >
-              <SlidersHorizontalIcon className="size-4" />
-              {guidance?.guidance_dirty ? (
-                // Guidance edited but not yet applied — surface the pending
-                // state on the (otherwise opaque) settings button.
-                <span
-                  className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-amber-500"
-                  aria-hidden="true"
-                />
-              ) : null}
-            </Button>
-            {running ? (
-              <Button
-                variant="destructive"
-                onClick={cancelHarvest}
-                disabled={cancelling}
-              >
-                {cancelling ? <Spinner /> : <XIcon data-icon="inline-start" />}
-                Cancel harvest
-              </Button>
-            ) : (
-              // A split control: the dropdown (LEFT) offers the annotation
-              // re-harvest; the primary button (RIGHT) runs a full harvest.
-              // no-overlap (ml-0): two solid buttons share a seam, so a visible
-              // divider reads better than the default 1px border-overlap (which
-              // would hide under the neighbour).
-              <ButtonGroup className="[&>*:not(:first-child)]:ml-0">
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
+    // The view owns the WHOLE inset (see App.jsx) — the chat-page geometry:
+    // the LEFT column re-creates the standard section stack (topbar + padded
+    // content region, identical spacing to every other section), and the
+    // sub-agent I/O panel stands beside it OUTSIDE that stack, viewport top
+    // to bottom — exactly like the chat doc peek. Width-animated clip; the
+    // inner wrapper is fixed-width so the panel never reflows mid-slide.
+    <div className="flex h-full min-h-0 w-full flex-1 items-stretch overflow-hidden">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {topbar}
+        {/* The standard content-region paddings (App.jsx's px-4 pt-4 pb-2
+            top-strip case), then a full-width scroll region with the card
+            re-centered on the shared max-w-6xl + p-1 math — closed-panel
+            geometry is pixel-identical to the shared centered block. */}
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pt-4 pb-2">
+          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto p-1">
+            <div className="mx-auto flex h-full w-full max-w-6xl flex-col gap-4">
+              <Card className="min-h-0 flex-1">
+                <CardHeader className="border-b">
+                  <CardTitle className="flex items-center gap-2">
+                    <PlayIcon className="size-4" />
+                    Harvest
+                  </CardTitle>
+                  <div className="col-start-2 row-span-2 row-start-1 flex items-center gap-2 self-start justify-self-end">
                     <Button
+                      variant="outline"
                       size="icon"
-                      disabled={starting || startingAnnotations || authoringGuardrails}
-                      aria-label="More harvest options"
-                      title={
-                        authoringGuardrails
-                          ? "Guardrails are being authored — wait for the badge to clear"
-                          : "More harvest options"
-                      }
-                      // Buttons carry `border border-transparent bg-clip-padding`;
-                      // in dark mode that transparent 1px reveals the near-black
-                      // page behind the button (a stray dark ring). Tint the border
-                      // to the fill (border-primary) so it blends into the blue.
-                      className="border-primary"
+                      onClick={() => setSettingsOpen(true)}
+                      title="Harvest settings (model + dataset guidance)"
+                      aria-label="Harvest settings"
+                      // Always clickable — dataset guidance lives in the panel now and
+                      // must stay editable mid-run; only the model selects lock inside.
+                      className="relative"
                     >
-                      {startingAnnotations ? <Spinner /> : <ChevronDownIcon />}
+                      <SlidersHorizontalIcon className="size-4" />
+                      {guidance?.guidance_dirty ? (
+                        // Guidance edited but not yet applied — surface the pending
+                        // state on the (otherwise opaque) settings button.
+                        <span
+                          className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-amber-500"
+                          aria-hidden="true"
+                        />
+                      ) : null}
                     </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start" className="w-64">
-                    <DropdownMenuLabel>Re-harvest</DropdownMenuLabel>
-                    <DropdownMenuItem
-                      onSelect={openAnnotationPicker}
-                      disabled={startingAnnotations}
-                      className="flex-col items-start gap-0.5"
-                    >
-                      <span className="flex items-center gap-2">
-                        <MessageSquareTextIcon />
-                        Apply annotations…
-                        {guidance?.guidance_dirty ? " + guidance" : ""}
-                      </span>
-                      <span className="pl-6 text-[11px] text-muted-foreground">
-                        {guidance?.guidance_dirty
-                          ? "In-place: pick which notes to apply, plus the updated guidance."
-                          : "In-place: pick which of your open notes to apply."}
-                      </span>
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() => setCrossOpen(true)}
-                      disabled={startingCross}
-                      className="flex-col items-start gap-0.5"
-                    >
-                      <span className="flex items-center gap-2">
-                        <Link2Icon />
-                        Cross-dataset discovery…
-                      </span>
-                      <span className="pl-6 text-[11px] text-muted-foreground">
-                        Discover + verify relationships with another dataset.
-                      </span>
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-                <Button
-                  onClick={requestStartHarvest}
-                  disabled={starting || authoringGuardrails}
-                  title={
-                    authoringGuardrails
-                      ? "Guardrails are being authored — wait for the badge to clear"
-                      : undefined
-                  }
-                  // border-primary blends the transparent edges into the fill (no
-                  // dark ring in dark mode); the left edge is the divider seam.
-                  className="border-primary border-l-primary-foreground/30"
-                >
-                  {starting ? (
-                    <Spinner />
-                  ) : (
-                    <PlayIcon data-icon="inline-start" />
-                  )}
-                  Start full harvest
-                </Button>
-              </ButtonGroup>
-            )}
-          </div>
-          <HarvestSettingsSheet
-            open={settingsOpen}
-            onOpenChange={setSettingsOpen}
-            model={model}
-            effort={effort}
-            onModelChange={onModelChange}
-            onEffortChange={setEffort}
-            subModel={subModel}
-            subEffort={subEffort}
-            onSubModelChange={onSubModelChange}
-            onSubEffortChange={setSubEffort}
-            revModel={revModel}
-            revEffort={revEffort}
-            onRevModelChange={onRevModelChange}
-            onRevEffortChange={setRevEffort}
-            locked={running || starting}
-            guidance={guidance}
-            guidanceDraft={guidanceDraft}
-            onGuidanceDraftChange={setGuidanceDraft}
-            guidanceLoading={guidanceLoading}
-            savingGuidance={savingGuidance}
-            onSaveGuidance={saveGuidance}
-          />
-          <Dialog open={confirmFullOpen} onOpenChange={setConfirmFullOpen}>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Re-run a full harvest?</DialogTitle>
-                <DialogDescription>
-                  <span className="font-medium text-foreground">
-                    {domain}/{dataset}
-                  </span>{" "}
-                  already has a knowledge bundle. A full harvest rebuilds it
-                  from scratch — every existing doc is discarded and
-                  re-authored, including any applied annotations and manual
-                  edits
-                  {hasExternal
-                    ? ", and its cross-dataset references (external/) — re-run" +
-                      " a cross-dataset discovery afterwards to restore them"
-                    : ""}
-                  . This can't be undone. To apply new feedback without a
-                  rebuild, use{" "}
-                  <span className="font-medium">Apply my annotations</span>{" "}
-                  instead.
-                </DialogDescription>
-              </DialogHeader>
-              <DialogFooter>
-                <DialogClose asChild>
-                  <Button variant="outline">Cancel</Button>
-                </DialogClose>
-                <Button variant="destructive" onClick={confirmStartHarvest}>
-                  <PlayIcon data-icon="inline-start" />
-                  Rebuild bundle
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-          {/* Cross-dataset target picker. Rendered at CardHeader level (a
+                    {running ? (
+                      <Button
+                        variant="destructive"
+                        onClick={cancelHarvest}
+                        disabled={cancelling}
+                      >
+                        {cancelling ? (
+                          <Spinner />
+                        ) : (
+                          <XIcon data-icon="inline-start" />
+                        )}
+                        Cancel harvest
+                      </Button>
+                    ) : (
+                      // A split control: the dropdown (LEFT) offers the annotation
+                      // re-harvest; the primary button (RIGHT) runs a full harvest.
+                      // no-overlap (ml-0): two solid buttons share a seam, so a visible
+                      // divider reads better than the default 1px border-overlap (which
+                      // would hide under the neighbour).
+                      <ButtonGroup className="[&>*:not(:first-child)]:ml-0">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              size="icon"
+                              disabled={
+                                starting ||
+                                startingAnnotations ||
+                                authoringGuardrails
+                              }
+                              aria-label="More harvest options"
+                              title={
+                                authoringGuardrails
+                                  ? "Guardrails are being authored — wait for the badge to clear"
+                                  : "More harvest options"
+                              }
+                              // Buttons carry `border border-transparent bg-clip-padding`;
+                              // in dark mode that transparent 1px reveals the near-black
+                              // page behind the button (a stray dark ring). Tint the border
+                              // to the fill (border-primary) so it blends into the blue.
+                              className="border-primary"
+                            >
+                              {startingAnnotations ? (
+                                <Spinner />
+                              ) : (
+                                <ChevronDownIcon />
+                              )}
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="start" className="w-64">
+                            <DropdownMenuLabel>Re-harvest</DropdownMenuLabel>
+                            <DropdownMenuItem
+                              onSelect={openAnnotationPicker}
+                              disabled={startingAnnotations}
+                              className="flex-col items-start gap-0.5"
+                            >
+                              <span className="flex items-center gap-2">
+                                <MessageSquareTextIcon />
+                                Apply annotations…
+                                {guidance?.guidance_dirty ? " + guidance" : ""}
+                              </span>
+                              <span className="pl-6 text-[11px] text-muted-foreground">
+                                {guidance?.guidance_dirty
+                                  ? "In-place: pick which notes to apply, plus the updated guidance."
+                                  : "In-place: pick which of your open notes to apply."}
+                              </span>
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onSelect={() => setCrossOpen(true)}
+                              disabled={startingCross}
+                              className="flex-col items-start gap-0.5"
+                            >
+                              <span className="flex items-center gap-2">
+                                <Link2Icon />
+                                Cross-dataset discovery…
+                              </span>
+                              <span className="pl-6 text-[11px] text-muted-foreground">
+                                Discover + verify relationships with another
+                                dataset.
+                              </span>
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                        <Button
+                          onClick={requestStartHarvest}
+                          disabled={starting || authoringGuardrails}
+                          title={
+                            authoringGuardrails
+                              ? "Guardrails are being authored — wait for the badge to clear"
+                              : undefined
+                          }
+                          // border-primary blends the transparent edges into the fill (no
+                          // dark ring in dark mode); the left edge is the divider seam.
+                          className="border-primary border-l-primary-foreground/30"
+                        >
+                          {starting ? (
+                            <Spinner />
+                          ) : (
+                            <PlayIcon data-icon="inline-start" />
+                          )}
+                          Start full harvest
+                        </Button>
+                      </ButtonGroup>
+                    )}
+                  </div>
+                  <HarvestSettingsSheet
+                    open={settingsOpen}
+                    onOpenChange={setSettingsOpen}
+                    model={model}
+                    effort={effort}
+                    onModelChange={onModelChange}
+                    onEffortChange={setEffort}
+                    subModel={subModel}
+                    subEffort={subEffort}
+                    onSubModelChange={onSubModelChange}
+                    onSubEffortChange={setSubEffort}
+                    revModel={revModel}
+                    revEffort={revEffort}
+                    onRevModelChange={onRevModelChange}
+                    onRevEffortChange={setRevEffort}
+                    locked={running || starting}
+                    guidance={guidance}
+                    guidanceDraft={guidanceDraft}
+                    onGuidanceDraftChange={setGuidanceDraft}
+                    guidanceLoading={guidanceLoading}
+                    savingGuidance={savingGuidance}
+                    onSaveGuidance={saveGuidance}
+                  />
+                  <Dialog
+                    open={confirmFullOpen}
+                    onOpenChange={setConfirmFullOpen}
+                  >
+                    <DialogContent>
+                      <DialogHeader>
+                        <DialogTitle>Re-run a full harvest?</DialogTitle>
+                        <DialogDescription>
+                          <span className="font-medium text-foreground">
+                            {domain}/{dataset}
+                          </span>{" "}
+                          already has a knowledge bundle. A full harvest
+                          rebuilds it from scratch — every existing doc is
+                          discarded and re-authored, including any applied
+                          annotations and manual edits
+                          {hasExternal
+                            ? ", and its cross-dataset references (external/) — re-run" +
+                              " a cross-dataset discovery afterwards to restore them"
+                            : ""}
+                          . This can't be undone. To apply new feedback without
+                          a rebuild, use{" "}
+                          <span className="font-medium">
+                            Apply my annotations
+                          </span>{" "}
+                          instead.
+                        </DialogDescription>
+                      </DialogHeader>
+                      <DialogFooter>
+                        <DialogClose asChild>
+                          <Button variant="outline">Cancel</Button>
+                        </DialogClose>
+                        <Button
+                          variant="destructive"
+                          onClick={confirmStartHarvest}
+                        >
+                          <PlayIcon data-icon="inline-start" />
+                          Rebuild bundle
+                        </Button>
+                      </DialogFooter>
+                    </DialogContent>
+                  </Dialog>
+                  {/* Cross-dataset target picker. Rendered at CardHeader level (a
               sibling of the trigger, like the confirm dialog above) — nesting
               a Dialog inside the DropdownMenuItem would bubble its close click
               back into the menu. */}
-          <Dialog open={crossOpen} onOpenChange={setCrossOpen}>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Cross-dataset discovery</DialogTitle>
-                <DialogDescription>
-                  Explore one other dataset for relationships with{" "}
-                  <span className="font-medium text-foreground">
-                    {domain}/{dataset}
-                  </span>
-                  , verify them against live data, and write the resulting
-                  join/metric docs into{" "}
-                  <span className="font-medium">this dataset's external/</span>{" "}
-                  folder. The target's listing gains a "referenced by" signal
-                  pointing here — nothing is written into its bundle. Both
-                  datasets need a published bundle; a full harvest of{" "}
-                  <span className="font-medium">this</span> dataset removes
-                  its external/ docs (re-run the cross harvest to restore
-                  them).
-                </DialogDescription>
-              </DialogHeader>
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="cross-target">Target dataset</Label>
-                {/* A searchable list, not a plain dropdown: real catalogs run
+                  <Dialog open={crossOpen} onOpenChange={setCrossOpen}>
+                    <DialogContent>
+                      <DialogHeader>
+                        <DialogTitle>Cross-dataset discovery</DialogTitle>
+                        <DialogDescription>
+                          Explore one other dataset for relationships with{" "}
+                          <span className="font-medium text-foreground">
+                            {domain}/{dataset}
+                          </span>
+                          , verify them against live data, and write the
+                          resulting join/metric docs into{" "}
+                          <span className="font-medium">
+                            this dataset's external/
+                          </span>{" "}
+                          folder. The target's listing gains a "referenced by"
+                          signal pointing here — nothing is written into its
+                          bundle. Both datasets need a published bundle; a full
+                          harvest of <span className="font-medium">this</span>{" "}
+                          dataset removes its external/ docs (re-run the cross
+                          harvest to restore them).
+                        </DialogDescription>
+                      </DialogHeader>
+                      <div className="flex flex-col gap-2">
+                        <Label htmlFor="cross-target">Target dataset</Label>
+                        {/* A searchable list, not a plain dropdown: real catalogs run
                     to thousands of datasets. cmdk filters as you type. */}
-                <Command className="rounded-xl border">
-                  <CommandInput
-                    id="cross-target"
-                    placeholder="Search datasets…"
-                  />
-                  <CommandList className="max-h-52">
-                    <CommandEmpty>No datasets match.</CommandEmpty>
-                    <CommandGroup>
-                      {crossCandidates.map((d) => {
-                        const id = `${d.data_domain}/${d.dataset}`
-                        // Already documented (either direction) — re-running
-                        // replaces that pair's docs.
-                        const done =
-                          crossReferences.includes(id) ||
-                          crossReferencedBy.includes(id)
-                        return (
-                          <CommandItem
-                            key={id}
-                            value={id}
-                            onSelect={() =>
-                              setCrossTarget(crossTarget === id ? "" : id)
-                            }
-                          >
-                            <CheckIcon
-                              className={cn(
-                                "size-4",
-                                crossTarget === id
-                                  ? "opacity-100"
-                                  : "opacity-0"
-                              )}
-                            />
-                            <span className="min-w-0 truncate">{id}</span>
-                            {done ? (
-                              <span className="ml-auto text-xs text-muted-foreground">
-                                documented
-                              </span>
-                            ) : null}
-                          </CommandItem>
-                        )
-                      })}
-                    </CommandGroup>
-                  </CommandList>
-                </Command>
-                {crossCandidates.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">
-                    No other Glue-backed datasets are registered yet — map one
-                    first (cross-references are Glue↔Glue for now).
-                  </p>
-                ) : null}
-              </div>
-              <DialogFooter>
-                <DialogClose asChild>
-                  <Button variant="outline">Cancel</Button>
-                </DialogClose>
-                <Button
-                  onClick={startCrossHarvest}
-                  disabled={!crossTarget || startingCross}
-                >
-                  {startingCross ? (
-                    <Spinner />
-                  ) : (
-                    <PlayIcon data-icon="inline-start" />
-                  )}
-                  Start discovery
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-          {/* Annotation picker — scope dropdown + per-note checkboxes so a run
+                        <Command className="rounded-xl border">
+                          <CommandInput
+                            id="cross-target"
+                            placeholder="Search datasets…"
+                          />
+                          <CommandList className="max-h-52">
+                            <CommandEmpty>No datasets match.</CommandEmpty>
+                            <CommandGroup>
+                              {crossCandidates.map((d) => {
+                                const id = `${d.data_domain}/${d.dataset}`
+                                // Already documented (either direction) — re-running
+                                // replaces that pair's docs.
+                                const done =
+                                  crossReferences.includes(id) ||
+                                  crossReferencedBy.includes(id)
+                                return (
+                                  <CommandItem
+                                    key={id}
+                                    value={id}
+                                    onSelect={() =>
+                                      setCrossTarget(
+                                        crossTarget === id ? "" : id
+                                      )
+                                    }
+                                  >
+                                    <CheckIcon
+                                      className={cn(
+                                        "size-4",
+                                        crossTarget === id
+                                          ? "opacity-100"
+                                          : "opacity-0"
+                                      )}
+                                    />
+                                    <span className="min-w-0 truncate">
+                                      {id}
+                                    </span>
+                                    {done ? (
+                                      <span className="ml-auto text-xs text-muted-foreground">
+                                        documented
+                                      </span>
+                                    ) : null}
+                                  </CommandItem>
+                                )
+                              })}
+                            </CommandGroup>
+                          </CommandList>
+                        </Command>
+                        {crossCandidates.length === 0 ? (
+                          <p className="text-xs text-muted-foreground">
+                            No other Glue-backed datasets are registered yet —
+                            map one first (cross-references are Glue↔Glue for
+                            now).
+                          </p>
+                        ) : null}
+                      </div>
+                      <DialogFooter>
+                        <DialogClose asChild>
+                          <Button variant="outline">Cancel</Button>
+                        </DialogClose>
+                        <Button
+                          onClick={startCrossHarvest}
+                          disabled={!crossTarget || startingCross}
+                        >
+                          {startingCross ? (
+                            <Spinner />
+                          ) : (
+                            <PlayIcon data-icon="inline-start" />
+                          )}
+                          Start discovery
+                        </Button>
+                      </DialogFooter>
+                    </DialogContent>
+                  </Dialog>
+                  {/* Annotation picker — scope dropdown + per-note checkboxes so a run
               can apply a PARTIAL selection. Always shown; the cross scope is
               offered only when external/ docs (or notes on them) exist. */}
-          <Dialog open={annoOpen} onOpenChange={setAnnoOpen}>
-            <DialogContent className="sm:max-w-lg">
-              <DialogHeader>
-                <DialogTitle>Apply annotations</DialogTitle>
-                <DialogDescription>
-                  Pick which of your pending notes on{" "}
-                  <span className="font-medium text-foreground">
-                    {domain}/{dataset}
-                  </span>{" "}
-                  this run should apply.
-                  {showCrossScope
-                    ? " Notes on cross-dataset docs are verified against the" +
-                      " target dataset's data — each target is its own scope," +
-                      " and the run's SQL access is widened to that target" +
-                      " only."
-                    : ""}
-                </DialogDescription>
-              </DialogHeader>
-              {annoLoading ? (
-                <div className="flex flex-col gap-2">
-                  <Skeleton className="h-8 w-44" />
-                  <Skeleton className="h-14 w-full" />
-                  <Skeleton className="h-14 w-full" />
-                </div>
-              ) : (
-                // min-w-0: DialogContent is a grid, and a grid item's default
-                // min-width:auto lets a nowrap child (the truncating quote
-                // line) blow the column past the dialog's max-w — the same
-                // overflow as the mapping select. Shrinkable item = real
-                // truncation.
-                <div className="flex min-h-0 min-w-0 flex-col gap-3">
-                  <div className="flex flex-col gap-2">
-                    <Label htmlFor="anno-scope">Scope</Label>
-                    <Select value={annoScope} onValueChange={changeAnnoScope}>
-                      <SelectTrigger id="anno-scope" className="w-full">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent
-                        position="popper"
-                        className="max-w-(--radix-select-trigger-width)"
-                      >
-                        <SelectGroup>
-                          <SelectItem value="dataset">
-                            <DatabaseIcon className="size-4" />
-                            Dataset docs
-                          </SelectItem>
-                          {/* One scope per cross-dataset TARGET: the pair names
+                  <Dialog open={annoOpen} onOpenChange={setAnnoOpen}>
+                    <DialogContent className="sm:max-w-lg">
+                      <DialogHeader>
+                        <DialogTitle>Apply annotations</DialogTitle>
+                        <DialogDescription>
+                          Pick which of your pending notes on{" "}
+                          <span className="font-medium text-foreground">
+                            {domain}/{dataset}
+                          </span>{" "}
+                          this run should apply.
+                          {showCrossScope
+                            ? " Notes on cross-dataset docs are verified against the" +
+                              " target dataset's data — each target is its own scope," +
+                              " and the run's SQL access is widened to that target" +
+                              " only."
+                            : ""}
+                        </DialogDescription>
+                      </DialogHeader>
+                      {annoLoading ? (
+                        <div className="flex flex-col gap-2">
+                          <Skeleton className="h-8 w-44" />
+                          <Skeleton className="h-14 w-full" />
+                          <Skeleton className="h-14 w-full" />
+                        </div>
+                      ) : (
+                        // min-w-0: DialogContent is a grid, and a grid item's default
+                        // min-width:auto lets a nowrap child (the truncating quote
+                        // line) blow the column past the dialog's max-w — the same
+                        // overflow as the mapping select. Shrinkable item = real
+                        // truncation.
+                        <div className="flex min-h-0 min-w-0 flex-col gap-3">
+                          <div className="flex flex-col gap-2">
+                            <Label htmlFor="anno-scope">Scope</Label>
+                            <Select
+                              value={annoScope}
+                              onValueChange={changeAnnoScope}
+                            >
+                              <SelectTrigger id="anno-scope" className="w-full">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent
+                                position="popper"
+                                className="max-w-(--radix-select-trigger-width)"
+                              >
+                                <SelectGroup>
+                                  <SelectItem value="dataset">
+                                    <DatabaseIcon className="size-4" />
+                                    Dataset docs
+                                  </SelectItem>
+                                  {/* One scope per cross-dataset TARGET: the pair names
                               exactly which dataset the run verifies against. */}
-                          {crossScopePairs.map((pair) => (
-                            <SelectItem key={pair} value={`cross:${pair}`}>
-                              <Link2Icon className="size-4" />
-                              <span className="min-w-0 truncate">
-                                Cross-dataset · {pair}
-                              </span>
-                            </SelectItem>
-                          ))}
-                        </SelectGroup>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-muted-foreground">
-                      {annoSelectedCount} of {visibleAnno.length} selected
-                    </span>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={toggleAllAnno}
-                      disabled={!visibleAnno.length}
-                    >
-                      {allAnnoSelected ? "Unselect all" : "Select all"}
-                    </Button>
-                  </div>
-                  {visibleAnno.length ? (
-                    // shrink-0 on the rows: flex children shrink by default, so
-                    // once the list exceeds the max height every row would
-                    // compress and clip its text instead of scrolling.
-                    <div className="flex max-h-[50vh] flex-col gap-1.5 overflow-y-auto pr-1">
-                      {visibleAnno.map((n) => (
-                        <label
-                          key={n.annotation_id}
-                          className="flex min-w-0 shrink-0 cursor-pointer items-start gap-2.5 overflow-hidden rounded-xl border px-3 py-2 transition-colors hover:bg-muted/50"
+                                  {crossScopePairs.map((pair) => (
+                                    <SelectItem
+                                      key={pair}
+                                      value={`cross:${pair}`}
+                                    >
+                                      <Link2Icon className="size-4" />
+                                      <span className="min-w-0 truncate">
+                                        Cross-dataset · {pair}
+                                      </span>
+                                    </SelectItem>
+                                  ))}
+                                </SelectGroup>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs text-muted-foreground">
+                              {annoSelectedCount} of {visibleAnno.length}{" "}
+                              selected
+                            </span>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={toggleAllAnno}
+                              disabled={!visibleAnno.length}
+                            >
+                              {allAnnoSelected ? "Unselect all" : "Select all"}
+                            </Button>
+                          </div>
+                          {visibleAnno.length ? (
+                            // shrink-0 on the rows: flex children shrink by default, so
+                            // once the list exceeds the max height every row would
+                            // compress and clip its text instead of scrolling.
+                            <div className="flex max-h-[50vh] flex-col gap-1.5 overflow-y-auto pr-1">
+                              {visibleAnno.map((n) => (
+                                <label
+                                  key={n.annotation_id}
+                                  className="flex min-w-0 shrink-0 cursor-pointer items-start gap-2.5 overflow-hidden rounded-xl border px-3 py-2 transition-colors hover:bg-muted/50"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    className="mt-0.5 size-3.5 shrink-0 accent-primary"
+                                    checked={annoSelected.has(n.annotation_id)}
+                                    onChange={() =>
+                                      toggleAnnoNote(n.annotation_id)
+                                    }
+                                  />
+                                  <span className="flex min-w-0 flex-col gap-0.5">
+                                    <span className="text-sm leading-snug break-words">
+                                      {n.note}
+                                    </span>
+                                    <span className="truncate font-mono text-[11px] text-muted-foreground">
+                                      {n.concept_id === "_dataset"
+                                        ? "general note"
+                                        : n.concept_id}
+                                      {n.quote ? ` · “${n.quote}”` : ""}
+                                    </span>
+                                  </span>
+                                </label>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-sm text-muted-foreground">
+                              {annoScope !== "dataset"
+                                ? `No pending notes on the ${annoScope.slice("cross:".length)} cross-dataset docs.`
+                                : guidance?.guidance_dirty
+                                  ? "No pending notes on this dataset's docs — the run applies the updated guidance only."
+                                  : "No pending notes on this dataset's docs."}
+                            </p>
+                          )}
+                          {annoScope === "dataset" &&
+                          guidance?.guidance_dirty &&
+                          visibleAnno.length ? (
+                            <p className="text-xs text-muted-foreground">
+                              The updated dataset guidance rides this run too.
+                            </p>
+                          ) : null}
+                        </div>
+                      )}
+                      <DialogFooter>
+                        <DialogClose asChild>
+                          <Button variant="outline">Cancel</Button>
+                        </DialogClose>
+                        <Button
+                          onClick={applyPickedAnnotations}
+                          disabled={
+                            annoLoading ||
+                            startingAnnotations ||
+                            (annoSelectedCount === 0 && !guidanceOnlyRun)
+                          }
                         >
-                          <input
-                            type="checkbox"
-                            className="mt-0.5 size-3.5 shrink-0 accent-primary"
-                            checked={annoSelected.has(n.annotation_id)}
-                            onChange={() => toggleAnnoNote(n.annotation_id)}
-                          />
-                          <span className="flex min-w-0 flex-col gap-0.5">
-                            <span className="text-sm leading-snug break-words">
-                              {n.note}
-                            </span>
-                            <span className="truncate font-mono text-[11px] text-muted-foreground">
-                              {n.concept_id === "_dataset"
-                                ? "general note"
-                                : n.concept_id}
-                              {n.quote ? ` · “${n.quote}”` : ""}
-                            </span>
-                          </span>
-                        </label>
-                      ))}
+                          {startingAnnotations ? (
+                            <Spinner />
+                          ) : (
+                            <PlayIcon data-icon="inline-start" />
+                          )}
+                          {annoSelectedCount
+                            ? `Apply ${annoSelectedCount} note${annoSelectedCount === 1 ? "" : "s"}`
+                            : guidanceOnlyRun
+                              ? "Apply guidance"
+                              : "Apply"}
+                        </Button>
+                      </DialogFooter>
+                    </DialogContent>
+                  </Dialog>
+                </CardHeader>
+                <CardContent className="flex min-h-0 flex-1 flex-col gap-4">
+                  {error ? (
+                    <Alert variant="destructive">
+                      <AlertTitle>Failed to read harvest status</AlertTitle>
+                      <AlertDescription>{error}</AlertDescription>
+                    </Alert>
+                  ) : loading && !status ? (
+                    <div className="flex flex-col gap-2">
+                      <Skeleton className="h-6 w-40" />
+                      <Skeleton className="h-4 w-64" />
                     </div>
                   ) : (
-                    <p className="text-sm text-muted-foreground">
-                      {annoScope !== "dataset"
-                        ? `No pending notes on the ${annoScope.slice("cross:".length)} cross-dataset docs.`
-                        : guidance?.guidance_dirty
-                          ? "No pending notes on this dataset's docs — the run applies the updated guidance only."
-                          : "No pending notes on this dataset's docs."}
-                    </p>
-                  )}
-                  {annoScope === "dataset" &&
-                  guidance?.guidance_dirty &&
-                  visibleAnno.length ? (
-                    <p className="text-xs text-muted-foreground">
-                      The updated dataset guidance rides this run too.
-                    </p>
-                  ) : null}
-                </div>
-              )}
-              <DialogFooter>
-                <DialogClose asChild>
-                  <Button variant="outline">Cancel</Button>
-                </DialogClose>
-                <Button
-                  onClick={applyPickedAnnotations}
-                  disabled={
-                    annoLoading ||
-                    startingAnnotations ||
-                    (annoSelectedCount === 0 && !guidanceOnlyRun)
-                  }
-                >
-                  {startingAnnotations ? (
-                    <Spinner />
-                  ) : (
-                    <PlayIcon data-icon="inline-start" />
-                  )}
-                  {annoSelectedCount
-                    ? `Apply ${annoSelectedCount} note${annoSelectedCount === 1 ? "" : "s"}`
-                    : guidanceOnlyRun
-                      ? "Apply guidance"
-                      : "Apply"}
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-        </CardHeader>
-        <CardContent className="flex min-h-0 flex-1 flex-col gap-4">
-          {error ? (
-            <Alert variant="destructive">
-              <AlertTitle>Failed to read harvest status</AlertTitle>
-              <AlertDescription>{error}</AlertDescription>
-            </Alert>
-          ) : loading && !status ? (
-            <div className="flex flex-col gap-2">
-              <Skeleton className="h-6 w-40" />
-              <Skeleton className="h-4 w-64" />
-            </div>
-          ) : (
-            <>
-              <div className="flex flex-wrap items-center gap-3">
-                <span className="text-sm text-muted-foreground">Status</span>
-                {currentStatus ? (
-                  <Badge variant={statusVariant(currentStatus)}>
-                    {currentStatus}
-                  </Badge>
-                ) : (
-                  <Badge variant="outline">no harvest yet</Badge>
-                )}
-                {/* The harvest itself is done (row terminal) — the follow-on
+                    <>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <span className="text-sm text-muted-foreground">
+                          Status
+                        </span>
+                        {currentStatus ? (
+                          <Badge variant={statusVariant(currentStatus)}>
+                            {currentStatus}
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline">no harvest yet</Badge>
+                        )}
+                        {/* The harvest itself is done (row terminal) — the follow-on
                     guardrails author is running under its own build lock. */}
-                {authoringGuardrails ? (
-                  <Badge
-                    variant="outline"
-                    className="border-amber-300 text-amber-600 dark:border-amber-700 dark:text-amber-500"
-                  >
-                    <ShieldCheckIcon />
-                    Authoring guardrails
-                  </Badge>
-                ) : null}
-                <Separator orientation="vertical" className="h-5" />
-                <span className="text-sm text-muted-foreground">Bundle</span>
-                {ready ? (
-                  <Badge variant="default">
-                    <CheckCircle2Icon />
-                    ready
-                  </Badge>
-                ) : (
-                  <Badge variant="outline">
-                    <CircleDashedIcon />
-                    not ready
-                  </Badge>
-                )}
-              </div>
+                        {authoringGuardrails ? (
+                          <Badge
+                            variant="outline"
+                            className="border-amber-300 text-amber-600 dark:border-amber-700 dark:text-amber-500"
+                          >
+                            <ShieldCheckIcon />
+                            Authoring guardrails
+                          </Badge>
+                        ) : null}
+                        <Separator orientation="vertical" className="h-5" />
+                        <span className="text-sm text-muted-foreground">
+                          Bundle
+                        </span>
+                        {ready ? (
+                          <Badge variant="default">
+                            <CheckCircle2Icon />
+                            ready
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline">
+                            <CircleDashedIcon />
+                            not ready
+                          </Badge>
+                        )}
+                      </div>
 
-              {crossReferences.length || crossReferencedBy.length ? (
-                // The reindex-derived cross-reference signal. Pair docs live in
-                // the bundle that authored them, so "referenced by" points at
-                // ANOTHER dataset's external/ folder — worth showing here, since
-                // nothing in this bundle reveals it.
-                <div className="flex flex-col gap-1 text-xs text-muted-foreground">
-                  {crossReferences.length ? (
-                    <span className="flex flex-wrap items-center gap-1.5">
-                      <Link2Icon className="size-3.5" />
-                      Cross-references
-                      {crossReferences.map((id) => (
-                        <Badge key={id} variant="secondary">
-                          {id}
-                        </Badge>
-                      ))}
-                    </span>
-                  ) : null}
-                  {crossReferencedBy.length ? (
-                    <span className="flex flex-wrap items-center gap-1.5">
-                      <Link2Icon className="size-3.5" />
-                      Referenced by
-                      {crossReferencedBy.map((id) => (
-                        <Badge key={id} variant="outline">
-                          {id}
-                        </Badge>
-                      ))}
-                      <span>(their bundle holds the pair docs)</span>
-                    </span>
-                  ) : null}
-                </div>
-              ) : null}
+                      {crossReferences.length || crossReferencedBy.length ? (
+                        // The reindex-derived cross-reference signal. Pair docs live in
+                        // the bundle that authored them, so "referenced by" points at
+                        // ANOTHER dataset's external/ folder — worth showing here, since
+                        // nothing in this bundle reveals it.
+                        <div className="flex flex-col gap-1 text-xs text-muted-foreground">
+                          {crossReferences.length ? (
+                            <span className="flex flex-wrap items-center gap-1.5">
+                              <Link2Icon className="size-3.5" />
+                              Cross-references
+                              {crossReferences.map((id) => (
+                                <Badge key={id} variant="secondary">
+                                  {id}
+                                </Badge>
+                              ))}
+                            </span>
+                          ) : null}
+                          {crossReferencedBy.length ? (
+                            <span className="flex flex-wrap items-center gap-1.5">
+                              <Link2Icon className="size-3.5" />
+                              Referenced by
+                              {crossReferencedBy.map((id) => (
+                                <Badge key={id} variant="outline">
+                                  {id}
+                                </Badge>
+                              ))}
+                              <span>(their bundle holds the pair docs)</span>
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : null}
 
-              {(inner.mode ||
-                inner.started_at ||
-                showUpdated ||
-                inner.detail ||
-                inner.model) && (
-                // Parallel columns to save vertical space: each field is a small
-                // stacked (label over value) cell in a fixed 2-column grid (2×2 for
-                // the usual Mode/Model/Started/Updated set).
-                <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
-                  {inner.mode && (
-                    <div className="min-w-0">
-                      <dt className="text-xs text-muted-foreground">Mode</dt>
-                      <dd className="break-words">
-                        {MODE_LABEL[inner.mode] || inner.mode}
-                      </dd>
-                    </div>
-                  )}
-                  {inner.cross_target && (
-                    // Cross-dataset discovery: WHO the run is against (stamped
-                    // on the status row at trigger time).
-                    <div className="min-w-0">
-                      <dt className="text-xs text-muted-foreground">Target</dt>
-                      <dd className="break-words">{inner.cross_target}</dd>
-                    </div>
-                  )}
-                  {(inner.model || inner.effort) && (
-                    // Model + effort merged into one field: model_id / effort_level.
-                    <div className="min-w-0">
-                      <dt className="text-xs text-muted-foreground">Model</dt>
-                      <dd className="break-words">
-                        {entryFor(inner.model)?.label || inner.model || "—"}
-                        {inner.effort ? ` / ${inner.effort}` : ""}
-                      </dd>
-                    </div>
-                  )}
-                  {inner.subagent_model && (
-                    // Present only when the run chose a separate sub-agent
-                    // config; absent means the sub-agents ran on the model above.
-                    <div className="min-w-0">
-                      <dt className="text-xs text-muted-foreground">
-                        Sub-agent model
-                      </dt>
-                      <dd className="break-words">
-                        {entryFor(inner.subagent_model)?.label ||
-                          inner.subagent_model}
-                        {inner.subagent_effort
-                          ? ` / ${inner.subagent_effort}`
-                          : ""}
-                      </dd>
-                    </div>
-                  )}
-                  {inner.reviewer_model && (
-                    // Present only when the run gave the adversarial reviewer
-                    // its own config; absent = same as the sub-agents.
-                    <div className="min-w-0">
-                      <dt className="text-xs text-muted-foreground">
-                        Reviewer model
-                      </dt>
-                      <dd className="break-words">
-                        {entryFor(inner.reviewer_model)?.label ||
-                          inner.reviewer_model}
-                        {inner.reviewer_effort
-                          ? ` / ${inner.reviewer_effort}`
-                          : ""}
-                      </dd>
-                    </div>
-                  )}
-                  {inner.started_at && (
-                    <div className="min-w-0">
-                      <dt className="text-xs text-muted-foreground">Started</dt>
-                      <dd className="break-words">
-                        {new Date(inner.started_at).toLocaleString()}
-                      </dd>
-                    </div>
-                  )}
-                  {showUpdated && (
-                    <div className="min-w-0">
-                      <dt className="text-xs text-muted-foreground">Updated</dt>
-                      <dd className="break-words">
-                        {new Date(inner.updated_at).toLocaleString()}
-                      </dd>
-                    </div>
-                  )}
-                  {inner.detail && (
-                    <div className="col-span-full min-w-0">
-                      <dt className="text-xs text-muted-foreground">Detail</dt>
-                      <dd className="break-words">{inner.detail}</dd>
-                    </div>
-                  )}
-                </dl>
-              )}
+                      {(inner.mode ||
+                        inner.started_at ||
+                        showUpdated ||
+                        inner.detail ||
+                        inner.model) && (
+                        // Parallel columns to save vertical space: each field is a small
+                        // stacked (label over value) cell in a fixed 2-column grid (2×2 for
+                        // the usual Mode/Model/Started/Updated set).
+                        <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+                          {inner.mode && (
+                            <div className="min-w-0">
+                              <dt className="text-xs text-muted-foreground">
+                                Mode
+                              </dt>
+                              <dd className="break-words">
+                                {MODE_LABEL[inner.mode] || inner.mode}
+                              </dd>
+                            </div>
+                          )}
+                          {inner.cross_target && (
+                            // Cross-dataset discovery: WHO the run is against (stamped
+                            // on the status row at trigger time).
+                            <div className="min-w-0">
+                              <dt className="text-xs text-muted-foreground">
+                                Target
+                              </dt>
+                              <dd className="break-words">
+                                {inner.cross_target}
+                              </dd>
+                            </div>
+                          )}
+                          {(inner.model || inner.effort) && (
+                            // Model + effort merged into one field: model_id / effort_level.
+                            <div className="min-w-0">
+                              <dt className="text-xs text-muted-foreground">
+                                Model
+                              </dt>
+                              <dd className="break-words">
+                                {entryFor(inner.model)?.label ||
+                                  inner.model ||
+                                  "—"}
+                                {inner.effort ? ` / ${inner.effort}` : ""}
+                              </dd>
+                            </div>
+                          )}
+                          {inner.subagent_model && (
+                            // Present only when the run chose a separate sub-agent
+                            // config; absent means the sub-agents ran on the model above.
+                            <div className="min-w-0">
+                              <dt className="text-xs text-muted-foreground">
+                                Sub-agent model
+                              </dt>
+                              <dd className="break-words">
+                                {entryFor(inner.subagent_model)?.label ||
+                                  inner.subagent_model}
+                                {inner.subagent_effort
+                                  ? ` / ${inner.subagent_effort}`
+                                  : ""}
+                              </dd>
+                            </div>
+                          )}
+                          {inner.reviewer_model && (
+                            // Present only when the run gave the adversarial reviewer
+                            // its own config; absent = same as the sub-agents.
+                            <div className="min-w-0">
+                              <dt className="text-xs text-muted-foreground">
+                                Reviewer model
+                              </dt>
+                              <dd className="break-words">
+                                {entryFor(inner.reviewer_model)?.label ||
+                                  inner.reviewer_model}
+                                {inner.reviewer_effort
+                                  ? ` / ${inner.reviewer_effort}`
+                                  : ""}
+                              </dd>
+                            </div>
+                          )}
+                          {inner.started_at && (
+                            <div className="min-w-0">
+                              <dt className="text-xs text-muted-foreground">
+                                Started
+                              </dt>
+                              <dd className="break-words">
+                                {new Date(inner.started_at).toLocaleString()}
+                              </dd>
+                            </div>
+                          )}
+                          {showUpdated && (
+                            <div className="min-w-0">
+                              <dt className="text-xs text-muted-foreground">
+                                Updated
+                              </dt>
+                              <dd className="break-words">
+                                {new Date(inner.updated_at).toLocaleString()}
+                              </dd>
+                            </div>
+                          )}
+                          {inner.detail && (
+                            <div className="col-span-full min-w-0">
+                              <dt className="text-xs text-muted-foreground">
+                                Detail
+                              </dt>
+                              <dd className="break-words">{inner.detail}</dd>
+                            </div>
+                          )}
+                        </dl>
+                      )}
 
-              {!currentStatus ? (
-                <p className="text-sm text-muted-foreground">
-                  No harvest has been recorded for this dataset yet. Click
-                  "Start full harvest" to begin.
-                </p>
-              ) : (
-                <>
-                  <Separator />
-                  <HarvestFeed
-                    events={events}
-                    running={running}
-                    aborted={aborted}
-                    draining={draining}
-                    api={api}
-                    domain={domain}
-                    dataset={dataset}
-                  />
-                </>
-              )}
-            </>
-          )}
-        </CardContent>
-      </Card>
+                      {!currentStatus ? (
+                        <p className="text-sm text-muted-foreground">
+                          No harvest has been recorded for this dataset yet.
+                          Click "Start full harvest" to begin.
+                        </p>
+                      ) : (
+                        <>
+                          <Separator />
+                          <HarvestFeed
+                            events={events}
+                            running={running}
+                            aborted={aborted}
+                            draining={draining}
+                            api={api}
+                            domain={domain}
+                            dataset={dataset}
+                            onOpenSquare={openSquare}
+                          />
+                        </>
+                      )}
+                    </>
+                  )}
+                </CardContent>
+              </Card>
+            </div>
+          </div>
+        </div>
+      </div>
+      {/* The width-animated clip — the FULL inset height, top to bottom
+          (PanelShell's own py-3/pr-3 float it off the edges, same as the
+          chat doc peek). Inline style (not a class) because the width is a
+          live drag number; the transition is disabled mid-drag so the panel
+          tracks the pointer instead of rubber-banding behind it. */}
+      <div
+        className={cn(
+          "h-full shrink-0 overflow-hidden",
+          !squarePanelDragging &&
+            "transition-[width] duration-300 ease-in-out motion-reduce:transition-none"
+        )}
+        style={{ width: squarePanelOpen ? squarePanelWidth : 0 }}
+        aria-hidden={!squarePanelOpen}
+      >
+        <div
+          className={cn("h-full", !squarePanelOpen && "invisible")}
+          style={{ width: squarePanelWidth }}
+        >
+          <SubagentPanel
+            square={liveSquare || square}
+            onClose={() => setSquarePanelOpen(false)}
+            onResizeStart={startSquarePanelResize}
+            resizing={squarePanelDragging}
+          />
+        </div>
+      </div>
     </div>
   )
 }
@@ -1590,6 +1748,8 @@ function toolIcon(tool) {
       return DatabaseIcon
     case "run_code":
       return TerminalIcon
+    case "lint_bundle":
+      return ShieldCheckIcon
     case "task":
       return UsersIcon
     default:
@@ -1648,11 +1808,31 @@ function mergeRows(events, aborted) {
             id: e.sub_id,
             state: "active",
             label: e.label,
+            // The full dispatch brief (when the emitter carried more than
+            // the teaser label) — the drill-in sheet's Input tab.
+            input: e.full || e.label,
           })
+      } else if (e.phase === "update") {
+        // Mid-flight I/O enrichment (the emitter's `update` patch): the full
+        // dispatch brief lands right after start, the final answer right
+        // before complete. Patches the square without touching its state.
+        if (sq) {
+          if (e.full) sq.input = e.full
+          if (e.result) sq.result = e.result
+        }
       } else if (e.phase === "complete" || e.phase === "error") {
-        const state = e.phase === "complete" ? "done" : "error"
-        if (sq) sq.state = state
-        else row.squares.set(e.sub_id, { id: e.sub_id, state, label: e.label })
+        const next = sq || {
+          id: e.sub_id,
+          label: e.label,
+          input: e.full || e.label,
+        }
+        next.state = e.phase === "complete" ? "done" : "error"
+        // An errored square carries a bounded failure snippet — keep it for the
+        // square's tooltip so a dead sub-agent is diagnosable from the feed.
+        if (e.error) next.error = e.error
+        // The sub-agent's final answer — the drill-in sheet's Output tab.
+        if (e.result) next.result = e.result
+        row.squares.set(e.sub_id, next)
       }
     } else if (e.kind === "tool_call") {
       // The eval tool IS the QuickJS fan-out dispatcher — don't show it as a tool
@@ -1672,6 +1852,7 @@ function mergeRows(events, aborted) {
           id: e.call_id,
           state: "active",
           label: e.label,
+          input: e.full || e.label,
         })
         callIndex.set(e.call_id, { kind: "task", batch: openTaskWave })
         continue
@@ -1685,15 +1866,21 @@ function mergeRows(events, aborted) {
       const target = e.call_id != null ? callIndex.get(e.call_id) : undefined
       if (!target) continue
       if (target.kind === "tool") {
-        rows[target.idx] = {
-          ...rows[target.idx],
-          state: e.ok ? "ok" : "failed",
-        }
+        const next = { ...rows[target.idx], state: e.ok ? "ok" : "failed" }
+        if (!e.ok && e.error) next.error = e.error
+        // The lint gate's structured report rides its successful result —
+        // keep it on the row so StepRow can badge it and open the modal.
+        if (e.lint) next.lint = e.lint
+        rows[target.idx] = next
       } else {
         // A task dispatch finished — flip its square done/error.
         const idx = batchIndex.get(target.batch)
         const sq = idx != null ? rows[idx].squares.get(e.call_id) : null
-        if (sq) sq.state = e.ok ? "done" : "error"
+        if (sq) {
+          sq.state = e.ok ? "done" : "error"
+          if (!e.ok && e.error) sq.error = e.error
+          if (e.result) sq.result = e.result
+        }
       }
       // Orphan result (call outside our window, or the eval's): carries no
       // tool/label, so rendering it standalone would be a blank row. Drop it.
@@ -1749,7 +1936,7 @@ const SQUARE_CLASS = {
   error: "bg-destructive",
 }
 
-function FleetRow({ row }) {
+function FleetRow({ row, onOpenSquare }) {
   const done = row.squares.filter(
     (s) => s.state === "done" || s.state === "error"
   ).length
@@ -1764,10 +1951,16 @@ function FleetRow({ row }) {
           <span className="text-muted-foreground">Dispatching sub-agents…</span>
         ) : (
           row.squares.map((sq, i) => (
-            <span
+            <button
+              type="button"
               key={sq.id || i}
-              title={`${sq.label || "sub-agent"} — ${sq.state}`}
-              className={cn("size-3.5 rounded-[3px]", SQUARE_CLASS[sq.state])}
+              title={`${sq.label || "sub-agent"} — ${sq.state}${sq.error ? `: ${sq.error}` : ""}`}
+              onClick={() => onOpenSquare?.(sq)}
+              className={cn(
+                "size-3.5 cursor-pointer rounded-[3px] transition-transform",
+                "hover:scale-125 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                SQUARE_CLASS[sq.state]
+              )}
             />
           ))
         )}
@@ -1778,6 +1971,112 @@ function FleetRow({ row }) {
         </span>
       ) : null}
     </div>
+  )
+}
+
+// Markdown-rendered pane for the sub-agent sheet. Same wrap rules as
+// AgentMessageDialog: long fenced code must wrap inside the panel, never
+// grow its intrinsic width.
+// memo(): mounted inside the drag-resizable panel, which re-renders at
+// pointermove frequency — re-parsing the (up to 24KB) markdown per frame is
+// the drag jank; the text prop only changes when the square's I/O does.
+const MarkdownPane = memo(function MarkdownPane({ text, empty }) {
+  if (!text) {
+    return <p className="text-sm text-muted-foreground">{empty}</p>
+  }
+  return (
+    <div className="okf-prose min-w-0 [&_code]:break-words [&_pre]:break-words [&_pre]:whitespace-pre-wrap">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[
+          [rehypeHighlight, { detect: true, ignoreMissing: true }],
+        ]}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  )
+})
+
+// One sub-agent dispatch's I/O, opened by clicking its fleet square — the
+// chat citation panel's surface: an inset, rounded card that PUSHES the view
+// (mounted in HarvestView's width-animated clip) and drag-resizes via the
+// PanelShell gutter grip. Tabs: the dispatch brief (Input) and the
+// sub-agent's FINAL answer (Output — never its internal steps, which stay
+// off the feed by design). Defaults to Output — the tab you open a finished
+// square for.
+function SubagentPanel({ square, onClose, onResizeStart, resizing }) {
+  const sq = square || {}
+  return (
+    <PanelShell onResizeStart={onResizeStart} resizing={resizing}>
+      <div className="flex items-start justify-between gap-2 border-b p-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
+            <UsersIcon className="size-4 shrink-0 text-muted-foreground" />
+            Sub-agent
+            {sq.state === "error" ? (
+              <Badge variant="destructive">failed</Badge>
+            ) : sq.state === "active" ? (
+              <Badge variant="secondary">running</Badge>
+            ) : (
+              <Badge variant="outline">done</Badge>
+            )}
+          </div>
+          <p className="mt-1 text-xs break-words text-muted-foreground">
+            {sq.label || "dispatch"}
+          </p>
+        </div>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-7 shrink-0"
+          onClick={onClose}
+          aria-label="Close sub-agent panel"
+        >
+          <XIcon className="size-4" />
+        </Button>
+      </div>
+      {/* key: a fresh square resets the tabs back to Output. */}
+      <Tabs
+        key={sq.id || "none"}
+        defaultValue="output"
+        className="flex min-h-0 flex-1 flex-col gap-2 p-3"
+      >
+        <TabsList className="shrink-0 self-start">
+          <TabsTrigger value="output">Output</TabsTrigger>
+          <TabsTrigger value="input">Input</TabsTrigger>
+        </TabsList>
+        <TabsContent
+          value="output"
+          className="okf-thin-scroll min-h-0 flex-1 overflow-y-auto pr-2"
+        >
+          {sq.error ? (
+            <p className="mb-3 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs break-words">
+              {sq.error}
+            </p>
+          ) : null}
+          <MarkdownPane
+            text={sq.result}
+            empty={
+              sq.state === "active"
+                ? "Still running — the final answer lands when this sub-agent completes."
+                : sq.error
+                  ? "No answer — the dispatch failed (error above)."
+                  : "The final answer wasn't captured for this dispatch."
+            }
+          />
+        </TabsContent>
+        <TabsContent
+          value="input"
+          className="okf-thin-scroll min-h-0 flex-1 overflow-y-auto pr-2"
+        >
+          <MarkdownPane
+            text={sq.input}
+            empty="The dispatch brief wasn't captured for this run."
+          />
+        </TabsContent>
+      </Tabs>
+    </PanelShell>
   )
 }
 
@@ -1831,6 +2130,163 @@ function AgentMessageDialog({ open, onOpenChange, text }) {
             </ReactMarkdown>
           </div>
         </ScrollArea>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// Amber outline badge for lint warnings — the repo's warning convention is
+// amber utilities (no --warning token exists; see "pending re-harvest").
+const LINT_WARN_BADGE =
+  "border-amber-500/50 text-amber-600 dark:border-amber-700 dark:text-amber-400"
+
+// One lint step's status glyph: ok reads green (a pass, not a non-event),
+// skipped reads muted, failed and error-carrying issues read destructive,
+// warning-only issues read amber. Emerald pair matches VersionHistory's
+// success checks.
+function LintStepIcon({ status, errors }) {
+  if (status === "ok")
+    return (
+      <CheckCircle2Icon className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+    )
+  if (status === "skipped")
+    return (
+      <CircleDashedIcon className="size-3.5 shrink-0 text-muted-foreground" />
+    )
+  if (status === "failed" || errors > 0)
+    return <XCircleIcon className="size-3.5 shrink-0 text-destructive" />
+  return (
+    <TriangleAlertIcon className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+  )
+}
+
+// Step key -> display label: "explain_sql" reads "Explain SQL", "required_docs"
+// reads "Required docs" — sentence case, acronyms uppercased.
+function lintStepLabel(step) {
+  const label = String(step || "").replace(/_/g, " ")
+  return (label.charAt(0).toUpperCase() + label.slice(1)).replace(
+    /\bsql\b/gi,
+    "SQL"
+  )
+}
+
+// The lint gate's report in a modal, opened by clicking a `lint_bundle` feed
+// row that carries a `lint` payload: per-step statuses, then the findings.
+// Overflow rules learned elsewhere in this file apply: plain scroll div, NOT
+// ScrollArea (Radix's display:table viewport lets long unbreakable paths grow
+// past the dialog — see ReasoningView's sources list), `min-w-0` throughout
+// (DialogContent's grid children default to min-width:auto), `break-all` on
+// mono paths and `break-words` on messages so nothing spills past the right
+// edge. Finding messages carry backticked identifiers — InlineMarkdown renders
+// them as inline code without block elements.
+function LintReportDialog({ open, onOpenChange, lint }) {
+  const steps = Array.isArray(lint.steps) ? lint.steps : []
+  const findings = Array.isArray(lint.findings) ? lint.findings : []
+  const notes = [
+    lint.hidden
+      ? `${lint.hidden} more finding(s) truncated from the feed.`
+      : null,
+    lint.note || null,
+  ].filter(Boolean)
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle className="flex flex-wrap items-center gap-2">
+            <ShieldCheckIcon className="size-4" />
+            Bundle lint
+            {lint.errors > 0 ? (
+              <Badge variant="destructive">
+                {lint.errors} {lint.errors === 1 ? "error" : "errors"}
+              </Badge>
+            ) : null}
+            {lint.warnings > 0 ? (
+              <Badge variant="outline" className={LINT_WARN_BADGE}>
+                {lint.warnings} {lint.warnings === 1 ? "warning" : "warnings"}
+              </Badge>
+            ) : null}
+            {/* Zero counts only mean "clean" when the lint actually PASSED —
+                a crashed tool or a failed step reports ok:false with no
+                findings, and must not read as a pass. */}
+            {lint.errors === 0 && lint.warnings === 0 ? (
+              lint.ok === false ? (
+                <Badge variant="destructive" title={lint.note || undefined}>
+                  failed
+                </Badge>
+              ) : (
+                <Badge variant="outline">clean</Badge>
+              )
+            ) : null}
+          </DialogTitle>
+        </DialogHeader>
+        <div className="okf-thin-scroll max-h-[70vh] min-w-0 space-y-4 overflow-y-auto pr-3">
+          {/* Per-step statuses — the step name, its glyph, and its counts. A
+              skipped/failed step's note (e.g. "engine does not support
+              EXPLAIN") shows as the row's title tooltip. */}
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-3">
+            {steps.map((s) => (
+              <div
+                key={s.step}
+                className="flex min-w-0 items-center gap-1.5 text-xs"
+                title={s.note || undefined}
+              >
+                <LintStepIcon status={s.status} errors={s.errors || 0} />
+                <span className="truncate">{lintStepLabel(s.step)}</span>
+                {s.errors > 0 || s.warnings > 0 ? (
+                  <span className="shrink-0 text-[10px] text-muted-foreground">
+                    {[
+                      s.errors > 0 ? `${s.errors}E` : null,
+                      s.warnings > 0 ? `${s.warnings}W` : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                  </span>
+                ) : s.status === "skipped" ? (
+                  <span className="shrink-0 text-[10px] text-muted-foreground">
+                    skipped
+                  </span>
+                ) : null}
+              </div>
+            ))}
+          </div>
+          {findings.length ? (
+            <ul className="space-y-2">
+              {findings.map((f, i) => (
+                <li key={i} className="min-w-0 rounded-md border p-2">
+                  <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                    {f.severity === "error" ? (
+                      <Badge variant="destructive">error</Badge>
+                    ) : (
+                      <Badge variant="outline" className={LINT_WARN_BADGE}>
+                        warning
+                      </Badge>
+                    )}
+                    <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+                      {f.code}
+                    </span>
+                    {f.path ? (
+                      <span className="min-w-0 font-mono text-[11px] break-all text-muted-foreground">
+                        {f.path}
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="mt-1 min-w-0 text-xs break-words">
+                    <InlineMarkdown text={f.message || ""} />
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              {lint.ok === false
+                ? "The lint did not complete — see the step statuses and notes."
+                : "No findings — the bundle is clean."}
+            </p>
+          )}
+          {notes.length ? (
+            <p className="text-xs text-muted-foreground">{notes.join(" ")}</p>
+          ) : null}
+        </div>
       </DialogContent>
     </Dialog>
   )
@@ -1925,7 +2381,11 @@ function HarvestSettingsSheet({
           <span className="text-sm font-medium">Harvester</span>
           <div className="flex flex-col gap-2">
             <Label htmlFor="harvest-model">Model</Label>
-            <Select value={model} onValueChange={onModelChange} disabled={locked}>
+            <Select
+              value={model}
+              onValueChange={onModelChange}
+              disabled={locked}
+            >
               <SelectTrigger id="harvest-model" className="w-full">
                 <SelectValue placeholder="Select a model..." />
               </SelectTrigger>
@@ -1936,7 +2396,11 @@ function HarvestSettingsSheet({
           </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="harvest-effort">Reasoning effort</Label>
-            <Select value={effort} onValueChange={onEffortChange} disabled={locked}>
+            <Select
+              value={effort}
+              onValueChange={onEffortChange}
+              disabled={locked}
+            >
               <SelectTrigger id="harvest-effort" className="w-full">
                 <SelectValue placeholder="Select an effort..." />
               </SelectTrigger>
@@ -2135,8 +2599,12 @@ function StepRow({ step }) {
   }, [isAgent, step.label])
 
   const modalText = step.full || step.label
+  // The lint gate's row carries its structured report — clickable to open the
+  // findings modal, whatever the counts (a clean pass is worth confirming too).
+  const lint = !isAgent && step.lint ? step.lint : null
   // A plain agent row is clickable only when trimmed/overflowing.
-  const expandable = isAgent && (Boolean(step.full) || overflowing)
+  const expandable =
+    (isAgent && (Boolean(step.full) || overflowing)) || Boolean(lint)
 
   // Icon: agent -> sparkles; tool -> tool-specific, swapping to a check/cross
   // once the result lands so completion reads at a glance.
@@ -2187,7 +2655,30 @@ function StepRow({ step }) {
           {!isAgent && step.state === "pending" ? (
             <Spinner className="size-3" />
           ) : !isAgent && step.state === "failed" ? (
-            <Badge variant="destructive">failed</Badge>
+            <Badge variant="destructive" title={step.error || undefined}>
+              failed
+            </Badge>
+          ) : null}
+          {/* Lint outcome at a glance; the modal has the full report. Errors
+              outrank warnings on the row — the modal shows both counts. Zero
+              counts read "clean" only when ok is not false: a crashed tool /
+              failed step must not badge as a pass. */}
+          {lint ? (
+            lint.errors > 0 ? (
+              <Badge variant="destructive">
+                {lint.errors} {lint.errors === 1 ? "error" : "errors"}
+              </Badge>
+            ) : lint.warnings > 0 ? (
+              <Badge variant="outline" className={LINT_WARN_BADGE}>
+                {lint.warnings} {lint.warnings === 1 ? "warning" : "warnings"}
+              </Badge>
+            ) : lint.ok === false ? (
+              <Badge variant="destructive" title={lint.note || undefined}>
+                failed
+              </Badge>
+            ) : (
+              <Badge variant="outline">clean</Badge>
+            )
           ) : null}
           {step.ts ? (
             <span className="text-[10px] text-muted-foreground">
@@ -2199,8 +2690,14 @@ function StepRow({ step }) {
       {/* Dialog is a SIBLING of the row (not a child): React events bubble up the
           component tree even from a portal, so nesting it inside the clickable
           row made the close button re-trigger the row's onClick and reopen it. */}
-      {expandable ? (
-        <AgentMessageDialog open={open} onOpenChange={setOpen} text={modalText} />
+      {lint ? (
+        <LintReportDialog open={open} onOpenChange={setOpen} lint={lint} />
+      ) : expandable ? (
+        <AgentMessageDialog
+          open={open}
+          onOpenChange={setOpen}
+          text={modalText}
+        />
       ) : null}
     </>
   )
@@ -2262,7 +2759,10 @@ function ScopeRow({ label, counts, swatch }) {
     )
   return (
     <Fragment>
-      <span className="flex min-w-0 items-center gap-1.5 text-xs" title={precise}>
+      <span
+        className="flex min-w-0 items-center gap-1.5 text-xs"
+        title={precise}
+      >
         <span className={cn("size-1.5 shrink-0 rounded-full", swatch)} />
         <span className="truncate">{label}</span>
       </span>
@@ -2378,7 +2878,10 @@ function UsagePill({ usage }) {
 // to the bottom on new events only when the user is already pinned there (so
 // scrolling up to read history isn't yanked away). Uses a native overflow div —
 // shadcn ScrollArea exposes no viewport ref, which the auto-follow needs.
-function HarvestFeed({
+// memo(): the parent re-renders at pointermove frequency while the sub-agent
+// panel drags (width state lives in HarvestView) — every prop here is stable
+// between feed polls, so the whole merge + markdown subtree can skip those.
+const HarvestFeed = memo(function HarvestFeed({
   events,
   running,
   aborted,
@@ -2386,6 +2889,7 @@ function HarvestFeed({
   api,
   domain,
   dataset,
+  onOpenSquare,
 }) {
   const viewportRef = useRef(null)
   const stickRef = useRef(true)
@@ -2400,8 +2904,10 @@ function HarvestFeed({
     stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
   }
 
-  const rows = mergeRows(events, aborted)
-  const usage = latestUsage(events)
+  // Memoized on the events snapshot: the merge walks every event and the
+  // usage scan is O(n) — recomputing them on unrelated re-renders is waste.
+  const rows = useMemo(() => mergeRows(events, aborted), [events, aborted])
+  const usage = useMemo(() => latestUsage(events), [events])
 
   return (
     // min-h-0 flex-1: grow to fill the card's remaining height (the parent chain
@@ -2425,7 +2931,11 @@ function HarvestFeed({
       >
         {rows.map((r) =>
           r.kind === "fleet" ? (
-            <FleetRow key={`fleet-${r.batch}`} row={r} />
+            <FleetRow
+              key={`fleet-${r.batch}`}
+              row={r}
+              onOpenSquare={onOpenSquare}
+            />
           ) : (
             <StepRow key={r.seq} step={r} />
           )
@@ -2452,4 +2962,4 @@ function HarvestFeed({
       </div>
     </div>
   )
-}
+})

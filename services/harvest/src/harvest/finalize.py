@@ -16,10 +16,11 @@ and CONVENTIONS.md).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
-from harvest.fsutil import mkdirs, write_text
+from harvest.fsutil import mkdirs, remove_tree, write_text
 from okf_core.index_gen import regenerate_indexes
 
 _STATE_DIR = ".harvest"
@@ -46,8 +47,18 @@ def finalize_bundle(
     """
     root = Path(dataset_root)
 
-    # 1) Regenerate index.md files (progressive disclosure).
-    regenerate_indexes(root, synthesize=synthesize)
+    # 1) Regenerate index.md files (progressive disclosure). The writer/remover
+    # are fsutil's, not raw pathlib: these land on the S3 Files (NFS) mount,
+    # where an in-place rewrite of an existing index can come back EACCES —
+    # which used to fail the whole harvest HERE, after every doc was authored
+    # (seen live on `references/enums/index.md`). fsutil heals that by
+    # unlinking first, and retries transient ESTALE/EIO.
+    regenerate_indexes(
+        root,
+        synthesize=synthesize,
+        write_file=lambda path, text: write_text(path, text),
+        remove_file=remove_tree,
+    )
 
     # 2) Write the commit marker LAST.
     state = {
@@ -67,6 +78,25 @@ def finalize_bundle(
         state_dir / _STATE_FILE,
         json.dumps(state, indent=2, sort_keys=True) + "\n",
     )
+
+    # 3) Drop the recorded context-extractor digests — AFTER the commit
+    # marker, so a failure anywhere earlier keeps them for debugging. They
+    # exist for run_review's context-fidelity phase, which is over by now;
+    # the next full harvest would wipe them at start anyway (that wipe stays
+    # — it is what protects a run whose predecessor crashed past this point).
+    # Best-effort: the harvest is COMMITTED at this point, and a stubborn NFS
+    # delete error must not flip a finished multi-hour run to failed (same
+    # rationale as the index-write healing above); the start-of-run wipe is
+    # the correctness backstop.
+    try:
+        remove_tree(state_dir / "context")
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "Could not remove %s after commit; the next full harvest's "
+            "start-of-run wipe will clear it",
+            state_dir / "context",
+            exc_info=True,
+        )
 
     return state
 

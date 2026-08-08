@@ -226,7 +226,7 @@ npm install        # first run only
 npm run dev        # http://localhost:5173
 ```
 
-Port `5173` is whitelisted in Cognito for the OIDC redirect, so local dev works against the real deployed Cognito and Control API. See [`ui/README.md`](./ui/README.md) for details.
+Port `5173` is allowlisted in Cognito for the OIDC redirect, so local dev works against the real deployed Cognito and Control API. See [`ui/README.md`](./ui/README.md) for details.
 
 ---
 

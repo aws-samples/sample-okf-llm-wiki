@@ -285,9 +285,92 @@ def test_finalize_writes_commit_marker_last(tmp_path):
     assert (tmp_path / "tables" / "index.md").is_file()
 
 
+def test_finalize_cleans_recorded_context_digests_after_the_marker(tmp_path):
+    # The extractor digests exist for run_review's context-fidelity phase,
+    # which is over by finalize time — a COMPLETED run deletes them (a run
+    # that fails before the marker keeps them for debugging; the next full
+    # harvest's start-of-run wipe covers that path).
+    ctx = tmp_path / ".harvest" / "context"
+    ctx.mkdir(parents=True)
+    (ctx / "digest-01.md").write_text("# digest", encoding="utf-8")
+    finalize_bundle(tmp_path, data_domain="s", dataset="o", tables=[], timestamp="t")
+    assert not ctx.exists()
+    # The rest of .harvest/ survives (the marker just got written there).
+    assert (tmp_path / ".harvest" / "state.json").is_file()
+
+
 def test_mark_in_progress_then_complete(tmp_path):
     mark_in_progress(tmp_path, data_domain="s", dataset="o", timestamp="t0")
     marker = tmp_path / ".harvest" / "state.json"
     assert json.loads(marker.read_text())["status"] == "in_progress"
     finalize_bundle(tmp_path, data_domain="s", dataset="o", tables=[], timestamp="t1")
     assert json.loads(marker.read_text())["status"] == "complete"
+
+
+def test_finalize_heals_a_read_only_index_instead_of_failing(tmp_path):
+    """The live finalize failure: the S3 Files mount presents an existing
+    index.md read-only, so okf_core's RAW rewrite raised EACCES and took the
+    whole harvest down AFTER every doc was authored (seen on
+    references/enums/index.md). finalize injects fsutil's healing writer."""
+    from harvest.finalize import finalize_bundle
+
+    root = tmp_path / "ds"
+    (root / "tables").mkdir(parents=True)
+    (root / "tables" / "races.md").write_text(
+        "---\ntype: Glue Table\ntitle: Races\ndescription: d\ntimestamp: t\n---\n"
+    )
+    stale = root / "tables" / "index.md"
+    stale.write_text("old\n")
+    stale.chmod(0o444)  # the mount's read-only presentation
+
+    state = finalize_bundle(
+        root,
+        data_domain="sales",
+        dataset="f1",
+        tables=["races"],
+        timestamp="2026-01-01T00:00:00Z",
+    )
+    assert state["status"] == "complete"
+    assert "Races" in stale.read_text()  # healed + rewritten, not a crash
+
+
+def test_finalize_digest_cleanup_failure_never_fails_a_committed_harvest(
+    tmp_path, monkeypatch
+):
+    # The harvest is COMMITTED once the marker is written — a stubborn NFS
+    # error deleting .harvest/context/ afterwards must not flip a finished
+    # run to failed (status row saying failed while the marker says complete).
+    from harvest import finalize as fz
+
+    ctx = tmp_path / ".harvest" / "context"
+    ctx.mkdir(parents=True)
+    (ctx / "digest-01.md").write_text("# digest", encoding="utf-8")
+
+    def boom(path):
+        raise OSError("EACCES: mount presented the dir read-only")
+
+    monkeypatch.setattr(fz, "remove_tree", boom)
+    state = finalize_bundle(
+        tmp_path, data_domain="s", dataset="o", tables=[], timestamp="t"
+    )
+    assert state["status"] == "complete"  # returned, not raised
+    assert (tmp_path / ".harvest" / "state.json").is_file()
+
+
+def test_runner_has_a_mechanical_lint_backstop_before_finalize():
+    # The supervisor prompt prescribes the fix-to-zero gate, but a prompt is
+    # advice: the runner must measure the shipped bundle itself and surface
+    # the counts on the status row (never blocking publish).
+    import inspect
+
+    from harvest import runner as rn
+
+    src = inspect.getsource(rn.run_full_harvest)
+    norm = " ".join(src.split())
+    assert "from okf_core.lint import lint_bundle as _offline_lint" in norm
+    # The backstop sits between the agent run and finalize, and its detail
+    # rides the COMPLETE status write.
+    assert norm.index("_offline_lint") < norm.index("state = finalize_bundle(")
+    assert 'status="complete", detail=lint_detail,' in norm
+    # Best-effort: the backstop must never fail the run.
+    assert "never fail the run" in src

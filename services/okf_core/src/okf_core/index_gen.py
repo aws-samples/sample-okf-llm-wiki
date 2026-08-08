@@ -8,11 +8,15 @@ this runs offline (the harvest agent can pass a Bedrock-backed synthesizer).
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable
 
 from okf_core.document import OKFDocument
+from okf_core.paths import is_reserved_rel_segments
+
+log = logging.getLogger(__name__)
 
 _INDEX_FILE = "index.md"
 
@@ -43,7 +47,8 @@ def _build_index_text(entries: list[tuple[str, str, str, str]]) -> str:
 # Directory names that are never OKF concept dirs and must not get an index.md
 # or contribute entries: dot-prefixed reserved dirs (.harvest, .context) and
 # deepagents' internal scratch dirs (defense-in-depth in case any leak to disk).
-_INTERNAL_DIRS = {"large_tool_results", "conversation_history"}
+# The reserved-directory rule (dot-dirs + deepagents scratch) is shared —
+# okf_core.paths.is_reserved_rel_segments — with lint and the link graph.
 
 
 def _is_ignored_rel(bundle_root: Path, path: Path) -> bool:
@@ -52,7 +57,7 @@ def _is_ignored_rel(bundle_root: Path, path: Path) -> bool:
         rel = path.relative_to(bundle_root)
     except ValueError:
         return False
-    return any(seg.startswith(".") or seg in _INTERNAL_DIRS for seg in rel.parts)
+    return is_reserved_rel_segments(rel.parts)
 
 
 def _directories_to_index(bundle_root: Path) -> list[Path]:
@@ -74,18 +79,39 @@ def _fallback_synth(rel_path: str, children: list[tuple[str, str]]) -> str:
     return f"Contains {len(children)} entries: {titles}."
 
 
+def _default_write(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+
+
+def _default_remove(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
 def regenerate_indexes(
     bundle_root: Path,
     *,
     synthesize: Callable[[str, list[tuple[str, str]]], str] | None = None,
+    write_file: Callable[[Path, str], None] | None = None,
+    remove_file: Callable[[Path], None] | None = None,
 ) -> list[Path]:
     """(Re)write every directory's ``index.md``. Returns the paths written.
 
     ``synthesize(rel_path, [(title, desc), ...]) -> str`` produces the one-line
     directory description; when omitted a deterministic listing is used.
+
+    ``write_file(path, text)`` / ``remove_file(path)`` override how an index is
+    written / a stale one dropped. The defaults are plain pathlib calls; the
+    harvest passes ``fsutil``'s, which are resilient on the S3 Files (NFS)
+    mount — a transient ESTALE is retried and an in-place rewrite the mount
+    refuses with ``PermissionError`` heals by unlinking first. That mattered
+    live: a raw rewrite of an existing ``references/enums/index.md`` failed
+    EACCES and took the whole harvest down at finalize, after all the authoring
+    was already done.
     """
     bundle_root = Path(bundle_root)
     synth = synthesize or _fallback_synth
+    write = write_file or _default_write
+    remove = remove_file or _default_remove
     written: list[Path] = []
     if not bundle_root.exists():
         return written
@@ -134,10 +160,16 @@ def regenerate_indexes(
             # phantom subdirectory links into a subtree that no longer exists.
             # Deepest-first ordering means a child's stale index is deleted
             # before its parent decides whether the child still counts.
-            index_path.unlink(missing_ok=True)
+            # Best-effort: a stale generated index that the mount refuses to
+            # drop is a cosmetic wart (a phantom subdirectory link), never a
+            # reason to fail a finished harvest at finalize.
+            try:
+                remove(index_path)
+            except OSError:
+                log.warning("could not remove stale index %s", index_path, exc_info=True)
             continue
 
-        index_path.write_text(_build_index_text(entries), encoding="utf-8")
+        write(index_path, _build_index_text(entries))
         written.append(index_path)
 
         if directory == bundle_root:

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from okf_core.index_gen import regenerate_indexes
 
 
@@ -82,3 +84,31 @@ def test_stale_index_chain_is_deleted_when_concepts_are_removed(tmp_path):
     root_index = (root / "index.md").read_text(encoding="utf-8")
     assert "external" not in root_index
     assert "tables" in root_index
+
+
+def test_write_heals_a_read_only_index(tmp_path):
+    """The live finalize failure: the mount presents an existing index.md
+    read-only, so a RAW rewrite raises EACCES and (before the injected writer)
+    took the whole harvest down after all authoring was done. The harvest
+    passes fsutil's healing writer instead."""
+    _write(tmp_path, "tables/races.md", "Glue Table", "Races", "d")
+    stale = tmp_path / "tables" / "index.md"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("old\n")
+    stale.chmod(0o444)  # read-only presentation, like the mount's
+
+    # Raw default writer: this is the failure mode we hit in production.
+    with pytest.raises(PermissionError):
+        regenerate_indexes(tmp_path)
+
+    # Healing writer (what harvest.finalize injects): unlink, then rewrite.
+    def healing_write(path, text):
+        try:
+            path.write_text(text, encoding="utf-8")
+        except PermissionError:
+            path.unlink(missing_ok=True)
+            path.write_text(text, encoding="utf-8")
+
+    written = regenerate_indexes(tmp_path, write_file=healing_write)
+    assert stale in written
+    assert "Races" in stale.read_text()

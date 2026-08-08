@@ -312,7 +312,7 @@ def test_reconcile_resolves_ruled_and_reverts_skipped(anno_table, tmp_path):
     # The agent didn't rule on a2 -> it's returned to the open pool, not stranded.
     assert a2["status"]["S"] == anno.STATUS_OPEN
     # The tally reflects what happened (drives the run's status detail).
-    assert tally == {"applied": 1, "rejected": 0, "reverted": 1}
+    assert tally == {"applied": 1, "rejected": 0, "reverted": 1, "write_failed": 0}
 
 
 def test_reconcile_missing_results_reverts_all(anno_table, tmp_path):
@@ -325,4 +325,53 @@ def test_reconcile_missing_results_reverts_all(anno_table, tmp_path):
         survivors=[{"annotation_id": "a1", "concept_id": "tables/races"}],
     )
     assert _get(anno_table, "s", "tables/races", "a1")["status"]["S"] == anno.STATUS_OPEN
-    assert tally == {"applied": 0, "rejected": 0, "reverted": 1}
+    assert tally == {"applied": 0, "rejected": 0, "reverted": 1, "write_failed": 0}
+
+
+def test_reconcile_counts_failed_writebacks_not_applied(anno_table, tmp_path):
+    # A verdict whose UpdateItem fails (here: the row no longer exists) must
+    # count as write_failed, NOT applied — a tally that claims success while
+    # the row stays in_review turns a real failure invisible (the UI shows
+    # anything non-resolved as still pending).
+    root = tmp_path
+    (root / ".harvest").mkdir(parents=True)
+    (root / runner.ANNOTATION_RESULTS_REL).write_text(
+        json.dumps([
+            {"annotation_id": "ghost", "concept_id": "tables/races",
+             "outcome": "applied", "comment": "edited"},
+        ])
+    )
+    survivors = [{"annotation_id": "ghost", "concept_id": "tables/races"}]
+    ct = hanno.build_annotations_client()
+    tally = runner._reconcile_annotation_results(
+        ct, root, data_domain="sales", dataset="orders", user_sub="s",
+        survivors=survivors,
+    )
+    assert tally == {"applied": 0, "rejected": 0, "reverted": 0, "write_failed": 1}
+
+
+def test_reconcile_unconfigured_client_reports_all_as_write_failed(tmp_path):
+    # No annotations table configured: nothing can be written back and every
+    # survivor silently stays in_review — the tally must say so instead of
+    # returning all-zeros that read as a clean no-op.
+    survivors = [
+        {"annotation_id": "a1", "concept_id": "tables/races"},
+        {"annotation_id": "a2", "concept_id": "tables/results"},
+    ]
+    tally = runner._reconcile_annotation_results(
+        None, tmp_path, data_domain="sales", dataset="orders", user_sub="s",
+        survivors=survivors,
+    )
+    assert tally["write_failed"] == 2
+
+
+def test_run_detail_surfaces_writeback_failures():
+    # The status detail is the operator's only window into the reconcile — a
+    # write-back failure must ride it, not just the logs.
+    import inspect
+
+    from harvest import runner as rn
+
+    src = inspect.getsource(rn.run_annotation_harvest)
+    assert "write_failed" in src
+    assert "FAILED" in src

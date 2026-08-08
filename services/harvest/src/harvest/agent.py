@@ -40,12 +40,19 @@ from typing import Any
 from harvest.fsutil import mkdirs
 from harvest.graph_tools import make_graph_tools
 from harvest.guard_engine import OKFGuardEngine
-from harvest.okf_guard import OKFGuardMiddleware, ToolErrorMiddleware
+from harvest.lint_tool import make_lint_tool
+from harvest.okf_guard import (
+    OKFGuardMiddleware,
+    SubagentDispatchGuard,
+    ToolErrorMiddleware,
+)
 from harvest.prompts import (
     build_context_extractor_prompt,
+    build_context_reviewer_prompt,
     build_cross_author_prompt,
     build_cross_reviewer_prompt,
     build_cross_supervisor_prompt,
+    build_fixer_prompt,
     build_reference_author_prompt,
     build_reviewer_prompt,
     build_supervisor_prompt,
@@ -534,6 +541,21 @@ def build_harvest_agent(
         interpreter_mw = CodeInterpreterMiddleware()
     except Exception:  # noqa: BLE001 - dynamic dispatch is a nice-to-have
         interpreter_mw = None
+    if interpreter_mw is not None:
+        # The library's lifecycle events don't carry a dispatch's full brief or
+        # its final answer — shim its task() choke point so both ride the
+        # custom stream for the UI's fleet drill-in. Its own try: losing the
+        # drill-in's I/O must never cost the interpreter itself.
+        try:
+            from harvest.subagent_io import install_quickjs_io_forwarding
+
+            install_quickjs_io_forwarding()
+        except Exception:  # noqa: BLE001 - observability only
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Sub-agent I/O forwarding unavailable", exc_info=True
+            )
 
     # Adaptive thinking rides on the model instances. A scope-tagged
     # UsageForwarder on each MODEL INSTANCE meters token usage for every turn —
@@ -582,6 +604,13 @@ def build_harvest_agent(
     dataset_root = Path(dataset_root)
     mkdirs(dataset_root)  # NFS-resilient (tolerates transient ESTALE on the mount)
 
+    # Pin the run's dataset root for the context-digest recorder: the capture
+    # sites (the QuickJS shim and the step feed) see extractor dispatches but
+    # don't know where the bundle lives. See harvest.context_digests.
+    from harvest.context_digests import configure as _configure_digest_recorder
+
+    _configure_digest_recorder(dataset_root)
+
     link_graph = LinkGraph(dataset_root)
     engine = OKFGuardEngine(link_graph)
 
@@ -598,10 +627,31 @@ def build_harvest_agent(
             cross_target["data_domain"], cross_target["dataset"]
         )
 
+    # A FULL harvest is the only mode that owns bundle-level shape: it wipes and
+    # re-authors everything, runs the lint gate, and is the one told to fix its
+    # `stale-table-doc` findings. Scoped modes (annotation/incremental) and cross
+    # runs replace the supervisor prompt, so they'd carry the tool with no
+    # guidance on when to use it — the same reason the lint gate is gated here.
+    full_harvest = cross_target is None and supervisor_prompt is None
+
     guard = OKFGuardMiddleware(
         engine,
         read_current=_make_read_current(dataset_root),
         writable_prefix=writable_prefix,
+    )
+    # The SUPERVISOR's own guard: identical, plus `delete` for retiring a stale
+    # doc (one .md file, never a dot-dir or a directory — see okf_guard). The
+    # authoring sub-agents keep `guard` above, which still refuses delete: a
+    # table-author has no business removing anything.
+    main_guard = (
+        OKFGuardMiddleware(
+            engine,
+            read_current=_make_read_current(dataset_root),
+            writable_prefix=writable_prefix,
+            allow_delete=True,
+        )
+        if full_harvest
+        else guard
     )
     # The verify-and-report sub-agents' guard: refuses EVERY write/edit (and,
     # like the main guard, the recursive `delete` deepagents ≥0.7 exposes).
@@ -611,6 +661,19 @@ def build_harvest_agent(
         engine,
         read_current=_make_read_current(dataset_root),
         read_only=True,
+    )
+    # The fix-author's guard: writes allowed ONLY to the doc paths of the
+    # review cluster bound to the CURRENT dispatch (run_review sets it via a
+    # contextvar around each fixer's task-tool call — see harvest.review).
+    # Fails closed: with no cluster bound (e.g. the model dispatching
+    # fix-author by hand), every write is refused.
+    from harvest.review import current_fix_allowlist
+
+    fixer_guard = OKFGuardMiddleware(
+        engine,
+        read_current=_make_read_current(dataset_root),
+        writable_prefix=writable_prefix,
+        write_allowlist=current_fix_allowlist,
     )
     # Tool-boundary safety net: a raising tool (e.g. a PermissionError from the
     # S3 Files mount mid-write) becomes a ToolMessage(status="error") the model
@@ -650,6 +713,36 @@ def build_harvest_agent(
 
         run_code_tool = make_run_code_tool(sandbox)
         all_tools.append(run_code_tool)
+
+    # Whole-bundle lint gate — FULL harvests only, MAIN AGENT ONLY. Scoped
+    # modes (annotation/incremental hand in supervisor_prompt) and cross runs
+    # can't perform its fix-to-zero workflow — cross writes are guard-confined
+    # to the pair subtree, so a bundle-wide error the tool reports would be
+    # unfixable there, and their prompts never mention the tool. Sub-agent
+    # specs below get all_tools (authors/reviewers work one doc/cluster at a
+    # time — a bundle-wide scan in their hands is wasted tokens). No-arg by
+    # design: expected tables come from the .metadata/ snapshot on disk and
+    # EXPLAIN availability from this run's source, so there is nothing for
+    # the model to pass (or get wrong).
+    main_tools = list(all_tools)
+    if full_harvest:
+        main_tools.append(make_lint_tool(source, dataset_root))
+        # The deterministic review workflow (ONE call replaces the old
+        # cluster→eval→Promise.all orchestration): clusters computed here,
+        # one read-only reviewer per cluster, findings piped into a
+        # cluster-confined fix-author, everything surfaced as fleet squares,
+        # full transcript in .harvest/review/. Same gating rationale as the
+        # lint gate above: only the full-harvest supervisor prompt carries
+        # its workflow.
+        from harvest.review import make_run_review_tool
+
+        main_tools.append(
+            make_run_review_tool(
+                link_graph=link_graph,
+                dataset_root=dataset_root,
+                concurrency=subagent_concurrency,
+            )
+        )
 
     # Containment: bundle files (bare paths like tables/races.md) go to the
     # dataset root on disk via the DEFAULT FilesystemBackend; deepagents'
@@ -754,17 +847,58 @@ def build_harvest_agent(
         "name": "reviewer",
         "description": (
             "Adversarially verify a CLUSTER of related authored OKF concept docs "
-            "(1-5 ids, grouped by the cluster_concepts tool) against live data. "
-            "Pass the concept ids (e.g. 'tables/races, references/joins/"
-            "circuits__races') and what to scrutinize. Returns confirmed findings "
-            "grouped by doc (wrong grain, bad join key, mis-stated gotcha, "
-            "cross-doc contradiction, SQL that errors/returns wrong rows) with "
-            "the query that proves each — or 'no issues found'."
+            "against live data (dispatched by the run_review tool, one per link "
+            "cluster). Pass the concept ids (e.g. 'tables/races, references/"
+            "joins/circuits__races') and what to scrutinize. Replies with a "
+            "first-line verdict — CLEAN, or FINDINGS grouped by doc (wrong "
+            "grain, bad join key, mis-stated gotcha, cross-doc contradiction, "
+            "SQL that errors/returns wrong rows), each with the query that "
+            "proves it."
         ),
         "system_prompt": build_reviewer_prompt(prompt_profile, gpt=reviewer_gpt),
         "tools": all_tools,  # source + graph tools; read_file comes from the backend
         "middleware": [readonly_guard, tool_errors, prompt_cache],
         "model": reviewer_chat_model,
+    }
+
+    # Context-fidelity reviewer — READ-ONLY, dispatched ONLY by run_review's
+    # context phase (after all cluster fixes), one per pair of recorded
+    # context-extractor digests (.harvest/context/). Audits whether the bundle
+    # faithfully represents each extracted fact (semantic loss, dropped codes,
+    # weakened caveats, mis-routed rules); confirmed losses pipe into a
+    # fix-author. Rides the reviewer model instance — it IS review spend.
+    context_reviewer = {
+        "name": "context-reviewer",
+        "description": (
+            "Audit how faithfully the bundle represents the facts in recorded "
+            "context-extraction digests. Dispatched by the run_review tool "
+            "only — do not dispatch it directly. READ-ONLY — returns "
+            "plain-text findings, writes nothing."
+        ),
+        "system_prompt": build_context_reviewer_prompt(
+            prompt_profile, gpt=reviewer_gpt
+        ),
+        "tools": all_tools,  # bundle reads via the backend; live probes if needed
+        "middleware": [readonly_guard, tool_errors, prompt_cache],
+        "model": reviewer_chat_model,
+    }
+
+    # The review workflow's fix applier — dispatched ONLY by the run_review
+    # tool, one per cluster with confirmed findings. Its guard (fixer_guard)
+    # confines writes to that dispatch's cluster paths and fails closed, so a
+    # stray manual task() dispatch of this type cannot write anything.
+    fix_author = {
+        "name": "fix-author",
+        "description": (
+            "Apply an adversarial reviewer's confirmed findings to the docs of "
+            "ONE review cluster. Dispatched by the run_review tool only — its "
+            "write access is bound to that cluster's files; do not dispatch it "
+            "directly."
+        ),
+        "system_prompt": build_fixer_prompt(prompt_profile, gpt=subagent_gpt),
+        "tools": all_tools,
+        "middleware": [fixer_guard, tool_errors, prompt_cache],
+        "model": subagent_chat_model,
     }
 
     # Context fact-extractor — READ-ONLY. Reads the uploaded `.context/` docs once
@@ -812,7 +946,19 @@ def build_harvest_agent(
         "model": subagent_chat_model,
     }
 
-    main_middleware = [guard, tool_errors, prompt_cache, TodoListMiddleware()]
+    # main_guard (not guard): the supervisor's variant also permits `delete` on
+    # a single stale .md doc — see the guard construction above.
+    # SubagentDispatchGuard: the model may not dispatch workflow-only types
+    # (fix-author) itself, in ANY mode — a small ad-hoc fix is the
+    # supervisor's own edit_file; run_review owns the fixer fan-out. (The
+    # QuickJS task() path is blocked by the same list in subagent_io.)
+    main_middleware = [
+        main_guard,
+        SubagentDispatchGuard(),
+        tool_errors,
+        prompt_cache,
+        TodoListMiddleware(),
+    ]
     if interpreter_mw is not None:
         main_middleware.append(interpreter_mw)
 
@@ -848,11 +994,18 @@ def build_harvest_agent(
             profile=prompt_profile,
             gpt=supervisor_gpt,
         )
-        subagents = [table_author, reference_author, reviewer, context_extractor]
+        subagents = [
+            table_author,
+            reference_author,
+            reviewer,
+            context_reviewer,
+            fix_author,
+            context_extractor,
+        ]
 
     agent = create_deep_agent(
         model=chat_model,
-        tools=all_tools,
+        tools=main_tools,
         system_prompt=system_prompt,
         middleware=main_middleware,
         subagents=subagents,

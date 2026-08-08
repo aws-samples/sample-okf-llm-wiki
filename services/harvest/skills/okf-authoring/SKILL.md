@@ -96,6 +96,14 @@ anyway.
   changes how one must query ("billions of rows — always filter the partition
   key"). A precise, decaying count is noise; a stable, decision-shaping magnitude
   is signal. When in doubt, leave the number out and state the structure instead.
+- **Verification evidence follows the same rule.** When a doc must carry what
+  you measured (a join's match rate, an orphan share, a key-format anomaly),
+  record the **proportion and the mechanism**, never the raw tallies: "~9% of
+  keys are 13 characters (leading zero absent); zero-padding to 14 resolves
+  100%" survives a reload — "211 of 2,269 rows are 13 characters; 2,058 match
+  raw" is a current-load snapshot, false after the next refresh. If an absolute
+  figure is genuinely load-bearing, round it and stamp it indicative ("~2.3k
+  rows as of this harvest").
 
 ## Workflow
 
@@ -194,7 +202,9 @@ one `write` action. Steps per concept:
      happens to mention. For each candidate, VERIFY it with the
      `validate_join` tool — one call returns the key match rate in BOTH
      directions, the null-key share, and the cardinality class (1:1 / 1:N /
-     N:1 / M:N); put those numbers in the join doc as its evidence. Where the
+     N:1 / M:N); record that evidence in the join doc as proportions plus the
+     mechanism, never the probe's absolute row tallies (see "Capture the
+     essence, not the volatile numbers"). Where the
      tool is unavailable, establish the same facts with real queries, e.g.
      `SELECT COUNT(*) FROM a JOIN b ON a.k = b.k` vs the row counts, or a
      duplicate-key probe on the presumed FK. A sub-100% match rate IS the
@@ -203,8 +213,9 @@ one `write` action. Steps per concept:
      — and check the **value format** (casing, zero-padding, types): a join
      that only works through a cast or `TRIM`/`UPPER` must carry that
      normalization in its documented `ON` clause.
-     Record what you measured (cardinality, orphan behavior, normalization) in
-     the join doc — see the join template. Document only joins that hold; if a
+     Record what you measured (cardinality class, match-rate proportions,
+     orphan behavior, normalization) in the join doc — see the join template.
+     Document only joins that hold; if a
      context doc's asserted join fails or has surprising cardinality, that is a
      `# Gotchas`-worthy finding.
    - **Detect column families in wide tables.** If a table has many columns
@@ -527,7 +538,8 @@ context doc was verified against live data** (and joins beyond those the context
 mentioned were sought out); **every join doc states its measured cardinality and
 orphan behavior** (inner- vs left-join advice); **volatile stats (row counts,
 sizes, freshness timestamps) are omitted** unless a magnitude is stable and
-decision-shaping; citations point to sources you actually used.
+decision-shaping — and measured evidence is recorded as proportions + mechanism,
+never raw tallies; citations point to sources you actually used.
 
 ## Files in this skill
 

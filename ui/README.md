@@ -31,7 +31,7 @@ Open http://localhost:5173 and sign in. Vite hot-reloads on save.
 ### Why the port is pinned to 5173
 
 `vite.config.js` sets `server.strictPort: true` on port 5173. The Cognito app
-client only whitelists `http://localhost:5173/callback.html` (redirect) and
+client only allows `http://localhost:5173/callback.html` (redirect) and
 `http://localhost:5173/` (logout) as OAuth URLs. If Vite fell back to another
 port the login redirect would be rejected, so we fail loudly instead.
 
@@ -44,7 +44,7 @@ port — or add the new port to the Cognito app client's callback/logout URLs
 
 - **Redirect URI** — `src/lib/auth.js` derives it from `window.location.origin`,
   so it is `http://localhost:5173/callback.html` in dev automatically.
-- **Cognito** — the app client whitelists the localhost callback/logout URLs
+- **Cognito** — the app client allowlists the localhost callback/logout URLs
   (see `stage_cognito_urls` in `scripts/deploy.sh`).
 - **CORS** — the Control API's API Gateway allows all origins (`allow_origins:
   ["*"]`), so `fetch` from `localhost` works.

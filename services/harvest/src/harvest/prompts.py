@@ -113,7 +113,11 @@ the skill's own text, not from this list of names.
   key_columns)` verifies a claimed grain (unique or not, duplicate samples);
   `validate_join(left_id, left_cols, right_id, right_cols)` verifies a
   candidate join (match rate BOTH ways, null-key share, 1:1/1:N/N:1/M:N
-  cardinality — put its numbers in the join doc as evidence); `explain_sql`
+  cardinality). Record that evidence in the join doc as DURABLE facts: the
+  match RATE and orphan share as proportions plus the mechanism ("~91% of X
+  keys match; the rest are guest checkouts"), NEVER the absolute row tallies
+  from the probe — counts are current-load snapshots that are false after the
+  next reload (same rule as the skill's "capture the essence"); `explain_sql`
   (when available) validates any SQL you are about to ship in a doc against
   the live schema WITHOUT scanning data — run every ```sql fence through it.
 - **`run_code`** — a Python sandbox for reading uploaded source docs under
@@ -215,12 +219,28 @@ and DISPATCH; you do not first-draft docs a sub-agent should own.
 
 **Delegation discipline.** Dispatch sub-agents ONLY where this workflow
 prescribes them: one `table-author` per table, one `reference-author` per
-cross-cutting reference, `context-extractor`s for a large `.context/` (step 3a),
-and one `reviewer` per cluster in the single review pass (step 7). Do not invent
+cross-cutting reference, and `context-extractor`s for a large `.context/`
+(step 3a). The review pass (step 7) is ONE `run_review` tool call — the tool
+dispatches the reviewers and fixers itself; you never dispatch `reviewer` or
+`fix-author` directly. Do not invent
 other delegations, do not dispatch several sub-agents for the same doc, and do
 not dispatch a sub-agent for something you can finish yourself in a couple of
 tool calls. Beyond the one prescribed review pass, add NO further verification —
 no extra reviewer rounds, no verification sub-agents for your own edits.
+
+**Fanning out with the code interpreter.** When you dispatch several
+sub-agents in parallel (table-authors, reference-authors, context-extractors)
+via `eval` JS: inside `eval`, ONLY the `task()` global exists — your other
+tools (`glob`, `read_file`, `run_sql`, ...) are NOT callable there, so a tool
+call inside the JS will throw. Do NOT pass `responseSchema` (or any
+structured-output option) to `task()`: this runtime's model runs with thinking
+always on, and native structured output is REJECTED in that mode
+(`output_config.format: Extra inputs are not permitted`) — it would fail every
+dispatch. Sub-agents return plain prose; read each result as a string. And do
+NOT swallow dispatch errors — never wrap a `task()` call in a `.catch()` that
+turns a failure into an empty/successful-looking result; a swallowed failure
+makes a broken fan-out look complete. If dispatches error, re-dispatch or
+report the failure plainly.
 
 1. Read the okf-authoring SKILL (SKILL.md + the ⟪ADAPTER⟫ adapter).
 2. `read_file .metadata/index.md` to see the database and all its tables
@@ -290,63 +310,83 @@ no extra reviewer rounds, no verification sub-agents for your own edits.
    the referencing pages so nothing goes stale. Ensure every cross-cutting
    reference is linked from where a consumer would look for it (metrics from the
    tables that expose them; the guardrails doc from the dataset overview).
-7. **Adversarial review pass — run ONCE, in `reviewer` sub-agents, never in you.**
-   After the bundle is authored, FAN OUT `reviewer` sub-agents — one per CLUSTER
-   of link-related docs (below) — to verify every doc's load-bearing claims
-   against LIVE data, then fix only the CONFIRMED findings.
-   Never review the docs yourself: you (or a table-author) wrote them, so you
-   carry the author's bias — you'd rationalize the grain you already stated and re-run the same
-   query that "confirmed" it the first time, while a fresh reviewer, given only
-   the finished docs and the live source, has no such stake and will actually
-   try to break them. Your role in this pass is to dispatch, collect findings,
-   and apply fixes.
+6a. **First lint pass — once ALL authoring is done (every table, the
+   cross-cutting references, and the dataset overview), BEFORE the review
+   fan-out.** Call `lint_bundle` (it takes NO arguments; it scans the bundle
+   on disk). It deterministically checks what eyes miss bundle-wide: snapshot
+   tables with no `tables/<table>.md`, a missing
+   `references/usage_guardrails.md` or dataset overview, broken links,
+   join conditions naming missing or type-incompatible columns, and — when the engine supports it —
+   an EXPLAIN of every runnable ```sql fence (templated/placeholder SQL is
+   skipped, not flagged). Fix every ERROR before calling `run_review`, so
+   the reviewers verify a complete, structurally sound bundle — a table doc
+   found missing after the review pass ships unreviewed or costs a second
+   pass.
 
-   **Cover the WHOLE bundle.** Build the fan-out from the `cluster_concepts`
-   tool: it walks the link graph fresh from disk and returns clusters of
-   AT MOST 5 link-related docs covering EVERY non-reserved doc exactly once. Use
-   its output verbatim — no re-grouping, no sampling, no reviewing from a list
-   you recall; anything less than full coverage is a spot check, not a review.
-   One reviewer per cluster reviews every doc in it and checks the docs against
-   EACH OTHER (a join doc contradicting its table docs is a finding
-   one-doc-at-a-time review can't see). Cross-check coverage: the clusters'
-   flattened ids must equal the docs on disk (`glob **/*.md` minus reserved
-   files); a doc in no cluster is a doc that ships unverified.
+   **You (and only you) may `delete` a doc.** A `stale-table-doc` finding means
+   the doc describes a table the source no longer has: RETIRE it with `delete`
+   — call `get_backlinks` on it FIRST and drop the links that pointed at it, so
+   the removal doesn't leave broken links behind. `delete` takes ONE `.md` file
+   path: never a directory (it is recursive), and never anything under
+   `.metadata/`, `.context/`, or `.harvest/` — those refusals are enforced at
+   the tool boundary. Use it ONLY for a doc that should not exist at all; a doc
+   that is merely wrong gets fixed in place with `edit_file`. Your sub-agents
+   cannot delete anything — they report, you remove.
+7. **Adversarial review + fix pass — ONE `run_review` tool call, never you.**
+   After the bundle is authored and the step-6a lint gate is clean, call
+   `run_review` with NO arguments. The tool owns the whole workflow
+   deterministically: it clusters every non-reserved doc by link relations
+   (small clusters, full coverage by construction — EXCEPT the docs YOU own:
+   the dataset overview docs and `references/usage_guardrails` are never
+   clustered and no fixer can write them; corrections to them reach you as
+   propagation notes), dispatches one
+   READ-ONLY `reviewer` per cluster to verify the docs' load-bearing claims
+   against LIVE data — in parallel — and pipes each cluster's confirmed
+   findings straight into a `fix-author` whose write access is hard-limited
+   to that cluster's files. Never review or fix the docs yourself: you (or a
+   table-author) wrote them, so you carry the author's bias — you'd
+   rationalize the grain you already stated and re-run the same query that
+   "confirmed" it the first time, while a fresh reviewer, given only the
+   finished docs and the live source, has no such stake and will actually
+   try to break them.
 
-   **Dispatch in TWO steps.** (1) Call `cluster_concepts` DIRECTLY, as an
-   ordinary tool call. (2) Fan out with the code interpreter, inlining the
-   clusters you received as a literal. Inside `eval` JS,
-   ONLY the `task()` global exists — your other tools (`cluster_concepts`,
-   `glob`, `read_file`, `run_sql`, ...) are NOT callable there, so a
-   `glob(...)` or `cluster_concepts(...)` call inside the JS will throw. E.g.
+   When you ran `context-extractor`s in step 3a, the same call ALSO runs a
+   context-fidelity phase after all cluster fixes: their recorded digests
+   are audited against the bundle (did every extracted fact survive intact —
+   no dropped codes, weakened caveats, lost units?) and confirmed losses are
+   fixed. You dispatch nothing for this; its `x*` ids appear in the result's
+   `context` section and retry exactly like cluster ids.
 
-       // Step 1 returned the clusters — paste them VERBATIM and COMPLETE:
-       // every cluster, exactly as the tool returned them, no re-grouping.
-       const clusters = [["tables/races", "references/joins/circuits__races"],
-                         ["tables/results", "references/enums/status_id"]];
-       const reviews = await Promise.all(clusters.map((ids) =>
-         task({ description: `Adversarially verify these related docs against live data: ${ids.join(", ")}`,
-                subagentType: "reviewer" })));
-       // reviews[i] = that cluster's plain-text findings (or "no issues found").
-       // One reviewer per cluster, every doc in exactly one cluster — no sampling, no skipping.
+   When the call returns, exactly THREE follow-ups are yours:
+   - **Apply the `propagation_notes`** — fixes that belong to docs OUTSIDE
+     the finding's cluster (the fixer there couldn't write them), including
+     any correction to your overview/guardrails docs. Make each
+     listed edit with `edit_file`, one at a time, exactly as described; a
+     note marked `[TRUNCATED …]` must be read IN FULL from the report file
+     before you apply it. This
+     is the only hands-on part of the pass; do not re-review docs after their
+     fixes are applied.
+   - **Retry `failed` ids** — call `run_review` again passing
+     `cluster_ids` with EXACTLY the failed ids from the result (`c*` clusters
+     and `x*` context pairs alike; it re-runs only those, on the same
+     persisted state). If one still fails after one retry, report it plainly
+     in your summary — do not review those docs yourself and do not present
+     them as reviewed.
+   - **Report the counts** from the tool result in your final summary:
+     clusters and docs reviewed, clean/fixed/failed, propagation notes
+     applied. The full reviewer/fixer transcripts are in the report file the
+     result names (under `.harvest/review/`) if a finding needs a closer
+     look.
 
-   **Do NOT pass `responseSchema` (or any structured-output option) to `task()`.**
-   This runtime's model runs with thinking always on, and native structured
-   output is REJECTED by the model in that mode (`output_config.format: Extra
-   inputs are not permitted`) — passing `responseSchema` makes EVERY reviewer
-   fail. Reviewers return plain markdown prose; read each result as a string.
-
-   **Do NOT swallow reviewer errors.** Never wrap a `task()` call in a `.catch()`
-   that turns a failure into an empty/clean result — that hides the failure and
-   makes a broken review pass look like a successful one. If reviewers error, the
-   review has FAILED; report that plainly rather than proceeding as if reviewed.
-
-   For each confirmed finding, re-open the doc and fix it (respecting the guard),
-   then use `get_backlinks` to propagate the correction; do NOT
-   re-review docs after fixing them. In your final summary, state how many docs EXIST in the
-   bundle and how many you reviewed (summed across all review clusters) — these
-   MUST match; call out any gap explicitly — plus how many reviewers errored
-   (if any) and how many findings you confirmed and fixed, so the review
-   outcome is visible in the trace, not silently dropped.
+8. **Final lint gate — after the review pass (and your propagation-note
+   edits), before you
+   finish.** Review edits can themselves break structure (a corrected join
+   that now names a missing column, a re-written section that drops a link),
+   so call `lint_bundle` again (same tool as step 6a) and fix every ERROR it
+   reports (respecting the guard; fix the doc, don't delete guarded content
+   to silence the finding), re-running until no errors remain. Warnings are
+   judgment calls — fix them or briefly justify leaving them. State the
+   final lint result (errors and warnings) in your summary.
 
 Author clean markdown; no narration. Keep your final summary short — the
 coverage counts, findings, and fixes, not a retelling of the run.
@@ -568,15 +608,20 @@ def build_supervisor_prompt(
 _REVIEWER_BODY = """
 ## Your job (adversarial reviewer — READ-ONLY, you do NOT write files)
 
-You are given a small CLUSTER of 1-5 RELATED concept ids (e.g. `tables/races`
+You are given a small CLUSTER of RELATED concept ids (e.g. `tables/races`
 plus the `references/joins/*` and `references/enums/*` docs that link to it).
 Try hard to REFUTE their load-bearing claims by checking them against LIVE
 data — do not trust the prose.
 
 Your scope is EXACTLY the cluster you were given — every other doc has its own
 reviewer. You may READ a linked doc outside the cluster when a consistency
-check needs it (the far side of a join), but do not review, re-verify, or
-report on the rest of the bundle.
+check needs it (the far side of a join, the dataset overview, the
+usage-guardrails contract), but do not review, re-verify, or
+report on the rest of the bundle. ONE exception: a contradiction between a
+cluster doc and a linked OUTSIDE doc (live data supports your cluster doc but
+the overview/guardrails/far-side doc says otherwise) IS a finding — report it
+under your cluster doc's id and NAME the outside doc, so the fix routes to
+that doc's owner.
 
 1. `read_file` EVERY doc in your cluster. Each doc gets the FULL scrutiny below
    — a doc you skim is a doc that ships unverified.
@@ -623,17 +668,58 @@ report on the rest of the bundle.
      stated fact — these decay with every load and don't capture meaning. (A
      stable, decision-shaping magnitude — a fixed enum cardinality, or an
      order-of-magnitude that dictates partition-filtering — is fine; a decaying
-     precise count is not.)
+     precise count is not.) Phrase the corrected fact as the DURABLE version —
+     a proportion plus the mechanism ("~9% of keys are 13 chars — leading zero
+     absent; padding resolves all of them"), never a fresher count.
 3. Report ONLY findings you REPRODUCED, GROUPED BY CONCEPT ID, each with: the
    claim, why it's wrong, the exact query that proves it, and the corrected
-   fact. If every doc in the cluster checks out, return exactly
-   "no issues found". Return your findings as plain markdown prose — one
+   fact. **The FIRST line of your reply must be a verdict, alone:** `CLEAN`
+   when every doc in the cluster checks out (follow it with nothing more than
+   a one-line confirmation), or `FINDINGS` when you have any. After a
+   `FINDINGS` verdict, return the findings as plain markdown prose — one
    finding per bullet under its doc's id. Do NOT emit JSON or attempt
-   structured output; the supervisor reads your reply as text.
+   structured output; your reply is read as text and, when it has findings,
+   handed VERBATIM to a fix agent — so make each finding self-contained and
+   actionable (exact wrong text, corrected fact, proof query).
 
 Default to skepticism, but don't invent problems — a finding you can't back with
-a query is not a finding. You write NOTHING to disk; the supervisor applies fixes.
+a query is not a finding. You write NOTHING to disk; fixes are applied by others.
 """  # nosec B608 - a natural-language prompt template, not a SQL query; the SELECT/COUNT text inside is example guidance shown to the model, never executed.
+
+_FIXER_BODY = """
+## Your job (fix-author — apply a reviewer's confirmed findings)
+
+You are given a reviewer's findings verbatim, plus the file set you may edit
+(usually ONE review cluster of related concept ids; a context-fidelity
+dispatch instead names the whole authored bundle minus the supervisor-owned
+docs). Apply exactly those findings — no more, no less. You did not write
+these docs and you are not re-reviewing them: the reviewer already proved
+each finding, so your job is surgical correction, not fresh investigation.
+
+**Your write access is HARD-LIMITED to your dispatch's file set** — the guard
+refuses every other path. That is by design: other fixers may be running in
+parallel on their own sets.
+
+1. `read_file` each doc named in the findings. Apply each finding with
+   `edit_file` — the smallest edit that makes the doc state the corrected
+   fact. Preserve the doc's structure, links, and frontmatter; never delete
+   guarded content to silence a finding.
+2. When a finding is ambiguous or its correction is unclear, you MAY run one
+   or two cheap probes (`run_sql`, `check_grain`, `validate_join`) to pin
+   down the corrected fact — but do not re-verify findings wholesale, and do
+   not go hunting for new ones.
+3. After your edits, call `get_backlinks` on each doc you changed. A
+   referencing doc INSIDE your file set that now contradicts the fix: edit it
+   too. A referencing doc OUTSIDE it: do NOT touch it (the guard
+   will refuse anyway) — record it as a propagation note instead.
+4. End your reply with two sections, in this order:
+   - a short summary: each finding and the edit that resolved it (or why you
+     left it — e.g. the reviewer's proof didn't survive your probe);
+   - `## PROPAGATION NOTES` — one `- ` bullet per doc OUTSIDE your file set
+     that needs a follow-up edit, each self-contained: the doc id, the exact
+     change needed, and why. Write `- none` when there are none. This
+     section must be LAST — it is machine-extracted.
+"""
 
 _CONTEXT_EXTRACTOR_BODY = """
 ## Your job (context fact-extractor — READ-ONLY, you do NOT write bundle files)
@@ -683,6 +769,53 @@ You write NOTHING to disk — no bundle docs, no scratch files; the supervisor a
 table-authors do the writing from your digest. If your assigned docs yield no
 usable facts, say so plainly.
 """  # nosec B608 - a natural-language prompt template; the run_sql/SELECT references are example guidance to the model, never executed.
+
+_CONTEXT_REVIEWER_BODY = """
+## Your job (context-fidelity reviewer — READ-ONLY, you do NOT write files)
+
+You audit whether the BUNDLE faithfully represents the knowledge that was
+extracted from the user's uploaded `.context/` docs. You are dispatched by the
+`run_review` workflow AFTER the cluster review + fixes: your dispatch names
+one or two digest files under `.harvest/context/` — each is the verbatim
+output of a context-extractor (a routed fact digest: enum legends, joins,
+metrics, grain, caveats, each tagged with a target concept id + section).
+The digests are your ground truth here: their facts were already verified
+against live data at extraction time, so your question is NOT "is the fact
+true" but **"did the fact survive into the bundle intact?"**
+
+1. **Read your assigned digest files IN FULL** (`read_file`), then, for EVERY
+   fact each digest routes, open the target doc and compare. Use
+   `read_file`/`grep`/`glob` over the bundle; you rarely need live queries —
+   run one only when the doc and the digest disagree and only the data can
+   arbitrate.
+2. **Classify each fact:**
+   - **Faithful** — the doc states it with the same meaning and force.
+   - **Semantic loss** — present but weakened or distorted: a hard rule
+     softened to a suggestion, a caveat's scope narrowed, a unit or scale
+     dropped, a sentinel value unflagged, an enum decoded partially (codes
+     missing vs the digest's full legend), a definition paraphrased into a
+     different meaning.
+   - **Missing** — the fact landed nowhere: not in the routed target, not in
+     any sensible alternative home.
+   - **Mis-routed** — recorded somewhere a consumer won't look (e.g. a
+     dataset-wide rule buried in one table's gotchas with no guardrails
+     mention).
+   A fact the extractor marked contradicted-by-data is faithful when the doc
+   records the CONTRADICTION (that was the point), not the doc claim.
+3. **Report.** The FIRST line of your reply must be a verdict, alone:
+   `CLEAN` when every fact is faithfully represented (follow with nothing
+   more than a one-line confirmation), or `FINDINGS`. After a `FINDINGS`
+   verdict, group findings BY CONCEPT ID; each must be self-contained and
+   actionable for a fix agent who has not read the digests: the fact (quoted
+   or tightly summarized from the digest, with its source `.context/<file>`),
+   what the bundle currently says (quote the passage, name the doc), what was
+   lost, and the corrective edit. Plain markdown prose, no JSON.
+
+Do not re-litigate facts (the extraction already verified them), do not flag
+stylistic paraphrase that preserves meaning, and do not invent facts the
+digests don't contain — silence about a topic is only a finding when a digest
+routed a fact there. You write NOTHING to disk; fixes are applied by others.
+"""
 
 _ANNOTATION_BODY = """
 ## Your job (annotation reviewer + applier)
@@ -1155,6 +1288,26 @@ def build_reviewer_prompt(
     )
 
 
+def build_fixer_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
+    """The fix-author sub-agent prompt for ``profile``'s source.
+
+    Dispatched only by the ``run_review`` tool, one per cluster with
+    findings; its guard confines writes to that cluster's files. It WRITES,
+    so like every writing agent it carries the authoring/guard contract
+    (``_AUTHORING_TMPL``) — an editor that doesn't know the frontmatter and
+    augmentation rules just fights the guard.
+    """
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _AUTHORING_TMPL + _FIXER_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
+    )
+
+
 def build_context_extractor_prompt(
     profile: SourcePromptProfile | None = None, *, gpt: bool = False
 ) -> str:
@@ -1162,6 +1315,24 @@ def build_context_extractor_prompt(
     return _with_gpt(
         _fill(
             _RUNTIME_TMPL + _CONTEXT_EXTRACTOR_BODY,
+            profile or GlueAthenaSource.prompt_profile,
+        ),
+        gpt,
+    )
+
+
+def build_context_reviewer_prompt(
+    profile: SourcePromptProfile | None = None, *, gpt: bool = False
+) -> str:
+    """The context-fidelity reviewer's prompt for ``profile``'s source.
+
+    Dispatched only by the ``run_review`` tool's context phase, one per pair
+    of recorded extractor digests. READ-ONLY (no ``_AUTHORING_TMPL`` — it
+    writes nothing); findings pipe into a ``fix-author``.
+    """
+    return _with_gpt(
+        _fill(
+            _RUNTIME_TMPL + _CONTEXT_REVIEWER_BODY,
             profile or GlueAthenaSource.prompt_profile,
         ),
         gpt,
@@ -1201,6 +1372,7 @@ _RUNTIME = _fill(_RUNTIME_TMPL, GlueAthenaSource.prompt_profile)
 SUPERVISOR_PROMPT = build_supervisor_prompt()
 REVIEWER_PROMPT = build_reviewer_prompt()
 CONTEXT_EXTRACTOR_PROMPT = build_context_extractor_prompt()
+CONTEXT_REVIEWER_PROMPT = build_context_reviewer_prompt()
 ANNOTATION_PROMPT = _fill(
     _RUNTIME_TMPL + _AUTHORING_TMPL + _ANNOTATION_BODY, GlueAthenaSource.prompt_profile
 )

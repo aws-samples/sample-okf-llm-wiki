@@ -189,6 +189,16 @@ def _is_error_result(msg: Any) -> bool:
     return isinstance(content, str) and content.startswith("Error:")
 
 
+def _is_gate_denial(msg: Any) -> bool:
+    """A tool-boundary DENIAL (the guardrails gate's short-circuit payload).
+
+    A denial is an instructive refusal — its body names the exact corrective
+    action — not a failing attempt, so the trailing futility streak must not
+    read a run of denials (each for a different page) as flailing."""
+    content = getattr(msg, "content", None)
+    return isinstance(content, str) and '"denied"' in content
+
+
 def turn_slice(messages: list[Any]) -> list[Any]:
     """The messages of the CURRENT turn: from the last genuine user message on.
 
@@ -226,8 +236,27 @@ def detect(messages: list[Any]) -> Signal | None:
         if calls_since < COOLDOWN_CALLS:
             return None
 
-    # repetition — exact duplicate (tool, args) call within the turn.
+    # repetition — exact duplicate (tool, args) call within the turn. Only
+    # calls whose result SUCCEEDED seed the set: re-issuing a call that
+    # errored is course correction, not derailment (the guardrails gate
+    # denies a read_page until references/usage_guardrails is read — the
+    # retry after reading it is exactly what the denial instructed, and the
+    # denial is NOT "its result is above"). Identical FAILING retries are
+    # the futility signal's job below, not repetition's.
+    results_by_id: dict[str, Any] = {}
+    for m in window:
+        if isinstance(m, ToolMessage):
+            call_id = getattr(m, "tool_call_id", None)
+            if call_id:
+                results_by_id[call_id] = m
     seen_calls: set[tuple[str, str]] = set()
+    # Identical calls that ERRORED don't seed the repetition set (the retry a
+    # denial instructs is course correction, not derailment) — but the SAME
+    # failing call re-issued over and over IS derailment, and interleaved
+    # successes of other tools break the trailing-streak futility check
+    # below. Count identical errored calls across the whole turn so the
+    # deny → other tool → identical deny alternation still gets a nudge.
+    errored_counts: dict[tuple[str, str], int] = {}
     for msg in window:
         if not isinstance(msg, AIMessage):
             continue
@@ -238,16 +267,36 @@ def detect(messages: list[Any]) -> Signal | None:
             key = (name, json.dumps(tc.get("args") or {}, sort_keys=True, default=str))
             if key in seen_calls and "repetition" not in fired_kinds:
                 return Signal("repetition", _repetition_text(name))
-            seen_calls.add(key)
+            result = results_by_id.get(tc.get("id") or "")
+            if result is None or not _is_error_result(result):
+                seen_calls.add(key)
+            else:
+                errored_counts[key] = errored_counts.get(key, 0) + 1
+                if (
+                    errored_counts[key] >= ERROR_STREAK
+                    and "futility" not in fired_kinds
+                ):
+                    return Signal("futility", _futility_text(name, errored_counts[key]))
 
-    # futility — trailing streak of errored results from the same tool.
+    # futility — trailing streak of errored results from the same tool
+    # (different args allowed: N differently-flailing run_sql attempts in a
+    # row IS futility). Gate DENIALS are exempt here: the guardrails gate's
+    # normal first contact is several read_page denials for DIFFERENT pages
+    # before the guardrails read, and each denial already names the fix — a
+    # "re-derive your approach" nudge over those is wrong guidance (and its
+    # cooldown then suppresses a genuine signal). An IDENTICAL denied call
+    # re-issued over and over still fires via errored_counts above.
     streak_tool: str | None = None
     streak = 0
     for msg in reversed(window):
         if not isinstance(msg, ToolMessage):
             continue
         name = getattr(msg, "name", None) or ""
-        if not _is_error_result(msg) or (streak_tool is not None and name != streak_tool):
+        if (
+            not _is_error_result(msg)
+            or _is_gate_denial(msg)
+            or (streak_tool is not None and name != streak_tool)
+        ):
             break
         streak_tool = name
         streak += 1
