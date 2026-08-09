@@ -26,6 +26,38 @@ def test_list_domains_returns_only_domain_items(tools):
     assert all("cross_referenced_by" not in d for d in domains)
 
 
+def test_list_domains_attaches_the_dataset_overview(tools):
+    by_id = {
+        (d["data_domain"], d["dataset"]): d
+        for d in tools.list_domains()["datasets"]
+    }
+    # sales/f1 has a published datasets/f1.md -> its frontmatter description.
+    assert by_id[("sales", "f1")]["overview"] == "db"
+    # ops/logs was registered but never harvested -> no overview key at all.
+    assert "overview" not in by_id[("ops", "logs")]
+
+
+def test_list_domains_overview_falls_back_to_a_capped_body_excerpt(tools, aws):
+    # No usable frontmatter description -> a whitespace-collapsed body excerpt,
+    # hard-capped so a page of entries cannot flood the caller's context.
+    aws["s3"].put_object(
+        Bucket=BUNDLE_BUCKET,
+        Key="okf/ops/logs/datasets/logs.md",
+        Body=(
+            "---\ntype: Glue Database\ntitle: Logs\ndescription: ''\n"
+            "timestamp: t\n---\n\n# Overview\n\n" + ("service logs " * 100)
+        ).encode(),
+    )
+    entry = next(
+        d
+        for d in tools.list_domains()["datasets"]
+        if (d["data_domain"], d["dataset"]) == ("ops", "logs")
+    )
+    assert entry["overview"].startswith("# Overview service logs")
+    assert len(entry["overview"]) <= 600
+    assert entry["overview"].endswith("…")
+
+
 def test_list_domains_surfaces_cross_reference_signal(tools, aws):
     # A reindex-derived XREF row: sales/f1's bundle holds pair docs about
     # ops/logs. Both sides must learn about it — the initiating side so it can

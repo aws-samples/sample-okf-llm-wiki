@@ -50,6 +50,7 @@ import ast
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -103,6 +104,9 @@ KIND_SUBAGENT = "subagent"
 # discrimination is needed. The top-level counters stay the sum of the scopes
 # (older UIs keep working; new UIs render the drill-down from `by`).
 KIND_USAGE = "usage"
+#: A coalescing progress tick for the pre-agent snapshot passes — the UI
+#: renders ONE live bar per `phase` and updates it in place.
+KIND_PROGRESS = "progress"
 
 # Usage metering scopes (the keys of the KIND_USAGE snapshot's `by` object).
 SCOPE_SUPERVISOR = "supervisor"
@@ -502,6 +506,9 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         # thread-pool for async runs), so seq assignment must be atomic — a race
         # would mint duplicate seqs that the consumer's dedup then drops.
         self._lock = threading.Lock()
+        # Per-phase timestamp of the last progress emission (throttling state
+        # for emit_progress — see there).
+        self._progress_last: dict[str, float] = {}
         # Track the call_ids we EMITTED a tool_call for, so a tool_result is only
         # emitted when its call was. LangChain only passes `metadata` to the START
         # callbacks (on_tool_start / on_chat_model_start) — the END callbacks
@@ -882,6 +889,40 @@ class StepEmitter(BaseCallbackHandler):  # type: ignore[misc]
         changes.
         """
         self._emit({"kind": KIND_AGENT, "label": str(label)})
+
+    def emit_progress(
+        self, phase: str, done: int, total: int, label: str = ""
+    ) -> None:
+        """A coalescing progress tick for the PRE-AGENT snapshot passes
+        (column profiles, relationship evidence): ``kind="progress"`` with a
+        stable ``phase`` key, so the UI renders ONE live bar per phase and
+        updates it in place — not 237 feed lines for a 237-table pass.
+
+        Throttled per phase (and, like every emission, never raises): the
+        FIRST tick and any FINAL tick (done >= total) always emit;
+        intermediate ticks emit at most every ~2s — the UI polls the feed
+        every few seconds, so finer granularity is invisible and would only
+        bloat CloudWatch.
+        """
+        try:
+            now = time.monotonic()
+            with self._lock:
+                last = self._progress_last.get(phase)
+                final = total > 0 and done >= total
+                if last is not None and not final and now - last < 2.0:
+                    return
+                self._progress_last[phase] = now
+        except Exception:  # noqa: BLE001 - a progress tick must never break a harvest
+            return
+        self._emit(
+            {
+                "kind": KIND_PROGRESS,
+                "phase": str(phase),
+                "done": int(done),
+                "total": int(total),
+                "label": str(label or ""),
+            }
+        )
 
     def emit_subagent_event(self, event: dict[str, Any]) -> None:
         """Emit one real sub-agent lifecycle event from the custom stream.

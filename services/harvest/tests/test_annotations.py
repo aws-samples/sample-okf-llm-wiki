@@ -375,3 +375,16 @@ def test_run_detail_surfaces_writeback_failures():
     src = inspect.getsource(rn.run_annotation_harvest)
     assert "write_failed" in src
     assert "FAILED" in src
+
+
+def test_annotation_snapshot_refresh_reuses_caches():
+    # The annotation path refreshes .metadata in "cross" mode — the default
+    # ("full") would re-bill the entire profile + relationship pass (and a
+    # whole-catalog sketch scan) on every annotation run, which needs none
+    # of it.
+    import inspect
+
+    from harvest import runner as rn
+
+    src = inspect.getsource(rn.run_annotation_harvest)
+    assert 'export_metadata(source, dataset_root, profile_mode="cross")' in src

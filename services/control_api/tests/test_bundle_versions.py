@@ -318,6 +318,23 @@ def test_repromote_end_to_end(cfg, aws):
     }
     assert f"{PREFIX}tables/c.md" not in keys and f"{PREFIX}tables/b.md" in keys
 
+    # The precomputed /graph artifact was refreshed to the restored content and
+    # stamped with the fresh marker's completed_at (restore_snapshot only
+    # touches non-dot .md files, so without this refresh the artifact would
+    # linger stale and push /graph onto the live-compute path).
+    graph = json.loads(
+        s3.get_object(Bucket=BUCKET, Key=f"{PREFIX}.harvest/graph.json")[
+            "Body"
+        ].read()
+    )
+    marker = json.loads(
+        s3.get_object(Bucket=BUCKET, Key=f"{PREFIX}.harvest/state.json")[
+            "Body"
+        ].read()
+    )
+    assert graph["completed_at"] == marker["completed_at"]
+    assert {n["id"] for n in graph["nodes"]} == {"tables/a", "tables/b"}
+
     # The head is a NEW version with repromote provenance; history is 3 deep.
     resp = app.route(_event("GET", f"/bundle/{DOMAIN}/{DATASET}/versions"), cfg)
     versions = _json(resp)["versions"]

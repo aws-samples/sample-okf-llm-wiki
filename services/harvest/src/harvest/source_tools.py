@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from harvest.probes import grain_stats, join_stats, quote_ident as _quote_ident
 from harvest.source_base import Source
 from okf_core.paths import parse_concept_id
 
@@ -45,10 +46,6 @@ def _max_rows() -> int:
         return int(os.environ.get("OKF_HARVEST_SQL_MAX_ROWS", "") or 200)
     except ValueError:
         return 200
-
-
-def _quote_ident(name: str) -> str:
-    return '"' + str(name).replace('"', "").strip() + '"'
 
 
 def _compact(
@@ -182,40 +179,10 @@ def make_source_tools(source: Source) -> list[Any]:
             if isinstance(resolved, str):
                 return {"is_unique": None, "note": resolved}
             _, ref_sql = resolved
-            if not key_columns:
-                return {"is_unique": None, "note": "key_columns is empty"}
-            keys = ", ".join(_quote_ident(c) for c in key_columns)
-            try:
-                agg = source.run_query(
-                    f"SELECT COUNT(*) AS key_groups, SUM(c) AS total_rows, "
-                    f"SUM(CASE WHEN c > 1 THEN 1 ELSE 0 END) AS dupe_groups, "
-                    f"MAX(c) AS max_per_key FROM ("
-                    f"SELECT COUNT(*) AS c FROM {ref_sql} GROUP BY {keys}) g"
-                )
-            except Exception as e:  # noqa: BLE001
-                return {"is_unique": None, "note": f"Query failed: {e}"}
-            row = agg[0] if agg else {}
-            dupes = int(row.get("dupe_groups") or 0)
-            out: dict[str, Any] = {
-                "is_unique": dupes == 0,
-                "total_rows": int(row.get("total_rows") or 0),
-                "distinct_keys": int(row.get("key_groups") or 0),
-                "duplicate_key_groups": dupes,
-                "max_rows_per_key": int(row.get("max_per_key") or 0),
-                "sample_duplicates": [],
-                "note": "",
-            }
-            if dupes:
-                try:
-                    sample = source.run_query(
-                        f"SELECT {keys}, COUNT(*) AS n FROM {ref_sql} "
-                        f"GROUP BY {keys} HAVING COUNT(*) > 1 "
-                        f"ORDER BY COUNT(*) DESC LIMIT 5"
-                    )
-                    out["sample_duplicates"] = sample
-                except Exception as e:  # noqa: BLE001
-                    out["note"] = f"Duplicate sample failed: {e}"
-            return out
+            # The SQL core is shared with the snapshot-time relationship
+            # precompute (harvest.probes) — same probe, same numbers, whether
+            # it ran before the agent existed or the agent asked live.
+            return grain_stats(source, ref_sql, key_columns)
 
         @tool
         def validate_join(
@@ -235,77 +202,16 @@ def make_source_tools(source: Source) -> list[Any]:
             Costs a few aggregate scans per side — use it on CANDIDATE joins
             surfaced by the `.metadata/columns.tsv` grep, not exhaustively.
             """
-            if not left_columns or len(left_columns) != len(right_columns):
-                return {
-                    "note": "left_columns/right_columns must be non-empty and "
-                    "the same length"
-                }
             left = _resolve_table(left_concept_id)
             right = _resolve_table(right_concept_id)
             if isinstance(left, str):
                 return {"note": left}
             if isinstance(right, str):
                 return {"note": right}
-
-            def side_stats(
-                ref_sql: str, cols: list[str], other_ref: str, other_cols: list[str]
-            ) -> dict[str, Any]:
-                quoted = [_quote_ident(c) for c in cols]
-                o_quoted = [_quote_ident(c) for c in other_cols]
-                not_null = " AND ".join(f"t.{c} IS NOT NULL" for c in quoted)
-                any_null = " OR ".join(f"{c} IS NULL" for c in quoted)
-                sel = ", ".join(quoted)
-                on = " AND ".join(f"o.{oc} = t.{c}"
-                                  for c, oc in zip(quoted, o_quoted))
-                agg = source.run_query(
-                    f"SELECT COUNT(*) AS n, "
-                    f"SUM(CASE WHEN {any_null} THEN 1 ELSE 0 END) AS null_keys, "
-                    f"(SELECT COUNT(*) FROM (SELECT DISTINCT {sel} "
-                    f"FROM {ref_sql} WHERE NOT ({any_null})) d) AS distinct_keys "
-                    f"FROM {ref_sql}"
-                )
-                matched = source.run_query(
-                    f"SELECT COUNT(*) AS m FROM {ref_sql} t WHERE {not_null} "
-                    f"AND EXISTS (SELECT 1 FROM {other_ref} o WHERE {on})"
-                )
-                row = agg[0] if agg else {}
-                n = int(row.get("n") or 0)
-                nulls = int(row.get("null_keys") or 0)
-                m = int((matched[0] if matched else {}).get("m") or 0)
-                eligible = n - nulls
-                return {
-                    "rows": n,
-                    "null_key_rows": nulls,
-                    "distinct_keys": int(row.get("distinct_keys") or 0),
-                    "matched_rows": m,
-                    "match_rate": round(m / eligible, 4) if eligible else None,
-                    "_unique": int(row.get("distinct_keys") or 0) == eligible
-                    and eligible > 0,
-                }
-
-            try:
-                l_stats = side_stats(
-                    left[1], left_columns, right[1], right_columns
-                )
-                r_stats = side_stats(
-                    right[1], right_columns, left[1], left_columns
-                )
-            except Exception as e:  # noqa: BLE001
-                return {"note": f"Query failed: {e}"}
-            l_unique = l_stats.pop("_unique")
-            r_unique = r_stats.pop("_unique")
-            card = (
-                "1:1" if l_unique and r_unique
-                else "1:N" if l_unique
-                else "N:1" if r_unique
-                else "M:N"
+            # Shared SQL core (harvest.probes) — see check_grain above.
+            return join_stats(
+                source, left[1], left_columns, right[1], right_columns
             )
-            return {
-                "left": l_stats,
-                "right": r_stats,
-                "cardinality": card,
-                "note": "",
-            }
 
         tools += [check_grain, validate_join]
 

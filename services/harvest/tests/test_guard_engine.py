@@ -99,3 +99,32 @@ def test_edit_passthrough_when_file_absent(tmp_path):
     eng = _engine(tmp_path)
     d = eng.guard_edit_file("a", "b", existing_text=None)
     assert d.allow
+
+
+def test_engine_refuses_join_docs_without_a_fenced_condition(tmp_path):
+    eng = _engine(tmp_path)
+    doc = (
+        "---\ntype: Reference\ntitle: J\ndescription: d\n---\n\n"
+        'Use `a."id" = aa."annotation"` inline.\n'
+    )
+    d = eng.guard_write_file(
+        doc, existing_text=None, rel_path="references/joins/a__b.md"
+    )
+    assert not d.allow and "```sql" in d.message
+    # Same content is fine anywhere else...
+    assert eng.guard_write_file(
+        doc, existing_text=None, rel_path="tables/a.md"
+    ).allow
+    # ...and fine as a join doc once the fence is added.
+    fixed = doc + "\n```sql\na.id = aa.annotation\n```\n"
+    assert eng.guard_write_file(
+        fixed, existing_text=None, rel_path="references/joins/a__b.md"
+    ).allow
+    # An edit that REMOVES the only fenced condition is refused too.
+    d = eng.guard_edit_file(
+        "```sql\na.id = aa.annotation\n```\n",
+        "",
+        existing_text=fixed,
+        rel_path="references/joins/a__b.md",
+    )
+    assert not d.allow and "```sql" in d.message

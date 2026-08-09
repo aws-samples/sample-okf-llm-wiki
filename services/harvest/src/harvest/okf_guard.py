@@ -340,7 +340,11 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         existing = self._read_current(file_path)
 
         if name == "write_file":
-            decision = self.engine.guard_write_file(args.get("content", ""), existing)
+            decision = self.engine.guard_write_file(
+                args.get("content", ""),
+                existing,
+                rel_path=_normalized_rel(file_path),
+            )
             if not decision.allow:
                 return self._refuse(request, decision.message)
             if decision.new_content is not None:
@@ -349,7 +353,10 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
 
         # edit_file
         decision = self.engine.guard_edit_file(
-            args.get("old_string", ""), args.get("new_string", ""), existing
+            args.get("old_string", ""),
+            args.get("new_string", ""),
+            existing,
+            rel_path=_normalized_rel(file_path),
         )
         if not decision.allow:
             return self._refuse(request, decision.message)

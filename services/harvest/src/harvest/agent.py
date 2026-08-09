@@ -41,6 +41,7 @@ from harvest.fsutil import mkdirs
 from harvest.graph_tools import make_graph_tools
 from harvest.guard_engine import OKFGuardEngine
 from harvest.lint_tool import make_lint_tool
+from harvest.stats_tool import make_stats_tool
 from harvest.okf_guard import (
     OKFGuardMiddleware,
     SubagentDispatchGuard,
@@ -725,6 +726,10 @@ def build_harvest_agent(
     # EXPLAIN availability from this run's source, so there is nothing for
     # the model to pass (or get wrong).
     main_tools = list(all_tools)
+    # Bundle inventory — EVERY supervisor mode (full/scoped/cross): counts by
+    # concept type instead of glob-and-count-in-context. Counts only, no
+    # judgment (see stats_tool.py) — deliberately NOT in the sub-agent specs.
+    main_tools.append(make_stats_tool(dataset_root))
     if full_harvest:
         main_tools.append(make_lint_tool(source, dataset_root))
         # The deterministic review workflow (ONE call replaces the old

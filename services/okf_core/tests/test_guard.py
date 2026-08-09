@@ -119,3 +119,20 @@ def test_ensure_timestamp_fills_when_missing():
     assert fm["timestamp"]
     fm2 = ensure_timestamp({"type": "T", "timestamp": "keep"})
     assert fm2["timestamp"] == "keep"
+
+
+def test_join_docs_must_fence_their_on_clause():
+    from okf_core.guard import check_join_doc
+
+    fenced = "Join them.\n\n```sql\norders.customer_id = customers.id\n```\n"
+    inline = 'Use `a."id" = aa."annotation"` for aliases `a` and `aa`.\n'
+    # Non-join paths: never checked.
+    assert check_join_doc("tables/orders.md", inline).ok
+    # Join doc with a fenced qualified equality (even a bare fragment): ok.
+    assert check_join_doc("references/joins/a__b.md", fenced).ok
+    # The live failure shape: condition present but only in inline backticks.
+    res = check_join_doc("references/joins/a__b.md", inline)
+    assert not res.ok and "```sql" in res.error
+    # No condition at all: refused with the corrective example.
+    res = check_join_doc("references/joins/a__b.md", "prose only\n")
+    assert not res.ok and "retry the write" in res.error

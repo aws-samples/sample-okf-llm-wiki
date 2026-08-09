@@ -116,6 +116,42 @@ def test_cleanup_scoped_to_dataset(monkeypatch, tmp_path):
     assert (mount / "health_care" / "thrombosis_prediction").exists()  # sibling kept
 
 
+def test_cleanup_kills_the_commit_marker_even_when_partial(monkeypatch, tmp_path):
+    # A partial cleanup (poisoned inodes survive the walk) must NEVER leave a
+    # complete commit marker behind: a surviving state.json + graph.json pair
+    # over a gutted bundle reads as a healthy wiki (is_bundle_ready true, the
+    # /graph fast path serving the pre-cleanup graph). The markers go first.
+    import os as _os
+
+    mount = tmp_path / "mnt"
+    ds = mount / "health_care" / "toxicology"
+    (ds / ".harvest").mkdir(parents=True)
+    (ds / ".harvest" / "state.json").write_text('{"status": "complete"}')
+    (ds / ".harvest" / "graph.json").write_text('{"completed_at": "t"}')
+    (ds / "tables").mkdir()
+    (ds / "tables" / "molecule.md").write_text("doc")
+    poisoned = str(ds / "tables" / "bond.md")
+    (ds / "tables" / "bond.md").write_text("doc")
+    monkeypatch.setattr(ep, "MOUNT_PATH", str(mount))
+
+    real_unlink = _os.unlink
+
+    def unlink(path, *a, **kw):  # one poisoned inode the mount uid can't remove
+        if str(path) == poisoned:
+            raise OSError(13, "Permission denied", str(path))
+        return real_unlink(path, *a, **kw)
+
+    monkeypatch.setattr(_os, "unlink", unlink)
+    r = ep.start_harvest(
+        {"mode": "cleanup", "data_domain": "health_care", "dataset": "toxicology"}
+    )
+    assert r["status"] == "partial" and r["removed"] is False
+    # The poisoned doc survived, but both markers are gone regardless.
+    assert (ds / "tables" / "bond.md").exists()
+    assert not (ds / ".harvest" / "state.json").exists()
+    assert not (ds / ".harvest" / "graph.json").exists()
+
+
 def test_cleanup_absent_target_is_noop(monkeypatch, tmp_path):
     mount = tmp_path / "mnt"
     mount.mkdir()
@@ -297,6 +333,57 @@ def test_finalize_cleans_recorded_context_digests_after_the_marker(tmp_path):
     assert not ctx.exists()
     # The rest of .harvest/ survives (the marker just got written there).
     assert (tmp_path / ".harvest" / "state.json").is_file()
+
+
+def test_finalize_precomputes_the_graph_artifact(tmp_path):
+    # finalize writes .harvest/graph.json stamped with the SAME timestamp the
+    # commit marker carries — the Control API's /graph endpoint serves it iff
+    # the two match, so every mode that funnels through finalize (full,
+    # scoped/incremental, annotation, cross) refreshes the graph.
+    (tmp_path / "tables").mkdir()
+    (tmp_path / "tables" / "races.md").write_text(
+        "---\ntype: Glue Table\ntitle: Races\ndescription: d\ntimestamp: t\n---\n\n"
+        "See [results](results.md).\n"
+    )
+    (tmp_path / "tables" / "results.md").write_text(
+        "---\ntype: Glue Table\ntitle: Results\ndescription: d\ntimestamp: t\n---\n\nbody\n"
+    )
+    # Run inputs must stay out of the graph.
+    meta = tmp_path / ".metadata" / "tables"
+    meta.mkdir(parents=True)
+    (meta / "races.md").write_text("snapshot, not a concept")
+
+    finalize_bundle(
+        tmp_path,
+        data_domain="sales",
+        dataset="f1",
+        tables=["races", "results"],
+        timestamp="2026-07-01T00:00:00Z",
+    )
+    graph = json.loads((tmp_path / ".harvest" / "graph.json").read_text())
+    state = json.loads((tmp_path / ".harvest" / "state.json").read_text())
+    assert graph["completed_at"] == state["completed_at"]
+    assert {n["id"] for n in graph["nodes"]} == {"tables/races", "tables/results"}
+    assert {(e["source"], e["target"]) for e in graph["edges"]} == {
+        ("tables/races", "tables/results")
+    }
+
+
+def test_finalize_graph_failure_never_fails_the_run(tmp_path, monkeypatch):
+    # The graph is derived data: a crash precomputing it must not fail a
+    # finished multi-hour run — the endpoint just computes live instead.
+    from harvest import finalize as fz
+
+    def boom(files):
+        raise RuntimeError("graph builder exploded")
+
+    monkeypatch.setattr(fz, "build_graph_json", boom)
+    state = finalize_bundle(
+        tmp_path, data_domain="s", dataset="o", tables=[], timestamp="t"
+    )
+    assert state["status"] == "complete"  # returned, not raised
+    assert (tmp_path / ".harvest" / "state.json").is_file()  # marker still landed
+    assert not (tmp_path / ".harvest" / "graph.json").exists()
 
 
 def test_mark_in_progress_then_complete(tmp_path):

@@ -335,7 +335,7 @@ def _build_glue_source(
     data_role_arn = os.environ.get("OKF_HARVEST_DATA_ROLE_ARN")
     enable_lf = bool(os.environ.get("OKF_ENABLE_LAKEFORMATION"))
 
-    glue = athena = None
+    glue = athena = s3 = None
     if data_role_arn:
         policy = _session_policy(
             region=region,
@@ -355,6 +355,7 @@ def _build_glue_source(
             )
             glue = session.client("glue", region_name=region)
             athena = session.client("athena", region_name=region)
+            s3 = session.client("s3", region_name=region)
             log.info(
                 "Harvest using per-invocation scoped creds (data role, db=%s, wg=%s)",
                 database,
@@ -375,11 +376,13 @@ def _build_glue_source(
     if glue is None:
         glue = boto3.client("glue", region_name=region)
         athena = boto3.client("athena", region_name=region)
+        s3 = boto3.client("s3", region_name=region)
 
     return GlueAthenaSource(
         database=database,
         glue=glue,
         athena=athena,
+        s3=s3,
         region=region,
         account_id=account_id,
         athena_output_location=output_location,

@@ -361,7 +361,7 @@ verification passes on top of it.
 ---
 type: <Type name>                  # REQUIRED — the only field consumers rely on
 title: <Human-readable display name>
-description: <ONE sentence>         # used verbatim in generated index.md
+description: <ONE sentence — what it MEANS to the business>   # used verbatim in generated index.md
 resource: <canonical URI of the underlying asset>   # when the concept maps to a real asset
 tags: [<tag>, <tag>]
 timestamp: <ISO 8601 datetime>     # last meaningful change
@@ -370,7 +370,8 @@ timestamp: <ISO 8601 datetime>     # last meaningful change
 
 - `type` is the **only required** field. `title`/`description` are strongly
   recommended (they power indexes and search). `description` must be **one
-  tight sentence** — it is reused verbatim in auto-generated `index.md`.
+  tight sentence** about what the concept MEANS to the business — see the
+  subsection below; it is reused verbatim in auto-generated `index.md`.
 - `resource` is the canonical URI/ARN of the underlying asset (e.g. a Glue table
   ARN). Omit it for abstract concepts (a playbook, a pure definition).
 - Producers MAY add **any** extra keys; consumers must preserve and tolerate
@@ -378,6 +379,39 @@ timestamp: <ISO 8601 datetime>     # last meaningful change
 - When refining/augmenting an existing doc, **pass the complete frontmatter
   dict** — `write` is a full replacement, so omitting a key drops it. Preserve
   existing `type`/`title`/`resource` verbatim; merge (don't replace) `tags`.
+
+### `description` — business meaning, not mechanics
+
+The `description` is the highest-leverage sentence in the bundle: it is reused
+verbatim in every generated `index.md` and it is embedded for semantic search, so
+it is what a consuming agent reads when *deciding whether to open the doc at all*.
+It must therefore answer **"what is this about, and why would I want it?"** — the
+subject matter and its business meaning — not "how is this thing built".
+
+Write what the data *means*: the real-world entity or activity it records, the
+business process or domain it belongs to, and the questions it exists to answer.
+Use the language the business uses. Mechanical facts (storage format, column
+count, partitioning, load cadence, the literal grain restated from the title) are
+**body material** — they belong in `# Overview` or `# Schema`, not here.
+
+| Instead of (mechanical) | Write (business meaning) |
+|---|---|
+| "Glue table with 14 columns partitioned by `dt`, stored as Parquet in S3." | "Completed customer orders, one row per order, used for revenue and fulfilment reporting." |
+| "Fact table joined to `dim_customer` on `customer_id`." | "Subscription billing events — what each customer was charged and why." |
+| "Contains data from the `races` table." | "Formula 1 race calendar: when and where each Grand Prix was held." |
+| "Reference doc for the `status` column." | "The order lifecycle stages, and which of them count as revenue-recognised." |
+
+Two failure modes to avoid specifically:
+- **Restating the title.** If `title: Races` and `description: Race data`, the
+  sentence carries zero information — a reader learns nothing they didn't already
+  see in the link text. Say what a race *is* here and what the rows are good for.
+- **Describing the plumbing.** A description that would still be true if the
+  subject matter were completely different ("A Glue table populated by a daily
+  ETL job") is describing the pipeline, not the dataset.
+
+The same rule applies to a `# Overview` body: lead with what the thing is and what
+it's for in business terms, then get to grain, coverage, and caveats. The
+mechanical detail is not banned — it is just never the *opening* frame.
 
 ## Body
 
@@ -529,7 +563,9 @@ Both are reserved at **every** level — never name a concept doc `index.md` or
 3. `index.md` / `log.md` follow their structure where present.
 
 Then quality (soft, but do it — conformance checks none of these): one-sentence
-`description` on every doc; concepts cross-linked; `index.md` regenerated;
+`description` on every doc **stating business meaning, not mechanics** (it neither
+restates the `title` nor describes storage/partitioning/pipeline);
+concepts cross-linked; `index.md` regenerated;
 SQL/examples are real, not invented, **and in the source's pinned dialect**;
 every asset's **grain is measured, not assumed**; wide tables **summarize
 repeating column families** instead of enumerating every column; every confusable

@@ -495,6 +495,22 @@ def run_cleanup(payload: dict) -> dict:
     # Files first (unlink), then dirs deepest-first (rmdir) — so we remove whatever
     # this uid CAN, and report exactly which inodes it can't (the poisoned ones).
     removed_paths, failed = [], []
+
+    # But kill the commit markers FIRST: a "partial" outcome that unlinks the
+    # concept docs while `.harvest/state.json` survives would leave a marker
+    # still reading status=complete over a gutted bundle — is_bundle_ready
+    # stays true and the /graph fast path keeps serving the surviving
+    # pre-cleanup graph.json as "fresh" (its stamp still matches that marker).
+    # With the marker gone first, every downstream read degrades honestly
+    # (not-ready, live compute) no matter which inodes the walk fails on.
+    for marker in sorted(target.rglob(".harvest/state.json")) + sorted(
+        target.rglob(".harvest/graph.json")
+    ):
+        try:
+            os.unlink(marker)
+            removed_paths.append(str(marker))
+        except OSError as e:
+            failed.append({"path": str(marker), "error": f"{type(e).__name__}: {e}"})
     for dirpath, dirnames, filenames in os.walk(target, topdown=False):
         for fn in filenames:
             fp = os.path.join(dirpath, fn)

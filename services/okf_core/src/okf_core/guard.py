@@ -195,3 +195,32 @@ def check_augmentation(
             ),
         )
     return GuardResult(ok=True)
+
+
+def check_join_doc(rel_path: str, body: str) -> GuardResult:
+    """A join doc must ship its ON clause as a qualified equality inside a
+    ```sql fence. Enforced at WRITE time (not just lint time) so the author
+    self-corrects in one retry instead of the supervisor inheriting one
+    finding per join doc after the fan-out — seen live: 107 warnings on a
+    240-table harvest. Inline backticks don't count: only fenced SQL gets
+    schema-checked and EXPLAIN-validated downstream. Reuses lint's own
+    primitives so guard and lint can never disagree on the rule."""
+    from okf_core.lint import _JOIN_EQ_RE, _is_join_doc, _mask_sql, _sql_fences_in
+
+    if not _is_join_doc(rel_path):
+        return GuardResult(ok=True)
+    for fence in _sql_fences_in(body):
+        if _JOIN_EQ_RE.search(_mask_sql(fence, idents=False)):
+            return GuardResult(ok=True)
+    return GuardResult(
+        ok=False,
+        error=(
+            "Refusing to write this join doc: no `table.column = "
+            "table.column` condition inside a ```sql fence. A join doc must "
+            "ship its ON clause as FENCED SQL — inline backticks don't "
+            "count (only fenced SQL is schema-checked and EXPLAIN-"
+            "validated). Add e.g.\n\n```sql\norders.customer_id = "
+            "customers.id\n```\n\nwith any required cast/TRIM baked in, "
+            "then retry the write."
+        ),
+    )

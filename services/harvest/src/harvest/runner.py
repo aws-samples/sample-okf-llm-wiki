@@ -203,14 +203,38 @@ def _emit_profile_summary(emitter, snap: dict[str, Any] | None) -> None:
     profiled = prof.get("profiled", 0)
     cached = prof.get("cached", 0)
     skipped = prof.get("skipped", 0)
-    if not (profiled or cached or skipped):
+    if profiled or cached or skipped:
+        bits = [f"{profiled} profiled"]
+        if cached:
+            bits.append(f"{cached} reused from cache")
+        if skipped:
+            bits.append(f"{skipped} skipped")
+        emitter.emit_status("Column profiles: " + ", ".join(bits))
+
+    # Same treatment for the relationship-evidence pass (joins + grain probed
+    # deterministically at snapshot time — see harvest.relationships). Silent
+    # when it produced nothing, for the same "0 would read as failure" reason.
+    rels = snap.get("relationships") or {}
+    joins = rels.get("joins_probed", 0)
+    grain = rels.get("grain_probed", 0)
+    r_cached = rels.get("cached", 0)
+    r_skipped = rels.get("skipped", 0)
+    if not (joins or grain or r_cached or r_skipped):
+        # Distinguish "ran, nothing to probe" from "didn't run": a dataset
+        # whose key names defeat every nominator must not look like a broken
+        # pass (and vice versa). Silent only when the pass never ran.
+        if rels.get("ran"):
+            emitter.emit_status(
+                "Relationship evidence: no join/grain candidates found "
+                "(authors will probe relationships live)"
+            )
         return
-    bits = [f"{profiled} profiled"]
-    if cached:
-        bits.append(f"{cached} reused from cache")
-    if skipped:
-        bits.append(f"{skipped} skipped")
-    emitter.emit_status("Column profiles: " + ", ".join(bits))
+    bits = [f"{joins} join(s)", f"{grain} grain check(s)"]
+    if r_cached:
+        bits.append(f"{r_cached} reused from cache")
+    if r_skipped:
+        bits.append(f"{r_skipped} skipped")
+    emitter.emit_status("Relationship evidence: " + ", ".join(bits))
 
 
 def _invoke_config(recursion_limit: int, emitter):
@@ -418,7 +442,11 @@ def run_full_harvest(
                     f"Snapshotting catalog metadata and profiling columns "
                     f"({len(tables)} tables)…"
                 )
-            snap = export_metadata(source, dataset_root)
+            snap = export_metadata(
+                source,
+                dataset_root,
+                progress=emitter.emit_progress if emitter is not None else None,
+            )
             _emit_profile_summary(emitter, snap)
             log.info(
                 "Metadata snapshot written for %s/%s: %d tables, %d files",
@@ -860,7 +888,12 @@ def run_cross_harvest(
                     "Snapshotting catalog metadata (cached column profiles "
                     "reused where unchanged)…"
                 )
-            snap = export_metadata(source, dataset_root, profile_mode="cross")
+            snap = export_metadata(
+                source,
+                dataset_root,
+                profile_mode="cross",
+                progress=emitter.emit_progress if emitter is not None else None,
+            )
             _emit_profile_summary(emitter, snap)
         except Exception:  # noqa: BLE001 - snapshot is an accelerator, not a hard dep
             log.warning(
@@ -1182,8 +1215,12 @@ def run_annotation_harvest(
 
         # Refresh the read-only .metadata/ snapshot so the agent verifies each
         # annotation against current Glue metadata. Best-effort accelerator.
+        # "cross" mode, deliberately: it reuses every fingerprint-matched
+        # profile/relationship sheet and never sketches, so an annotation run
+        # stays a cheap catalog refresh — the default ("full") would re-bill
+        # the whole profile + relationship pass just to verify annotations.
         try:
-            export_metadata(source, dataset_root)
+            export_metadata(source, dataset_root, profile_mode="cross")
         except Exception:  # noqa: BLE001 - snapshot is an accelerator, not a hard dep
             log.warning(
                 "Metadata snapshot failed for %s/%s (annotated); continuing",

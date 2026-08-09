@@ -447,6 +447,7 @@ def write_profiles(
     profile_mode: str = "full",
     changed_tables: frozenset[str] | set[str] = frozenset(),
     cfg: ProfileConfig | None = None,
+    progress: Any = None,
 ) -> dict[str, Any]:
     """Write ``.metadata/profile/`` for this run. Never raises.
 
@@ -473,7 +474,22 @@ def write_profiles(
         getattr(mp, "rowcount_param_keys", ()) or ()
     )
 
-    for table, meta in tables_meta.items():
+    # Live-feed progress: one coalescing tick per table (phase "profiles").
+    # Best-effort like everything here — a broken callback never breaks the
+    # pass. Ticks fire at the TOP of each iteration ("working on i of N");
+    # the final tick after the loop completes the bar.
+    total_tables = len(tables_meta)
+
+    def _tick(done: int, label: str) -> None:
+        if progress is None or not total_tables:
+            return
+        try:
+            progress("profiles", done, total_tables, label)
+        except Exception:  # noqa: BLE001 - a progress tick must never break the pass
+            pass
+
+    for _i, (table, meta) in enumerate(tables_meta.items(), start=1):
+        _tick(_i, table)
         fp = table_fingerprint(meta, data_shape=_data_shape(meta, shape_keys))
         cached_ok = cache.fingerprints.get(table) == fp and table in cache.sheets
         reuse = cached_ok and (
@@ -507,6 +523,7 @@ def write_profiles(
         out["profiled"] += 1
         out["files"].append(f"profile/{table}.md")
 
+    _tick(total_tables, "done")
     if out["files"] or out["skipped"]:
         write_text(profile_root / MANIFEST_NAME, "\n".join(manifest_lines) + "\n")
     return out

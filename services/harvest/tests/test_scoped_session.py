@@ -176,10 +176,12 @@ def test_build_source_uses_scoped_session_when_data_role_set(monkeypatch):
 
     src = clients.build_source(DB, region=REGION, account_id=ACCOUNT)
 
-    # Clients came from the SCOPED session, not ambient boto3.
+    # Clients came from the SCOPED session, not ambient boto3 — including the
+    # s3 client backing estimate_table_bytes (the size-gate fallback).
     assert src.glue.name == "scoped:glue"
     assert src.athena.name == "scoped:athena"
-    assert fake.made == ["glue", "athena"]
+    assert src.s3.name == "scoped:s3"
+    assert fake.made == ["glue", "athena", "s3"]
     # The minted policy pins THIS database.
     sids = _sids(captured["policy"])
     assert (

@@ -406,6 +406,22 @@ class RedshiftSource:
         """
         return ("", f"RANDOM() < {percent / 100.0:g}")
 
+    def sql_sketch_column_query(self, ref_sql: str, col_sql: str, k: int) -> str:
+        """One column's KMV/bottom-k sketch as a standalone query.
+
+        Redshift has no n-smallest ARRAY aggregate (Trino's ``min(x, n)``),
+        so sketching is one query per column instead of one per table — cheap
+        regardless, because Redshift is columnar: the scan touches only this
+        column's blocks. ``FNV_HASH`` differs from Athena's xxhash64, which
+        is fine: sketches are only ever compared WITHIN one dataset/engine.
+        The varchar cast makes an int ``42`` and a varchar ``'42'`` sketch
+        identically (cast-requiring joins are real joins)."""
+        return (
+            f"SELECT DISTINCT fnv_hash(cast({col_sql} as varchar)) AS h "
+            f"FROM {ref_sql} WHERE {col_sql} IS NOT NULL "
+            f"ORDER BY h LIMIT {int(k)}"
+        )
+
     def run_query(
         self,
         query: str,

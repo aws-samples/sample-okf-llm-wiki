@@ -82,10 +82,13 @@ def register_tools(mcp, tools: ConsumptionTools) -> None:
         substring over "<data_domain>/<dataset>". Prefer `search_domains` /
         `semantic_search` to FIND a dataset by meaning; list for the catalog.
 
-        Each result includes the dataset's parent domain description (if declared)
-        plus its cross-dataset reference signal: `cross_references` names datasets
-        THIS one holds pair docs for (read them under its own `external/<d>/<ds>/`),
-        and `cross_referenced_by` names datasets whose bundle holds pair docs about
+        Each result includes an `overview` snippet of the dataset itself (from
+        its published overview doc — absent when the dataset was never
+        harvested; `read_page` the `datasets/<name>` concept for the full doc),
+        the parent domain description (if declared), plus its cross-dataset
+        reference signal: `cross_references` names datasets THIS one holds pair
+        docs for (read them under its own `external/<d>/<ds>/`), and
+        `cross_referenced_by` names datasets whose bundle holds pair docs about
         this one (read them at `<that dataset>/external/<this>/…`).
         """
         return tools.list_domains(

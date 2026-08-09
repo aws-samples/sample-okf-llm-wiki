@@ -32,7 +32,7 @@ from okf_core.lint import lint_bundle as _lint_offline
 # step note, never silent: a statement-count cap AND a wall-clock budget —
 # each Athena poll can take up to its 60s timeout, so a count cap alone still
 # allows a multi-minute stall on a congested workgroup.
-_MAX_EXPLAIN_STATEMENTS = 100
+_MAX_EXPLAIN_STATEMENTS = 250
 _EXPLAIN_TIME_BUDGET_S = 300.0
 # Findings shown to the model per call; the rest are counted in `note` (fix
 # these, re-run, the next batch surfaces). Errors always outrank warnings.

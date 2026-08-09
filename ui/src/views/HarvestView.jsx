@@ -1779,6 +1779,7 @@ function mergeRows(events, aborted) {
   // call_id -> where its tool_result lands: a normal tool row, or a task square.
   const callIndex = new Map()
   const batchIndex = new Map() // fleet batch key -> index of its fleet row
+  const progressIndex = new Map() // progress phase -> index of its bar row
   // The open static-task wave key, or null between waves. Reset by any row that
   // isn't a `task` call (agent/tool/subagent) — task RESULTS produce no row, so
   // they don't close a wave that's still being dispatched.
@@ -1884,6 +1885,23 @@ function mergeRows(events, aborted) {
       }
       // Orphan result (call outside our window, or the eval's): carries no
       // tool/label, so rendering it standalone would be a blank row. Drop it.
+    } else if (e.kind === "progress") {
+      // The snapshot passes tick one coalescing event per phase: ONE bar row
+      // per phase, updated in place (the row keeps its original seq so it
+      // stays put in the timeline; the payload is always the latest tick).
+      openTaskWave = null
+      const idx = progressIndex.get(e.phase)
+      if (idx == null) {
+        progressIndex.set(e.phase, rows.length)
+        rows.push({ ...e, kind: "progress" })
+      } else {
+        rows[idx] = {
+          ...rows[idx],
+          done: e.done,
+          total: e.total,
+          label: e.label,
+        }
+      }
     } else if (e.kind === "agent") {
       openTaskWave = null
       rows.push({ ...e, kind: "agent" })
@@ -2576,6 +2594,47 @@ function HarvestSettingsSheet({
   )
 }
 
+// One live progress bar for a pre-agent snapshot pass (kind="progress").
+// mergeRows keeps exactly one row per phase and updates it in place as the
+// runtime ticks through tables/pairs; the pass's existing summary line still
+// lands after completion with the final counts.
+const PROGRESS_PHASES = {
+  profiles: "Column profiles",
+  relationships: "Relationship evidence",
+}
+
+function ProgressRow({ row }) {
+  const total = row.total > 0 ? row.total : 0
+  const done = total > 0 ? Math.min(row.done ?? 0, total) : row.done ?? 0
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0
+  const complete = total > 0 && done >= total
+  const title = PROGRESS_PHASES[row.phase] || row.phase
+  return (
+    <div className="flex items-center gap-2 rounded-md border px-2 py-1.5 text-sm">
+      {complete ? (
+        <CheckCircle2Icon className="size-4 shrink-0 text-muted-foreground" />
+      ) : (
+        <Spinner className="size-4 shrink-0 text-muted-foreground" />
+      )}
+      <span className="shrink-0 font-medium">{title}</span>
+      <div className="h-1.5 min-w-16 flex-1 overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full rounded-full bg-primary transition-[width] duration-500"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+        {done}/{total}
+      </span>
+      {row.label && !complete ? (
+        <span className="hidden max-w-44 truncate text-xs text-muted-foreground sm:inline">
+          {row.label}
+        </span>
+      ) : null}
+    </div>
+  )
+}
+
 function StepRow({ step }) {
   const isAgent = step.kind === "agent"
   const [open, setOpen] = useState(false)
@@ -2936,6 +2995,8 @@ const HarvestFeed = memo(function HarvestFeed({
               row={r}
               onOpenSquare={onOpenSquare}
             />
+          ) : r.kind === "progress" ? (
+            <ProgressRow key={`progress-${r.phase}`} row={r} />
           ) : (
             <StepRow key={r.seq} step={r} />
           )

@@ -31,10 +31,10 @@ from tests.fakes import f1_like_glue
 
 
 class _AllowEngine:
-    def guard_write_file(self, content, existing):
+    def guard_write_file(self, content, existing, rel_path=None):
         return types.SimpleNamespace(allow=True, new_content=None, message=None)
 
-    def guard_edit_file(self, old, new, existing):
+    def guard_edit_file(self, old, new, existing, rel_path=None):
         return types.SimpleNamespace(allow=True, new_content=None, message=None)
 
 

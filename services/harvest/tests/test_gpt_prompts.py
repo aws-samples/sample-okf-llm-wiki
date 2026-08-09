@@ -89,3 +89,43 @@ def test_benchmark_prompts_never_carry_the_addendum():
     for p in (SQL_SOLVER_PROMPT, BEHAVIOR_SOLVER_PROMPT, JUDGE_SYSTEM_PROMPT):
         for block in _BLOCKS:
             assert block not in p
+
+
+_CLAUDE_BLOCKS = ("<no_narration>", "<reply_contract>", "<delegate_by_reference>")
+
+
+def test_default_prompts_carry_the_claude_addendum():
+    # The stack's default family gets its own correction blocks — Claude
+    # over-narrates and over-reports in multi-agent runs, which is pure token
+    # cost (a sub-agent reply is re-read on every later supervisor turn).
+    for build in _BUILDERS:
+        p = build()
+        for block in _CLAUDE_BLOCKS:
+            assert block in p
+    p = prompts.build_supervisor_prompt()
+    for block in _CLAUDE_BLOCKS:
+        assert block in p
+
+
+def test_family_addenda_are_mutually_exclusive():
+    for build in _BUILDERS:
+        p = build(gpt=True)
+        for block in _CLAUDE_BLOCKS:
+            assert block not in p
+
+
+def test_benchmark_prompts_carry_no_family_addendum():
+    for p in (SQL_SOLVER_PROMPT, BEHAVIOR_SOLVER_PROMPT, JUDGE_SYSTEM_PROMPT):
+        for block in _BLOCKS + _CLAUDE_BLOCKS:
+            assert block not in p
+
+
+def test_claude_addendum_never_trades_completeness_for_brevity():
+    # The one way this addendum could HURT the harvest: an extractor or
+    # reviewer reading "be brief" as "drop facts" — the fidelity review would
+    # then flag semantic losses the prompt itself caused.
+    a = prompts._CLAUDE_ADDENDUM
+    assert "ALL SIGNAL" in a
+    assert "never the substance" in a
+    # And it teaches delegation by file reference, not transcription.
+    assert "by reference" in a and "paid once" in a

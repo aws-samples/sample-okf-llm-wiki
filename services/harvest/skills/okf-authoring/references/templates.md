@@ -23,6 +23,15 @@ Frontmatter key order that reads well: `type`, `resource`, `title`,
 include `title`/`description`/`timestamp` for quality, and `resource` when the
 concept maps to a real asset.
 
+> **`description` is about SUBJECT MATTER, not mechanics.** Every `description`
+> placeholder below means "one sentence on what this is about and why someone
+> would want it" — the real-world thing it records and its business meaning — never
+> how it is stored, partitioned, loaded, or joined. It is reused verbatim in
+> `index.md` and embedded for search, so it is what a consuming agent uses to
+> decide whether to open the doc. "Completed customer orders, used for revenue and
+> fulfilment reporting" — not "Parquet table partitioned by `dt`". See
+> "`description` — business meaning, not mechanics" in SKILL.md.
+
 ---
 
 ## Dataset / collection (a container of other concepts)
@@ -32,15 +41,17 @@ concept maps to a real asset.
 type: Glue Database
 resource: arn:aws:glue:<region>:<account_id>:database/<database>
 title: <Display name>
-description: <One sentence: what this dataset is and what it contains.>
+description: <One sentence: what business activity/entity this dataset covers and what it's used for.>
 tags: [<domain>, <domain>]
 timestamp: 2026-05-28T00:00:00Z
 ---
 
 # Overview
-<1–2 paragraphs: what the dataset is, who produces it, what it's used for.
- Describe the tables and their grains; avoid baking in volatile row counts —
- see "Capture the essence, not the volatile numbers" in SKILL.md.>
+<1–2 paragraphs. OPEN with the business subject: what activity or entity this
+ dataset covers, whose domain it belongs to, and the questions it exists to
+ answer. Then who produces it, and the tables and their grains; avoid baking in
+ volatile row counts — see "Capture the essence, not the volatile numbers" and
+ "`description` — business meaning, not mechanics" in SKILL.md.>
 
 # Using the dataset
 <How to access/query it. A short, representative sample query if helpful — prefer
@@ -70,13 +81,14 @@ invent fields.
 type: Glue Table
 resource: arn:aws:glue:<region>:<account_id>:table/<database>/<table>
 title: <Display name>
-description: <One sentence describing the table and its grain.>
+description: <One sentence: what real-world thing each row represents and what it answers.>
 tags: [<tag>, <tag>]
 timestamp: 2026-05-28T00:00:00Z
 ---
 
 # Overview
-<What this table is. The grain: "one row per ___". Time range. Caveats.>
+<OPEN with what this table is about in business terms and what it's used for.
+ Then the grain: "one row per ___". Time range. Caveats.>
 
 # Schema
 
@@ -231,7 +243,11 @@ COUNT(DISTINCT user_id)
 
 One canonical file per table pair, the two table names sorted alphabetically and
 joined by a double underscore. Owns the concrete `ON` clause — with any required
-normalization (cast/`TRIM`/`UPPER`) baked in, never left implicit. Both sides
+normalization (cast/`TRIM`/`UPPER`) baked in, never left implicit — and the
+clause MUST appear inside a ```sql fence, exactly as the template below shows.
+Inline backticks in prose do not count: only fenced SQL gets schema-checked and
+EXPLAIN-validated, and a runtime write guard REFUSES a join doc without a fenced
+`table.column = table.column` condition. Both sides
 link to it from their `# Joins` section. State what you MEASURED this run: the
 cardinality, the orphan behavior (inner- vs left-join advice), and any key
 normalization — the same bar cross-dataset joins meet. Express the evidence as
