@@ -88,10 +88,15 @@ class GlueAthenaSource:
         athena_output_location: str | None = None,
         athena_workgroup: str | None = None,
         catalog_id: str | None = None,
+        s3: Any | None = None,
     ):
         self.database = database
         self.glue = glue
         self.athena = athena
+        # Optional (tests/fakes omit it): used ONLY by estimate_table_bytes,
+        # the size-gate fallback for tables whose Glue Parameters carry no
+        # byte hint (DDL-created tables — only crawlers/ETL write totalSize).
+        self.s3 = s3
         self.region = region
         self.account_id = account_id
         self.athena_output_location = athena_output_location
@@ -253,6 +258,111 @@ class GlueAthenaSource:
     def sql_sample_clause(self, percent: float) -> tuple[str, str]:
         """(FROM-suffix, WHERE-predicate) sampling ~percent% of the table."""
         return (f"TABLESAMPLE BERNOULLI ({percent:g})", "")
+
+    def estimate_table_bytes(
+        self, table: str, *, stop_at: int | None
+    ) -> int | None:
+        """Actual on-S3 byte size of a table's data, by listing its location.
+
+        The relationship precompute's size-gate fallback: DDL-created tables
+        carry no ``totalSize`` Parameter (only crawlers/ETL write those), and
+        assuming them large would skip every probe on a hand-registered
+        catalog. Listing is cheap (no query, no scan; LIST calls only).
+
+        ``stop_at`` picks the contract. With an int, the listing EARLY-EXITS
+        once the total exceeds it and returns that running total — a LOWER
+        BOUND good only for "over or under the gate", never for sizing a
+        sample. With None, the listing runs to completion and the figure is
+        exact (the sampled-probe percent needs this: a lower bound would
+        inflate the sample fraction on a huge table by orders of magnitude).
+
+        Returns None when it cannot tell (no s3 client injected, a VIEW or
+        non-S3 location, listing denied/failed, or the page cap hit before
+        the listing finished) — the caller then assumes large, as before.
+        A partitioned table whose root location lists as EMPTY is also None:
+        its partitions live elsewhere (ADD PARTITION with external
+        locations), so zero is not evidence of small.
+        """
+        if self.s3 is None:
+            return None
+        try:
+            tbl = self._get_table_raw(table)
+        except Exception:  # noqa: BLE001 - can't tell -> assume large
+            return None
+        loc = str((tbl.get("StorageDescriptor") or {}).get("Location") or "")
+        if not loc.startswith("s3://"):
+            return None  # a view / non-S3 table has nothing listable
+        bucket, _, prefix = loc[len("s3://") :].partition("/")
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"  # 'data/orders' must not also sum 'data/orders_v2'
+        total = 0
+        token: str | None = None
+        try:
+            for _ in range(50):  # ≤ 50k objects — bounds the API call count
+                kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+                if token:
+                    kwargs["ContinuationToken"] = token
+                resp = self.s3.list_objects_v2(**kwargs)
+                total += sum(
+                    int(o.get("Size") or 0) for o in resp.get("Contents") or []
+                )
+                if stop_at is not None and total > stop_at:
+                    return total  # over the gate — no need to keep listing
+                if not resp.get("IsTruncated"):
+                    if total == 0 and tbl.get("PartitionKeys"):
+                        return None  # partition data lives outside the root
+                    return total
+                token = resp.get("NextContinuationToken")
+        except Exception:  # noqa: BLE001 - can't tell -> assume large
+            return None
+        return None  # page cap hit before the listing finished: cannot be sure
+
+    def sql_sampled_ref(self, ref_sql: str, percent: float) -> str:
+        """A table reference sampled at ~``percent``% for the relationship
+        probes' big-fact-side path.
+
+        ``TABLESAMPLE SYSTEM``, deliberately NOT the profiler's BERNOULLI:
+        SYSTEM skips whole splits, so it cuts the bytes Athena BILLS —
+        BERNOULLI reads everything and filters rows after, which would make
+        a "sampled" probe of a TB fact table cost the same as a full one.
+        The trade-off is coarseness: SYSTEM samples storage splits, so data
+        clustered by the join key (e.g. time-partitioned facts where orphans
+        concentrate in recent files) can skew the rate — the evidence sheet
+        carries an INDICATIVE banner for exactly that reason.
+
+        Returned as a parenthesized subquery, not a bare ``ref TABLESAMPLE``
+        suffix: Trino's grammar nests the alias INSIDE the sampled relation
+        (``orders o TABLESAMPLE SYSTEM (10)``), so callers composing
+        ``FROM {ref} t`` — every probe in probes.py does — would produce a
+        parse error with the suffix form. A derived table aliases normally."""
+        return f"(SELECT * FROM {ref_sql} TABLESAMPLE SYSTEM ({percent:g}))"
+
+    def sql_bottomk_sketch(self, col_sql: str, k: int) -> str:
+        """Aggregate expression: the ``k`` smallest xxhash64 values of a
+        column's distinct values (a KMV/bottom-k sketch, as array<bigint>).
+
+        Values are hashed through a varchar cast so an int ``42`` and a
+        varchar ``'42'`` sketch identically — cast-requiring joins are real
+        joins. NULLs vanish (to_utf8(NULL) is NULL; min ignores it). One
+        SELECT can carry this expression for EVERY column of a table, so a
+        whole table sketches in a single (columnar) scan.
+
+        The DISTINCT is load-bearing: Trino's ``min(x, n)`` is an order
+        statistic over input ROWS, not distinct values. Without it a value
+        repeated m times fills m sketch slots, so any column where rows ≫
+        distinct (every fact-side FK, average fanout f) collapses to ~k/f
+        usable hashes — wrecking the cardinality estimate and tripping the
+        enum-domain suppression on exactly the columns sketches exist for.
+
+        The from_big_endian_64 is equally load-bearing: Trino's xxhash64
+        returns VARBINARY, which renders as unparseable bytes in the result
+        set. Decoding to a signed bigint here is what makes the sketch cells
+        plain int arrays (and matches the signed 64-bit normalization the
+        KMV estimator assumes)."""
+        return (
+            "min(DISTINCT from_big_endian_64(xxhash64(to_utf8("
+            f"cast({col_sql} as varchar)))), {int(k)})"
+        )
 
     def run_query(
         self,

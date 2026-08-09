@@ -19,22 +19,22 @@ from harvest.okf_guard import OKFGuardMiddleware
 class _AllowEngine:
     """Guard engine stub: write allowed with a normalized content rewrite."""
 
-    def guard_write_file(self, content, existing):
+    def guard_write_file(self, content, existing, rel_path=None):
         return types.SimpleNamespace(
             allow=True, new_content=content + "\n<normalized>", message=None
         )
 
-    def guard_edit_file(self, old, new, existing):
+    def guard_edit_file(self, old, new, existing, rel_path=None):
         return types.SimpleNamespace(allow=True, new_content=None, message="")
 
 
 class _DenyEngine:
-    def guard_write_file(self, content, existing):
+    def guard_write_file(self, content, existing, rel_path=None):
         return types.SimpleNamespace(
             allow=False, new_content=None, message="nope: missing title"
         )
 
-    def guard_edit_file(self, old, new, existing):
+    def guard_edit_file(self, old, new, existing, rel_path=None):
         return types.SimpleNamespace(allow=False, new_content=None, message="nope")
 
 

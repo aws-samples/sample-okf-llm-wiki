@@ -1285,3 +1285,43 @@ def test_static_task_path_records_context_extractor_digest(tmp_path):
         assert results[0]["result"].startswith("## tables/orders")
     finally:
         cd.configure(None)
+
+
+def test_emit_progress_shape_and_throttle(monkeypatch):
+    events, sink = _collect()
+    em = StepEmitter(sink)
+    clock = {"t": 100.0}
+    monkeypatch.setattr("harvest.steps.time.monotonic", lambda: clock["t"])
+
+    em.emit_progress("profiles", 1, 237, "artist")   # first tick: emits
+    em.emit_progress("profiles", 2, 237, "release")  # <2s later: throttled
+    clock["t"] += 3
+    em.emit_progress("profiles", 50, 237, "work")    # >2s later: emits
+    em.emit_progress("profiles", 237, 237, "done")   # FINAL: always emits
+    em.emit_progress("relationships", 1, 96, "join") # other phase: first tick
+
+    assert [e["kind"] for e in events] == ["progress"] * 4
+    assert [(e["phase"], e["done"]) for e in events] == [
+        ("profiles", 1),
+        ("profiles", 50),
+        ("profiles", 237),
+        ("relationships", 1),
+    ]
+    assert events[0]["total"] == 237 and events[0]["label"] == "artist"
+    assert [e["seq"] for e in events] == [1, 2, 3, 4]
+
+
+def test_runner_threads_progress_into_the_snapshot():
+    import inspect
+
+    from harvest import runner as rn
+
+    src = inspect.getsource(rn)
+    # Both emitter-scoped export_metadata call sites (full + incremental)
+    # thread the live-feed progress callback into the snapshot passes.
+    assert (
+        src.count(
+            "progress=emitter.emit_progress if emitter is not None else None"
+        )
+        == 2
+    )

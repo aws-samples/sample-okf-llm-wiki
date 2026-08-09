@@ -111,3 +111,35 @@ def test_export_is_fresh_each_run(tmp_path):
     export_metadata(src2, tmp_path)
     assert (tmp_path / METADATA_DIR / "tables" / "alpha.md").is_file()
     assert not (tmp_path / METADATA_DIR / "tables" / "beta.md").exists()
+
+
+def test_summary_keeps_the_relationships_ran_flag(tmp_path):
+    # The runner's "no join/grain candidates found" feed line keys off
+    # summary["relationships"]["ran"] — the summary filter used to drop it,
+    # which made the empty-pass line dead code in every real path (seen
+    # live: a healthy california_schools pass was indistinguishable from a
+    # broken one). This goes THROUGH export_metadata on purpose; asserting
+    # on a handcrafted dict is what hid the bug.
+    summary = export_metadata(_source(), tmp_path)
+    assert summary["relationships"]["ran"] is True
+
+
+def test_write_profiles_ticks_progress_per_table(tmp_path):
+    # The tick fires at the top of every table's turn (reused, skipped,
+    # errored, or profiled alike) and a final tick completes the bar — the
+    # UI's one live line for a 237-table pass. A failing callback must never
+    # break the pass (best-effort like everything here).
+    ticks = []
+    export_metadata(
+        _source(),
+        tmp_path,
+        progress=lambda ph, d, t, label: ticks.append((ph, d, t, label)),
+    )
+    prof = [t for t in ticks if t[0] == "profiles"]
+    assert prof, "profile pass emitted no progress ticks"
+    total = prof[0][2]
+    assert total >= 2  # the f1 fixture has two tables
+    assert prof[-1][1] == total  # final tick completes the bar
+    assert [d for _, d, _, _ in prof] == sorted(d for _, d, _, _ in prof)
+    # The relationship pass rides the same callback with its own phase.
+    assert any(t[0] == "relationships" for t in ticks)

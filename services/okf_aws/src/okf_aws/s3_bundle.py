@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from okf_core.paths import INTERNAL_SCRATCH_DIRS
+
 _BUNDLE_PREFIX = "okf/"
 _RESERVED_FILES = {"index.md", "log.md"}
 
@@ -48,7 +50,17 @@ def parse_bundle_key(s3_key: str) -> ConceptLocation | None:
     # ignore reserved files and any dot-prefixed segment (.context/.harvest/...)
     if concept_parts[-1] in _RESERVED_FILES:
         return None
-    if any(seg.startswith(".") for seg in concept_parts):
+    if any(seg.startswith(".") or not seg for seg in concept_parts):
+        # An EMPTY segment (a `//` in the key) would make the concept id an
+        # absolute path when joined under a bundle root — refuse it like the
+        # read-one-file validator does.
+        return None
+    if any(seg in INTERNAL_SCRATCH_DIRS for seg in concept_parts[:-1]):
+        # deepagents scratch leaks are runtime state, never concepts — same
+        # rule (and same PARENTS-only scoping: a table doc legitimately named
+        # conversation_history.md keeps its stem) as okf_core's local walkers
+        # (link graph, index gen, graph_json.collect_bundle_files). Without
+        # this the S3 side would index/embed/graph a leak the local side hides.
         return None
     concept_id = "/".join(concept_parts)[: -len(".md")]
     table = None
@@ -83,6 +95,18 @@ def domain_doc_key(data_domain: str) -> str:
 
 def state_marker_key(data_domain: str, dataset: str) -> str:
     return f"{bundle_prefix(data_domain, dataset)}.harvest/state.json"
+
+
+def graph_artifact_key(data_domain: str, dataset: str) -> str:
+    """S3 key of the precomputed ``/graph`` artifact (``okf_core.graph_json``).
+
+    Written by ``finalize_bundle`` (every harvest mode) and refreshed by
+    repromote; served by the Control API when its ``completed_at`` matches the
+    commit marker's.
+    """
+    from okf_core.graph_json import GRAPH_ARTIFACT_REL
+
+    return f"{bundle_prefix(data_domain, dataset)}{GRAPH_ARTIFACT_REL}"
 
 
 def is_bundle_ready(s3, bucket: str, data_domain: str, dataset: str) -> bool:

@@ -80,9 +80,10 @@ than inventing a value.
 _MCP_NAV = (
     """\
 ## How to navigate (fastest moves)
-- Find datasets by MEANING: `search_domains` / `semantic_search`. \
-`list_domains` pages the catalog — narrow with `domain`/`query`; \
-`next_cursor` continues. Every other tool takes (data_domain, dataset).
+- Find datasets by MEANING: `search_domains`/`semantic_search`. \
+`list_domains` pages the catalog (`domain`/`query` narrow, `next_cursor` \
+pages, `overview` previews). Every other tool takes \
+(data_domain, dataset).
 - Go index-first: `list_directory` at the root, then per subdirectory — it \
 names every page, so you never guess concept ids.
 - `grep` is a REGEX over page contents — use it for exact tokens (a column \

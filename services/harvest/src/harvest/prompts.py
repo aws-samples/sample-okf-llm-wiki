@@ -98,6 +98,16 @@ the skill's own text, not from this list of names.
     questions for free. A sheet marked INDICATIVE was computed from a sample —
     treat its value lists as leads, never as a complete enum; verify with
     `run_sql` before documenting a legend.
+  - `.metadata/relationships/` — PRE-VERIFIED join + grain EVIDENCE, when
+    present: `joins/<a>__<b>--<key>.md` (match rate BOTH ways, null-key
+    share, 1:1/1:N/N:1/M:N cardinality, orphan samples — measured at snapshot
+    time by the SAME probes as `validate_join`) and `grain/<table>.md` (key
+    uniqueness, duplicate samples — same probe as `check_grain`). READ THESE
+    FIRST: a sheet's verdict (HOLDS / WEAK / SUSPECT / REFUTED / TYPE
+    MISMATCH) is this run's evidence — do NOT re-run `validate_join`/`check_grain` on a
+    relationship a sheet already answers. Probe live ONLY what the sheets
+    don't cover (differently-named keys, context-doc claims, composite
+    grains) or where a sheet and another source genuinely conflict.
   `.metadata/` is READ-ONLY (writes are refused) — it is an input, like
   `.context/`, never a place you author.
 - **Live source tools** (the snapshot can't answer these): `sample_rows` (a
@@ -204,6 +214,20 @@ _AUTHORING_TMPL = """
   citations that are already there. Read the current file first and augment, don't
   shrink. The error comes back as a tool message — self-correct and retry.
 - **`resource`**: ⟪RESOURCE_NOTE⟫. `timestamp`: omit it, the guard auto-fills it.
+- **`description` says what the data MEANS, not how it is built.** One sentence on
+  the subject matter and its business value — the real-world activity or entity the
+  rows record, and the questions it answers. It is reused verbatim in every
+  `index.md` and embedded for semantic search, so it is what a consuming agent
+  reads when deciding whether to open the doc at all. "Completed customer orders,
+  used for revenue and fulfilment reporting" — NOT "Parquet table partitioned by
+  `dt` with 14 columns". Storage format, partitioning, load cadence, column counts
+  and join keys are body material (`# Overview` / `# Schema`), never the
+  description. Two specific failures: restating the title (`title: Races` +
+  `description: Race data` teaches a reader nothing), and describing the plumbing
+  (a sentence that would still be true if the subject matter were entirely
+  different is describing the pipeline, not the data). Same rule for the
+  `# Overview` lead: business subject first, then grain, coverage, caveats. See
+  the skill's "`description` — business meaning, not mechanics".
 - **Right-size every doc you write**: match a doc's length to what its content
   needs — cover the substance, then stop. No filler sections, no redundant
   summaries, no boilerplate; omit a conventional section (Gotchas, Examples) when
@@ -269,14 +293,20 @@ report the failure plainly.
 4. For EACH table, dispatch a `table-author` sub-agent (via the task tool),
    passing the table's concept id (e.g. `tables/races`) and, when you ran
    context-extractors, the slice of the digest for that table. Each writes one
-   file. After the fan-out, confirm every table produced its `tables/<table>.md`
-   (e.g. `ls tables/`); re-dispatch any table-author that errored or left its
-   file missing. Do NOT advance to the overview/review or let the run finalize
-   with a table doc still missing.
+   file. After the fan-out, confirm every table produced its `tables/<table>.md`:
+   call `get_stats` (no arguments) and compare `tables` against
+   `snapshot_tables` — exact counts, no directory listing to eyeball;
+   re-dispatch any table-author that errored or left its file missing (only
+   then `ls tables/` to see WHICH one). Do NOT advance to the overview/review
+   or let the run finalize with a table doc still missing.
 5. **Cross-cutting references — DISCOVER then FAN OUT `reference-author` sub-agents
    (do NOT first-draft them yourself).** The table-authors already wrote each
    table's own `references/enums/*` and `references/joins/*` (co-located with the
-   table they verified). YOU are responsible for the references that SPAN tables:
+   table they verified). `get_stats` shows the per-subtype inventory INCLUDING
+   ZEROS (`named_sets: 0`, `glossary: 0`, ...) — a zero is a fact, not an
+   instruction: decide from the dataset + `.context/` whether it is right, and
+   author only what the evidence supports. YOU are responsible for the
+   references that SPAN tables:
    metrics, named_sets, glossary terms, known_issues, canonical recipes, and the
    dataset's `references/usage_guardrails.md`. Your job is to DISCOVER the fact instances
    (from the `.context/` digest + `grep .metadata/columns.tsv` + what the
@@ -472,7 +502,9 @@ them into every cross-author brief.
    (`external/<td>/<tds>/joins/<a>__<b>.md`, `metrics/<name>.md`, or another
    canonical fact-typed folder per the skill) plus a COMPLETE grounding brief:
    the convergence + consumer question, the EXACT verified SQL (with any
-   format normalization baked in), and the measured cardinality/overlap/orphan
+   format normalization baked in — and in the authored doc the join condition
+   must land inside a ```sql fence, never inline backticks: the write guard
+   refuses a join doc without one), and the measured cardinality/overlap/orphan
    numbers. Cross-authors author FROM the brief — they do not re-verify — so a
    brief missing its query or numbers comes straight back to you. With one or
    two relationships, skip the fan-out and write the docs yourself.
@@ -1127,21 +1159,34 @@ the `references/joins/*` and `references/enums/*` docs co-located with it (steps
    blindly overwrite (augmentation guard).
 3. `read_file .metadata/tables/<table>.md` for schema, ⟪SCHEMA_TYPE_TERM⟫, partitions,
    storage location, row-count/update params, and the resource (use it as `resource`).
-4. `sample_rows("tables/<table>", n=5)` for real values; then VERIFY the grain
-   with `run_sql` (per the skill — measure "one row per X", don't assume it) and
-   confirm any suspected gotcha (a `double` that might be physically int, a
-   string date, mixed formats) with a real query. Use these counts/samples to
-   VERIFY only — do NOT bake a raw row count into the prose (it decays every load;
-   state the grain and structure instead).
-4a. **Discover and verify this table's joins.** `grep <key> .metadata/columns.tsv`
-   for every column of this table that appears in a sibling — that surfaces
-   candidate joins BEYOND any a `.context/` doc mentioned. For each plausible one,
-   verify with `run_sql` that the keys match on both sides and establish the
-   cardinality; document (via `references/joins/*`, linked from `# Joins`) only
-   joins that hold. If a context doc asserts a join that fails or fans out
-   unexpectedly, record that as a `# Gotchas` finding. And treat every `.context/`
-   fact (grain, join, enum, metric) as a hypothesis to confirm against live data,
-   not to transcribe on faith — where the data disagrees, the data wins.
+4. `sample_rows("tables/<table>", n=5)` for real values. For the GRAIN, check
+   `.metadata/relationships/grain/<table>.md` FIRST — a UNIQUE verdict there IS
+   the measured grain (state it; don't re-probe). Only when no sheet covers
+   your key (composite grains, no sheet at all) measure it yourself with
+   `check_grain`/`run_sql` per the skill. Confirm any suspected gotcha (a
+   `double` that might be physically int, a string date, mixed formats) with a
+   real query. Use these counts/samples to VERIFY only — do NOT bake a raw row
+   count into the prose (it decays every load; state the grain and structure
+   instead).
+4a. **This table's joins: evidence sheets first, probes second.** `grep
+   <table> .metadata/relationships/joins/` (when present) — each sheet already
+   carries the match rates, cardinality, and orphan samples for one candidate,
+   measured this run. A HOLDS sheet: document the join (via
+   `references/joins/*`, linked from `# Joins` — the ON clause must live in a
+   ```sql fence, never inline backticks: the write guard refuses a join doc
+   without one), translating the evidence into
+   proportions + mechanism (use the orphan sample to explain WHAT doesn't
+   match and whether to LEFT or INNER join). A REFUTED sheet: do not document
+   it. A SUSPECT sheet (shared code list, not a key relationship): do not
+   document a join — if the shared codes matter, they belong in an
+   enum/named-set reference. A WEAK or TYPE MISMATCH sheet: investigate
+   before deciding. THEN `grep
+   <key> .metadata/columns.tsv` for candidates NO sheet covers (differently
+   named keys, context-doc claims) and verify only those with `validate_join`.
+   If a context doc asserts a join that fails or fans out unexpectedly, record
+   that as a `# Gotchas` finding. And treat every `.context/` fact (grain,
+   join, enum, metric) as a hypothesis to confirm against live data, not to
+   transcribe on faith — where the data disagrees, the data wins.
 4b. **Decode this table's coded columns.** For each opaque coded column, find its
    legend in the uploaded `.context/` docs (data dictionary / code list) — read
    them via `read_file`, or `run_code` for PDF/XLSX — and transcribe the
@@ -1265,9 +1310,65 @@ JSON, not XML-tagged blocks.
 """
 
 
+# -- Claude-family runtime addendum --------------------------------------------
+# Appended when the reading model is NOT a GPT — i.e. the Claude family this
+# stack defaults to. The mirror image of _GPT_ADDENDUM: it targets the Claude
+# behaviors that are wrong for a headless MULTI-AGENT authoring job. These are
+# token problems, not correctness problems — a sub-agent's reply is re-read as
+# supervisor input on every subsequent turn, so narration and recap compound
+# across a 200-table fan-out. Same exclusion as the GPT addendum: benchmark
+# solver/judge prompts never carry it (their output contracts are explicit).
+#   <no_narration>          — Claude narrates upcoming tool calls and recaps
+#                             finished work; both are pure cost here.
+#   <reply_contract>        — a final reply is machine input for the
+#                             dispatcher, not a report for a human. On point
+#                             means ALL SIGNAL, never fewer facts (a digest
+#                             must stay complete — the fidelity review audits
+#                             it for semantic loss).
+#   <delegate_by_reference> — skills/sheets/checklists are files: apply them,
+#                             point sub-agents at their PATHS, never
+#                             transcribe their content into briefs or replies.
+_CLAUDE_ADDENDUM = """
+## Claude-family runtime notes
+
+<no_narration>
+No narration, no preambles, no recaps: never announce what you are about to
+do, never summarize what you just did — go straight from deciding to the
+tool call. No filler ("Great!", "Certainly"), no restating your instructions
+or the brief back. Spend tokens on the work, not on describing the work.
+</no_narration>
+
+<reply_contract>
+Your final reply is machine input for the agent that dispatched you, and it
+is re-read on every one of that agent's subsequent turns — each extra
+sentence is paid for many times over. Lead with the outcome, then only
+load-bearing facts: paths written, verdicts, measured numbers, findings,
+blockers. No process story, no methodology recap, no headers around
+two-line content; an empty result is one line, not a paragraph. On point
+means ALL SIGNAL, not fewer facts — where your reply IS the deliverable (an
+extraction digest, review findings), completeness wins: cut the padding,
+never the substance.
+</reply_contract>
+
+<delegate_by_reference>
+Instructions and evidence live in files — use them by reference, never by
+transcription. When your prompt names a file (the authoring skill, a
+checklist, an evidence sheet), read it and APPLY it; do not paraphrase its
+content into replies or docs. When you dispatch a sub-agent, point it at
+paths (skill files, sheet paths, concept ids, digest slices) instead of
+inlining what a file already holds: a path is paid once, inlined content is
+paid on every turn of that agent's run.
+</delegate_by_reference>
+"""
+
+
 def _with_gpt(prompt: str, gpt: bool) -> str:
-    """Append the GPT-family addendum when the reading model is a GPT."""
-    return prompt + _GPT_ADDENDUM if gpt else prompt
+    """Append the family addendum for the model that will READ this prompt:
+    the GPT addendum for OpenAI models, the Claude addendum otherwise (this
+    stack's default family). Exactly one is appended — the blocks correct
+    OPPOSITE failure modes: GPT under-formats and hands back at uncertainty;
+    Claude over-narrates and over-reports."""
+    return prompt + (_GPT_ADDENDUM if gpt else _CLAUDE_ADDENDUM)
 
 
 # -- per-source sub-agent prompt builders ------------------------------------

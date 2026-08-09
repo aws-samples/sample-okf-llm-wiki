@@ -122,3 +122,147 @@ def test_sample_rows_none_without_athena():
 
 def test_table_names():
     assert set(_source().table_names()) == {"races", "results"}
+
+
+# ---------------------------------------------------------------------------
+# estimate_table_bytes — the size-gate fallback for hint-less tables
+# ---------------------------------------------------------------------------
+
+
+class _FakeS3Pages:
+    """list_objects_v2 fake: yields scripted pages of object sizes."""
+
+    def __init__(self, pages, truncate_forever=False):
+        self.pages = pages
+        self.truncate_forever = truncate_forever
+        self.calls = 0
+
+    def list_objects_v2(self, **kwargs):
+        i = min(self.calls, len(self.pages) - 1)
+        page = self.pages[i]
+        self.calls += 1
+        truncated = self.truncate_forever or self.calls < len(self.pages)
+        return {
+            "Contents": [{"Size": s} for s in page],
+            "IsTruncated": truncated,
+            "NextContinuationToken": f"t{self.calls}",
+        }
+
+
+def _sized_source(location, s3):
+    class _Glue:
+        def get_table(self, **kwargs):
+            return {
+                "Table": {
+                    "Name": kwargs["Name"],
+                    "StorageDescriptor": {"Location": location},
+                }
+            }
+
+    from harvest.glue_source import GlueAthenaSource
+
+    return GlueAthenaSource("db", glue=_Glue(), s3=s3)
+
+
+def test_estimate_table_bytes_sums_the_location(tmp_path):
+    s3 = _FakeS3Pages([[100, 200], [300]])
+    src = _sized_source("s3://bucket/data/orders/", s3)
+    assert src.estimate_table_bytes("orders", stop_at=10_000) == 600
+    assert s3.calls == 2
+
+
+def test_estimate_table_bytes_early_exits_over_the_gate():
+    s3 = _FakeS3Pages([[5_000], [5_000], [5_000]], truncate_forever=True)
+    src = _sized_source("s3://bucket/data/big/", s3)
+    # Exceeds stop_at on page 2 — no need to keep listing.
+    assert src.estimate_table_bytes("big", stop_at=8_000) == 10_000
+    assert s3.calls == 2
+
+
+def test_estimate_table_bytes_cannot_tell_returns_none():
+    from harvest.glue_source import GlueAthenaSource
+
+    # A VIEW (no s3:// location) has nothing listable.
+    src = _sized_source("", _FakeS3Pages([[1]]))
+    assert src.estimate_table_bytes("v", stop_at=100) is None
+    # No s3 client injected (tests/fakes): can't tell.
+    class _Glue:
+        def get_table(self, **kwargs):
+            return {"Table": {"Name": "t"}}
+
+    assert (
+        GlueAthenaSource("db", glue=_Glue()).estimate_table_bytes("t", stop_at=1)
+        is None
+    )
+    # Page cap hit while still under the gate: cannot be sure -> None.
+    s3 = _FakeS3Pages([[1]], truncate_forever=True)
+    src = _sized_source("s3://bucket/tiny/", s3)
+    assert src.estimate_table_bytes("t", stop_at=10_000) is None
+    assert s3.calls == 50
+
+
+def test_bottomk_sketch_hashes_distinct_values_not_rows():
+    # Two load-bearing tokens, both invisible to fakes and both fatal live:
+    # DISTINCT — Trino's min(x, n) is an order statistic over input ROWS, so
+    # without it a fact-side FK with fanout f collapses to ~k/f usable
+    # hashes; from_big_endian_64 — Trino's xxhash64 returns VARBINARY, so
+    # without the decode every sketch cell is unparseable and the whole
+    # nominator silently disables itself.
+    expr = _source().sql_bottomk_sketch('"driverid"', 256)
+    assert expr == (
+        "min(DISTINCT from_big_endian_64(xxhash64(to_utf8("
+        'cast("driverid" as varchar)))), 256)'
+    )
+
+
+def test_sampled_ref_is_an_aliasable_subquery():
+    # Trino nests the alias INSIDE a sampled relation ('orders o TABLESAMPLE
+    # SYSTEM (10)'), so a bare 'ref TABLESAMPLE ...' suffix can never be
+    # composed as 'FROM {ref} t' — which every probe does. The subquery form
+    # aliases like any derived table.
+    ref = _source().sql_sampled_ref('"db"."big"', 2.5)
+    assert ref == '(SELECT * FROM "db"."big" TABLESAMPLE SYSTEM (2.5))'
+
+
+def test_estimate_table_bytes_prefix_is_slash_terminated():
+    # 'data/orders' must not also sum a sibling 'data/orders_v2'.
+    class _CapturingS3(_FakeS3Pages):
+        def __init__(self, pages):
+            super().__init__(pages)
+            self.prefixes = []
+
+        def list_objects_v2(self, **kwargs):
+            self.prefixes.append(kwargs.get("Prefix"))
+            return super().list_objects_v2(**kwargs)
+
+    s3 = _CapturingS3([[100]])
+    src = _sized_source("s3://bucket/data/orders", s3)
+    assert src.estimate_table_bytes("orders", stop_at=10_000) == 100
+    assert s3.prefixes == ["data/orders/"]
+
+
+def test_estimate_table_bytes_full_listing_with_no_stop_at():
+    # stop_at=None is the SAMPLE-PERCENT contract: no early exit, the figure
+    # is exact. (The gate contract early-exits and returns a lower bound.)
+    s3 = _FakeS3Pages([[6000], [4000], [2000]])
+    src = _sized_source("s3://bucket/t/", s3)
+    assert src.estimate_table_bytes("t", stop_at=None) == 12000
+    assert s3.calls == 3
+
+
+def test_estimate_table_bytes_partitioned_empty_root_is_unmeasurable():
+    # ADD PARTITION can point partitions OUTSIDE the table's root location:
+    # an empty root is 'cannot tell', not 'zero bytes' (zero would earn a
+    # huge table an unbudgeted FULL probe).
+    class _PartitionedGlue:
+        def get_table(self, **kwargs):
+            return {
+                "Table": {
+                    "Name": kwargs["Name"],
+                    "StorageDescriptor": {"Location": "s3://bucket/t/"},
+                    "PartitionKeys": [{"Name": "dt"}],
+                }
+            }
+
+    src = GlueAthenaSource("db", glue=_PartitionedGlue(), s3=_FakeS3Pages([[]]))
+    assert src.estimate_table_bytes("t", stop_at=None) is None

@@ -323,3 +323,4 @@ def test_source_without_atoms_is_a_clean_no_op(tmp_path: Path):
                          tables_meta={"t": _meta(("a", "string"))},
                          cache=read_cached_profiles(tmp_path), cfg=CFG)
     assert out["files"] == []
+

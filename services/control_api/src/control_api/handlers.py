@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
-import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,8 +26,10 @@ log = logging.getLogger(__name__)
 
 from okf_aws import ar_policy, registry_entity
 from okf_aws import (
+    bundle_marker_state,
     bundle_marker_status,
     bundle_prefix,
+    graph_artifact_key,
     is_bundle_ready,
     parse_bundle_key,
     state_marker_key,
@@ -38,7 +40,7 @@ from okf_core import chat_threads as ct
 from okf_core import guidance as gd
 from okf_core import policy_rebuild
 from okf_core.domain import DOMAIN_DATASET
-from okf_core.links import extract_links_with_headings
+from okf_core.graph_json import build_graph_json
 from okf_core.paths import is_external_concept_id, parse_concept_id
 from okf_core.session import HARVEST_LEASE_STALE_SECONDS, runtime_session_id
 from okf_core.sources import (
@@ -3054,6 +3056,13 @@ def _parse_step_line(message: str, *, session_id: str) -> dict[str, Any] | None:
     for k in ("phase", "batch", "sub_id", "subagent_type"):
         if rec.get(k):
             out[k] = rec.get(k)
+    # Snapshot-pass progress bar (kind="progress"): stable `phase` (already
+    # forwarded above) plus done/total counters — the UI renders one live bar
+    # per phase and updates it in place.
+    if rec.get("kind") == "progress":
+        for k in ("done", "total"):
+            if isinstance(rec.get(k), int):
+                out[k] = rec[k]
     # Running token-usage snapshot (kind="usage"): cumulative counts for the whole
     # run. Passed through verbatim as a dict so the UI can show a running total.
     if isinstance(rec.get("usage"), dict):
@@ -3274,66 +3283,76 @@ def read_bundle_file(
     return {"key": key, "text": text}
 
 
-def build_graph_json(files: dict[str, str]) -> dict[str, Any]:
-    """Build ``{nodes, edges}`` link-graph JSON for the UI from concept docs.
+# How many concept docs the live-compute fallback of ``bundle_graph`` fetches
+# concurrently. Serial GETs were the 503: ~20ms of round-trip x 700+ docs blew
+# through the 30s Lambda/API-GW window on the first big bundle.
+_GRAPH_FETCH_WORKERS = 16
 
-    ``files`` maps concept id (e.g. ``tables/races``) -> raw markdown text. We
-    materialize the docs into a temp dir preserving structure, then reuse
-    ``okf_core.links.extract_links_with_headings`` (the exact resolver the
-    harvest agent and viewer use) so link resolution is identical everywhere.
-    Edges whose target is not itself a known concept are dropped.
 
-    * nodes: ``{id, title, type}`` (title/type from YAML frontmatter, best effort)
-    * edges: ``{source, target}`` for each resolved intra-bundle link
+def _fetch_bundle_docs(s3, *, bucket: str, prefix: str) -> dict[str, str]:
+    """Download every concept doc under a bundle prefix, concurrently.
+
+    Returns ``{concept_id: text}``. A key that vanishes between the listing
+    and the GET (a full harvest's start-of-run wipe, a repromote's delete
+    markers) is skipped rather than failing the whole graph — the caller is
+    building a view of a moving bundle, not asserting one.
     """
-    from okf_core.document import OKFDocument, OKFDocumentError
+    located = [
+        (loc.concept_id, key)
+        for key in _iter_bundle_keys(s3, bucket=bucket, prefix=prefix)
+        if (loc := parse_bundle_key(key)) is not None
+    ]
 
-    node_ids = set(files.keys())
-    nodes: list[dict[str, Any]] = []
-    edges: list[dict[str, Any]] = []
+    def fetch(item: tuple[str, str]) -> tuple[str, str | None]:
+        concept_id, key = item
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            return concept_id, obj["Body"].read().decode("utf-8")
+        except Exception as e:  # noqa: BLE001 - map missing object to a skip
+            code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404", "NotFound"):
+                return concept_id, None
+            raise
 
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        # Write each concept doc to <root>/<concept_id>.md, creating parent dirs.
-        for concept_id, text in files.items():
-            path = root / f"{concept_id}.md"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
-
-        for concept_id in sorted(files):
-            text = files[concept_id]
-            title = concept_id
-            type_ = "Unknown"
-            body = text
-            try:
-                doc = OKFDocument.parse(text)
-                fm = doc.frontmatter or {}
-                title = str(fm.get("title") or concept_id)
-                type_ = str(fm.get("type") or "Unknown")
-                body = doc.body or ""
-            except (OKFDocumentError, Exception) as e:  # noqa: BLE001 - tolerate malformed docs
-                del e  # keep title/type defaults; a bad doc still becomes a node
-            nodes.append({"id": concept_id, "title": title, "type": type_})
-
-            doc_dir = (root / f"{concept_id}.md").parent
-            for link in extract_links_with_headings(body, doc_dir, root):
-                if link.target in node_ids:
-                    edges.append({"source": concept_id, "target": link.target})
-
-    return {"nodes": nodes, "edges": edges}
+    with ThreadPoolExecutor(max_workers=_GRAPH_FETCH_WORKERS) as pool:
+        results = list(pool.map(fetch, located))
+    return {cid: text for cid, text in results if text is not None}
 
 
 def bundle_graph(s3, *, bucket: str, data_domain: str, dataset: str) -> dict[str, Any]:
-    """Download the bundle's concept docs and return link-graph JSON for the UI."""
+    """Return link-graph JSON for the UI — precomputed artifact when fresh.
+
+    Fast path: ``finalize_bundle`` writes ``.harvest/graph.json`` stamped with
+    the same ``completed_at`` the commit marker carries (every harvest mode
+    funnels through finalize, and repromote refreshes it too), so one GET +
+    an equality check serves the graph in O(1) regardless of bundle size.
+    Anything else — mid-harvest (marker ``in_progress``), a legacy bundle, a
+    failed precompute — falls back to building the same JSON live from the
+    docs (parallel downloads; ``okf_core.graph_json`` guarantees the two
+    paths produce identical output).
+    """
+    try:
+        obj = s3.get_object(
+            Bucket=bucket, Key=graph_artifact_key(data_domain, dataset)
+        )
+        artifact = json.loads(obj["Body"].read())
+    except Exception:  # noqa: BLE001 - absent/unreadable artifact => live compute
+        artifact = None
+    if (
+        isinstance(artifact, dict)
+        and isinstance(artifact.get("nodes"), list)
+        and isinstance(artifact.get("edges"), list)
+        and artifact.get("completed_at")
+    ):
+        state = bundle_marker_state(s3, bucket, data_domain, dataset) or {}
+        if (
+            state.get("status") == "complete"
+            and state.get("completed_at") == artifact["completed_at"]
+        ):
+            return {"nodes": artifact["nodes"], "edges": artifact["edges"]}
+
     prefix = bundle_prefix(data_domain, dataset)
-    files: dict[str, str] = {}
-    for key in _iter_bundle_keys(s3, bucket=bucket, prefix=prefix):
-        loc = parse_bundle_key(key)
-        if loc is None:
-            continue
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        files[loc.concept_id] = obj["Body"].read().decode("utf-8")
-    return build_graph_json(files)
+    return build_graph_json(_fetch_bundle_docs(s3, bucket=bucket, prefix=prefix))
 
 
 # --------------------------------------------------------------------------- #
@@ -4035,6 +4054,41 @@ def repromote_bundle(
             data_domain=data_domain,
             dataset=dataset,
         )
+        # Refresh the precomputed /graph artifact LAST, after the repromote is
+        # fully committed (marker, lease, convergence manifest, signal):
+        # restore_snapshot only touches non-dot ``.md`` files, so the old
+        # graph.json — stamped with the OLD completed_at — would otherwise
+        # linger stale and push every /graph read onto the slow live-compute
+        # path until the next harvest. The refresh re-downloads the whole
+        # bundle, the one genuinely expensive step in this 30s-capped Lambda,
+        # which is exactly why it runs after the commit: a hard timeout here
+        # loses only the fast path (mismatched stamp -> live compute) and the
+        # HTTP response, never the repromote itself. Same reason it is
+        # best-effort for ordinary exceptions.
+        try:
+            graph = build_graph_json(
+                _fetch_bundle_docs(
+                    s3, bucket=bucket, prefix=bundle_prefix(data_domain, dataset)
+                )
+            )
+            s3.put_object(
+                Bucket=bucket,
+                Key=graph_artifact_key(data_domain, dataset),
+                Body=(
+                    json.dumps(
+                        {"completed_at": completed_at, **graph}, sort_keys=True
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+        except Exception:  # noqa: BLE001 - graph is derived; repromote already committed
+            logging.getLogger(__name__).warning(
+                "repromote: could not refresh the graph artifact for %s/%s; "
+                "the /graph endpoint will compute live until the next harvest",
+                data_domain,
+                dataset,
+                exc_info=True,
+            )
         return {
             "status": "complete",
             "copied": len(copied),

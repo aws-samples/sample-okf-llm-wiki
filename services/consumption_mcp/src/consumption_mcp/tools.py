@@ -237,11 +237,13 @@ class ConsumptionTools:
         substring over ``"<domain>/<dataset>"``. Prefer ``search_domains`` /
         ``semantic_search`` to FIND a dataset by meaning.
 
-        Each entry carries its domain's description plus the cross-dataset
-        signal: ``cross_references`` — datasets this one holds pair docs FOR
-        (read them under this dataset's ``external/<d>/<ds>/``);
-        ``cross_referenced_by`` — the counterpart holds pair docs about THIS
-        one (read them under ``<that dataset>/external/<this>/…``).
+        Each entry carries an ``overview`` snippet of the dataset (absent when
+        never harvested — ``read_page`` ``datasets/<name>`` for the full doc),
+        its domain's description, plus the cross-dataset signal: ``cross_references`` —
+        datasets this one holds pair docs FOR (read them under this dataset's
+        ``external/<d>/<ds>/``); ``cross_referenced_by`` — the counterpart
+        holds pair docs about THIS one (read them under
+        ``<that dataset>/external/<this>/…``).
         """
         # Implementation notes (deliberately not in the model-facing docstring):
         #
@@ -366,7 +368,61 @@ class ConsumptionTools:
             if pair_key in referenced_by:
                 m["cross_referenced_by"] = sorted(referenced_by[pair_key])
 
+        # Attach each dataset's own overview so an agent can pick from the
+        # catalog without a read_page round-trip per candidate. Fetched in
+        # parallel for JUST this page; datasets with no published overview doc
+        # (registered but never harvested) simply lack the key.
+        self._attach_overviews(mappings)
+
         return {"datasets": mappings, "next_cursor": _encode_cursor(next_key)}
+
+    # Overview snippets are a catalog aid, not the doc itself: the frontmatter
+    # description is the curated one-paragraph summary (guard-required on every
+    # doc), and the cap keeps a 100-entry page from flooding the caller's
+    # context. Agents read_page the full overview once they have chosen.
+    _OVERVIEW_MAX_CHARS = 600
+    _OVERVIEW_FETCH_WORKERS = 16
+
+    def _attach_overviews(self, mappings: list[dict[str, Any]]) -> None:
+        """Set ``overview`` on each mapping from its ``datasets/<ds>.md`` doc.
+
+        Prefers the doc's frontmatter ``description``; falls back to a
+        whitespace-collapsed body excerpt. Best-effort throughout: a missing
+        doc, unreadable object, or parse failure just leaves the key off —
+        the catalog listing itself must never fail on bundle content.
+        """
+        if not mappings:
+            return
+
+        def fetch(m: dict[str, Any]) -> str | None:
+            key = (
+                f"{bundle_prefix(m['data_domain'], m['dataset'])}"
+                f"datasets/{m['dataset']}.md"
+            )
+            try:
+                obj = self.s3.get_object(Bucket=self.config.bundle_bucket, Key=key)
+                text = obj["Body"].read().decode("utf-8")
+            except Exception:  # noqa: BLE001 - no doc / no bundle => no overview
+                return None
+            desc, body = "", text
+            try:
+                doc = OKFDocument.parse(text)
+                desc = str((doc.frontmatter or {}).get("description") or "")
+                body = doc.body or ""
+            except Exception:  # noqa: BLE001 - malformed doc: excerpt the raw text
+                pass
+            snippet = desc.strip() or " ".join(body.split())
+            if len(snippet) > self._OVERVIEW_MAX_CHARS:
+                snippet = snippet[: self._OVERVIEW_MAX_CHARS - 1].rstrip() + "…"
+            return snippet or None
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=self._OVERVIEW_FETCH_WORKERS) as pool:
+            overviews = list(pool.map(fetch, mappings))
+        for m, snippet in zip(mappings, overviews):
+            if snippet:
+                m["overview"] = snippet
 
     def _scan_domains_legacy(self):
         """The pre-index full listing (one filtered scan): the fallback path."""

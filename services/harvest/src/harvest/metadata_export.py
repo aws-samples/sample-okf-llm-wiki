@@ -42,6 +42,10 @@ from typing import Any
 
 from harvest.fsutil import write_text
 from harvest.profile import read_cached_profiles, write_profiles
+from harvest.relationships import (
+    read_cached_relationships,
+    write_relationship_evidence,
+)
 from harvest.source_base import Source, SourceMetadataProfile
 from okf_core.paths import EXTERNAL_DIR, external_pair_prefix
 
@@ -147,6 +151,7 @@ def _manifest_markdown(
     profile: SourceMetadataProfile,
     *,
     has_profiles: bool = False,
+    has_relationships: bool = False,
 ) -> str:
     """The .metadata/index.md manifest: how to explore + one line per table."""
     parts = [
@@ -168,6 +173,19 @@ def _manifest_markdown(
                 "lists are not exhaustive."
             ]
             if has_profiles
+            else []
+        ),
+        *(
+            [
+                "- `.metadata/relationships/` — PRE-VERIFIED join + grain "
+                "evidence, probed at snapshot time by the same probes as "
+                "`validate_join`/`check_grain`: `joins/<a>__<b>--<key>.md` "
+                "(match rates both ways, cardinality, orphan samples) and "
+                "`grain/<table>.md` (key uniqueness). READ THESE FIRST — do "
+                "not re-probe a relationship a sheet already answers; probe "
+                "live only what the sheets don't cover."
+            ]
+            if has_relationships
             else []
         ),
         "",
@@ -285,6 +303,7 @@ def export_metadata(
     *,
     profile_mode: str = "full",
     changed_tables: frozenset[str] | set[str] = frozenset(),
+    progress: Any = None,
 ) -> dict[str, Any]:
     """Fetch all Glue metadata for the dataset and write it under ``.metadata/``.
 
@@ -301,9 +320,10 @@ def export_metadata(
     profile = source.metadata_profile
     meta_root = Path(dataset_root) / METADATA_DIR
 
-    # The previous run's profiles must be read BEFORE the wipe — they are the
-    # reuse cache for incremental/cross runs.
+    # The previous run's profiles and relationship evidence must be read
+    # BEFORE the wipe — they are the reuse cache for incremental/cross runs.
     profile_cache = read_cached_profiles(dataset_root)
+    rel_cache = read_cached_relationships(dataset_root)
 
     # Always start from a clean snapshot so a table dropped from the source since
     # the last run leaves no stale sheet. write_text recreates the dirs.
@@ -322,8 +342,22 @@ def export_metadata(
         cache=profile_cache,
         profile_mode=profile_mode,
         changed_tables=changed_tables,
+        progress=progress,
     )
     written.extend(f"{METADATA_DIR}/{rel}" for rel in prof.get("files", []))
+
+    # Relationship evidence (joins + grain, probed deterministically): runs
+    # AFTER profiles and is likewise best-effort — see harvest.relationships.
+    rels = write_relationship_evidence(
+        source,
+        meta_root,
+        tables_meta=tables_meta,
+        cache=rel_cache,
+        profile_mode=profile_mode,
+        changed_tables=changed_tables,
+        progress=progress,
+    )
+    written.extend(f"{METADATA_DIR}/{rel}" for rel in rels.get("files", []))
 
     write_text(
         meta_root / "index.md",
@@ -333,6 +367,7 @@ def export_metadata(
             manifest_rows,
             profile,
             has_profiles=bool(prof.get("files")),
+            has_relationships=bool(rels.get("files")),
         ),
     )
     written.append(f"{METADATA_DIR}/index.md")
@@ -342,6 +377,17 @@ def export_metadata(
         "files_written": len(written),
         "files": written,
         "profiles": {k: prof.get(k, 0) for k in ("profiled", "cached", "skipped")},
+        "relationships": {
+            # "ran" must survive this filter: the runner's feed line uses it
+            # to tell "ran and found no candidates" from "never ran" — losing
+            # it made the empty-pass line dead code (seen live: a healthy
+            # california_schools pass looked identical to a broken one).
+            **{
+                k: rels.get(k, 0)
+                for k in ("joins_probed", "grain_probed", "cached", "skipped")
+            },
+            "ran": bool(rels.get("ran")),
+        },
     }
 
 

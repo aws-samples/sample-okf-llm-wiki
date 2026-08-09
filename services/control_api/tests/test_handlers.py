@@ -2327,3 +2327,115 @@ def test_bundle_graph_from_s3(cfg):
     assert {"datasets/orders", "tables/orders", "tables/customers"} == ids
     edges = {(e["source"], e["target"]) for e in g["edges"]}
     assert ("tables/orders", "tables/customers") in edges
+
+
+def _put_graph_artifact(s3, completed_at):
+    """A precomputed artifact with a sentinel node no seeded doc produces —
+    seeing it in the response proves the artifact was SERVED, not recomputed."""
+    s3.put_object(
+        Bucket=BUCKET,
+        Key="okf/sales/orders/.harvest/graph.json",
+        Body=json.dumps(
+            {
+                "completed_at": completed_at,
+                "nodes": [
+                    {"id": "tables/precomputed", "title": "p", "type": "Glue Table"}
+                ],
+                "edges": [],
+            }
+        ).encode("utf-8"),
+    )
+
+
+def test_bundle_graph_serves_a_fresh_precomputed_artifact(cfg):
+    _seed_bundle(cfg.s3)
+    _put_graph_artifact(cfg.s3, "2026-01-01T00:00:00Z")
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key="okf/sales/orders/.harvest/state.json",
+        Body=json.dumps(
+            {"status": "complete", "completed_at": "2026-01-01T00:00:00Z"}
+        ).encode("utf-8"),
+    )
+    g = handlers.bundle_graph(
+        cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
+    )
+    assert {n["id"] for n in g["nodes"]} == {"tables/precomputed"}
+    # Served shape is exactly {nodes, edges} — the stamp stays internal.
+    assert set(g) == {"nodes", "edges"}
+
+
+def test_bundle_graph_recomputes_when_the_artifact_is_stale(cfg):
+    # An artifact from an older completed_at than the commit marker (e.g. a
+    # repromote whose graph refresh failed) must NOT be served — the endpoint
+    # falls back to computing from the live docs.
+    _seed_bundle(cfg.s3)
+    _put_graph_artifact(cfg.s3, "2026-01-01T00:00:00Z")
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key="okf/sales/orders/.harvest/state.json",
+        Body=json.dumps(
+            {"status": "complete", "completed_at": "2026-02-02T00:00:00Z"}
+        ).encode("utf-8"),
+    )
+    g = handlers.bundle_graph(
+        cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
+    )
+    assert {n["id"] for n in g["nodes"]} == {
+        "datasets/orders",
+        "tables/orders",
+        "tables/customers",
+    }
+
+
+def test_bundle_graph_recomputes_mid_harvest(cfg):
+    # During a run the marker says in_progress (mark_in_progress overwrote it),
+    # so the previous run's artifact — stamp intact — must not be served: the
+    # UI polling a live harvest sees the docs as they land, not last week's graph.
+    _seed_bundle(cfg.s3)
+    _put_graph_artifact(cfg.s3, "2026-01-01T00:00:00Z")
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key="okf/sales/orders/.harvest/state.json",
+        Body=json.dumps(
+            {"status": "in_progress", "started_at": "2026-02-02T00:00:00Z"}
+        ).encode("utf-8"),
+    )
+    g = handlers.bundle_graph(
+        cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
+    )
+    assert {n["id"] for n in g["nodes"]} == {
+        "datasets/orders",
+        "tables/orders",
+        "tables/customers",
+    }
+
+
+def test_get_harvest_events_forwards_progress_fields(cfg):
+    """The snapshot passes' kind="progress" ticks survive the field allowlist
+    (phase + done/total) — the UI renders one live bar per phase from them."""
+    sid = "sid-progress"
+    _seed_status(cfg, session_id=sid)
+    logs = FakeLogs(
+        {
+            HARVEST_LOG_GROUP: [
+                _step_line(
+                    sid, 1, "progress",
+                    phase="profiles", done=12, total=237, label="artist",
+                ),
+            ]
+        }
+    )
+    res = handlers.get_harvest_events(
+        logs,
+        cfg.ddb,
+        registry_table=REGISTRY,
+        log_group=HARVEST_LOG_GROUP,
+        data_domain="sales",
+        dataset="orders",
+        since=0,
+    )
+    e = res["events"][0]
+    assert e["kind"] == "progress" and e["phase"] == "profiles"
+    assert e["done"] == 12 and e["total"] == 237
+    assert e["label"] == "artist"

@@ -25,6 +25,7 @@ from okf_core.document import OKFDocument
 from okf_core.guard import (
     check_augmentation,
     check_frontmatter,
+    check_join_doc,
     ensure_timestamp,
     reorder_frontmatter,
 )
@@ -57,7 +58,8 @@ class OKFGuardEngine:
     # -- the two tools we guard -----------------------------------------
 
     def guard_write_file(
-        self, content: str, existing_text: str | None
+        self, content: str, existing_text: str | None,
+        rel_path: str | None = None,
     ) -> WriteDecision:
         """Guard a full-file ``write_file`` of a ``.md`` concept doc.
 
@@ -93,6 +95,10 @@ class OKFGuardEngine:
             if not aug.ok:
                 return WriteDecision(allow=False, message=aug.error)
 
+        join_check = check_join_doc(rel_path or "", doc.body)
+        if not join_check.ok:
+            return WriteDecision(allow=False, message=join_check.error)
+
         # Canonicalize key order. Rewrite the content so what lands on disk is
         # normalized (timestamp already filled above).
         fm = reorder_frontmatter(fm)
@@ -102,7 +108,8 @@ class OKFGuardEngine:
         return WriteDecision(allow=True, new_content=normalized)
 
     def guard_edit_file(
-        self, old_string: str, new_string: str, existing_text: str | None
+        self, old_string: str, new_string: str, existing_text: str | None,
+        rel_path: str | None = None,
     ) -> WriteDecision:
         """Guard an ``edit_file`` (exact string replacement) of a ``.md`` doc.
 
@@ -152,6 +159,13 @@ class OKFGuardEngine:
         )
         if not aug.ok:
             return WriteDecision(allow=False, message=aug.error)
+
+        join_check = check_join_doc(rel_path or "", result_doc.body)
+        if not join_check.ok:
+            return WriteDecision(
+                allow=False,
+                message=f"Refusing this edit: {join_check.error}",
+            )
 
         # Edits are surgical; we don't rewrite content (that would defeat the
         # exact-string contract). Just mark the graph dirty and allow.
