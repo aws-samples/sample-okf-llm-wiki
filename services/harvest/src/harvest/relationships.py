@@ -207,8 +207,20 @@ def read_cached_relationships(dataset_root: str | Path) -> _CachedRelationships:
 
 
 def _top_level_columns(meta: dict[str, Any]) -> dict[str, str]:
-    """{column_name: type} for a table's top-level columns."""
+    """{column_name: type} for a table's top-level columns.
+
+    INCLUDES partition keys: in lake-style warehouses the partition column is
+    often exactly the join/grain key (seen live: a partition key on one table
+    joining a storage column on another — invisible when only ``flat_schema``
+    is read, so the schema's one real pair nominated nothing). The engine
+    queries partition columns like any other, so every consumer of this map
+    (name/role/sketch nomination, grain keys, probe type lookup) handles them
+    unchanged. On a name collision the storage column wins (a column can't
+    legally be both; the storage type is what a probe would scan)."""
     out: dict[str, str] = {}
+    for f in meta.get("flat_partition_schema") or []:
+        if int(f.get("depth") or 0) == 0 and f.get("name"):
+            out[str(f["name"])] = str(f.get("type") or "")
     for f in meta.get("flat_schema") or []:
         if int(f.get("depth") or 0) == 0 and f.get("name"):
             out[str(f["name"])] = str(f.get("type") or "")

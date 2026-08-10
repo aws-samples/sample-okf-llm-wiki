@@ -73,6 +73,9 @@ relationships/
 1. **Shared names** (normalized: case- and underscore-blind, so `driver_id`
    groups with `driverid`). Only *key-like* names qualify — `_id`/`_key`/
    `_nbr`/`_sk` suffixes, or `raceid`-style names whose prefix names a table.
+   Partition keys count as columns everywhere in this pass (in lake-style
+   warehouses the partition column often IS the join key, and the engine
+   queries it like any other).
    Widely-shared keys pair each holder with the column's **home table** (the
    probable PK side: `raceid` → `races`) instead of exploding pairwise; a key
    shared by many tables with no home is refused with a note.
