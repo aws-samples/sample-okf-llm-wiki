@@ -31,6 +31,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import {
@@ -65,6 +70,38 @@ const DEFAULT_SOURCE_TYPE = "glue"
 // Redshift mapping row must still render its label on a deployment where the
 // Redshift option isn't offered for NEW mappings.
 const SOURCE_LABELS = { glue: "AWS Glue", redshift: "Amazon Redshift" }
+
+// Hover label for dropdown options whose visible text is ellipsized. Capped
+// so a paragraph-length catalog description doesn't become a screen-sized tip.
+const OPTION_TITLE_MAX_CHARS = 280
+// A bare name only earns a popup when it is long enough to plausibly be
+// ellipsized in a dropdown row (long Glue db names — no description needed).
+const OPTION_NAME_TOOLTIP_MIN_CHARS = 32
+
+function optionTitle(name, description) {
+  if (!description) {
+    return name.length >= OPTION_NAME_TOOLTIP_MIN_CHARS ? name : null
+  }
+  const full = `${name} — ${description}`
+  return full.length > OPTION_TITLE_MAX_CHARS
+    ? `${full.slice(0, OPTION_TITLE_MAX_CHARS - 1).trimEnd()}…`
+    : full
+}
+
+// Tooltip'd option row: no-op without a label (a bare name needs no popup).
+// The delay keeps a scroll through the list from strobing tooltips; side
+// "right" keeps the popup off the rows still being scanned.
+function OptionHoverLabel({ label, children }) {
+  if (!label) return children
+  return (
+    <Tooltip delayDuration={300}>
+      <TooltipTrigger asChild>{children}</TooltipTrigger>
+      <TooltipContent side="right" sideOffset={8}>
+        {label}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
 
 function sourceLabel(type) {
   if (!type) return "—"
@@ -426,12 +463,17 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                 >
                   <SelectGroup>
                     {declaredDomains.map((d) => (
-                      <SelectItem key={d.data_domain} value={d.data_domain}>
-                        <span className="min-w-0 truncate">
-                          {d.data_domain}
-                          {d.description ? ` — ${d.description}` : ""}
-                        </span>
-                      </SelectItem>
+                      <OptionHoverLabel
+                        key={d.data_domain}
+                        label={optionTitle(d.data_domain, d.description)}
+                      >
+                        <SelectItem value={d.data_domain}>
+                          <span className="min-w-0 truncate">
+                            {d.data_domain}
+                            {d.description ? ` — ${d.description}` : ""}
+                          </span>
+                        </SelectItem>
+                      </OptionHoverLabel>
                     ))}
                   </SelectGroup>
                 </SelectContent>
@@ -460,12 +502,17 @@ function NewMappingDialog({ api, databases, declaredDomains, onCreated }) {
                   >
                     <SelectGroup>
                       {databases.map((db) => (
-                        <SelectItem key={db.name} value={db.name}>
-                          <span className="min-w-0 truncate">
-                            {db.name}
-                            {db.description ? ` — ${db.description}` : ""}
-                          </span>
-                        </SelectItem>
+                        <OptionHoverLabel
+                          key={db.name}
+                          label={optionTitle(db.name, db.description)}
+                        >
+                          <SelectItem value={db.name}>
+                            <span className="min-w-0 truncate">
+                              {db.name}
+                              {db.description ? ` — ${db.description}` : ""}
+                            </span>
+                          </SelectItem>
+                        </OptionHoverLabel>
                       ))}
                     </SelectGroup>
                   </SelectContent>
