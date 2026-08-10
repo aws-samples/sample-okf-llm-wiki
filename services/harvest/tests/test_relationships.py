@@ -115,6 +115,28 @@ def test_enumeration_refuses_widely_shared_keys_without_a_home():
     assert len(notes) == 1 and "customerkey" in notes[0]  # normalized form
 
 
+def test_enumeration_sees_partition_keys():
+    # The hifa bug: a lake-style table whose join key is a PARTITION column
+    # (flat_partition_schema, not flat_schema) was invisible to nomination,
+    # so the schema's one real pair nominated nothing. Partition columns are
+    # queryable like any other and are often exactly the join key.
+    countries = _meta({"name": "string"})
+    countries["flat_partition_schema"] = [
+        {"name": "routen_id", "type": "bigint", "depth": 0}
+    ]
+    meta = {
+        "countries": countries,
+        "distribution": _meta({"routen_id": "bigint", "amount": "double"}),
+    }
+    cands, notes = enumerate_join_candidates(meta, CFG)
+    pairs = {(c["left"], c["right"], c["column_l"], c["column_r"]) for c in cands}
+    assert ("countries", "distribution", "routen_id", "routen_id") in pairs
+    cand = next(c for c in cands if c["left"] == "countries")
+    # The partition key's type came through, so the pair is probe-comparable.
+    assert cand["type_l"] == "bigint" and cand["comparable"] is True
+    assert notes == []
+
+
 def test_enumeration_flags_type_mismatch_instead_of_dropping():
     meta = {
         "orders": _meta({"customer_id": "string"}),
