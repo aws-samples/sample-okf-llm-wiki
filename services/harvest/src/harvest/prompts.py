@@ -941,6 +941,37 @@ def guidance_block(dataset_guidance: str | None) -> str:
 # supervisor body is WRONG as a system prompt for this run — it prescribes a
 # per-table fan-out and a whole-bundle review pass, while the task is "one table
 # changed; update it and what references it".
+# Appended to every SCOPED supervisor body (maintenance + annotation): the
+# lint tool is now on every non-cross supervisor, but a scoped run's fix
+# obligation is confined to what IT touched — without this scoping, a single
+# pre-existing error elsewhere would balloon a one-table update into a bundle
+# repair job.
+_SCOPED_DELETE_BLOCK = """
+## Retiring a doc
+
+**You (and only you) may `delete` a doc.** If the change you are applying means
+a doc should not exist at all — the source table it describes was DROPPED from
+the catalog, or an annotation retires it — remove it with `delete`. Call
+`get_backlinks` on it FIRST and fix the docs that pointed at it, so the removal
+leaves no broken links. `delete` takes ONE `.md` file path: never a directory
+(it is recursive), and never anything under `.metadata/`, `.context/`, or
+`.harvest/` — those refusals are enforced at the tool boundary. A doc that is
+merely wrong gets fixed in place with `edit_file`; deletion is only for a doc
+whose subject is gone.
+"""
+
+
+_SCOPED_LINT_BLOCK = """
+## Final check
+
+Before finishing, call `lint_bundle` (it takes NO arguments). Fix every ERROR
+in a doc THIS RUN created or edited — a broken link your edit introduced,
+frontmatter your rewrite damaged, a join key your change renamed away. Errors
+in docs you did not touch are pre-existing: leave them alone and NAME them in
+your final summary instead of expanding the run to fix them.
+"""
+
+
 _MAINTENANCE_BODY = """
 ## Your job (scoped maintenance)
 
@@ -965,7 +996,11 @@ def build_maintenance_supervisor_prompt(
     """The SUPERVISOR system prompt for an incremental (scoped) re-harvest."""
     return _with_gpt(
         _fill(
-            _RUNTIME_TMPL + _AUTHORING_TMPL + _MAINTENANCE_BODY,
+            _RUNTIME_TMPL
+            + _AUTHORING_TMPL
+            + _MAINTENANCE_BODY
+            + _SCOPED_DELETE_BLOCK
+            + _SCOPED_LINT_BLOCK,
             profile or GlueAthenaSource.prompt_profile,
         ),
         gpt,
@@ -989,7 +1024,14 @@ def build_annotation_supervisor_prompt(
     Markdown-reply rule still holds.
     """
     profile = profile or GlueAthenaSource.prompt_profile
-    prompt = _fill(_RUNTIME_TMPL + _AUTHORING_TMPL + _ANNOTATION_BODY, profile)
+    prompt = _fill(
+        _RUNTIME_TMPL
+        + _AUTHORING_TMPL
+        + _ANNOTATION_BODY
+        + _SCOPED_DELETE_BLOCK
+        + _SCOPED_LINT_BLOCK,
+        profile,
+    )
     return _with_gpt(prompt.replace("{results_rel}", results_rel), gpt)
 
 

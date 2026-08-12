@@ -826,6 +826,90 @@ def _r_delete_benchmark_report(cfg, params, body, query, caller):
     )
 
 
+def _r_start_qbank_generation(cfg, params, body, query, caller):
+    body = body or {}
+    if not cfg.harvest_runtime_arn:
+        raise handlers.ApiError(500, "harvest runtime is not configured")
+    # One catalog-validated model pair (the author agents); absent falls back
+    # to the runtime default, like every other run config.
+    model, effort = _validated_model_pair(cfg, body, "model", "effort")
+    return 200, handlers.start_qbank_generation(
+        cfg.agentcore,
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        runtime_arn=cfg.harvest_runtime_arn,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        config={
+            k: body[k]
+            for k in ("count", "checks", "sql_share", "dimensions")
+            if k in body
+        },
+        model=model,
+        effort=effort,
+        requested_by=(caller.ident if caller else "") or "",
+    )
+
+
+def _r_list_qbanks(cfg, params, body, query, caller):
+    return 200, handlers.list_qbanks(
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_get_qbank(cfg, params, body, query, caller):
+    return 200, handlers.get_qbank(
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        qbank_id=params["qbank_id"],
+    )
+
+
+def _r_apply_qbank(cfg, params, body, query, caller):
+    return 200, handlers.apply_qbank(
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        qbank_id=params["qbank_id"],
+    )
+
+
+def _r_cancel_qbank(cfg, params, body, query, caller):
+    return 200, handlers.cancel_qbank_generation(
+        cfg.agentcore,
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        runtime_arn=cfg.harvest_runtime_arn,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        qbank_id=params["qbank_id"],
+    )
+
+
+def _r_delete_qbank(cfg, params, body, query, caller):
+    return 200, handlers.delete_qbank(
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        qbank_id=params["qbank_id"],
+    )
+
+
 def _r_aggregate_report_annotations(cfg, params, body, query, caller):
     if not cfg.harvest_runtime_arn:
         raise handlers.ApiError(500, "harvest runtime is not configured")
@@ -1104,6 +1188,15 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
         "/benchmark/{domain}/{dataset}/runs/{report_id}",
         _r_delete_benchmark_report,
     ),
+    # Synthetic question-bank generation (mode=generate_questions; see
+    # okf_core.qbank). Apply writes the canonical questions.csv (replace —
+    # the bucket is versioned and runs pin the CSV version they started with).
+    ("POST", "/benchmark/{domain}/{dataset}/qbanks", _r_start_qbank_generation),
+    ("GET", "/benchmark/{domain}/{dataset}/qbanks", _r_list_qbanks),
+    ("POST", "/benchmark/{domain}/{dataset}/qbanks/{qbank_id}/apply", _r_apply_qbank),
+    ("POST", "/benchmark/{domain}/{dataset}/qbanks/{qbank_id}/cancel", _r_cancel_qbank),
+    ("GET", "/benchmark/{domain}/{dataset}/qbanks/{qbank_id}", _r_get_qbank),
+    ("DELETE", "/benchmark/{domain}/{dataset}/qbanks/{qbank_id}", _r_delete_qbank),
     # Chat conversations (per-user sidebar list). thread_id is a single opaque
     # segment (a UUID the SPA generates), so it's a clean path param. Rename is
     # PUT (not PATCH) because the API Gateway CORS allow_methods + the CORS_HEADERS

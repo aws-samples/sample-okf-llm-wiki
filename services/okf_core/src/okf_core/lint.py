@@ -492,17 +492,47 @@ class _Context:
         return merged
 
 
-def _read_columns_tsv(path: Path) -> dict[str, dict[str, str]] | None:
-    if not path.is_file():
+def read_columns_tsv(path: Path) -> dict[str, dict[str, str]] | None:
+    """``{table: {column: type}}`` (lower-cased keys) from a columns.tsv, or
+    None when the file is missing/unreadable or its header lacks the required
+    columns.
+
+    PUBLIC and HEADER-DRIVEN — the one parser for this format (lint's snapshot
+    checks and the benchmark question generator's leakage lint both read
+    through it, so they can never disagree). Header-driven rather than
+    positional because the format varies by fork: this repo's snapshot is
+    4-col (``table\tcolumn\ttype\tcomment``) while the multi-database fork's
+    is 5-col with ``database`` first — resolving indices from the header row
+    keeps one implementation correct for both.
+    """
+    try:
+        if not path.is_file():
+            return None
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
         return None
+    if not lines:
+        return None
+    header = [h.strip().lower() for h in lines[0].split("\t")]
+    try:
+        t_i, c_i = header.index("table"), header.index("column")
+    except ValueError:
+        return None
+    ty_i = header.index("type") if "type" in header else -1
     out: dict[str, dict[str, str]] = {}
-    lines = path.read_text(encoding="utf-8").splitlines()
-    for line in lines[1:]:  # skip the "table\tcolumn\ttype\tcomment" header
+    for line in lines[1:]:
         parts = line.split("\t")
-        if len(parts) < 3 or not parts[0]:
+        if len(parts) <= max(t_i, c_i) or not parts[t_i]:
             continue
-        out.setdefault(parts[0].lower(), {})[parts[1].lower()] = parts[2]
+        out.setdefault(parts[t_i].lower(), {})[parts[c_i].lower()] = (
+            parts[ty_i] if 0 <= ty_i < len(parts) else ""
+        )
     return out
+
+
+# Backward-compatible internal alias (lint's own call sites predate the
+# public name).
+_read_columns_tsv = read_columns_tsv
 
 
 # ---------------------------------------------------------------------------

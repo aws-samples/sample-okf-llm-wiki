@@ -238,22 +238,24 @@ def test_allow_delete_still_honors_the_writable_prefix(monkeypatch):
     assert "outside this run's writable subtree" in result["content"]
 
 
-def test_delete_is_wired_to_the_supervisor_guard_only():
+def test_delete_is_wired_to_every_supervisor_guard_but_no_subagent():
     import inspect
 
     from harvest import agent as ag
 
     src = inspect.getsource(ag.build_harvest_agent)
-    # A separate guard instance carries allow_delete, used by the MAIN
-    # middleware only; sub-agent specs keep the plain `guard`.
+    # ONE guard instance carries allow_delete — the supervisor's, in EVERY
+    # mode (a scoped run must retire a DROPPED table's doc; cross deletes are
+    # confined to the pair subtree by writable_prefix). It must be
+    # unconditional: no `if full_harvest else guard` demotion.
     assert "allow_delete=True," in src
     assert "main_middleware = [ main_guard," in " ".join(src.split())
+    assert "else guard" not in src
+    # Sub-agent specs keep the plain `guard`, which refuses delete.
     assert src.count('"middleware": [guard, tool_errors, prompt_cache]') >= 2
-    # Full harvests only (scoped/cross prompts never mention the tool).
-    assert "full_harvest = cross_target is None and supervisor_prompt is None" in src
 
 
-def test_supervisor_prompt_explains_when_to_delete():
+def test_supervisor_prompts_explain_when_to_delete():
     from harvest import prompts
 
     p = prompts.SUPERVISOR_PROMPT
@@ -263,6 +265,16 @@ def test_supervisor_prompt_explains_when_to_delete():
     assert "stale-table-doc" in norm
     assert "get_backlinks" in norm
     assert "never a directory" in norm
+    # The scoped supervisors (maintenance + annotation) get the tool too, so
+    # their prompts must say when to reach for it (a DROPPED table's doc).
+    for scoped in (
+        prompts.build_maintenance_supervisor_prompt(),
+        prompts.build_annotation_supervisor_prompt(results_rel=".harvest/annotation_results.json"),
+    ):
+        s = " ".join(scoped.split())
+        assert "`delete`" in s
+        assert "DROPPED" in s
+        assert "get_backlinks" in s
     # Sub-agents' prompts must NOT advertise a tool they cannot use.
     for other in (prompts.TABLE_AUTHOR_PROMPT, prompts.REVIEWER_PROMPT):
         assert "`delete`" not in other

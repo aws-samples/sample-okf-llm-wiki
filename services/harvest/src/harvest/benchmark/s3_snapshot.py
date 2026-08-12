@@ -134,6 +134,39 @@ def materialize_snapshots(
     return written
 
 
+def materialize_ground_truth(
+    s3, *, bucket: str, data_domain: str, dataset: str, dest_dir: str
+) -> None:
+    """Fill ``dest_dir`` with the dataset's GROUND TRUTH only: ``.metadata/``
+    (the catalog snapshot, profiles, relationship evidence) and ``.context/``
+    (the uploaded source docs, binary included).
+
+    The question-bank generator's tree — deliberately NO authored wiki docs.
+    The wiki is the system under test: questions authored from it would be
+    phrased in its own vocabulary and test parroting; questions authored from
+    the source truth test whether the wiki captured it. The confinement is
+    physical (the docs are simply absent from the agent's filesystem), the
+    same way solver gold-blindness works.
+
+    A dataset with no ``.metadata/columns.tsv`` FAILS loudly — there is no
+    catalog truth to author from, so the generation can only hallucinate.
+    ``.context/`` alone is best-effort (most datasets have no uploads).
+    """
+    prefix = bundle_prefix(data_domain, dataset)
+    root = Path(dest_dir)
+    for extra in _JUDGE_EXTRA_DIRS:  # (".metadata/", ".context/")
+        _copy_latest_tree(
+            s3, bucket=bucket, prefix=prefix + extra,
+            dest_root=root / extra.rstrip("/"),
+        )
+    if not (root / ".metadata" / "columns.tsv").is_file():
+        raise SnapshotError(
+            "the dataset has no .metadata snapshot (columns.tsv) — run a "
+            "harvest first; questions can only be authored from the catalog "
+            "ground truth"
+        )
+
+
 def _copy_latest_tree(s3, *, bucket: str, prefix: str, dest_root: Path) -> None:
     """Best-effort copy of every latest object under ``prefix`` into ``dest_root``."""
     token = None

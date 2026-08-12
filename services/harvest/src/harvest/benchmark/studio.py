@@ -77,14 +77,14 @@ _GRADER_DEFAULT_TIMEOUT_S = 60.0
 _GRADER_DEFAULT_MAX_ROWS = 50000
 
 
-def _grader_timeout_s() -> float:
+def grader_timeout_s() -> float:
     try:
         return max(1.0, float(os.environ.get("OKF_BENCHMARK_GRADER_TIMEOUT_S", "")))
     except (TypeError, ValueError):
         return _GRADER_DEFAULT_TIMEOUT_S
 
 
-def _grader_max_rows() -> int:
+def grader_max_rows() -> int:
     try:
         return max(1, int(os.environ.get("OKF_BENCHMARK_GRADER_MAX_ROWS", "")))
     except (TypeError, ValueError):
@@ -99,8 +99,8 @@ def _grading_execute(source):
     cell — a silent mis-grade. The row cap turns a pathological result set into
     a classified grading failure instead of an unbounded buffer.
     """
-    timeout_s = _grader_timeout_s()
-    max_rows = _grader_max_rows()
+    timeout_s = grader_timeout_s()
+    max_rows = grader_max_rows()
 
     def execute(sql: str):
         _header, rows = source.run_query(

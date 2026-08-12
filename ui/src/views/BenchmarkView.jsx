@@ -26,6 +26,7 @@ import {
 } from "lucide-react"
 
 import { uploadToPresigned } from "@/lib/api"
+import QuestionBankSection from "@/components/benchmark/QuestionBankGenerator"
 import {
   GROUPED_MODEL_CATALOG,
   MODEL_CATALOG,
@@ -319,8 +320,8 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
           <p className="text-sm text-muted-foreground">
             A CSV with a <code>question</code> column and one gold column per
             check: <code>gold_sql</code> (Accuracy),{" "}
-            <code>expected_behavior</code> (Behavior — free-form: what the
-            agent should do, e.g. refuse, cite a caveat, not invent numbers).
+            <code>expected_behavior</code> (Behavior — free-form: what the agent
+            should do, e.g. refuse, cite a caveat, not invent numbers).
           </p>
           <div>
             <input
@@ -335,7 +336,11 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
               onClick={() => fileInputRef.current?.click()}
               disabled={uploading}
             >
-              {uploading ? <Spinner /> : <UploadIcon data-icon="inline-start" />}
+              {uploading ? (
+                <Spinner />
+              ) : (
+                <UploadIcon data-icon="inline-start" />
+              )}
               {questions?.valid
                 ? "Replace questions CSV"
                 : "Upload questions CSV"}
@@ -343,6 +348,18 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
           </div>
           <QuestionSetStatus questions={questions} />
         </div>
+
+        <Separator />
+
+        {/* Synthetic question banks: generate from ground truth, review,
+            download or apply (apply replaces the question set above — the
+            inspect reload keeps its counts current). */}
+        <QuestionBankSection
+          api={api}
+          domain={domain}
+          dataset={dataset}
+          onApplied={inspect}
+        />
 
         <Separator />
 
@@ -415,8 +432,8 @@ export default function BenchmarkView({ api, selection, onOpenReport }) {
                   {fmtWhen(confirmDelete.created_at) || confirmDelete.report_id}
                 </span>{" "}
                 will be deleted, with every attempt, trace, and judge review it
-                holds. This can't be undone — the runs it represents can only
-                be paid for again with a new benchmark.
+                holds. This can't be undone — the runs it represents can only be
+                paid for again with a new benchmark.
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -458,7 +475,9 @@ function NewBenchmarkDialog({
   const defaultModel = MODEL_CATALOG[0]?.model || ""
   const [checks, setChecks] = useState(() => new Set(["sql"]))
   const [solverModel, setSolverModel] = useState(defaultModel)
-  const [solverEffort, setSolverEffort] = useState(defaultEffortFor(defaultModel))
+  const [solverEffort, setSolverEffort] = useState(
+    defaultEffortFor(defaultModel)
+  )
   const [judgeModel, setJudgeModel] = useState(defaultModel)
   const [judgeEffort, setJudgeEffort] = useState(defaultEffortFor(defaultModel))
   const [runs, setRuns] = useState("3")
@@ -470,7 +489,9 @@ function NewBenchmarkDialog({
   const [starting, setStarting] = useState(false)
 
   const checkCounts = questions?.check_counts || {}
-  const enabledWithQuestions = [...checks].some((c) => (checkCounts[c] || 0) > 0)
+  const enabledWithQuestions = [...checks].some(
+    (c) => (checkCounts[c] || 0) > 0
+  )
   const canStart = checks.size > 0 && enabledWithQuestions && !starting
 
   const toggleCheck = (key) =>
@@ -638,7 +659,9 @@ function NewBenchmarkDialog({
               <Label htmlFor="bench-version">Wiki version</Label>
               <Select
                 value={versionId || "__current__"}
-                onValueChange={(v) => setVersionId(v === "__current__" ? "" : v)}
+                onValueChange={(v) =>
+                  setVersionId(v === "__current__" ? "" : v)
+                }
               >
                 <SelectTrigger id="bench-version" className="w-full">
                   <SelectValue />
@@ -684,7 +707,15 @@ function NewBenchmarkDialog({
 
 // One model + effort picker pair over the shared harvest catalog (the benchmark
 // pickers use the harvest catalog by design — not chat's pinned model).
-function ModelEffortField({ idPrefix, label, help, model, effort, onModel, onEffort }) {
+function ModelEffortField({
+  idPrefix,
+  label,
+  help,
+  model,
+  effort,
+  onModel,
+  onEffort,
+}) {
   const efforts = effortsFor(model)
   return (
     <div className="flex flex-col gap-2">
@@ -832,7 +863,10 @@ function ReportRow({ report, onOpen, onDelete, deleting }) {
                   {fmtScore(report[`${c}_raw`])}
                 </span>
                 {typeof report[`${c}_adjusted`] === "number" ? (
-                  <span> · Judge adjudication {fmtScore(report[`${c}_adjusted`])}</span>
+                  <span>
+                    {" "}
+                    · Judge adjudication {fmtScore(report[`${c}_adjusted`])}
+                  </span>
                 ) : null}
               </span>
             ) : (
@@ -927,8 +961,7 @@ function QuestionSetStatus({ questions }) {
           {questions.count} question{questions.count === 1 ? "" : "s"}
         </span>{" "}
         —{" "}
-        {CHECK_META.map((c) => `${c.label}: ${counts[c.key] || 0}`).join(", ")}
-        .
+        {CHECK_META.map((c) => `${c.label}: ${counts[c.key] || 0}`).join(", ")}.
         {questions.capped
           ? ` Capped from ${questions.total_in_csv} rows at the ${questions.max_questions}-question limit (first ${questions.max_questions} used).`
           : ""}

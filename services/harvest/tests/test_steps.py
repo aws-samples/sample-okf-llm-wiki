@@ -38,6 +38,14 @@ from harvest.steps import (
         ("read_file", {"file_path": "/tables/races.md"}, "Reading tables/races.md"),
         ("write_file", {"file_path": "tables/drivers.md"}, "Writing tables/drivers.md"),
         ("edit_file", {"file_path": "index.md"}, "Editing index.md"),
+        # delete shows the FULL root-relative path (not the 2-segment tail):
+        # a removal is the op an operator audits from the feed.
+        (
+            "delete",
+            {"file_path": "/references/metrics/race_wins.md"},
+            "Deleting references/metrics/race_wins.md",
+        ),
+        ("delete", {}, "Deleting a file"),
         ("glob", {"pattern": "*.md"}, "Searching for *.md"),
         ("grep", {"query": "grain"}, "Searching for grain"),
         ("write_todos", {}, "Planning the work"),

@@ -641,18 +641,18 @@ def build_harvest_agent(
         writable_prefix=writable_prefix,
     )
     # The SUPERVISOR's own guard: identical, plus `delete` for retiring a stale
-    # doc (one .md file, never a dot-dir or a directory — see okf_guard). The
-    # authoring sub-agents keep `guard` above, which still refuses delete: a
-    # table-author has no business removing anything.
-    main_guard = (
-        OKFGuardMiddleware(
-            engine,
-            read_current=_make_read_current(dataset_root),
-            writable_prefix=writable_prefix,
-            allow_delete=True,
-        )
-        if full_harvest
-        else guard
+    # doc (one .md file, never a dot-dir or a directory — see okf_guard). In
+    # EVERY mode: a scoped/incremental run whose table was DROPPED from the
+    # catalog must retire that doc, and an annotation can retire one too. Cross
+    # mode keeps `writable_prefix`, so its deletes are confined to the pair
+    # subtree like its writes. The authoring sub-agents keep `guard` above,
+    # which still refuses delete: a table-author has no business removing
+    # anything.
+    main_guard = OKFGuardMiddleware(
+        engine,
+        read_current=_make_read_current(dataset_root),
+        writable_prefix=writable_prefix,
+        allow_delete=True,
     )
     # The verify-and-report sub-agents' guard: refuses EVERY write/edit (and,
     # like the main guard, the recursive `delete` deepagents ≥0.7 exposes).
@@ -715,30 +715,32 @@ def build_harvest_agent(
         run_code_tool = make_run_code_tool(sandbox)
         all_tools.append(run_code_tool)
 
-    # Whole-bundle lint gate — FULL harvests only, MAIN AGENT ONLY. Scoped
-    # modes (annotation/incremental hand in supervisor_prompt) and cross runs
-    # can't perform its fix-to-zero workflow — cross writes are guard-confined
-    # to the pair subtree, so a bundle-wide error the tool reports would be
-    # unfixable there, and their prompts never mention the tool. Sub-agent
-    # specs below get all_tools (authors/reviewers work one doc/cluster at a
-    # time — a bundle-wide scan in their hands is wasted tokens). No-arg by
-    # design: expected tables come from the .metadata/ snapshot on disk and
-    # EXPLAIN availability from this run's source, so there is nothing for
-    # the model to pass (or get wrong).
+    # Whole-bundle lint gate — MAIN AGENT ONLY, every mode except cross. The
+    # full-harvest supervisor runs its fix-to-zero workflow twice; scoped
+    # supervisors (annotation/incremental hand in supervisor_prompt) run it as
+    # a FINAL check on the docs they touched (their prompt bodies scope the
+    # fix obligation — pre-existing errors elsewhere are reported, not
+    # ballooned into the run). Cross runs stay excluded: their writes are
+    # guard-confined to the pair subtree, so a bundle-wide error the tool
+    # reports would be unfixable there. Sub-agent specs below get all_tools
+    # (authors/reviewers work one doc/cluster at a time — a bundle-wide scan
+    # in their hands is wasted tokens). No-arg by design: expected tables come
+    # from the .metadata/ snapshot on disk and EXPLAIN availability from this
+    # run's source, so there is nothing for the model to pass (or get wrong).
     main_tools = list(all_tools)
     # Bundle inventory — EVERY supervisor mode (full/scoped/cross): counts by
     # concept type instead of glob-and-count-in-context. Counts only, no
     # judgment (see stats_tool.py) — deliberately NOT in the sub-agent specs.
     main_tools.append(make_stats_tool(dataset_root))
-    if full_harvest:
+    if cross_target is None:
         main_tools.append(make_lint_tool(source, dataset_root))
+    if full_harvest:
         # The deterministic review workflow (ONE call replaces the old
         # cluster→eval→Promise.all orchestration): clusters computed here,
         # one read-only reviewer per cluster, findings piped into a
         # cluster-confined fix-author, everything surfaced as fleet squares,
-        # full transcript in .harvest/review/. Same gating rationale as the
-        # lint gate above: only the full-harvest supervisor prompt carries
-        # its workflow.
+        # full transcript in .harvest/review/. FULL harvests only: scoped
+        # runs fix what they touched, they don't re-review the bundle.
         from harvest.review import make_run_review_tool
 
         main_tools.append(

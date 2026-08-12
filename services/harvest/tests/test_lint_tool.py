@@ -155,20 +155,34 @@ def test_tool_takes_no_arguments_and_never_raises(tmp_path):
     assert isinstance(result, dict) and result["ok"] is False
 
 
-def test_lint_gate_is_wired_to_the_main_agent_of_full_harvests_only():
+def test_lint_gate_is_wired_to_every_main_agent_except_cross():
     import inspect
 
     from harvest import agent as ag
+    from harvest.prompts import (
+        build_annotation_supervisor_prompt,
+        build_maintenance_supervisor_prompt,
+    )
 
     src = inspect.getsource(ag.build_harvest_agent)
-    # Full harvests only: scoped modes hand in supervisor_prompt and cross
-    # runs are pair-confined — neither can run the fix-to-zero workflow.
+    # Full + scoped supervisors get the tool; cross runs stay excluded (their
+    # writes are pair-confined, so bundle-wide errors would be unfixable).
     assert "full_harvest = cross_target is None and supervisor_prompt is None" in src
-    assert "if full_harvest:" in src
-    assert "main_tools.append(make_lint_tool(source, dataset_root))" in src
+    assert (
+        "if cross_target is None:\n        main_tools.append(make_lint_tool(source, dataset_root))"
+        in src
+    )
     assert "tools=main_tools," in src
     # Sub-agent specs keep all_tools (no bundle-wide scan in their hands).
     assert src.count('"tools": all_tools') >= 4
+    # The scoped prompts carry the final-check instruction — scoped to the
+    # docs THIS run touched, never the full gate's fix-to-zero obligation.
+    for prompt in (
+        build_maintenance_supervisor_prompt(),
+        build_annotation_supervisor_prompt(results_rel=".harvest/results.json"),
+    ):
+        assert "lint_bundle" in prompt
+        assert "pre-existing" in prompt
 
 
 def test_explain_crash_does_not_discard_the_offline_report(tmp_path, monkeypatch):

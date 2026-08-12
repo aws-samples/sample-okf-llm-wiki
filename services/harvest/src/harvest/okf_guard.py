@@ -11,15 +11,18 @@ Two refusals sit in front of the engine checks:
 
 * ``delete`` (the recursive filesystem tool deepagents ≥0.7 hands every agent
   whose backend supports it) is refused unless the guard was built with
-  ``allow_delete=True`` — which the agent builder does for the FULL-harvest
-  SUPERVISOR only. The supervisor owns bundle-level shape (it is the one told
-  to fix the lint gate's ``stale-table-doc`` findings), so it can retire a doc
-  whose source table is gone; an authoring sub-agent has no business deleting
-  anything, and the read-only ones certainly don't. Even when allowed, a
-  delete must be a single ``.md`` FILE outside every dot-dir (and inside the
-  cross-mode writable subtree): a recursive directory delete is the blast
-  radius this refusal originally existed to prevent, and ``.metadata/``,
-  ``.context/``, ``.harvest/`` are inputs/state, never the agent's to remove.
+  ``allow_delete=True`` — which the agent builder does for the SUPERVISOR in
+  EVERY mode (full, scoped/incremental, annotation, cross). The supervisor
+  owns bundle-level shape: the full harvest retires ``stale-table-doc`` lint
+  findings, a scoped run retires the doc of a table DROPPED from the catalog,
+  an annotation can retire a doc, and a cross run's deletes stay confined to
+  its pair subtree by ``writable_prefix``. An authoring sub-agent has no
+  business deleting anything, and the read-only ones certainly don't. Even
+  when allowed, a delete must be a single ``.md`` FILE outside every dot-dir
+  (and inside the cross-mode writable subtree): a recursive directory delete
+  is the blast radius this refusal originally existed to prevent, and
+  ``.metadata/``, ``.context/``, ``.harvest/`` are inputs/state, never the
+  agent's to remove.
 * ``read_only=True`` builds a guard variant for the verify-and-report
   sub-agents (reviewer, context-extractor): every write/edit is refused, so
   "read-only" is enforced at the tool boundary rather than promised by the
@@ -142,7 +145,7 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         self._writable_prefix = writable_prefix.strip("/") + "/" if writable_prefix else None
         # Verify-and-report sub-agents: refuse every write/edit outright.
         self._read_only = read_only
-        # The full-harvest supervisor only (see the module docstring): may
+        # The supervisor only — every mode (see the module docstring): may
         # retire a single stale .md doc. Never set for sub-agents.
         self._allow_delete = allow_delete and not read_only
         # The `fix-author` variant: a CALLABLE returning the exact set of

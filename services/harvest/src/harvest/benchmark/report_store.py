@@ -150,8 +150,18 @@ def update_report_row(
     dataset: str,
     report_id: str,
     attrs: dict[str, Any],
+    sk: str | None = None,
+    unless_status: str | None = None,
 ) -> None:
     """Best-effort UpdateItem of flat scalars onto the REPORT# row.
+
+    ``sk`` overrides the sort key for row kinds that share this exact
+    lifecycle (the QBANK# rows of ``mode=generate_questions``); default is the
+    REPORT# row of ``report_id``. ``unless_status`` additionally guards the
+    write on the row's ``status`` NOT being that value — how a runtime's
+    terminal ``complete`` is prevented from resurrecting a row the operator
+    just CANCELLED (the same shape as the deleted-row condition: the blocked
+    write is dropped, never retried — that drop is the point).
 
     ``attrs`` values must be bool/int/float/str (the ``_marshal`` contract).
     Never raises — a row write must not fail a run whose S3 report is already
@@ -189,14 +199,19 @@ def update_report_row(
                 "S": datetime.now(timezone.utc).isoformat(timespec="seconds")
             }
             sets.append("#u = :u")
+            condition = "attribute_exists(pk)"
+            if unless_status:
+                names["#st"] = "status"
+                values[":blocked"] = {"S": unless_status}
+                condition += " AND #st <> :blocked"
             client.update_item(
                 TableName=table,
                 Key={
                     "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
-                    "sk": {"S": br.report_sk(report_id)},
+                    "sk": {"S": sk or br.report_sk(report_id)},
                 },
                 UpdateExpression="SET " + ", ".join(sets),
-                ConditionExpression="attribute_exists(pk)",
+                ConditionExpression=condition,
                 ExpressionAttributeNames=names,
                 ExpressionAttributeValues=values,
             )
@@ -204,10 +219,11 @@ def update_report_row(
         except Exception as e:  # noqa: BLE001 - the S3 report is the durable truth
             code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
             if code == "ConditionalCheckFailedException":
-                # The row was deleted — dropping the late write is the contract.
+                # The row was deleted (or holds the blocked status) — dropping
+                # the late write is the contract.
                 log.info(
-                    "Report row %s for %s/%s no longer exists; write dropped.",
-                    report_id, data_domain, dataset,
+                    "Report row %s for %s/%s is gone or %s; write dropped.",
+                    report_id, data_domain, dataset, unless_status or "deleted",
                 )
                 return
             if attempt < attempts:

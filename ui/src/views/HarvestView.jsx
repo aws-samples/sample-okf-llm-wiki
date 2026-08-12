@@ -28,6 +28,7 @@ import {
   SlidersHorizontalIcon,
   SparklesIcon,
   TerminalIcon,
+  Trash2Icon,
   TriangleAlertIcon,
   UsersIcon,
   WrenchIcon,
@@ -1321,7 +1322,12 @@ export default function HarvestView({
               can apply a PARTIAL selection. Always shown; the cross scope is
               offered only when external/ docs (or notes on them) exist. */}
                   <Dialog open={annoOpen} onOpenChange={setAnnoOpen}>
-                    <DialogContent className="sm:max-w-lg">
+                    {/* 2xl, not the lg default: each row is a full annotation
+                        note plus its quoted doc context — at lg the prose
+                        wraps into a tall column and the quotes truncate to
+                        uselessness. Same width tier as the other
+                        content-heavy dialogs (benchmark setup, qbank). */}
+                    <DialogContent className="sm:max-w-2xl">
                       <DialogHeader>
                         <DialogTitle>Apply annotations</DialogTitle>
                         <DialogDescription>
@@ -1741,6 +1747,10 @@ function toolIcon(tool) {
     case "write_file":
     case "edit_file":
       return FileTextIcon
+    case "delete":
+      // Its own icon, not the file one: a removal should be visually loud in
+      // the feed (the step label carries the full doc path for the same reason).
+      return Trash2Icon
     case "list_concepts":
     case "read_concept_raw":
     case "sample_rows":
@@ -2605,7 +2615,7 @@ const PROGRESS_PHASES = {
 
 function ProgressRow({ row }) {
   const total = row.total > 0 ? row.total : 0
-  const done = total > 0 ? Math.min(row.done ?? 0, total) : row.done ?? 0
+  const done = total > 0 ? Math.min(row.done ?? 0, total) : (row.done ?? 0)
   const pct = total > 0 ? Math.round((done / total) * 100) : 0
   const complete = total > 0 && done >= total
   const title = PROGRESS_PHASES[row.phase] || row.phase
@@ -2623,7 +2633,7 @@ function ProgressRow({ row }) {
           style={{ width: `${pct}%` }}
         />
       </div>
-      <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+      <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
         {done}/{total}
       </span>
       {row.label && !complete ? (

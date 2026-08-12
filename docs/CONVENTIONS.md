@@ -1335,6 +1335,50 @@ per-case inline summaries, ALL traces are laid into the judge's file tree as
 `.traces/<check>/q<id>-run<n>.md` so it can `grep` across solvers for
 systemic patterns.
 
+**Synthetic question banks** (`mode: "generate_questions"` — `okf_core.qbank`
++ `harvest/benchmark/qgen.py`) share the Benchmark Studio posture exactly: no
+lease, no mount, nothing written to the bundle, loud failures on the row. The
+index row is `sk = "QBANK#<qbank_id>"` on the same `HARVEST#<d>#<ds>`
+partition (ids `qb<timestamp>-<token>`, time-prefixed and chronologically
+sortable like report ids), same `queued → running → complete/failed`
+lifecycle, heartbeat, and stale-delete escape; the artifact —
+`benchmark/<d>/<ds>/qbank/<id>.json`, gold-carrying, off-mount — holds
+`{config, questions[], dropped[], counts, telemetry}`. The author agents see
+ONLY the dataset's ground truth (`.metadata/` + `.context/`, physically
+materialized without the wiki docs — the wiki is the system under test) plus
+the live source tools; the config (`count` 20–100, `checks` + `sql_share`,
+`dimensions`) is validated by `okf_core.qbank.validate_config` at the Control
+API AND in the runtime, and the deterministic allocator turns it into
+explicit (dimension, tier, check) slots. Questions are delivered through the
+`submit_question` tool, which validates at submit time (shape, cross-author
+dedup, business-language leakage lint, and a live gold execution under the
+grading caps — an applied bank can never produce DISCARDED questions); a
+quota middleware refuses a silent finish (every slot filled or explicitly
+forfeited), one backfill round — chunked into round-1-sized author batches so
+a large leftover set doesn't blow one agent's step budget — retries the
+leftovers, and the rest are dropped WITH reasons in the artifact. Routes: `POST/GET
+/benchmark/{d}/{ds}/qbanks`, `GET/DELETE .../qbanks/{qbank_id}`, `POST
+.../qbanks/{qbank_id}/apply`, `POST .../qbanks/{qbank_id}/cancel`. Cancel
+mirrors the harvest cancel (best-effort `StopRuntimeSession` on the row's
+session, then a CONDITIONAL flip to `cancelled` that never clobbers a
+terminal state) with one stronger guarantee: **partial work does not
+survive** — the cancel purges every artifact version under the qbank key,
+the runtime discards instead of persisting when it finds the row cancelled,
+EVERY runtime row write (the initial `running` flip included — a cancel
+landing while the row is still queued cannot be undone by the cold start,
+which also exits without generating) is conditional on NOT-cancelled (a
+blocked write is dropped, closing the resurrection race), the start path's
+failure flip is conditional the same way (a hung invoke can neither
+overwrite a cancel nor upsert a ghost of a deleted row), and `GET`/`apply`
+serve the artifact for COMPLETE rows only, so even a race-surviving orphan
+is unreachable. Dataset deletion purges QBANK# rows with the REPORT# rows.
+A bank past the inline response cap ships as a presigned `bank_url` (the
+canonical CSV stays inline). Apply renders the canonical CSV
+(`question,gold_sql,expected_behavior,tier,dimension`; the extra columns are
+ignored by `load_questions` per its documented contract) and REPLACES
+`benchmark/<d>/<ds>/questions.csv` (reversible: versioned bucket, runs pin
+their CSV version).
+
 or, for writing/refreshing a domain's concept doc through the mount:
 
 ```json
@@ -1453,6 +1497,7 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_HARVEST_REL_SKETCH_ENABLED` / `OKF_HARVEST_REL_SKETCH_K` / `OKF_HARVEST_REL_SKETCH_MIN_CONTAINMENT` / `OKF_HARVEST_REL_SKETCH_MAX_COLUMNS` | the NAME-BLIND value-sketch nominator inside the relationship pass (full harvests only; default on): per key-ish/text column a KMV bottom-k sketch (`k` default `256`, error ~1/√k) is computed during the snapshot — Athena in ONE columnar scan per table via `min(DISTINCT from_big_endian_64(xxhash64(...)), k)` (both tokens matter: `min(x, n)` is a row-level order statistic so a multiset sketch collapses on fact-side FKs, and Trino's `xxhash64` returns VARBINARY so without the decode every cell is unparseable and the nominator silently disables itself), Redshift one cheap per-column query via `FNV_HASH` — and all cross-table column pairs are compared in memory; pairs whose estimated value containment ≥ the threshold (default `0.5`) are nominated into the SAME probe/verdict pipeline as name/role candidates (`via="sketch"` note on the sheet). This is what catches renamed keys (`cds` = `cdscode`). Guardrails: the CONTAINED side must exceed the enum-domain size (a tiny domain is inside everything — the dense-integer trap) and must NOT be its own table's PK (bare `id` or a self-naming key — FKs point AT PKs, so a PK contained elsewhere is the dense-surrogate coincidence: 301 junk `id↔id` nominations on MusicBrainz), containment INTO a dense INT PK additionally requires the contained column to NAME the containing table (`artist` → `artist.id`, `begin_area` → `area.id` — a 1..N surrogate numerically contains every smaller int column, so values alone prove nothing there; hash/UUID PKs and non-PK containers like `cdscode` stay name-free since sparse domains don't collide by chance), same-named holder pairs collapse toward the column's HOME table exactly like the name source (`tag` in fifteen `*_tag` tables pairs each holder with `tag`, never pairwise; widely-shared same-named columns with no home are refused), max `12` columns sketched per table (eligibility is TYPE-based — int/text families only, name-blind; names only RANK under the cap), dedup against name/role nominations, and the shared budget/size gates apply — oversized tables are not sketched at all, and a sketch is always its OWN full scan of just the sketched columns, never the profile pass's row sample (per-VALUE facts don't survive row sampling; a sampled sketch would publish deflated containment that reads as "unrelated"). Sketch nominations are the one candidate source that does not re-enumerate from the catalog, so full runs persist them in `relationships/candidates.json` and incremental/cross runs (which never sketch) revalidate + merge them — without it the first non-full run would silently drop every sketch-discovered sheet. Known blind spot: key pairs whose distinct counts differ by more than ~`k`/8 are beyond the sketch's resolving power — counted in the harvest log, falls back to live probing |
 | `OKF_HARVEST_BEDROCK_MAX_ATTEMPTS` | botocore `retries.max_attempts` in adaptive mode (default `5`); retries transient throttles and timeouts instead of failing the run |
 | `OKF_BENCHMARK_MAX_CONCURRENCY` | how many benchmark solver ReAct loops (and judge reviews) run at once in a Benchmark Studio run (default `10`). Its own `asyncio.Semaphore` — each solver is one in-flight model request at a time, so this is the peak concurrent Bedrock requests from the benchmark. Raise on generous quota, lower on `ThrottlingException`. `mode: "benchmark"` runs only. |
+| `OKF_QGEN_MAX_CONCURRENCY` | peak concurrent question-author agents in a `mode: "generate_questions"` run (default `4` — authors are long-lived explorers, not one-question solvers). Gold validation reuses the grader's `OKF_BENCHMARK_GRADER_TIMEOUT_S`/`_MAX_ROWS` caps so a generated gold can never be DISCARDED at grading time. |
 | `OKF_BENCHMARK_ATHENA_CONCURRENCY` | how many benchmark grading queries (gold/predicted SQL EX executions) run against Athena at once (default `15`); size under the Athena workgroup's concurrent-DML limit. `mode: "benchmark"` runs only |
 | `OKF_BENCHMARK_GRADER_TIMEOUT_S` | per-query timeout in seconds for the SQL EX grader's Athena executions (default `60`). A timed-out query is best-effort cancelled (`stop_query_execution`) so it doesn't keep holding a workgroup slot; the timeout classifies as TRANSIENT (retried with backoff, never memoized). Grading only — the harvest's own `sample_rows`/`run_sql` keep their own timeout. `mode: "benchmark"` runs only |
 | `OKF_BENCHMARK_GRADER_MAX_ROWS` | row cap on one grading query's result set (default `50000`). Past the cap collection stops and the outcome is classified — gold → DISCARDED ("gold result exceeds N rows"), prediction → FAIL — instead of buffering an unbounded result. Grading only. `mode: "benchmark"` runs only |
