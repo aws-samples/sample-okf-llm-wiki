@@ -87,6 +87,48 @@ exactly what each check would grade. A run pins the CSV version it was started
 with, so re-uploading mid-run never changes what an in-flight run grades —
 only future runs see the new set.
 
+### Or: generate a question bank synthetically
+
+**Generate questions** (same page) authors a bank for you. An agent — running
+on the harvest runtime, no lease, nothing written to the wiki — reads the
+dataset's **ground truth only**: the `.metadata/` catalog snapshot (schema,
+value profiles, join/grain evidence) and the `.context/` uploaded source docs.
+It deliberately never sees the authored wiki: questions phrased in the wiki's
+own vocabulary would test parroting; questions authored from the source truth
+test whether the wiki *captured* it. Questions are phrased in business
+language (a lint rejects physical `snake_case`/`table.column` identifiers),
+and every Accuracy gold is **executed live** through the same runner grading
+uses before it lands in the bank — an applied bank can't produce DISCARDED
+questions.
+
+You choose: how many questions (20–100), which checks (Accuracy / Behavior /
+both, with the mix ratio), which **dimensions** to probe (Direct Retrieval,
+Aggregation & Decomposition, NL Resolution & Disambiguation, Comparison,
+Derived KPI Computation, Conditional & Multi-Step Reasoning, Anomaly & Pattern
+Detection, Counterfactual & Projection, Meta/Introspection, Grain & Join-Trap
+Safety, Null & Sentinel Semantics, Unanswerable/Honesty), and the author
+model. Complexity mixes automatically (~30% easy / 40% medium / 30% hard;
+easy = one table, medium = one join or grouped aggregate, hard = multi-step /
+disambiguation / a known trap). A quota gate keeps authors honest: every
+requested slot must be filled or explicitly forfeited with a reason; forfeits
+get one backfill round, and anything still unfilled is **dropped and reported**
+("57/60 delivered", reasons shown) — never silently padded.
+
+A running generation can be **cancelled** from its row (the stop button):
+the runtime session is terminated and the partial bank is discarded — a
+cancelled generation never leaves questions behind, so what you see in the
+list is only banks that finished whole. Cancel is immediate; regenerate when
+you want a fresh attempt.
+
+When the generation completes, click the row to review the bank (filter by
+dimension/tier/check, expand each question's gold or expectation), then
+**Download CSV** (hand-edit and upload like any bank) or **Apply to Studio**
+— which replaces the dataset's question set. Apply is reversible by
+construction: the bucket is versioned and runs pin the CSV version they
+started with. Generated CSVs carry two extra columns (`tier`, `dimension`)
+that the parser ignores today — they ride along for humans and for future
+per-dimension score slicing.
+
 ---
 
 ## Step 2 — Configure and start a run
@@ -203,7 +245,8 @@ datasets; full descriptions in [`CONVENTIONS.md`](./CONVENTIONS.md)):
 | `OKF_BENCHMARK_MAX_CONCURRENCY` | `10` | Peak concurrent solver (and judge) model requests. Lower on `ThrottlingException`. |
 | `OKF_BENCHMARK_ATHENA_CONCURRENCY` | `15` | Peak concurrent grading queries. Keep under the Athena workgroup's concurrent-DML limit. |
 | `OKF_BENCHMARK_GRADER_TIMEOUT_S` | `60` | Per-query timeout for grading executions; a timed-out query is cancelled so it doesn't hold a workgroup slot. Raise for slow warehouses. |
-| `OKF_BENCHMARK_GRADER_MAX_ROWS` | `50000` | Row cap per grading result set. Past it, a gold is DISCARDED / a prediction FAILS with an explicit "exceeds N rows" reason. |
+| `OKF_BENCHMARK_GRADER_MAX_ROWS` | `50000` | Row cap per grading result set. Past it, a gold is DISCARDED / a prediction FAILS with an explicit "exceeds N rows" reason. (Question generation validates golds under the same timeout/row caps.) |
+| `OKF_QGEN_MAX_CONCURRENCY` | `4` | Peak concurrent question-author agents during a bank generation. |
 
 Grading errors are classified: transient Athena faults (throttles, 5xx,
 timeouts) are retried with backoff, and if one still fails the outcome reads

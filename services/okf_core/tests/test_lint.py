@@ -516,3 +516,31 @@ def test_type_families_cover_redshift_spellings():
     assert _type_family("time without time zone") == "time"
     assert _type_family("timestamp with time zone") == "timestamp"
     assert not _families_comparable(_type_family("text"), _type_family("bigint"))
+
+
+def test_read_columns_tsv_is_header_driven(tmp_path):
+    # ONE public parser for the snapshot format (lint + the benchmark question
+    # generator's leakage lint both read through it). Header-driven so the
+    # 4-col layout here and the multi-database fork's 5-col (database first)
+    # layout parse with the same code.
+    from okf_core.lint import read_columns_tsv
+
+    four = tmp_path / "four.tsv"
+    four.write_text(
+        "table\tcolumn\ttype\tcomment\nRaces\tRace_Id\tbigint\tpk\n",
+        encoding="utf-8",
+    )
+    assert read_columns_tsv(four) == {"races": {"race_id": "bigint"}}
+
+    five = tmp_path / "five.tsv"
+    five.write_text(
+        "database\ttable\tcolumn\ttype\tcomment\nsales\torders\tid\tint\tpk\n",
+        encoding="utf-8",
+    )
+    assert read_columns_tsv(five) == {"orders": {"id": "int"}}
+
+    # Missing file / unrecognizable header -> None (callers degrade).
+    assert read_columns_tsv(tmp_path / "absent.tsv") is None
+    weird = tmp_path / "weird.tsv"
+    weird.write_text("a\tb\tc\nx\ty\tz\n", encoding="utf-8")
+    assert read_columns_tsv(weird) is None

@@ -402,6 +402,8 @@ function ChartFrameInner({ code, title, live, boxHeight = 340 }) {
         loading="lazy"
         // Kept mounted at full size (it must load + draw to report ok) but
         // transparent until reveal; the placeholder floats above it meanwhile.
+        // Reveal is a PURE opacity cross-fade — no transform: a translate/scale
+        // ramp here read as the chart drifting up and growing as it appeared.
         style={{
           width: "100%",
           height: "100%",
@@ -410,8 +412,7 @@ function ChartFrameInner({ code, title, live, boxHeight = 340 }) {
           background: "transparent",
           colorScheme: "normal",
           opacity: showChart ? 1 : 0,
-          transform: showChart ? "none" : "translateY(6px) scale(0.99)",
-          transition: "opacity 0.5s ease, transform 0.5s ease",
+          transition: "opacity 0.5s ease",
         }}
       />
       )}

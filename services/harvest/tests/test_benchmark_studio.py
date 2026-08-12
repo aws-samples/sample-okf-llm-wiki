@@ -544,12 +544,12 @@ def test_grading_execute_threads_env_knobs_and_positional(monkeypatch):
 
 
 def test_grading_execute_defaults(monkeypatch):
-    from harvest.benchmark.studio import _grader_max_rows, _grader_timeout_s
+    from harvest.benchmark.studio import grader_max_rows, grader_timeout_s
 
     monkeypatch.delenv("OKF_BENCHMARK_GRADER_TIMEOUT_S", raising=False)
     monkeypatch.delenv("OKF_BENCHMARK_GRADER_MAX_ROWS", raising=False)
-    assert _grader_timeout_s() == 60.0
-    assert _grader_max_rows() == 50000
+    assert grader_timeout_s() == 60.0
+    assert grader_max_rows() == 50000
 
 
 def test_get_text_pins_the_questions_version():

@@ -405,6 +405,54 @@ export function makeApi(token) {
         "DELETE",
         `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/runs/${encodeURIComponent(reportId)}`
       ),
+    // Synthetic question banks (mode=generate_questions). start: {count,
+    // checks, sql_share?, dimensions?, model?, effort?} → {qbank_id, status:
+    // "queued"}; the list poller takes it from there. get returns {row, bank,
+    // csv} — bank/csv null until complete; csv is the canonical rendering the
+    // Download button saves and Apply writes as the dataset's questions.csv.
+    startQbankGeneration: (domain, dataset, config) =>
+      request(
+        token,
+        "POST",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/qbanks`,
+        config
+      ),
+    listQbanks: (domain, dataset) =>
+      request(
+        token,
+        "GET",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/qbanks`
+      ),
+    getQbank: (domain, dataset, qbankId) =>
+      request(
+        token,
+        "GET",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/qbanks/${encodeURIComponent(qbankId)}`
+      ),
+    // Apply = REPLACE the dataset's question set (the bucket is versioned and
+    // runs pin the CSV version they started with, so this is reversible and
+    // never affects an in-flight run).
+    applyQbank: (domain, dataset, qbankId) =>
+      request(
+        token,
+        "POST",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/qbanks/${encodeURIComponent(qbankId)}/apply`
+      ),
+    // Terminate an in-flight generation: stops the runtime session, flips the
+    // row to cancelled, and PURGES any partial artifact — cancelled work does
+    // not survive (regenerate instead).
+    cancelQbank: (domain, dataset, qbankId) =>
+      request(
+        token,
+        "POST",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/qbanks/${encodeURIComponent(qbankId)}/cancel`
+      ),
+    deleteQbank: (domain, dataset, qbankId) =>
+      request(
+        token,
+        "DELETE",
+        `/benchmark/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/qbanks/${encodeURIComponent(qbankId)}`
+      ),
     // Kick the annotation aggregator for a complete report (409 while one runs).
     // Progress lands on the row's agg_status; the final set in the report JSON.
     aggregateReportAnnotations: (domain, dataset, reportId) =>

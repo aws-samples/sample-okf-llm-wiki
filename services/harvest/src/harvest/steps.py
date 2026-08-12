@@ -227,6 +227,15 @@ def shape_step(tool_name: str, args: dict[str, Any] | None) -> dict[str, str]:
             "tool": name,
             "label": f"Editing {_basename(fp)}" if fp else "Editing a file",
         }
+    if name == "delete":
+        fp = _first_arg(args, "file_path", "path")
+        # The FULL root-relative path, not the 2-segment tail the other file
+        # ops show: a removal is the one op an operator audits from the feed,
+        # so the label must name the doc unambiguously.
+        return {
+            "tool": name,
+            "label": f"Deleting {fp.lstrip('/')}" if fp else "Deleting a file",
+        }
     if name in ("glob", "grep"):
         pat = _first_arg(args, "pattern", "query")
         return {

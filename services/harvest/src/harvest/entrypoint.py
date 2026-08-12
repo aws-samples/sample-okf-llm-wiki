@@ -95,6 +95,11 @@ def _dispatch(payload: dict, session_id: str | None = None) -> None:
 
         run_aggregate_annotations(payload, session_id=session_id)
         return
+    if mode == "generate_questions":
+        from harvest.benchmark.qgen import run_generate_questions
+
+        run_generate_questions(payload, session_id=session_id)
+        return
 
     # AR rules maintenance — the rebuild authority invokes this when a policy
     # needs (re)authoring and no content-addressed snapshot covers the current
@@ -284,6 +289,8 @@ def _safe(payload: dict) -> dict:
             "mode",
             "changed_table",
             "report_id",
+            "qbank_id",
+            "config",
             "checks",
             "runs",
             "version_id",
@@ -329,6 +336,10 @@ def _validate(payload: dict) -> str | None:
         from harvest.benchmark.studio import validate_aggregate_payload
 
         return validate_aggregate_payload(payload)
+    if mode == "generate_questions":
+        from harvest.benchmark.qgen import validate_qgen_payload
+
+        return validate_qgen_payload(payload)
     if mode == "ar_rules":
         for key in ("data_domain", "dataset"):
             if not payload.get(key):

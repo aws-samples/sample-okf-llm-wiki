@@ -146,6 +146,11 @@ STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
 STATUS_COMPLETE = "complete"
 STATUS_FAILED = "failed"
+#: Operator-initiated termination (QBANK rows today; reports have no cancel).
+#: Terminal like failed — and the partial work does NOT survive: the cancel
+#: path stops the microVM, purges any artifact, and the runtime discards
+#: rather than persists when it finds the row cancelled.
+STATUS_CANCELLED = "cancelled"
 
 #: The annotation-aggregation sub-lifecycle (a field on the report, not a row
 #: status): idle until the user asks, then running/complete/failed.

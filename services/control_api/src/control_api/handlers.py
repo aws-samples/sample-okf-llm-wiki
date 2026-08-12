@@ -1050,22 +1050,37 @@ def _purge_s3_prefix_versions(s3, *, bucket: str, prefix: str) -> int:
 def _delete_report_rows(
     ddb, registry_table: str, data_domain: str, dataset: str
 ) -> int:
-    """Delete every benchmark ``REPORT#`` row for a dataset; returns the count.
+    """Delete every benchmark ``REPORT#`` AND ``QBANK#`` row for a dataset;
+    returns the count.
 
     Same partition as the harvest status row (``HARVEST#<d>#<ds>``), so this is
-    one Query on the sk prefix + per-row deletes. Without it a deleted dataset's
-    reports (KPIs, gold-derived config) survived — and re-registering the same
-    names resurrected them in the new owner's report list.
+    one Query per sk prefix + per-row deletes. Without it a deleted dataset's
+    reports (KPIs, gold-derived config) — and its generated question banks —
+    survived: re-registering the same names resurrected them in the new
+    owner's lists, as ghost banks whose artifacts the S3 purge already
+    removed.
     """
     from okf_core import benchmark_report as br
+    from okf_core import qbank as qb
 
+    return sum(
+        _delete_rows_by_sk_prefix(
+            ddb, registry_table, f"HARVEST#{data_domain}#{dataset}", prefix
+        )
+        for prefix in (br.report_sk_query_prefix(), qb.qbank_sk_query_prefix())
+    )
+
+
+def _delete_rows_by_sk_prefix(
+    ddb, registry_table: str, pk: str, sk_prefix: str
+) -> int:
     deleted = 0
     kwargs: dict[str, Any] = {
         "TableName": registry_table,
         "KeyConditionExpression": "pk = :pk AND begins_with(sk, :skp)",
         "ExpressionAttributeValues": {
-            ":pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
-            ":skp": {"S": br.report_sk_query_prefix()},
+            ":pk": {"S": pk},
+            ":skp": {"S": sk_prefix},
         },
     }
     while True:
@@ -1673,22 +1688,39 @@ def _fail_report_row(
     """Best-effort flip of a REPORT# row to failed (start-path cleanup only)."""
     from okf_core import benchmark_report as br
 
+    _fail_row(
+        ddb,
+        registry_table=registry_table,
+        pk=_report_pk(data_domain, dataset),
+        sk=br.report_sk(report_id),
+        detail=detail,
+    )
+
+
+def _fail_row(ddb, *, registry_table: str, pk: str, sk: str, detail: str) -> None:
+    """Flip one lifecycle row (REPORT#/QBANK#) to ``failed`` — best-effort,
+    and CONDITIONAL: the row must still exist (UpdateItem otherwise UPSERTS,
+    and a slow invoke failing after the operator deleted the row would
+    resurrect a keyless ghost) and must not be ``cancelled`` (the operator's
+    cancel verdict outranks a late failure report). A blocked write is
+    dropped on purpose."""
+    from okf_core import benchmark_report as br
+
     try:
         ddb.update_item(
             TableName=registry_table,
-            Key={
-                "pk": {"S": _report_pk(data_domain, dataset)},
-                "sk": {"S": br.report_sk(report_id)},
-            },
+            Key={"pk": {"S": pk}, "sk": {"S": sk}},
             UpdateExpression="SET #s = :s, detail = :d, updated_at = :u",
+            ConditionExpression="attribute_exists(pk) AND #s <> :cancelled",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":s": {"S": br.STATUS_FAILED},
                 ":d": {"S": detail[:1024]},
                 ":u": {"S": _now_iso()},
+                ":cancelled": {"S": br.STATUS_CANCELLED},
             },
         )
-    except Exception:  # noqa: BLE001 - best-effort cleanup
+    except Exception:  # noqa: BLE001 - best-effort cleanup; a blocked write IS the contract
         pass
 
 
@@ -2121,6 +2153,484 @@ def delete_benchmark_report(
         },
     )
     return {"deleted": True, "report_id": report_id, "objects_deleted": deleted}
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic question banks (mode=generate_questions — okf_core.qbank)
+# --------------------------------------------------------------------------- #
+
+
+def start_qbank_generation(
+    agentcore,
+    ddb,
+    *,
+    registry_table: str,
+    runtime_arn: str,
+    data_domain: str,
+    dataset: str,
+    config: dict[str, Any] | None,
+    model: str | None,
+    effort: str | None,
+    requested_by: str = "",
+) -> dict[str, Any]:
+    """Validate the generation config, write the QUEUED QBANK# row, invoke the
+    runtime (``mode=generate_questions``).
+
+    Mirrors :func:`start_benchmark_run`'s trust boundary: the config
+    normalizes via ``okf_core.qbank`` (400s HERE, not minutes later on the
+    row), the dataset must be registered, and an invoke failure flips the row
+    to ``failed`` so the list never shows a phantom queued generation.
+    """
+    from okf_core import benchmark_report as br
+    from okf_core import qbank as qb
+
+    try:
+        config = qb.validate_config(config)
+    except qb.QbankConfigError as e:
+        raise ApiError(400, str(e)) from e
+
+    if not ddb.get_item(
+        TableName=registry_table,
+        Key={"pk": {"S": f"DOMAIN#{data_domain}"}, "sk": {"S": f"DATASET#{dataset}"}},
+    ).get("Item"):
+        raise ApiError(404, f"no such dataset: {data_domain}/{dataset}")
+
+    # Resolve the source BEFORE writing the queued row (same reason as
+    # benchmark runs: a DDB read throwing after the PutItem would orphan a
+    # queued row no runtime will ever touch).
+    source = get_dataset_source(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
+
+    now = _now_iso()
+    qbank_id = qb.new_qbank_id(
+        now_compact=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"),
+        token=uuid.uuid4().hex[:8],
+    )
+    session_id = runtime_session_id(data_domain, dataset, unique_token=qbank_id)
+
+    # The QUEUED index row — flat scalars only, like REPORT# rows.
+    item: dict[str, Any] = {
+        "pk": {"S": _report_pk(data_domain, dataset)},
+        "sk": {"S": qb.qbank_sk(qbank_id)},
+        "qbank_id": {"S": qbank_id},
+        "status": {"S": br.STATUS_QUEUED},
+        "created_at": {"S": now},
+        "updated_at": {"S": now},
+        "requested_count": {"N": str(config[qb.FIELD_COUNT])},
+        "checks": {"S": ",".join(config[qb.FIELD_CHECKS])},
+        "sql_share": {"N": str(config[qb.FIELD_SQL_SHARE])},
+        "dimensions": {"S": ",".join(config[qb.FIELD_DIMENSIONS])},
+        "runtime_session_id": {"S": session_id},
+    }
+    if model:
+        item["model"] = {"S": model}
+    if effort:
+        item["effort"] = {"S": effort}
+    if requested_by:
+        item["requested_by"] = {"S": requested_by}
+    ddb.put_item(
+        TableName=registry_table,
+        Item=item,
+        ConditionExpression="attribute_not_exists(sk)",
+    )
+
+    payload: dict[str, Any] = {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "mode": "generate_questions",
+        "qbank_id": qbank_id,
+        "config": config,
+    }
+    if model:
+        payload["model"] = model
+    if effort:
+        payload["effort"] = effort
+    if source:
+        payload["source"] = source
+
+    try:
+        ack = _invoke_ack(
+            agentcore.invoke_agent_runtime(
+                agentRuntimeArn=runtime_arn,
+                runtimeSessionId=session_id,
+                payload=json.dumps(payload).encode(),
+                qualifier="DEFAULT",
+            )
+        )
+    except Exception as e:  # noqa: BLE001 - flip the row so no phantom queued run
+        _fail_qbank_row(
+            ddb, registry_table=registry_table, data_domain=data_domain,
+            dataset=dataset, qbank_id=qbank_id, detail=f"invoke failed: {e}",
+        )
+        raise ApiError(502, f"could not start the generation: {e}") from e
+    if isinstance(ack, dict) and ack.get("status") == "rejected":
+        err = str(ack.get("error") or "the runtime rejected the payload")
+        _fail_qbank_row(
+            ddb, registry_table=registry_table, data_domain=data_domain,
+            dataset=dataset, qbank_id=qbank_id, detail=f"runtime rejected: {err}",
+        )
+        raise ApiError(502, f"the runtime rejected the generation: {err}")
+
+    return {
+        "qbank_id": qbank_id,
+        "status": br.STATUS_QUEUED,
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "config": config,
+    }
+
+
+def _fail_qbank_row(
+    ddb, *, registry_table: str, data_domain: str, dataset: str, qbank_id: str,
+    detail: str,
+) -> None:
+    """See ``_fail_row``: conditional so a hung invoke that fails LATE can
+    neither overwrite an operator's cancel nor upsert a ghost of a deleted
+    row."""
+    from okf_core import qbank as qb
+
+    _fail_row(
+        ddb,
+        registry_table=registry_table,
+        pk=_report_pk(data_domain, dataset),
+        sk=qb.qbank_sk(qbank_id),
+        detail=detail,
+    )
+
+
+def list_qbanks(
+    ddb, *, registry_table: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """Every QBANK# row for the dataset, newest first (ids are time-prefixed,
+    so the sk range ordering is chronological — same trick as reports)."""
+    from okf_core import qbank as qb
+
+    kwargs: dict[str, Any] = {
+        "TableName": registry_table,
+        "KeyConditionExpression": "pk = :pk AND begins_with(sk, :skp)",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": _report_pk(data_domain, dataset)},
+            ":skp": {"S": qb.qbank_sk_query_prefix()},
+        },
+        "ScanIndexForward": False,
+    }
+    qbanks: list[dict[str, Any]] = []
+    while True:
+        resp = ddb.query(**kwargs)
+        qbanks.extend(_report_row_to_dict(item) for item in resp.get("Items", []))
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+    return {"data_domain": data_domain, "dataset": dataset, "qbanks": qbanks}
+
+
+def _get_qbank_row(
+    ddb, *, registry_table: str, data_domain: str, dataset: str, qbank_id: str
+) -> dict[str, Any]:
+    from okf_core import qbank as qb
+
+    if not qb.is_valid_qbank_id(qbank_id):
+        raise ApiError(400, f"invalid qbank id: {qbank_id!r}")
+    resp = ddb.get_item(
+        TableName=registry_table,
+        Key={
+            "pk": {"S": _report_pk(data_domain, dataset)},
+            "sk": {"S": qb.qbank_sk(qbank_id)},
+        },
+    )
+    item = resp.get("Item")
+    if not item:
+        raise ApiError(404, "no such question bank")
+    return item
+
+
+def _read_qbank_artifact(
+    s3, *, bucket: str, data_domain: str, dataset: str, qbank_id: str
+) -> dict[str, Any]:
+    from okf_core import qbank as qb
+
+    key = qb.qbank_key(data_domain, dataset, qbank_id)
+    try:
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except Exception as e:  # noqa: BLE001 - a missing artifact is a 404
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            raise ApiError(404, "no generated bank document") from e
+        raise ApiError(502, f"could not read the question bank: {e}") from e
+    try:
+        doc = json.loads(body)
+    except ValueError as e:
+        raise ApiError(502, "the question bank document is corrupt") from e
+    if not isinstance(doc, dict):
+        raise ApiError(502, "the question bank document is corrupt")
+    return doc
+
+
+def get_qbank(
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    qbank_id: str,
+) -> dict[str, Any]:
+    """One generated bank: the index row + (when complete) the artifact and
+    its canonical CSV rendering.
+
+    ``bank`` is None while queued/running or after a failure — the row tells
+    that story. ``csv`` is rendered HERE from the artifact's questions (one
+    implementation, ``okf_core.qbank.render_csv``) so the download the UI
+    offers and the apply below ship byte-identical banks.
+    """
+    from okf_core import qbank as qb
+
+    from okf_core import benchmark_report as br
+
+    item = _get_qbank_row(
+        ddb, registry_table=registry_table, data_domain=data_domain,
+        dataset=dataset, qbank_id=qbank_id,
+    )
+    bank = None
+    bank_url = None
+    csv_text = None
+    # Artifact served for COMPLETE rows only: a cancelled/failed generation's
+    # partial bank must not survive (the cancel path purges it, and this gate
+    # keeps even a race-surviving orphan unreachable).
+    if _s(item.get("status")) == br.STATUS_COMPLETE:
+        try:
+            # Same inline-cap/presign degrade as reports: a bank that outgrew
+            # the Lambda response ships as a short-lived URL instead of an
+            # opaque 502 (the UI follows it). The CSV rendering is far smaller
+            # than the JSON artifact, so it is read + rendered server-side
+            # regardless — Download must not depend on the inline path.
+            bank, bank_url = _read_benchmark_artifact(
+                s3,
+                bucket=bucket,
+                key=qb.qbank_key(data_domain, dataset, qbank_id),
+                what="question bank",
+                missing="no generated bank document",
+            )
+            doc = bank
+            if doc is None:
+                doc = _read_qbank_artifact(
+                    s3, bucket=bucket, data_domain=data_domain, dataset=dataset,
+                    qbank_id=qbank_id,
+                )
+            csv_text = qb.render_csv(list(doc.get("questions") or []))
+            if len(csv_text.encode("utf-8")) > _BENCHMARK_INLINE_MAX_BYTES:
+                csv_text = None  # pathological; the UI still has bank_url
+        except ApiError as e:
+            if e.status != 404:
+                raise
+    return {
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "row": _report_row_to_dict(item),
+        "bank": bank,
+        "bank_url": bank_url,
+        "csv": csv_text,
+    }
+
+
+def apply_qbank(
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    qbank_id: str,
+) -> dict[str, Any]:
+    """Apply a generated bank as the dataset's Benchmark Studio question set.
+
+    Renders the artifact's questions to CSV and writes the canonical
+    ``questions.csv`` key — REPLACE semantics, safe by construction: the
+    bundle bucket is versioned and every run pins the CSV version it started
+    with, so in-flight runs are untouched and the previous set stays
+    recoverable. The response carries the same per-check counts the upload
+    path reports (parsed by the same ``load_questions``), so what the UI
+    shows is exactly what a run would grade.
+    """
+    from okf_core import benchmark_report as br
+    from okf_core import qbank as qb
+    from okf_core.benchmark_questions import load_questions
+
+    item = _get_qbank_row(
+        ddb, registry_table=registry_table, data_domain=data_domain,
+        dataset=dataset, qbank_id=qbank_id,
+    )
+    if _s(item.get("status")) != br.STATUS_COMPLETE:
+        raise ApiError(409, "the generation is not complete yet")
+    bank = _read_qbank_artifact(
+        s3, bucket=bucket, data_domain=data_domain, dataset=dataset,
+        qbank_id=qbank_id,
+    )
+    questions = list(bank.get("questions") or [])
+    if not questions:
+        raise ApiError(409, "the generated bank holds no questions to apply")
+    csv_text = qb.render_csv(questions)
+    loaded = load_questions(csv_text)  # belt and braces: must parse as a bank
+    if not loaded.questions:
+        raise ApiError(502, "the generated bank did not render to a valid CSV")
+    s3.put_object(
+        Bucket=bucket,
+        Key=benchmark_questions_key(data_domain, dataset),
+        Body=csv_text.encode("utf-8"),
+        ContentType="text/csv",
+    )
+    return {
+        "applied": True,
+        "qbank_id": qbank_id,
+        "question_count": len(loaded.questions),
+        "check_counts": loaded.check_counts,
+    }
+
+
+def cancel_qbank_generation(
+    agentcore,
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    runtime_arn: str,
+    data_domain: str,
+    dataset: str,
+    qbank_id: str,
+) -> dict[str, Any]:
+    """Terminate an in-flight generation — and make sure the partial work does
+    not survive. Mirrors :func:`cancel_harvest`'s three steps on the QBANK row:
+
+    1. Only ``queued``/``running`` rows are cancellable (409 otherwise).
+    2. Best-effort ``StopRuntimeSession`` on the row's ``runtime_session_id``
+       — kills the exact microVM authoring the bank; non-fatal if the session
+       already ended.
+    3. CONDITIONAL flip to ``cancelled`` (still queued/running) — a generation
+       that reached a terminal state first is reported, never clobbered.
+
+    Then the belt-and-braces the harvest doesn't need: PURGE any artifact
+    versions under the qbank key. The runtime discards rather than persists
+    when it finds the row cancelled, and its terminal write is conditional on
+    NOT-cancelled — but an artifact PUT already in flight when the kill lands
+    could still touch S3, and a gold-carrying partial bank must not linger.
+    """
+    from okf_core import benchmark_report as br
+    from okf_core import qbank as qb
+
+    item = _get_qbank_row(
+        ddb, registry_table=registry_table, data_domain=data_domain,
+        dataset=dataset, qbank_id=qbank_id,
+    )
+    current = _s(item.get("status")) or ""
+    if current not in (br.STATUS_QUEUED, br.STATUS_RUNNING):
+        raise ApiError(
+            409, f"the generation is not in progress (status={current!r})"
+        )
+    session_id = _s(item.get("runtime_session_id")) or ""
+
+    stopped = False
+    if session_id and runtime_arn:
+        try:
+            agentcore.stop_runtime_session(
+                runtimeSessionId=session_id,
+                agentRuntimeArn=runtime_arn,
+                qualifier="DEFAULT",
+            )
+            stopped = True
+        except Exception as e:  # noqa: BLE001 - proceed to flip the row regardless
+            logging.getLogger("control_api").warning(
+                "StopRuntimeSession failed for qbank %s: %s",
+                qbank_id, type(e).__name__,
+            )
+
+    try:
+        ddb.update_item(
+            TableName=registry_table,
+            Key={
+                "pk": {"S": _report_pk(data_domain, dataset)},
+                "sk": {"S": qb.qbank_sk(qbank_id)},
+            },
+            UpdateExpression="SET #s = :c, updated_at = :u, detail = :d",
+            ConditionExpression="#s = :queued OR #s = :running",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":c": {"S": br.STATUS_CANCELLED},
+                ":u": {"S": _now_iso()},
+                ":d": {"S": "cancelled by operator"},
+                ":queued": {"S": br.STATUS_QUEUED},
+                ":running": {"S": br.STATUS_RUNNING},
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            latest = _get_qbank_row(
+                ddb, registry_table=registry_table, data_domain=data_domain,
+                dataset=dataset, qbank_id=qbank_id,
+            )
+            return {
+                "qbank_id": qbank_id,
+                "status": _s(latest.get("status")) or current,
+                "cancelled": False,
+                "stopped_session": stopped,
+                "detail": "the generation reached a terminal state before cancel",
+            }
+        raise
+
+    purged = _purge_s3_prefix_versions(
+        s3, bucket=bucket, prefix=qb.qbank_key(data_domain, dataset, qbank_id)
+    )
+    return {
+        "qbank_id": qbank_id,
+        "status": br.STATUS_CANCELLED,
+        "cancelled": True,
+        "stopped_session": stopped,
+        "objects_purged": purged,
+    }
+
+
+def delete_qbank(
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    qbank_id: str,
+) -> dict[str, Any]:
+    """Delete one generated bank: its artifact versions + the index row.
+
+    Same active-run guard and stale escape as report deletion (the QBANK row
+    shares the REPORT lifecycle, heartbeat included). Purges ALL S3 versions —
+    the artifact carries gold.
+    """
+    from okf_core import benchmark_report as br
+    from okf_core import qbank as qb
+
+    item = _get_qbank_row(
+        ddb, registry_table=registry_table, data_domain=data_domain,
+        dataset=dataset, qbank_id=qbank_id,
+    )
+    status = _s(item.get("status"))
+    if status in (br.STATUS_QUEUED, br.STATUS_RUNNING) and not _report_row_is_stale(item):
+        raise ApiError(409, f"the generation is {status}; wait for it to finish")
+    deleted = _purge_s3_prefix_versions(
+        s3, bucket=bucket, prefix=qb.qbank_key(data_domain, dataset, qbank_id)
+    )
+    ddb.delete_item(
+        TableName=registry_table,
+        Key={
+            "pk": {"S": _report_pk(data_domain, dataset)},
+            "sk": {"S": qb.qbank_sk(qbank_id)},
+        },
+    )
+    return {"deleted": True, "qbank_id": qbank_id, "objects_deleted": deleted}
 
 
 def start_annotation_aggregation(

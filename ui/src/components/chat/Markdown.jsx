@@ -92,20 +92,108 @@ const CITE_SCHEME = "okf-cite:"
 //  - a partial `<cite`/`</cite` PREFIX at the very end (`<`, `<c`, `<ci`, …) —
 //    CITE_PARTIAL_RE only matches once "cite" is complete, so the first few
 //    characters of every citation otherwise flash at the line end;
-//  - an unbalanced `**` (bold) or single-backtick run — react-markdown renders
-//    the opener literally until its pair arrives ("**Wolfs" shows raw
-//    asterisks). BALANCING (appending the closer) renders the in-progress span
-//    styled as intended instead, with no visual jump when the real closer lands.
+//  - an unbalanced `**` (bold) / `*` (italic) or single-backtick run —
+//    react-markdown renders the opener literally until its pair arrives
+//    ("**Wolfs" shows raw asterisks). BALANCING (appending the closer)
+//    renders the in-progress span styled as intended instead, with no visual
+//    jump when the real closer lands.
 // Skipped inside an open ``` fence (CodeView owns that text verbatim), and
 // applied ONLY while streaming — a completed message renders exactly as sent.
 const CITE_PREFIX_TAIL_RE = /<\/?(?:c(?:i(?:t(?:e)?)?)?)?$/i
+
+// Balance emphasis with a tiny SCANNER, not a `**`-pair parity count — the
+// parity version flickered two ways: a chunk boundary landing BETWEEN the two
+// stars of a `**` left a lone trailing `*` (parity "balanced" → literal
+// asterisk for a frame), and bullets (`* item`) or asterisks inside inline
+// code threw the count off, so bolds that were ALREADY closed toggled between
+// styled and literal from frame to frame. The scanner:
+//  1. masks inline code spans (a `*` inside backticks is not emphasis);
+//  2. walks star RUNS (`*` italic, `**` bold, `***`+ both — so a balanced
+//     `***key point***` never leaves a phantom half-open delimiter);
+//  3. skips list bullets (line-start `* ` after only whitespace);
+//  4. applies FLANKING rules so prose asterisks are never read as emphasis:
+//     a run may OPEN only after start/whitespace/an opening bracket or quote
+//     and before a non-space, non-closing-punct char; it may CLOSE only after
+//     a non-space, non-opening-bracket char. `COUNT(*)`, `3*4`, and
+//     `price * quantity` all fail both tests and stay plain text — the old
+//     scanner pushed them as openers and appended a spurious closer to every
+//     streaming frame;
+//  5. tracks open bold/italic as a stack and appends the missing closers in
+//     reverse order (`**a *b` → `**a *b***`).
+// Deliberately conservative: intraword emphasis (`un**usual**`) is not
+// repaired — it renders literally for a frame and settles when complete,
+// which is the old parity behavior and strictly better than mis-styling
+// arithmetic. Underscore emphasis is not handled — the model writes `**`/`*`.
+function scanEmphasis(text) {
+  const masked = text.replace(/`[^`]*`/g, (m) => "\0".repeat(m.length))
+  const stack = []
+  const toggle = (delim, canOpen, canClose) => {
+    if (canClose) {
+      const open = stack.lastIndexOf(delim)
+      if (open >= 0) {
+        stack.length = open
+        return
+      }
+    }
+    if (canOpen) stack.push(delim)
+  }
+  for (let i = 0; i < masked.length; i++) {
+    if (masked[i] !== "*") continue
+    let j = i
+    while (masked[j + 1] === "*") j++
+    const n = j - i + 1
+    const prev = i > 0 ? masked[i - 1] : ""
+    const next = j + 1 < masked.length ? masked[j + 1] : ""
+    // A single `*`: bullet iff at line start (only blanks before it on the
+    // line) and followed by a space — that's list syntax, not emphasis.
+    if (n === 1) {
+      const lineStart = masked.lastIndexOf("\n", i - 1) + 1
+      if (/^[ \t]*$/.test(masked.slice(lineStart, i)) && next === " ") {
+        i = j
+        continue
+      }
+    }
+    const canOpen =
+      next !== "" &&
+      !/[\s)\]},.;:!?'"]/.test(next) &&
+      (prev === "" || /[\s([{"'\-–—]/.test(prev))
+    const canClose = prev !== "" && !/[\s([{]/.test(prev)
+    if (n >= 3) {
+      toggle("**", canOpen, canClose)
+      toggle("*", canOpen, canClose)
+    } else {
+      toggle(n === 2 ? "**" : "*", canOpen, canClose)
+    }
+    i = j
+  }
+  return stack
+}
+
+function balanceEmphasis(md) {
+  let out = md.replace(/(^|[\s(])\*{1,3}$/, "$1")
+  // A trailing single star in CLOSER position (non-space before it) can be
+  // the half-arrived first char of a `**` closer — the chunk boundary landed
+  // between the two stars. If bold is the innermost open emphasis at that
+  // point, complete the closer; reading it as an italic toggle re-styled the
+  // whole bold span for a frame (the reported flicker).
+  if (/[^\s*]\*$/.test(out)) {
+    const before = scanEmphasis(out.slice(0, -1))
+    if (before[before.length - 1] === "**") out += "*"
+  }
+  const stack = scanEmphasis(out)
+  for (let j = stack.length - 1; j >= 0; j--) out += stack[j]
+  return out
+}
+
 function stripStreamTail(md) {
   if (!md) return md || ""
   let out = md.replace(CITE_PREFIX_TAIL_RE, "")
-  const inFence = ((out.match(/^```/gm) || []).length) % 2 === 1
+  const inFence = (out.match(/^```/gm) || []).length % 2 === 1
   if (!inFence) {
-    if (((out.match(/\*\*/g) || []).length) % 2 === 1) out += "**"
-    if (((out.match(/`/g) || []).length) % 2 === 1) out += "`"
+    // Close an open inline-code span FIRST so the emphasis scanner's mask
+    // sees it as code and ignores any `*` inside it.
+    if ((out.match(/`/g) || []).length % 2 === 1) out += "`"
+    out = balanceEmphasis(out)
   }
   return out
 }
@@ -138,10 +226,16 @@ const CITE_ADJACENT_RE =
 function mergeAdjacentCites(md) {
   let out = md
   for (let pass = 0; pass < 8; pass++) {
-    const next = out.replace(CITE_ADJACENT_RE, (_m, src) => `<cite src="${src},`)
+    const next = out.replace(
+      CITE_ADJACENT_RE,
+      (_m, src) => `<cite src="${src},`
+    )
     // The replacement above leaves `<cite src="a,<cite src="b">` — collapse the
     // inner opener so the two srcs share one tag.
-    const joined = next.replace(/<cite\s+src="([^"]*),<cite\s+src="/gi, '<cite src="$1,')
+    const joined = next.replace(
+      /<cite\s+src="([^"]*),<cite\s+src="/gi,
+      '<cite src="$1,'
+    )
     if (joined === out) break
     out = joined
   }
@@ -195,74 +289,74 @@ function textOf(children) {
 // Memoized in Markdown so the object is stable across streaming re-renders.
 function makeComponents(datasetScope, webSources, wikiSources, onOpenDoc) {
   return {
-  a({ href, children, ...props }) {
-    // Citation badge — an `okf-cite:<encoded source list>` link (from
-    // preprocessCitations), rendered as ONE grouped pill with a paginated card.
-    if (typeof href === "string" && href.startsWith(CITE_SCHEME)) {
-      const list = decodeURIComponent(href.slice(CITE_SCHEME.length))
-      return (
-        <CitationGroup
-          sources={parseCiteList(list)}
-          datasetScope={datasetScope}
-          webSources={webSources}
-          wikiSources={wikiSources}
-          onOpenDoc={onOpenDoc}
-        />
-      )
-    }
-    return (
-      <a href={href} target="_blank" rel="noreferrer noopener" {...props}>
-        {children}
-      </a>
-    )
-  },
-  // Wrap GFM tables in the shared label-grid scroll container so chat markdown
-  // tables get the SAME gapped, zebra-tinted label look + padded thin scrollbar
-  // as the tool-result tables (index.css `.okf-label-grid`).
-  table({ children, ...props }) {
-    return (
-      <div className="okf-label-grid">
-        <table {...props}>{children}</table>
-      </div>
-    )
-  },
-  // Inline code (`x`) arrives here with no `language-` class (fenced blocks carry
-  // one and are handled by `pre`→CodeView). When the token LOOKS LIKE a concept id
-  // it renders as a distinct LABEL pill — but this is an INFERENCE from the string
-  // shape, not a verified file reference, so deliberately NO file icon (an icon
-  // would falsely assert the doc exists; a hallucinated id would look real).
-  code({ className, children, ...props }) {
-    const cls = className || ""
-    if (!/language-/.test(cls)) {
-      const txt = textOf(children)
-      if (CONCEPT_ID_RE.test(txt)) {
+    a({ href, children, ...props }) {
+      // Citation badge — an `okf-cite:<encoded source list>` link (from
+      // preprocessCitations), rendered as ONE grouped pill with a paginated card.
+      if (typeof href === "string" && href.startsWith(CITE_SCHEME)) {
+        const list = decodeURIComponent(href.slice(CITE_SCHEME.length))
         return (
-          <span className="okf-concept-label" title={txt}>
-            {txt}
-          </span>
+          <CitationGroup
+            sources={parseCiteList(list)}
+            datasetScope={datasetScope}
+            webSources={webSources}
+            wikiSources={wikiSources}
+            onOpenDoc={onOpenDoc}
+          />
         )
       }
-    }
-    return (
-      <code className={className} {...props}>
-        {children}
-      </code>
-    )
-  },
-  // A fenced block arrives as <pre><code class="language-xxx">…</code></pre>.
-  // Render the whole <pre> as a CodeView (reading the language + source off the
-  // inner <code>); leave everything else untouched.
-  pre({ children }) {
-    const child = Array.isArray(children) ? children[0] : children
-    const cls = child?.props?.className || ""
-    const match = /language-(\w+)/.exec(cls)
-    if (child?.props) {
       return (
-        <CodeView code={textOf(child.props.children)} language={match?.[1]} />
+        <a href={href} target="_blank" rel="noreferrer noopener" {...props}>
+          {children}
+        </a>
       )
-    }
-    return <pre>{children}</pre>
-  },
+    },
+    // Wrap GFM tables in the shared label-grid scroll container so chat markdown
+    // tables get the SAME gapped, zebra-tinted label look + padded thin scrollbar
+    // as the tool-result tables (index.css `.okf-label-grid`).
+    table({ children, ...props }) {
+      return (
+        <div className="okf-label-grid">
+          <table {...props}>{children}</table>
+        </div>
+      )
+    },
+    // Inline code (`x`) arrives here with no `language-` class (fenced blocks carry
+    // one and are handled by `pre`→CodeView). When the token LOOKS LIKE a concept id
+    // it renders as a distinct LABEL pill — but this is an INFERENCE from the string
+    // shape, not a verified file reference, so deliberately NO file icon (an icon
+    // would falsely assert the doc exists; a hallucinated id would look real).
+    code({ className, children, ...props }) {
+      const cls = className || ""
+      if (!/language-/.test(cls)) {
+        const txt = textOf(children)
+        if (CONCEPT_ID_RE.test(txt)) {
+          return (
+            <span className="okf-concept-label" title={txt}>
+              {txt}
+            </span>
+          )
+        }
+      }
+      return (
+        <code className={className} {...props}>
+          {children}
+        </code>
+      )
+    },
+    // A fenced block arrives as <pre><code class="language-xxx">…</code></pre>.
+    // Render the whole <pre> as a CodeView (reading the language + source off the
+    // inner <code>); leave everything else untouched.
+    pre({ children }) {
+      const child = Array.isArray(children) ? children[0] : children
+      const cls = child?.props?.className || ""
+      const match = /language-(\w+)/.exec(cls)
+      if (child?.props) {
+        return (
+          <CodeView code={textOf(child.props.children)} language={match?.[1]} />
+        )
+      }
+      return <pre>{children}</pre>
+    },
   }
 }
 
