@@ -168,6 +168,19 @@ You also have run_sql: a READ-ONLY SQL tool that executes on the Amazon Redshift
 Read the relevant table doc first so you use real column names (the wiki's table concept ids are already schema-qualified, e.g. `tables/public.races`); the tool's description has the statement rules. Report the numbers you actually got and, when useful, the query you ran; never fabricate or extrapolate results beyond what the query returned.
 </sql_tool>"""
 
+# Appended on EVERY run (run_computation is always bound — a computation is
+# the sanctioned execution path, so it never requires the raw-SQL opt-in;
+# execution capability degrades to a rendered-SQL receipt on deployments
+# without the SQL flag). Written to stand alone: run_sql may or may not be
+# wired this turn, so it is referenced conditionally.
+COMPUTATIONS_BLOCK = """
+
+<computations_tool>
+You also have run_computation. Before deriving an answer that needs live numbers, check list_computations: an Attested Computation is a canonical, parameterized, read-only statement the wiki's authors froze for exactly one recurring question shape — you pass typed parameter values and the platform runs the sanctioned SQL under caps. When one matches the question, PREFER it over any hand-derived query: it is faster, deterministic across sessions, and its receipt tells you whether a named human verified it (`verified`), nobody has yet (`unverified`), or the doc changed after verification (`stale`) — mention that status when you present the numbers. If the receipt comes back `executed: false` with a note that execution is not enabled, report the rendered SQL and what it would answer rather than fabricating rows.
+
+A question NO computation covers needs live SQL access — use the live SQL tool when this turn has one wired; otherwise answer from the wiki and say which numbers you could not compute. When the user keeps asking the same parameterizable shape and no computation exists for it, suggest promoting it: with the user's go-ahead, file it via submit_annotation when you have that tool this session (describe the question, its parameters, and the intended logic), or tell the user to annotate the related doc themselves — the next annotation harvest can author it as `references/computations/<slug>.md`.
+</computations_tool>"""
+
 
 def compose_system_prompt(*blocks: str) -> str:
     """The base prompt plus whichever optional tool blocks this run has.

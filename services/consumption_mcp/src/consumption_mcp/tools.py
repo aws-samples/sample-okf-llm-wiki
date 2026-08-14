@@ -93,6 +93,20 @@ class ConsumptionConfig:
     vector_bucket: str
     vector_index: str
     registry_table: str
+    # Attested Computations execution (run_computation). Listing/describing/
+    # rendering always work (they are bundle reads); EXECUTION exists only
+    # when the deployment grants the runtime role read-only SQL (infra:
+    # var.enable_attested_computations, default false — machine-vended MCP
+    # creds must not gain source-data read from a routine apply).
+    computations_enabled: bool = False
+    # Redshift-mapped datasets additionally need the Data API client
+    # (`enable_attested_computations && enable_redshift`).
+    redshift_enabled: bool = False
+    athena_workgroup: str = ""
+    athena_output: str = ""
+    athena_catalog: str = "AwsDataCatalog"
+    computation_max_rows: int = 200
+    computation_timeout_s: float = 120.0
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ConsumptionConfig":
@@ -102,6 +116,19 @@ class ConsumptionConfig:
             vector_bucket=env["OKF_VECTOR_BUCKET"],
             vector_index=env["OKF_VECTOR_INDEX"],
             registry_table=env.get("OKF_REGISTRY_TABLE", "okf-registry"),
+            computations_enabled=env.get("OKF_COMPUTATIONS_ENABLED", "").lower()
+            in ("1", "true", "yes"),
+            redshift_enabled=env.get("OKF_REDSHIFT_ENABLED", "").lower()
+            in ("1", "true", "yes"),
+            athena_workgroup=env.get("OKF_ATHENA_WORKGROUP", ""),
+            athena_output=env.get("OKF_ATHENA_OUTPUT", ""),
+            athena_catalog=env.get("OKF_ATHENA_CATALOG", "AwsDataCatalog"),
+            computation_max_rows=int(
+                env.get("OKF_COMPUTATION_MAX_ROWS", "") or 200
+            ),
+            computation_timeout_s=float(
+                env.get("OKF_COMPUTATION_TIMEOUT_S", "") or 120
+            ),
         )
 
 
@@ -201,12 +228,18 @@ class ConsumptionTools:
         bedrock_runtime,
         ddb,
         config: ConsumptionConfig,
+        athena=None,
+        redshift_data=None,
     ):
         self.s3 = s3
         self.s3vectors = s3vectors
         self.bedrock_runtime = bedrock_runtime
         self.ddb = ddb  # a DynamoDB resource Table object (boto3 resource style)
         self.config = config
+        # Optional: only wired when computation execution is enabled; absent,
+        # run_computation returns the rendered SQL without running it.
+        self.athena = athena
+        self.redshift_data = redshift_data
 
     # -- read_me ---------------------------------------------------------
 
@@ -1014,6 +1047,116 @@ class ConsumptionTools:
         )
         result["versions"] = [m.descriptor() for m in markers]
         return result
+
+    # -- Attested Computations (list / describe / run) --------------------
+    # docs/ATTESTED_COMPUTATIONS.md §6 — the S3/engine plumbing is shared
+    # with the chat tools and the Control API via okf_aws.computation_run.
+
+    def list_computations(self, data_domain: str, dataset: str) -> dict[str, Any]:
+        """Every Attested Computation this dataset publishes: canonical,
+        human-verifiable, parameterized read-only SQL you execute by passing
+        typed parameter values — never by writing SQL.
+
+        Each entry carries the parameter contracts (name/type/required/
+        default/enum/example) and its verification status: ``verified`` (a
+        named human attested this exact statement), ``unverified``, or
+        ``stale`` (the doc changed after verification). Prefer a computation
+        over deriving your own SQL whenever one matches the question.
+        """
+        from okf_aws import computation_run
+
+        return computation_run.list_computations(
+            self.s3, self.config.bundle_bucket, data_domain, dataset
+        )
+
+    def describe_computation(
+        self, name: str, data_domain: str, dataset: str
+    ) -> dict[str, Any]:
+        """One computation's full contract: parameters, the frozen SQL (with
+        its ``@parameter`` holes), the content hash, and verification status.
+
+        Read the prose doc (``references/computations/<name>``) via
+        ``read_page`` for the business definition and the concepts it links.
+        """
+        from okf_aws import computation_run
+
+        comp, errors = computation_run.load_computation(
+            self.s3, self.config.bundle_bucket, data_domain, dataset, name
+        )
+        if comp is None:
+            return {"error": "; ".join(errors)}
+        overlay = computation_run.load_overlay(
+            self.s3, self.config.bundle_bucket, data_domain, dataset
+        )
+        out = computation_run.summarize(comp, overlay.get(comp.slug))
+        out["sql"] = comp.sql
+        return out
+
+    def run_computation(
+        self,
+        name: str,
+        data_domain: str,
+        dataset: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute a computation by filling its typed parameter holes.
+
+        You supply VALUES only — the platform validates them against the
+        declared contracts (type, enum, min/max: violations are refused),
+        renders them as typed literals, substitutes into the sanctioned SQL,
+        and runs read-only under row/time caps. The receipt always carries the
+        exact ``executed_sql``, the ``computation_sha256`` it came from, and
+        the verification status; ``warnings`` flag values outside the profiled
+        domains (the query still runs — data evolves).
+        """
+        from okf_aws import computation_run
+        from okf_core.computations import ComputationError
+        from okf_core.sources import normalize_source
+
+        comp, errors = computation_run.load_computation(
+            self.s3, self.config.bundle_bucket, data_domain, dataset, name
+        )
+        if comp is None:
+            return {"error": "; ".join(errors)}
+        overlay = computation_run.load_overlay(
+            self.s3, self.config.bundle_bucket, data_domain, dataset
+        )
+        domains = computation_run.load_domains(
+            self.s3, self.config.bundle_bucket, data_domain, dataset
+        )
+        source: dict[str, Any] | None = None
+        try:
+            item = (
+                self.ddb.get_item(
+                    Key={"pk": f"DOMAIN#{data_domain}", "sk": f"DATASET#{dataset}"}
+                ).get("Item")
+                or {}
+            )
+            source = normalize_source(
+                item.get("source"), glue_database=item.get("glue_database")
+            )
+        except Exception:  # noqa: BLE001 - no descriptor => render-only receipt
+            source = None
+        try:
+            return computation_run.run_computation(
+                comp,
+                parameters,
+                athena=self.athena,
+                redshift_data=self.redshift_data,
+                source=source,
+                athena_workgroup=self.config.athena_workgroup,
+                athena_output=self.config.athena_output,
+                athena_catalog=self.config.athena_catalog,
+                max_rows=self.config.computation_max_rows,
+                timeout_s=self.config.computation_timeout_s,
+                domains=domains,
+                overlay_entry=overlay.get(comp.slug),
+                execute=self.config.computations_enabled,
+            )
+        except ComputationError as e:
+            # Invalid values are a corrective error naming every problem at
+            # once — the retry converges in one step.
+            return {"error": str(e), "parameters": comp.parameters}
 
 
 # -- list_domains plumbing (module level: pure, unit-testable) --------------------

@@ -21,6 +21,10 @@ the rest still run:
                        be linked from a dataset overview.
 5. ``joins``         — join docs' ``a.x = b.y`` conditions name existing
                        columns whose Hive type families are comparable.
+6. ``computations``  — Attested Computation docs are shape-valid (one
+                       statement, holes == parameters), their ``column``
+                       bindings exist, and declared enums are grounded in the
+                       profile evidence (``domains.json``).
 
 SQL fences are classified once by :func:`collect_sql_fences` (runnable
 statement vs bare ON-clause fragment, placeholder-templated or not) so the
@@ -152,6 +156,11 @@ _PLACEHOLDER_RES = (
     re.compile(r"\$\{[^}]*\}"),
     re.compile(r"(?<![:\w]):[A-Za-z_]\w*"),
     re.compile(r"\.\.\."),
+    # @param holes (Attested Computations): never runnable as written. The
+    # computation docs' fences re-enter the EXPLAIN gate example-substituted
+    # (see _collect_fences); any OTHER doc quoting @-parameterized SQL is
+    # simply not runnable, which this classification states.
+    re.compile(r"(?<![\w@])@[A-Za-z_]\w*"),
 )
 
 _FIRST_WORD_RE = re.compile(r"[A-Za-z]+")
@@ -340,12 +349,32 @@ def collect_sql_fences(bundle_root: str | Path) -> list[SqlFence]:
 
 
 def _collect_fences(ctx: "_Context") -> list[SqlFence]:
+    # Deferred import: computations imports lint's fence primitives at module
+    # level, so lint reaches back lazily (same pattern as guard.check_join_doc).
+    from okf_core import computations as _comp
+
     out: list[SqlFence] = []
     for rel in ctx.doc_paths:
         doc = ctx.parsed.get(rel)
         if doc is None:
             continue
+        comp = None
+        if rel.startswith(_comp.COMPUTATIONS_PREFIX):
+            comp, _errs = _comp.parse_computation(rel, doc)
         for text in _sql_fences_in(doc.body):
+            # A valid computation's fence enters the EXPLAIN gate with its
+            # parameters' EXAMPLE values substituted — the raw fence carries
+            # @holes and would otherwise be skipped as templated. This is how
+            # schema drift under a frozen statement breaks at harvest time,
+            # not at runtime.
+            if comp is not None and text == comp.sql:
+                try:
+                    stmt = comp.rendered(comp.example_values())
+                except _comp.ComputationError:
+                    out.append(_classify_fence(rel, text))
+                    continue
+                out.append(SqlFence(path=rel, text=text, statements=[stmt]))
+                continue
             out.append(_classify_fence(rel, text))
     return out
 
@@ -814,12 +843,147 @@ def _check_joins(ctx: _Context) -> LintStep:
     return LintStep("joins", "issues" if findings else "ok", note, findings)
 
 
+def _check_computations(ctx: _Context) -> LintStep:
+    """Attested Computation docs: shape-valid per the shared parser, `column`
+    bindings name real snapshot columns, and declared `enum` constraints are
+    grounded in the profile evidence (the author is an LLM — its bounds are
+    validated against domains.json BEFORE a human is ever asked to verify
+    them: an exhaustive scan contradicting an enum value is an error, a
+    truncated one a warning). Verification staleness is deliberately NOT a
+    finding — a stale stamp is legitimate state the serving layer surfaces,
+    and the only "fix" an agent could apply is nulling a human's fields."""
+    from okf_core import computations as comp_mod
+
+    findings: list[LintFinding] = []
+    comp_docs: list[str] = []
+    for rel, doc in ctx.parsed.items():
+        if rel.startswith(comp_mod.COMPUTATIONS_PREFIX):
+            comp_docs.append(rel)
+        elif (
+            doc is not None
+            and doc.frontmatter.get("type") == comp_mod.COMPUTATION_TYPE
+        ):
+            findings.append(
+                LintFinding(
+                    "error",
+                    "computation-outside-folder",
+                    rel,
+                    f"`type: {comp_mod.COMPUTATION_TYPE}` docs must live "
+                    f"directly under {comp_mod.COMPUTATIONS_PREFIX} — "
+                    f"`list_computations` will never find this one.",
+                )
+            )
+    if not comp_docs and not findings:
+        return LintStep("computations", "ok", "no computation docs")
+
+    domains = comp_mod.read_domains(ctx.root)
+    for rel in sorted(comp_docs):
+        doc = ctx.parsed[rel]
+        if doc is None:
+            continue  # the frontmatter step reports unparseable docs
+        if not comp_mod.is_computation_path(rel):
+            findings.append(
+                LintFinding(
+                    "error",
+                    "computation-outside-folder",
+                    rel,
+                    f"computations are FLAT: one doc directly under "
+                    f"{comp_mod.COMPUTATIONS_PREFIX} per computation (the "
+                    f"filename is the slug) — move this doc up.",
+                )
+            )
+            continue
+        comp, errors = comp_mod.parse_computation(rel, doc)
+        findings += [
+            LintFinding("error", "invalid-computation", rel, e) for e in errors
+        ]
+        if comp is None:
+            continue
+        # A human-verified computation is FROZEN to agents — a finding on one
+        # is real but UNFIXABLE by this run, and an unfixable error wedges the
+        # fix-to-zero gate. Downgrade to warning with the governance note so
+        # the report reaches the human who CAN act (unverify, then re-run).
+        frozen = comp_mod.is_frozen(comp)
+        drift_sev = "warning" if frozen else "error"
+        frozen_note = (
+            " This computation is human-verified (FROZEN) — a human must "
+            "unverify it in the UI before a harvest can repair it."
+            if frozen
+            else ""
+        )
+        for p in comp.parameters:
+            col = p.get("column")
+            if not col:
+                continue
+            table, _, column = col.rpartition(".")
+            if ctx.snapshot_columns is not None:
+                known = ctx.snapshot_columns.get(table)
+                if known is None:
+                    hits = [
+                        k for k in ctx.snapshot_columns if k.endswith("." + table)
+                    ]
+                    known = (
+                        ctx.snapshot_columns[hits[0]] if len(hits) == 1 else None
+                    )
+                if known is None:
+                    findings.append(
+                        LintFinding(
+                            drift_sev,
+                            "computation-unknown-column",
+                            rel,
+                            f"parameter `{p['name']}` binds `{col}`, but the "
+                            f"snapshot has no table `{table}` — fix the "
+                            f"binding or drop it.{frozen_note}",
+                        )
+                    )
+                    continue
+                if column not in known:
+                    findings.append(
+                        LintFinding(
+                            drift_sev,
+                            "computation-unknown-column",
+                            rel,
+                            f"parameter `{p['name']}` binds `{col}`, but "
+                            f"`{table}` has no column `{column}`.{frozen_note}",
+                        )
+                    )
+                    continue
+            dom = comp_mod.lookup_domain(domains, col)
+            if dom and p.get("enum") is not None:
+                observed = [str(v) for v in dom.get("values") or []]
+                # Canonicalized per type (value_observed): a numeric enum
+                # written `[1.0, 2.0]` against an exhaustive profile of
+                # ['1','2'] must NOT false-error a correct doc.
+                missing = [
+                    v
+                    for v in p["enum"]
+                    if not comp_mod.value_observed(p["type"], v, observed)
+                ]
+                if missing:
+                    shown = ", ".join(repr(v) for v in missing[:8])
+                    exhaustive = bool(dom.get("exhaustive"))
+                    findings.append(
+                        LintFinding(
+                            drift_sev if exhaustive else "warning",
+                            "computation-enum-not-observed",
+                            rel,
+                            f"parameter `{p['name']}` declares enum value(s) "
+                            f"the profile {'proved absent from' if exhaustive else 'did not observe in'} "
+                            f"`{col}`: {shown} — constraints must come from "
+                            f"evidence, not invention.{frozen_note}",
+                        )
+                    )
+    note = f"{len(comp_docs)} computation doc(s) checked"
+    return LintStep("computations", "issues" if findings else "ok", note, findings)
+
+
 _STEPS = (
     ("coverage", _check_coverage),
     ("required_docs", _check_required_docs),
     ("frontmatter", _check_frontmatter),
     ("links", _check_links),
     ("joins", _check_joins),
+    ("computations", _check_computations),
 )
 
 

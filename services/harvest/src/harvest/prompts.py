@@ -144,7 +144,8 @@ the skill's own text, not from this list of names.
   prose in the user's own docs; it does NOT write bundle files (use `write_file`).
 - **`type` values are FIXED** (downstream code routes on them): `⟪DB_TYPE⟫`
   for the dataset, ⟪TABLE_TYPE_NOTE⟫, `Reference` for joins/metrics/
-  enums/named_sets/known_issues. Use these EXACT strings (not the skill's
+  enums/named_sets/known_issues, `Attested Computation` for
+  `references/computations/` docs. Use these EXACT strings (not the skill's
   generic dotted alternates).
 - **Layout**: `datasets/<dataset>.md`, `tables/<table>.md`. Every standalone
   reference doc lives under a CANONICAL fact-typed folder — one doc per item:
@@ -152,7 +153,20 @@ the skill's own text, not from this list of names.
   `references/enums/<column>.md` (large coded-column legends),
   `references/named_sets/<name>.md`, `references/glossary/<term>.md` (reusable
   business terms), `references/known_issues/<slug>.md` (cross-cutting caveats, one
-  per issue), `references/recipes/<slug>.md` (canonical multi-step recipes). This
+  per issue), `references/recipes/<slug>.md` (canonical multi-step recipes),
+  `references/computations/<slug>.md` (Attested Computations — recurring
+  parameterizable questions frozen as ONE runnable statement with `@parameter`
+  holes; see the skill's template for the rules the write guard enforces, and
+  NEVER set the `verified`/`verified_by` fields — verification is a human act.
+  A HUMAN-VERIFIED computation is FROZEN in an IN-PLACE run (incremental,
+  annotation, cross): the guard refuses every write/edit/delete to it, so do
+  NOT try — if your evidence says it is wrong or stale (schema drift), REPORT
+  that in your summary and a human will unverify it in the UI. A FULL harvest
+  rebuilds the bundle from source, so nothing is frozen there: re-author
+  computations like any other doc, and when the schema still supports an
+  existing one, reproduce its fence and parameters VERBATIM — an identical
+  statement keeps the human's verification valid, a reworded one sends it back
+  to their review queue). This
   scheme is what keeps bundles uniform across every harvest — the ONLY doc that
   lives directly under `references/` is the dataset's single
   `references/usage_guardrails.md`; never file any other reference doc there or
@@ -272,8 +286,8 @@ report the failure plainly.
    info (shared join keys, near-synonyms) while planning.
 3. `write_todos` to plan: one item per table (table-author), then the cross-cutting
    references (one reference-author each: metrics, named_sets, glossary,
-   known_issues, recipes, and the usage_guardrails contract), the dataset
-   overview, and the review pass.
+   known_issues, recipes, computations, and the usage_guardrails contract), the
+   dataset overview, and the review pass.
 3a. **When there are uploaded `.context/` docs, extract their facts FIRST via
    `context-extractor` sub-agents.** `ls .context/` — if it holds docs (especially
    MANY, or large/binary ones like a multi-sheet dictionary or a long PDF spec),
@@ -307,7 +321,10 @@ report the failure plainly.
    instruction: decide from the dataset + `.context/` whether it is right, and
    author only what the evidence supports. YOU are responsible for the
    references that SPAN tables:
-   metrics, named_sets, glossary terms, known_issues, canonical recipes, and the
+   metrics, named_sets, glossary terms, known_issues, canonical recipes,
+   Attested Computations (a `.context/` KPI or a recurring parameterizable
+   question shape -> `references/computations/<slug>.md`, grounded in the
+   evidence sheets and run live with example values before writing), and the
    dataset's `references/usage_guardrails.md`. Your job is to DISCOVER the fact instances
    (from the `.context/` digest + `grep .metadata/columns.tsv` + what the
    table-authors reported) and then DISPATCH one `reference-author` per instance —
@@ -686,6 +703,14 @@ that doc's owner.
      dictionary/code-list and against real values via `run_sql`. Flag a coded
      column left undecoded when the context docs actually provide its legend, and
      flag any hallucinated code→meaning.
+   - **Attested Computations** (`references/computations/*` in your cluster):
+     REPRODUCE the frozen statement — substitute each parameter's `example`
+     value into its `@hole` sites and run it (EXPLAIN first, then execute).
+     Does the result match what the prose claims it computes? Do the declared
+     parameter constraints (`enum`/`min`/`max`) match the evidence
+     (`.metadata/profile/domains.json`, `.context/` policy) — a bound the
+     evidence contradicts, or one that was invented, is a finding. Never touch
+     the `verified`/`verified_by` fields in a suggested fix.
    - **Gotchas**: is each stated gotcha real (reproduce it), and is an obvious
      confusable sibling MISSING a gotcha it needs?
    - **Cross-doc consistency — the reason you review these docs TOGETHER**: the
@@ -883,6 +908,20 @@ EACH annotation:
      read the current file, augment, don't drop schema fields/citations). Use
      `get_backlinks(concept_id)` and propagate the fix to referencing docs so
      nothing goes stale. Outcome = `applied`.
+   - **Promotion to a computation**: an annotation asking to make a metric or
+     recurring question CANONICAL/RUNNABLE ("make this a canonical metric",
+     "we ask this every month — freeze the query") is the promotion path for
+     an **Attested Computation** — author
+     `references/computations/<slug>.md` per the skill's template (ONE
+     read-only statement with typed `@parameter` holes, `example` per
+     parameter, constraints only from evidence, run live before writing,
+     `verified` fields left null — a human verifies later in the UI), link it
+     from the related metric/table docs, and record the annotation `applied`.
+     A HUMAN-VERIFIED computation is FROZEN — the guard refuses every edit or
+     delete. An annotation against one is still ASSESSED against live data,
+     but never applied: record it `rejected` with a comment stating what you
+     found and that a human must Unverify the computation in the UI before a
+     re-run can change it.
    - **Not grounded** (the data contradicts it, or you can't reproduce it) → change
      NOTHING. Outcome = `rejected`.
    - **Correct but out of scope / duplicate / already true** → make any needed edit

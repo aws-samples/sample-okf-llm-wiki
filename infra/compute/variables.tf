@@ -249,6 +249,37 @@ variable "chat_sql_max_rows" {
   description = "Max rows the chat run_sql tool returns per query (the rest are truncated to bound a turn's token cost). Only used when var.enable_chat_sql = true."
 }
 
+# --- Attested Computations execution (optional) --------------------------------
+
+variable "enable_attested_computations" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Let run_computation EXECUTE (consumption MCP + the Control API's UI Run
+    modal). Listing/describing computations and rendering their SQL never need
+    this. Execution substitutes TYPED, validated parameter values into the
+    wiki's frozen, human-verifiable statements — no caller-supplied SQL ever
+    reaches an engine — and the grant is read-only by construction:
+    catalog-wide Glue/Athena READ + Athena results-bucket write, NO write to
+    source data (the same ceiling as var.enable_chat_sql). Left off, callers
+    get the rendered SQL back to run through their own access path.
+
+    OPT-IN BY DESIGN, unlike var.enable_chat_sql: the MCP surface's auth is
+    scope-based precisely so newly vended machine credentials work with no
+    infra change — so defaulting this on would have a routine `terraform
+    apply` silently upgrade every already-vended external credential from
+    bundle-read to querying all cataloged source data. Chat sits behind
+    Cognito USER auth (and its own per-run opt-in), which is why chat SQL can
+    default on; here the operator says yes explicitly.
+  EOT
+}
+
+variable "computation_max_rows" {
+  type        = number
+  default     = 200
+  description = "Max rows run_computation returns per execution (the rest are truncated to bound a turn's token cost). Only used when var.enable_attested_computations = true."
+}
+
 # --- Chat web search (optional) ----------------------------------------------
 
 variable "enable_web_search" {

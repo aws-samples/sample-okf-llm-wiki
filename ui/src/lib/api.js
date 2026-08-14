@@ -187,6 +187,42 @@ export function makeApi(token) {
     bundleGraph: (domain, dataset) =>
       request(token, "GET", `/bundle/${domain}/${dataset}/graph`),
 
+    // Attested Computations: list with merged verification badges, one doc's
+    // contract (the Run modal's form data), execute with typed parameter
+    // values, and the human verification flips (identity comes from the JWT
+    // server-side — nothing user-supplied rides the body).
+    listComputations: (domain, dataset) =>
+      request(token, "GET", `/bundle/${domain}/${dataset}/computations`),
+    getComputation: (domain, dataset, slug) =>
+      request(
+        token,
+        "GET",
+        `/bundle/${domain}/${dataset}/computations/${encodeURIComponent(slug)}`
+      ),
+    runComputation: (domain, dataset, slug, parameters) =>
+      request(
+        token,
+        "POST",
+        `/bundle/${domain}/${dataset}/computations/${encodeURIComponent(slug)}/run`,
+        { parameters }
+      ),
+    // `sha256` is the content hash the Verify screen DISPLAYED — the server
+    // refuses (409) if the doc changed since, so a human can never attest
+    // content they didn't review.
+    verifyComputation: (domain, dataset, slug, sha256) =>
+      request(
+        token,
+        "POST",
+        `/bundle/${domain}/${dataset}/computations/${encodeURIComponent(slug)}/verify`,
+        { sha256 }
+      ),
+    unverifyComputation: (domain, dataset, slug) =>
+      request(
+        token,
+        "POST",
+        `/bundle/${domain}/${dataset}/computations/${encodeURIComponent(slug)}/unverify`
+      ),
+
     // Bundle version history (reconstructed server-side from S3 object
     // versions; a version = one completed harvest/repromote). Diff selectors
     // are marker version_ids from listBundleVersions; both optional (default:

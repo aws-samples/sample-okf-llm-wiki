@@ -192,3 +192,92 @@ def test_write_text_heals_read_only_file(tmp_path):
     fsutil.write_text(target, '{"status": "in_progress"}')
 
     assert target.read_text(encoding="utf-8") == '{"status": "in_progress"}'
+
+
+# ---------------------------------------------------------------------------
+# ensure_authored_dirs — the in-place-run folder skeleton
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_authored_dirs_creates_the_skeleton(tmp_path):
+    created = fsutil.ensure_authored_dirs(tmp_path)
+    assert "references/computations" in created  # the live failure case
+    for rel in fsutil.AUTHORED_DIR_SKELETON:
+        assert (tmp_path / rel).is_dir()
+
+
+def test_ensure_authored_dirs_is_idempotent_and_reports_only_new(tmp_path):
+    (tmp_path / "references" / "joins").mkdir(parents=True)
+    created = fsutil.ensure_authored_dirs(tmp_path)
+    assert "references/joins" not in created  # existed already
+    assert "references/computations" in created
+    assert fsutil.ensure_authored_dirs(tmp_path) == []  # second pass: no-op
+
+
+def test_ensure_authored_dirs_extra_and_retry_on_transient_eacces(
+    tmp_path, monkeypatch
+):
+    # The mount can surface an attribute-cache blip as EACCES on mkdir — the
+    # skeleton pass must use the WIDER retry set (like the delete paths), so a
+    # one-off EACCES heals instead of skipping the directory.
+    real_mkdir = Path.mkdir
+    failed = {"n": 0}
+
+    def flaky_mkdir(self, *a, **kw):
+        if self.name == "computations" and failed["n"] < 2:
+            failed["n"] += 1
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "mkdir", flaky_mkdir)
+    monkeypatch.setattr(fsutil, "_BASE_SLEEP", 0)
+    created = fsutil.ensure_authored_dirs(
+        tmp_path, extra=("external/crm/customers",)
+    )
+    assert "references/computations" in created  # healed by retry
+    assert (tmp_path / "external" / "crm" / "customers").is_dir()  # extra honored
+
+
+def test_ensure_authored_dirs_logs_and_skips_a_persistent_refusal(
+    tmp_path, monkeypatch, caplog
+):
+    # A genuinely refused directory must not abort the pass: the rest of the
+    # skeleton is still created and the failure lands in the log (that log
+    # line is the diagnosis trail for the next live EACCES).
+    real_mkdir = Path.mkdir
+
+    def denied_mkdir(self, *a, **kw):
+        if self.name == "computations":
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "mkdir", denied_mkdir)
+    monkeypatch.setattr(fsutil, "_BASE_SLEEP", 0)
+    with caplog.at_level("WARNING", logger="harvest.fsutil"):
+        created = fsutil.ensure_authored_dirs(tmp_path)
+    assert "references/computations" not in created
+    assert (tmp_path / "references" / "recipes").is_dir()  # pass continued
+    assert any("could not pre-create" in r.message for r in caplog.records)
+
+
+def test_in_place_modes_precreate_dirs_full_harvest_does_not():
+    """Source-pinned: the skeleton pass belongs to the IN-PLACE modes only —
+    a full harvest wipes and re-authors, so its dirs are run-created (and a
+    pre-create before the wipe would be deleted anyway). The cross mode also
+    pre-creates ITS pair subtree (the only place it may write)."""
+    import inspect
+
+    from harvest import runner
+
+    assert "ensure_authored_dirs" not in inspect.getsource(
+        runner.run_full_harvest
+    )
+    for fn in (
+        runner.run_incremental_harvest,
+        runner.run_cross_harvest,
+        runner.run_annotation_harvest,
+    ):
+        assert "ensure_authored_dirs(" in inspect.getsource(fn), fn.__name__
+    assert "external_pair_prefix(target_data_domain, target_dataset)" in (
+        inspect.getsource(runner.run_cross_harvest)
+    )

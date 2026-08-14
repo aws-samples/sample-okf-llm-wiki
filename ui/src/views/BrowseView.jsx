@@ -1,8 +1,9 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react"
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import {
   AlertTriangleIcon,
+  BadgeCheckIcon,
   ChevronRightIcon,
   CodeIcon,
   FileTextIcon,
@@ -15,6 +16,12 @@ import {
 
 import { CodeView } from "@/components/chat/CodeView"
 import {
+  ComputationBanner,
+  RunComputationDialog,
+  VerificationBadge,
+  VerifyComputationDialog,
+} from "@/components/ComputationRunner"
+import {
   useVersionHistory,
   VersionDiffPane,
   VersionFilePane,
@@ -25,6 +32,7 @@ import {
   resolveConceptLink,
   resolveCrossBundleLink,
 } from "@/lib/bundle"
+import { buildHash } from "@/lib/route"
 import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -143,6 +151,45 @@ function FilesPane({
   // Show the raw markdown (frontmatter + body) instead of the rendered doc.
   // Reset to rendered whenever the selected doc changes.
   const [rawView, setRawView] = useState(false)
+
+  // Attested Computation docs: fetch the CONTRACT (parameters + frozen SQL +
+  // hash + MERGED verification state + observed domains) once per selected
+  // doc — the doc header's badge, the inline banner, and both dialogs (Run /
+  // Verify) all read this one object. Frontmatter alone can't answer
+  // "verified?": the overlay wins and the hash must match (see
+  // docs/ATTESTED_COMPUTATIONS.md §4), so the endpoint is the truth.
+  const isComputationDoc = Boolean(
+    selectedId?.startsWith("references/computations/")
+  )
+  const computationSlug = isComputationDoc
+    ? selectedId.slice("references/computations/".length)
+    : ""
+  const [computation, setComputation] = useState(null)
+  const [verifyOpen, setVerifyOpen] = useState(false)
+  // Monotonic request id: a SLOW response for a previously-selected doc must
+  // never land after (and clobber) the current doc's contract — the banner,
+  // badge, and Run/Verify dialogs would silently act on the WRONG slug.
+  const compReq = useRef(0)
+  const loadComputation = useCallback(() => {
+    const req = ++compReq.current
+    if (!isComputationDoc) {
+      setComputation(null)
+      return
+    }
+    api
+      .getComputation(domain, dataset, computationSlug)
+      .then((c) => {
+        if (compReq.current === req) setComputation(c)
+      })
+      .catch(() => {
+        if (compReq.current === req) setComputation(null) // invalid doc: prose still renders
+      })
+  }, [api, domain, dataset, computationSlug, isComputationDoc])
+  useEffect(() => {
+    setVerifyOpen(false)
+    setComputation(null) // clear the previous doc's contract while fetching
+    loadComputation()
+  }, [loadComputation])
   useEffect(() => {
     setRawView(false)
   }, [selectedId])
@@ -423,6 +470,21 @@ function FilesPane({
               from a text selection or the whole dataset. */}
           {!versionMode && selectedId && (
             <div className="flex shrink-0 items-center gap-2">
+              {/* The human attestation entry point for an Attested
+                  Computation doc (Run lives in the doc's inline banner —
+                  running is a reader action, verifying is a curator action,
+                  so they get different surfaces). */}
+              {isComputationDoc && computation?.computation === computationSlug && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 gap-1.5 text-xs"
+                  onClick={() => setVerifyOpen(true)}
+                >
+                  <BadgeCheckIcon className="size-3.5" />
+                  Verify
+                </Button>
+              )}
               {/* Radix's Switch renders a real <button>, which is labelable —
                   so wrapping it in a <label> makes the icon + text clickable. */}
               <label className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-muted-foreground">
@@ -495,6 +557,8 @@ function FilesPane({
                         domain={domain}
                         dataset={dataset}
                         onNavigateCross={onOpenCross}
+                        api={api}
+                        computation={computation}
                       />
                     </SelectionAnnotator>
                   )}
@@ -504,6 +568,21 @@ function FilesPane({
           </div>
         </div>
       </Card>
+
+      {isComputationDoc && computation?.computation === computationSlug && (
+        <VerifyComputationDialog
+          open={verifyOpen}
+          onOpenChange={setVerifyOpen}
+          api={api}
+          domain={domain}
+          dataset={dataset}
+          slug={computationSlug}
+          contract={computation}
+          // A flip changes the merged verification state — re-fetch so the
+          // badge/banner/dialogs all agree with the overlay.
+          onChanged={loadComputation}
+        />
+      )}
 
       {/* Annotations: a floating panel that slides in from the RIGHT. Floating
           (inset from the edges + rounded) rather than flush to the screen edge:
@@ -678,8 +757,15 @@ export function ConceptDoc({
   domain,
   dataset,
   onNavigateCross,
+  // Optional (the Browse view passes them; DocPeek omits both): the Control
+  // API client + the fetched computation CONTRACT for an Attested Computation
+  // doc. Together they light up the inline banner (with its Run modal) and
+  // the verification chip in the tag row.
+  api = null,
+  computation = null,
 }) {
   const { frontmatter, body } = useMemo(() => parseDocument(text), [text])
+  const [runnerOpen, setRunnerOpen] = useState(false)
 
   const components = useMemo(() => {
     // Stamp each block with its 1-based source line (from react-markdown's hast
@@ -744,9 +830,22 @@ export function ConceptDoc({
       a({ href, children, ...props }) {
         const resolved = href ? resolveConceptLink(href, conceptId) : null
         if (resolved) {
+          // href is a REAL deep link (#/browse/<domain>/<dataset>/<concept>) —
+          // open-in-new-tab, middle/cmd-click, and copy-link all land on this
+          // doc; the onClick still preventDefaults into the SPA navigator so a
+          // plain click never reloads the app. Without domain/dataset (no
+          // caller does this today) fall back to the bare-hash spelling.
+          const deep =
+            domain && dataset
+              ? buildHash({
+                  section: "browse",
+                  selectionKey: `${domain}/${dataset}`,
+                  concept: resolved.conceptId,
+                })
+              : `#${resolved.conceptId}`
           return (
             <a
-              href={`#${resolved.conceptId}`}
+              href={deep}
               onClick={(e) => {
                 e.preventDefault()
                 onNavigate(resolved.conceptId)
@@ -770,7 +869,11 @@ export function ConceptDoc({
         if (cross) {
           return (
             <a
-              href={`#${cross.dataDomain}/${cross.dataset}/${cross.conceptId}`}
+              href={buildHash({
+                section: "browse",
+                selectionKey: `${cross.dataDomain}/${cross.dataset}`,
+                concept: cross.conceptId,
+              })}
               title={`${cross.dataDomain}/${cross.dataset} · ${cross.conceptId}`}
               onClick={(e) => {
                 e.preventDefault()
@@ -810,6 +913,15 @@ export function ConceptDoc({
                 {t}
               </Badge>
             ))}
+            {/* The MERGED verification state (overlay wins, hash-checked) —
+                frontmatter alone can't answer this, so it rides the fetched
+                contract and only appears in the Browse view. */}
+            {computation && (
+              <VerificationBadge
+                verification={computation.verification}
+                verifiedBy={computation.verified_by}
+              />
+            )}
           </div>
           {title && (
             <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
@@ -828,6 +940,25 @@ export function ConceptDoc({
             </a>
           )}
         </div>
+      )}
+      {/* Attested Computation banner: between the header and the prose (the
+          compiled-metric treatment) — the contract at a glance + Run. */}
+      {computation && (
+        <ComputationBanner
+          contract={computation}
+          onRun={api ? () => setRunnerOpen(true) : null}
+        />
+      )}
+      {computation && api && runnerOpen && (
+        <RunComputationDialog
+          open={runnerOpen}
+          onOpenChange={setRunnerOpen}
+          api={api}
+          domain={domain}
+          dataset={dataset}
+          slug={computation.computation}
+          contract={computation}
+        />
       )}
       <div className="okf-prose">
         <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>

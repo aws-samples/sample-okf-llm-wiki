@@ -24,8 +24,10 @@ from datetime import datetime, timezone
 from okf_core.document import OKFDocument
 from okf_core.guard import (
     check_augmentation,
+    check_computation_doc,
     check_frontmatter,
     check_join_doc,
+    check_verification_fields,
     ensure_timestamp,
     reorder_frontmatter,
 )
@@ -85,38 +87,83 @@ class OKFGuardEngine:
         if not fm_check.ok:
             return WriteDecision(allow=False, message=fm_check.error)
 
+        existing_fm: dict | None = None
         if existing_text:
-            existing = OKFDocument.parse(existing_text)
-            aug = check_augmentation(
-                existing.body,
-                doc.body,
-                existing_type=str(existing.frontmatter.get("type") or ""),
-            )
-            if not aug.ok:
-                return WriteDecision(allow=False, message=aug.error)
+            # Tolerant: an existing doc that no longer parses (a torn write, a
+            # doc bricked by an earlier bug) must be REPAIRABLE — treating it
+            # as absent lets a full rewrite replace it, where raising here
+            # would refuse every attempt forever.
+            try:
+                existing = OKFDocument.parse(existing_text)
+            except Exception:  # noqa: BLE001 - unparseable existing = new doc
+                existing = None
+            if existing is not None:
+                existing_fm = existing.frontmatter
+                aug = check_augmentation(
+                    existing.body,
+                    doc.body,
+                    existing_type=str(existing.frontmatter.get("type") or ""),
+                )
+                if not aug.ok:
+                    return WriteDecision(allow=False, message=aug.error)
+
+        # Verification is a HUMAN act: an agent write may only leave the
+        # triple null or preserve the existing doc's exact values.
+        ver_check = check_verification_fields(fm, existing_fm)
+        if not ver_check.ok:
+            return WriteDecision(allow=False, message=ver_check.error)
 
         join_check = check_join_doc(rel_path or "", doc.body)
         if not join_check.ok:
             return WriteDecision(allow=False, message=join_check.error)
+
+        comp_check = check_computation_doc(rel_path or "", fm, doc.body)
+        if not comp_check.ok:
+            return WriteDecision(allow=False, message=comp_check.error)
 
         # Canonicalize key order. Rewrite the content so what lands on disk is
         # normalized (timestamp already filled above).
         fm = reorder_frontmatter(fm)
         normalized = OKFDocument(frontmatter=fm, body=doc.body).serialize()
 
+        # The canonical serialization must ROUND-TRIP: yaml.safe_dump renders
+        # a multi-line string containing '---' as an indented line inside the
+        # scalar, and OKFDocument.parse's terminator scan (`strip() == '---'`)
+        # then truncates the frontmatter mid-string — every later read of the
+        # doc fails, verification can never bind, and no agent can repair it.
+        # Refuse the write with the fix instead of bricking the doc.
+        try:
+            OKFDocument.parse(normalized).validate()
+        except Exception as e:  # noqa: BLE001 - surface as a corrective refusal
+            return WriteDecision(
+                allow=False,
+                message=(
+                    f"Refusing to write: the document does not survive the "
+                    f"canonical serialize/parse round-trip ({e}). This usually "
+                    f"means a frontmatter string contains a line that is "
+                    f"exactly `---` — rephrase that value (e.g. use a shorter "
+                    f"dash run or move the text into the body) and retry."
+                ),
+            )
+
         self.link_graph.mark_dirty()
         return WriteDecision(allow=True, new_content=normalized)
 
     def guard_edit_file(
         self, old_string: str, new_string: str, existing_text: str | None,
-        rel_path: str | None = None,
+        rel_path: str | None = None, replace_all: bool = False,
     ) -> WriteDecision:
         """Guard an ``edit_file`` (exact string replacement) of a ``.md`` doc.
 
         We simulate the edit against the current file, then run the same
-        frontmatter + augmentation checks on the *result*. If the file can't be
-        read or the old_string isn't present, we defer to the handler (which
-        will surface its own error) by allowing it through unchanged.
+        frontmatter + augmentation checks on the *result*. ``replace_all``
+        MUST mirror the tool arg deepagents forwards to the backend — the
+        guard otherwise validates a single-replacement document while the
+        backend writes the replace-everywhere one, and every check here
+        (verification fields, augmentation, computation shape) can be
+        bypassed through the divergence. If the file can't be read or the
+        old_string isn't present, we defer to the handler (which will surface
+        its own error) by allowing it through unchanged.
         """
         if existing_text is None:
             # Editing a file that doesn't exist yet — let the FS tool error.
@@ -125,7 +172,9 @@ class OKFGuardEngine:
             # Let the built-in edit tool report the no-match error itself.
             return WriteDecision(allow=True)
 
-        resulting = existing_text.replace(old_string, new_string, 1)
+        resulting = existing_text.replace(
+            old_string, new_string, -1 if replace_all else 1
+        )
         try:
             result_doc = OKFDocument.parse(resulting)
         except Exception as e:  # noqa: BLE001
@@ -160,11 +209,27 @@ class OKFGuardEngine:
         if not aug.ok:
             return WriteDecision(allow=False, message=aug.error)
 
+        ver_check = check_verification_fields(
+            result_doc.frontmatter, existing.frontmatter
+        )
+        if not ver_check.ok:
+            return WriteDecision(
+                allow=False, message=f"Refusing this edit: {ver_check.error}"
+            )
+
         join_check = check_join_doc(rel_path or "", result_doc.body)
         if not join_check.ok:
             return WriteDecision(
                 allow=False,
                 message=f"Refusing this edit: {join_check.error}",
+            )
+
+        comp_check = check_computation_doc(
+            rel_path or "", result_doc.frontmatter, result_doc.body
+        )
+        if not comp_check.ok:
+            return WriteDecision(
+                allow=False, message=f"Refusing this edit: {comp_check.error}"
             )
 
         # Edits are surgical; we don't rewrite content (that would defeat the

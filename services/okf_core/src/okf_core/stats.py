@@ -35,6 +35,7 @@ KNOWN_REFERENCE_SUBTYPES = (
     "joins",
     "enums",
     "metrics",
+    "computations",
     "named_sets",
     "glossary",
     "recipes",

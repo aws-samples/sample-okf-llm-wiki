@@ -275,6 +275,10 @@ stage_compute() {
   # chat/UI surface (incl. the Reasoning sidebar page — VITE_CHAT_POLICY_CHECK
   # is derived from it, so the ui stage must re-run after flipping); build
   # gates the harvest/incremental policy-build pipeline that enrollment needs.
+  # ENABLE_ATTESTED_COMPUTATIONS: lets run_computation EXECUTE on the
+  # consumption MCP + the UI's Run modal (Terraform default false — see
+  # var.enable_attested_computations for why it is opt-in). env + IAM only:
+  # flipping it needs just this compute stage, no image rebuild.
   tf "$ROOT/infra/compute" apply -auto-approve -input=false \
     -var="region=$AWS_REGION" \
     -var="name_prefix=${NAME_PREFIX:-okf}" \
@@ -284,7 +288,8 @@ stage_compute() {
     -var="chat_image_uri=${CHAT_IMAGE_URI:-}" \
     ${CONTROL_API_PROVISIONED_CONCURRENCY:+-var="control_api_provisioned_concurrency=$CONTROL_API_PROVISIONED_CONCURRENCY"} \
     ${ENABLE_POLICY_CHECKS:+-var="enable_policy_checks=$ENABLE_POLICY_CHECKS"} \
-    ${ENABLE_POLICY_BUILD:+-var="enable_policy_build=$ENABLE_POLICY_BUILD"}
+    ${ENABLE_POLICY_BUILD:+-var="enable_policy_build=$ENABLE_POLICY_BUILD"} \
+    ${ENABLE_ATTESTED_COMPUTATIONS:+-var="enable_attested_computations=$ENABLE_ATTESTED_COMPUTATIONS"}
   ok "Compute stack applied."
   backfill_registry_entity
 }

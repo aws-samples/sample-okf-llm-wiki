@@ -5768,3 +5768,218 @@ def delete_chat_thread(
         namespaced_thread_id=f"{user_sub}:{thread_id}",
     )
     return {"deleted": True, "thread_id": thread_id}
+
+
+# --------------------------------------------------------------------------- #
+# Attested Computations (docs/ATTESTED_COMPUTATIONS.md §6)
+# --------------------------------------------------------------------------- #
+#
+# The same loader/runner the consumption MCP and the chat tools use
+# (okf_aws.computation_run) behind the Cognito-authed REST surface, so a human
+# can list, run, and — uniquely here — VERIFY a computation from the UI.
+#
+# Verification writes NEVER touch the bundle tree: the Verify click lands in
+# the off-mount overlay object (verification/<domain>/<dataset>.json) and the
+# harvest runtime folds it into doc frontmatter through the mount at its next
+# run start. A raw put_object onto the doc would materialize a root-owned
+# path the runtime's uid-1000 mount identity cannot write — the pending.json
+# EACCES incident ("the mount is the sole writer of the bundle tree").
+
+
+def list_bundle_computations(
+    s3, *, bucket: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """Every computation the dataset publishes, verification merged (overlay
+    wins; hash mismatch surfaces as ``stale``); invalid docs named, not
+    dropped."""
+    from okf_aws import computation_run
+
+    return computation_run.list_computations(s3, bucket, data_domain, dataset)
+
+
+def get_bundle_computation(
+    s3, *, bucket: str, data_domain: str, dataset: str, slug: str
+) -> dict[str, Any]:
+    """One computation's contract + its frozen SQL (the Run modal's form data
+    and the Verify screen's review payload)."""
+    from okf_aws import computation_run
+
+    from okf_core.computations import lookup_domain
+
+    comp, errors = computation_run.load_computation(
+        s3, bucket, data_domain, dataset, slug
+    )
+    if comp is None:
+        raise ApiError(404, "; ".join(errors))
+    overlay = computation_run.load_overlay(s3, bucket, data_domain, dataset)
+    out = computation_run.summarize(comp, overlay.get(comp.slug))
+    out["sql"] = comp.sql
+    out["path"] = comp.path
+    # Observed values for column-bound parameters (profile evidence) — the Run
+    # modal's advisory type-ahead. Suggestions, never law: free text stays
+    # legal (the executor warns-and-runs on a miss).
+    domains = computation_run.load_domains(s3, bucket, data_domain, dataset)
+    observed: dict[str, Any] = {}
+    for p in comp.parameters:
+        col = p.get("column")
+        dom = lookup_domain(domains, col) if col else None
+        if dom:
+            observed[p["name"]] = {
+                "values": [str(v) for v in dom.get("values") or []],
+                "exhaustive": bool(dom.get("exhaustive")),
+            }
+    if observed:
+        out["observed"] = observed
+    return out
+
+
+def run_bundle_computation(
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    slug: str,
+    values: dict[str, Any] | None,
+    athena=None,
+    redshift_data=None,
+    athena_workgroup: str = "",
+    athena_output: str = "",
+    athena_catalog: str = "AwsDataCatalog",
+    max_rows: int = 200,
+    timeout_s: float = 120.0,
+    enabled: bool = False,
+) -> dict[str, Any]:
+    """Execute a computation for the UI's Run modal and return the receipt.
+
+    Invalid parameter values are a 400 carrying the full corrective message
+    (every problem named at once); an engine failure is NOT an error status —
+    the receipt returns un-executed with the rendered SQL and a note, exactly
+    like the MCP surface, so the modal can show what would have run.
+    """
+    from okf_aws import computation_run
+    from okf_core.computations import ComputationError
+
+    comp, errors = computation_run.load_computation(
+        s3, bucket, data_domain, dataset, slug
+    )
+    if comp is None:
+        raise ApiError(404, "; ".join(errors))
+    overlay = computation_run.load_overlay(s3, bucket, data_domain, dataset)
+    domains = computation_run.load_domains(s3, bucket, data_domain, dataset)
+    source = get_dataset_source(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
+    try:
+        return computation_run.run_computation(
+            comp,
+            values,
+            athena=athena,
+            redshift_data=redshift_data,
+            source=source,
+            athena_workgroup=athena_workgroup,
+            athena_output=athena_output,
+            athena_catalog=athena_catalog,
+            max_rows=max_rows,
+            timeout_s=timeout_s,
+            domains=domains,
+            overlay_entry=overlay.get(comp.slug),
+            execute=enabled,
+        )
+    except ComputationError as e:
+        raise ApiError(400, str(e)) from e
+
+
+def verify_computation(
+    s3,
+    *,
+    bucket: str,
+    data_domain: str,
+    dataset: str,
+    slug: str,
+    verified_by: str,
+    expected_sha256: str = "",
+) -> dict[str, Any]:
+    """A human's Verify click: sign the content hash the human REVIEWED.
+
+    ``expected_sha256`` is the hash the Verify screen displayed. The server
+    recomputes the doc's current hash and refuses (409) on mismatch — without
+    this precondition a writer racing the click (an annotation run, a
+    repromote) could swap the statement and the human would attest SQL they
+    never saw. The entry binds {slug, sha256, verified, verified_by} — *this
+    statement with these parameter contracts on this engine*. Identity comes
+    from the validated JWT (the route adapter passes caller.ident), never the
+    request body.
+    """
+    from okf_aws import computation_run
+
+    if not (verified_by or "").strip():
+        raise ApiError(401, "verification requires a verified caller identity")
+    comp, errors = computation_run.load_computation(
+        s3, bucket, data_domain, dataset, slug
+    )
+    if comp is None:
+        raise ApiError(404, "; ".join(errors))
+    if expected_sha256 and expected_sha256 != comp.sha256:
+        raise ApiError(
+            409,
+            "the computation changed since you loaded it — re-read the "
+            "statement and verify again (the hash you reviewed no longer "
+            "matches the doc)",
+        )
+    # STRICT overlay read: this is a read-modify-write of the whole object —
+    # a transient S3 error misread as "empty" would wipe every other stamp
+    # and tombstone in the dataset.
+    entries = computation_run.load_overlay(
+        s3, bucket, data_domain, dataset, strict=True
+    )
+    entry = {
+        "slug": comp.slug,
+        "sha256": comp.sha256,
+        "verified": _now_iso(),
+        "verified_by": verified_by.strip(),
+    }
+    entries[comp.slug] = entry
+    computation_run.save_overlay(s3, bucket, data_domain, dataset, entries)
+    from okf_core.computations import verification_state
+
+    return {
+        "computation": comp.slug,
+        "sha256": comp.sha256,
+        **verification_state(comp.sha256, overlay_entry=entry),
+    }
+
+
+def unverify_computation(
+    s3, *, bucket: str, data_domain: str, dataset: str, slug: str, revoked_by: str
+) -> dict[str, Any]:
+    """A human's Unverify click: a REVOKED tombstone, not a deletion.
+
+    A tombstone (not entry removal) because the doc may already CARRY a
+    folded-in stamp from an earlier run — with the entry merely absent,
+    serving would fall back to the doc's frontmatter and resurrect the
+    verification. The runtime's fold-in nulls the doc's triple and drops the
+    tombstone at the next run start.
+    """
+    from okf_aws import computation_run
+    from okf_core.paths import parse_concept_id
+
+    if not (revoked_by or "").strip():
+        raise ApiError(401, "unverification requires a verified caller identity")
+    try:
+        (slug,) = parse_concept_id(slug)
+    except ValueError as e:
+        raise ApiError(400, f"invalid computation name {slug!r}") from e
+    entries = computation_run.load_overlay(
+        s3, bucket, data_domain, dataset, strict=True
+    )
+    entries[slug] = {
+        "slug": slug,
+        "revoked": True,
+        "revoked_at": _now_iso(),
+        "revoked_by": revoked_by.strip(),
+    }
+    computation_run.save_overlay(s3, bucket, data_domain, dataset, entries)
+    return {"computation": slug, "verification": "unverified"}

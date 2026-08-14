@@ -197,6 +197,88 @@ def check_augmentation(
     return GuardResult(ok=True)
 
 
+def check_verification_fields(
+    new_fm: dict[str, Any], existing_fm: dict[str, Any] | None
+) -> GuardResult:
+    """Agents can never verify — without this single rule, ``verified`` is
+    theater. A write may leave the verification triple null, or PRESERVE the
+    existing doc's exact values (so a maintenance pass that keeps a verified
+    computation's fence verbatim keeps its stamp — the content hash, not the
+    field, is what binds); it may never invent or alter them. Only the human
+    Verify path (Control API overlay -> the runtime's fold-in) sets them.
+    Enforced on EVERY doc write, not just computations, so the fields can't
+    be squatted on elsewhere either."""
+    from okf_core.computations import VERIFICATION_FIELDS
+
+    existing = existing_fm or {}
+    for key in VERIFICATION_FIELDS:
+        new_val = new_fm.get(key)
+        if new_val is not None and new_val != existing.get(key):
+            return GuardResult(
+                ok=False,
+                error=(
+                    f"Refusing to write: `{key}` is set by a HUMAN through the "
+                    f"verification UI, never by an agent. Leave the "
+                    f"verification fields (`verified`, `verified_by`, "
+                    f"`verified_sha256`) null — or, when re-writing an "
+                    f"already-verified doc unchanged, preserve their existing "
+                    f"values exactly."
+                ),
+            )
+    return GuardResult(ok=True)
+
+
+def check_computation_doc(
+    rel_path: str, frontmatter: dict[str, Any], body: str
+) -> GuardResult:
+    """A computation doc must be shape-valid at WRITE time (same rationale as
+    ``check_join_doc``: the author self-corrects in one retry instead of the
+    supervisor inheriting a finding per doc after the fan-out). Reuses the
+    exact parser lint and the executors run, so the guard can never disagree
+    with them about what a valid computation is. Also pins the folder<->type
+    pairing: an `Attested Computation` doc anywhere else would be invisible
+    to `list_computations`, and a differently-typed doc inside the folder
+    would be dead weight consumers can't run."""
+    from okf_core.computations import (
+        COMPUTATION_TYPE,
+        COMPUTATIONS_PREFIX,
+        is_computation_path,
+        parse_computation,
+    )
+    from okf_core.document import OKFDocument
+
+    is_comp_type = frontmatter.get("type") == COMPUTATION_TYPE
+    in_folder = is_computation_path(rel_path)
+    if not is_comp_type and not in_folder:
+        return GuardResult(ok=True)
+    if is_comp_type and not in_folder:
+        return GuardResult(
+            ok=False,
+            error=(
+                f"Refusing to write: a `type: {COMPUTATION_TYPE}` doc must "
+                f"live directly under {COMPUTATIONS_PREFIX} (one doc per "
+                f"computation, slug = filename) — `{rel_path}` is outside it, "
+                f"so `list_computations` would never find it."
+            ),
+        )
+    comp, errors = parse_computation(
+        rel_path, OKFDocument(frontmatter=dict(frontmatter), body=body)
+    )
+    if errors:
+        shown = "; ".join(errors[:6]) + (" …" if len(errors) > 6 else "")
+        return GuardResult(
+            ok=False,
+            error=(
+                f"Refusing to write this computation doc: {shown}. A "
+                f"computation carries ONE read-only SELECT/WITH statement in "
+                f"a ```sql fence under `# Computation`, with every `@hole` "
+                f"declared in `parameters` (each with `type` and `example`) "
+                f"and every declared parameter used. Fix and retry."
+            ),
+        )
+    return GuardResult(ok=True)
+
+
 def check_join_doc(rel_path: str, body: str) -> GuardResult:
     """A join doc must ship its ON clause as a qualified equality inside a
     ```sql fence. Enforced at WRITE time (not just lint time) so the author

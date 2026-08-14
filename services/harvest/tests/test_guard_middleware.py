@@ -586,3 +586,67 @@ def test_annotation_results_file_is_the_one_writable_dot_path(monkeypatch):
     ro = OKFGuardMiddleware(_AllowEngine(), read_current=lambda _p: None, read_only=True)
     result = ro.wrap_tool_call(req, lambda r: "SHOULD NOT RUN")
     assert isinstance(result, dict) and result["status"] == "error"
+
+
+# -- FROZEN verified computations (docs/ATTESTED_COMPUTATIONS.md §4) ----------
+
+
+def test_frozen_paths_refuse_every_guarded_tool():
+    """A human-verified computation is immutable to agents: write, edit, AND
+    delete are refused — even on a guard that allows deletes (the supervisor)
+    or normally lets the engine allow the write."""
+    frozen = frozenset({"references/computations/season_points.md"})
+    for allow_delete in (False, True):
+        mw = OKFGuardMiddleware(
+            _AllowEngine(),
+            read_current=lambda _p: None,
+            allow_delete=allow_delete,
+            frozen_paths=frozen,
+        )
+        for tool in ("write_file", "edit_file", "delete"):
+            req = _request(
+                name=tool,
+                file_path="references/computations/season_points.md",
+                content="x",
+                old_string="a",
+                new_string="b",
+            )
+            out = mw.wrap_tool_call(req, lambda r: "MUTATED")
+            assert out != "MUTATED", f"{tool} slipped through the freeze"
+            assert "FROZEN" in out.content
+            assert "Unverify" in out.content
+            assert out.status == "error"
+    # Path normalization: a leading slash must not dodge the freeze.
+    mw = OKFGuardMiddleware(
+        _AllowEngine(), read_current=lambda _p: None, frozen_paths=frozen
+    )
+    req = _request(file_path="/references/computations/season_points.md", content="x")
+    assert mw.wrap_tool_call(req, lambda r: "MUTATED") != "MUTATED"
+
+
+def test_unfrozen_computations_stay_writable():
+    mw = OKFGuardMiddleware(
+        _AllowEngine(),
+        read_current=lambda _p: None,
+        frozen_paths=frozenset({"references/computations/other.md"}),
+    )
+    req = _request(
+        file_path="references/computations/draft.md",
+        content="---\ntype: Glue Table\n---\n",
+    )
+    assert mw.wrap_tool_call(req, lambda r: "WROTE") == "WROTE"
+
+
+def test_every_writing_guard_variant_carries_frozen_paths():
+    """agent.build_harvest_agent must thread frozen_paths into the subagent
+    guard, the supervisor guard, AND the fixer guard — a single dispatch path
+    without it is a hole in the freeze. Source-pinned like the delete wiring
+    test (building the real agent needs deepagents)."""
+    import inspect
+
+    from harvest import agent as agent_mod
+
+    src = inspect.getsource(agent_mod.build_harvest_agent)
+    # 3 writing guards (subagent, supervisor, fixer) + the lint gate (which
+    # downgrades findings on frozen docs to human-routed warnings).
+    assert src.count("frozen_paths=frozen_paths") == 4

@@ -17,9 +17,12 @@ the deepagents FilesystemBackend.
 from __future__ import annotations
 
 import errno
+import logging
 import shutil
 import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # Transient NFS errors worth retrying (stale handle, and remote I/O).
 _RETRYABLE = {errno.ESTALE, errno.EIO}  # 116, 5
@@ -139,6 +142,14 @@ def clean_authored_output(dataset_root: str | Path) -> list[str]:
     S3 Files write-through → ObjectRemoved event → reindex ``DeleteVectors``, its
     vector is pruned too).
 
+    UNCONDITIONAL by design — there is deliberately no keep-list. A full
+    harvest is the destructive mode: even human-VERIFIED Attested Computations
+    go (they are frozen against agents in the in-place modes only — see
+    ``harvest.verification.frozen_computation_paths``), so a re-authored
+    computation returns to the human's verify queue rather than inheriting a
+    stamp that attested different content. Requesting a full re-harvest IS
+    the decision to rebuild the wiki from source.
+
     PRESERVED (never deleted): dot-prefixed top-level entries — ``.context/``
     (user-uploaded source docs; these are INPUTS, not our output) and
     ``.harvest/`` (the commit marker the caller has just refreshed to
@@ -171,3 +182,73 @@ def clean_authored_output(dataset_root: str | Path) -> list[str]:
         _retry(_rm, what=f"rm {child}", retryable=_RM_RETRYABLE)
         removed.append(child.name)
     return removed
+
+
+#: The canonical authored-folder skeleton (the okf-authoring skill's routing
+#: table) — every directory a doc write is allowed to need. Pre-created by
+#: IN-PLACE runs; see :func:`ensure_authored_dirs`.
+AUTHORED_DIR_SKELETON = (
+    "datasets",
+    "tables",
+    "references",
+    "references/joins",
+    "references/metrics",
+    "references/enums",
+    "references/named_sets",
+    "references/glossary",
+    "references/known_issues",
+    "references/recipes",
+    "references/computations",
+)
+
+
+def ensure_authored_dirs(
+    dataset_root: str | Path, extra: tuple[str, ...] = ()
+) -> list[str]:
+    """Pre-create the canonical authored folders (IN-PLACE runs only).
+
+    A full harvest wipes and re-authors, so every directory it needs is
+    created by the run itself. An IN-PLACE run (incremental / annotation /
+    cross) works inside a tree materialized from existing S3 prefixes, and
+    creating a NEW directory there has failed live with EACCES: the deepagents
+    backend's write path does ONE raw ``mkdir(parents=True)`` with none of
+    this module's healing, and the whole write dies (seen when an annotation
+    promoted a bundle's first Attested Computation and
+    ``references/computations/`` didn't exist yet — file writes into existing
+    dirs in the same run were fine). Creating the skeleton up front, with the
+    wider EACCES/EPERM retry set the delete paths use (an attribute-cache
+    blip on this mount can surface as a permission error), means no agent
+    write should ever need a brand-new directory.
+
+    Best-effort per directory: a persistent refusal is LOGGED and skipped —
+    the run proceeds and the agent reports the blocked write exactly as
+    before, but the log now names the real failure. Unused empty dirs are
+    invisible downstream: they never materialize as S3 prefixes (no objects),
+    and index generation skips empty subtrees.
+
+    ``extra`` appends run-specific directories (e.g. a cross run's
+    ``external/<domain>/<dataset>`` pair subtree).
+
+    Returns the relative paths actually created (for logging).
+    """
+    root = Path(dataset_root)
+    created: list[str] = []
+    for rel in (*AUTHORED_DIR_SKELETON, *extra):
+        d = root / rel
+        try:
+            if d.is_dir():
+                continue
+            _retry(
+                lambda d=d: d.mkdir(parents=True, exist_ok=True),
+                what=f"mkdir {d}",
+                retryable=_RM_RETRYABLE,
+            )
+            created.append(rel)
+        except OSError:
+            log.warning(
+                "could not pre-create %s — an agent write needing this "
+                "directory will fail and be reported in-run",
+                d,
+                exc_info=True,
+            )
+    return created

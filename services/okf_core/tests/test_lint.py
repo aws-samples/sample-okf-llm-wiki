@@ -104,7 +104,7 @@ def _codes(report, severity=None):
 def test_clean_bundle_passes(tmp_path):
     report = lint_bundle(_bundle(tmp_path))
     assert report.findings == []
-    assert [s.status for s in report.steps] == ["ok"] * 5
+    assert [s.status for s in report.steps] == ["ok"] * 6
     assert report.ok is True
 
 
@@ -358,7 +358,7 @@ def test_failed_step_is_isolated_and_fails_the_report(tmp_path, monkeypatch):
     report = lint_bundle(root)
     assert report.steps[0].status == "failed"
     assert "boom" in report.steps[0].note
-    assert [s.status for s in report.steps[1:]] == ["ok"] * 4
+    assert [s.status for s in report.steps[1:]] == ["ok"] * 5
     assert report.ok is False  # a step that didn't run is not a pass
 
 

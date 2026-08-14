@@ -85,6 +85,13 @@ class Config:
         chat_threads_table: str = "okf-chat",
         chat_checkpoint_table: str = "okf-chat-checkpoints",
         events=None,
+        athena=None,
+        computations_enabled: bool = False,
+        athena_workgroup: str = "",
+        athena_output: str = "",
+        athena_catalog: str = "AwsDataCatalog",
+        computation_max_rows: int = 200,
+        computation_timeout_s: float = 120.0,
     ):
         self.bucket = bucket
         self.registry_table = registry_table
@@ -121,6 +128,18 @@ class Config:
         # accelerator is off (handlers treat it as a structural switch) — the
         # nightly reconcile remains the correctness path either way.
         self.events = events
+        # Attested Computations execution (the UI's Run modal). List/get/
+        # verify always work (bundle + overlay reads); EXECUTION exists only
+        # when var.enable_attested_computations granted the Lambda read-only
+        # SQL and set the flag (default false). Redshift-mapped datasets
+        # reuse the existing redshift_data client.
+        self.athena = athena
+        self.computations_enabled = computations_enabled
+        self.athena_workgroup = athena_workgroup
+        self.athena_output = athena_output
+        self.athena_catalog = athena_catalog
+        self.computation_max_rows = computation_max_rows
+        self.computation_timeout_s = computation_timeout_s
         # The allowed (model, effort) catalog the UI's picker offers; used to
         # VALIDATE a per-harvest model/effort selection before it reaches the
         # runtime + Bedrock. Defaults to okf_core's built-in catalog when the
@@ -187,6 +206,27 @@ class Config:
                 boto3.client("events", region_name=region)
                 if os.environ.get("OKF_EVENT_BUS_NAME")
                 else None
+            ),
+            # Client built only when execution is enabled — without the flag
+            # the IAM grant is absent too (var.enable_attested_computations).
+            athena=(
+                boto3.client("athena", region_name=region)
+                if os.environ.get("OKF_COMPUTATIONS_ENABLED", "").lower()
+                in ("1", "true", "yes")
+                else None
+            ),
+            computations_enabled=os.environ.get(
+                "OKF_COMPUTATIONS_ENABLED", ""
+            ).lower()
+            in ("1", "true", "yes"),
+            athena_workgroup=os.environ.get("OKF_ATHENA_WORKGROUP", ""),
+            athena_output=os.environ.get("OKF_ATHENA_OUTPUT", ""),
+            athena_catalog=os.environ.get("OKF_ATHENA_CATALOG", "AwsDataCatalog"),
+            computation_max_rows=int(
+                os.environ.get("OKF_COMPUTATION_MAX_ROWS", "") or 200
+            ),
+            computation_timeout_s=float(
+                os.environ.get("OKF_COMPUTATION_TIMEOUT_S", "") or 120
             ),
         )
 
@@ -1071,6 +1111,73 @@ def _r_bundle_diff(cfg, params, body, query, caller):
     )
 
 
+def _r_list_computations(cfg, params, body, query, caller):
+    return 200, handlers.list_bundle_computations(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_get_computation(cfg, params, body, query, caller):
+    return 200, handlers.get_bundle_computation(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        slug=params["slug"],
+    )
+
+
+def _r_run_computation(cfg, params, body, query, caller):
+    return 200, handlers.run_bundle_computation(
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        slug=params["slug"],
+        values=(body or {}).get("parameters") or {},
+        athena=cfg.athena,
+        redshift_data=cfg.redshift_data if cfg.computations_enabled else None,
+        athena_workgroup=cfg.athena_workgroup,
+        athena_output=cfg.athena_output,
+        athena_catalog=cfg.athena_catalog,
+        max_rows=cfg.computation_max_rows,
+        timeout_s=cfg.computation_timeout_s,
+        enabled=cfg.computations_enabled,
+    )
+
+
+def _r_verify_computation(cfg, params, body, query, caller):
+    # Identity from the validated JWT ONLY — a verified_by in the body would
+    # let any caller stamp any name onto the verification.
+    return 200, handlers.verify_computation(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        slug=params["slug"],
+        verified_by=caller.ident or "",
+        # The hash the Verify screen displayed — signing anything else would
+        # attest content the human never reviewed (409 on mismatch).
+        expected_sha256=str((body or {}).get("sha256") or ""),
+    )
+
+
+def _r_unverify_computation(cfg, params, body, query, caller):
+    return 200, handlers.unverify_computation(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        slug=params["slug"],
+        revoked_by=caller.ident or "",
+    )
+
+
 def _r_repromote_bundle(cfg, params, body, query, caller):
     return 200, handlers.repromote_bundle(
         cfg.s3,
@@ -1206,6 +1313,11 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("DELETE", "/chat/threads/{thread_id}", _r_delete_chat_thread),
     ("GET", "/bundle/{domain}/{dataset}/graph", _r_bundle_graph),
     ("GET", "/bundle/{domain}/{dataset}/file", _r_bundle_file),
+    ("GET", "/bundle/{domain}/{dataset}/computations", _r_list_computations),
+    ("GET", "/bundle/{domain}/{dataset}/computations/{slug}", _r_get_computation),
+    ("POST", "/bundle/{domain}/{dataset}/computations/{slug}/run", _r_run_computation),
+    ("POST", "/bundle/{domain}/{dataset}/computations/{slug}/verify", _r_verify_computation),
+    ("POST", "/bundle/{domain}/{dataset}/computations/{slug}/unverify", _r_unverify_computation),
     # Bundle version history (reconstructed from S3 object versions), diff, and
     # repromote; POST repromotes, GET polls its vector-index convergence.
     ("GET", "/bundle/{domain}/{dataset}/versions", _r_bundle_versions),

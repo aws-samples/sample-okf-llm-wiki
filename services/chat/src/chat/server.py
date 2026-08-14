@@ -606,6 +606,15 @@ def build_deps(config: Any = None):
         vector_bucket=chat_config.vector_bucket,
         vector_index=chat_config.vector_index,
         registry_table=chat_config.registry_table,
+        # run_computation executes over the SAME grants and deploy flag as
+        # run_sql (a computation is a source-data read); per-run exposure is
+        # additionally gated on the SQL opt-in in build_agent.
+        computations_enabled=chat_config.sql_enabled,
+        redshift_enabled=chat_config.redshift_enabled,
+        athena_workgroup=chat_config.athena_workgroup,
+        athena_output=chat_config.athena_output,
+        athena_catalog=chat_config.athena_catalog,
+        computation_max_rows=chat_config.sql_max_rows,
     )
     clients = {
         "s3": boto3.client("s3", region_name=region),
@@ -693,6 +702,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     from chat.config import build_chat_model
     from chat.guardrails_gate import GuardrailsGateMiddleware, guardrails_gate_enabled
     from chat.graph import (
+        COMPUTATIONS_BLOCK,
         SQL_BLOCK,
         SQL_REDSHIFT_BLOCK,
         WEB_SEARCH_BLOCK,
@@ -702,7 +712,11 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     )
     from chat.sql import AthenaSQL, RedshiftDataSQL, make_sql_tool
     from chat.steering import SteeringMiddleware, steering_enabled
-    from chat.tools import build_consumption_tools, make_agent_tools
+    from chat.tools import (
+        build_consumption_tools,
+        make_agent_tools,
+        make_run_computation_tool,
+    )
     from chat.web_search import build_web_search_engine, make_web_search_tool
 
     # The Athena / Redshift Data API clients are present only when their deploy
@@ -710,7 +724,12 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     athena_client = clients.pop("athena", None)
     redshift_data_client = clients.pop("redshift_data", None)
     annotations_table = clients.pop("annotations", None)
-    tools_impl = build_consumption_tools(config=consumption_config, **clients)
+    tools_impl = build_consumption_tools(
+        config=consumption_config,
+        athena=athena_client,
+        redshift_data=redshift_data_client,
+        **clients,
+    )
 
     # The web search client is built ONCE per process (not per run): it caches the
     # gateway's MCP session id, so a fresh client per turn would pay an extra
@@ -824,6 +843,38 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # are appended to the base prompt (see graph.compose_system_prompt: the
         # deployment-constant ones go first so the cached prefix stays long).
         blocks: list[str] = []
+        # ``policy_checker`` (a policy_check.PolicyChecker, or None) is
+        # constructed by the CALLER (_produce_run_chunks) — it needs the
+        # thread id for the curated question's durability and, on an
+        # ask_human resume, the fold hook — and armed per its opted tracks:
+        # computational rides the run_sql race below (and run_computation's
+        # post-substitution check); behavioural gets the before_model
+        # middleware. The checker is engine-agnostic (both SQL engines share
+        # make_sql_tool; a Redshift run is @-scoped by construction so its
+        # dataset resolves via the pinned scope).
+        sql_checker = (
+            policy_checker
+            if policy_checker is not None and policy_checker.wants("computational")
+            else None
+        )
+        # run_computation is ALWAYS bound — no deploy flag, no per-run opt-in.
+        # A computation is the SANCTIONED execution path (frozen statement,
+        # typed validated values, caps): gating it behind the raw-SQL opt-in
+        # would push exactly the users who don't enable ad-hoc SQL back to
+        # derived answers. EXECUTION capability still follows the deploy flag
+        # (the engine clients + IAM exist only under var.enable_chat_sql);
+        # without it the receipt returns the rendered SQL un-executed. First
+        # block appended: it is constant for EVERY run, so it extends the
+        # cached prompt prefix ahead of the deploy-varying ones.
+        agent_tools = [
+            *agent_tools,
+            make_run_computation_tool(
+                tools_impl,
+                dataset_scope=scope,
+                policy_checker=sql_checker,
+            ),
+        ]
+        blocks.append(COMPUTATIONS_BLOCK)
         # Public web search: DEPLOY-gated only (no per-run opt-in). Unlike run_sql
         # it reads no source data, and its value is exactly in the turns where a
         # question unexpectedly turns outward ("is that decline actually bad?") —
@@ -840,19 +891,6 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # Redshift scope on a deployment without Redshift enabled gets NO SQL
         # tool — running the dataset's queries through Athena would silently hit
         # the wrong backend/dialect.
-        # ``policy_checker`` (a policy_check.PolicyChecker, or None) is
-        # constructed by the CALLER (_produce_run_chunks) — it needs the
-        # thread id for the curated question's durability and, on an
-        # ask_human resume, the fold hook — and armed per its opted tracks:
-        # computational rides the run_sql race below; behavioural gets the
-        # before_model middleware. The checker is engine-agnostic (both SQL
-        # engines share make_sql_tool; a Redshift run is @-scoped by
-        # construction so its dataset resolves via the pinned scope).
-        sql_checker = (
-            policy_checker
-            if policy_checker is not None and policy_checker.wants("computational")
-            else None
-        )
         if features and "sql" in features:
             scoped = _sql_scope(scope)
             scoped_source = (scoped or {}).get("source") or {}

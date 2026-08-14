@@ -25,9 +25,10 @@ from __future__ import annotations
 
 import difflib
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterable
 
 from okf_aws.s3_bundle import bundle_prefix, parse_bundle_key, state_marker_key
 
@@ -445,4 +446,74 @@ def restore_snapshot(
     for key in sorted(set(live) - set(snapshot)):
         s3.delete_object(Bucket=bucket, Key=key)
         deleted.append(key)
+    # A restored tree must stay WRITABLE on the next harvest mount. The S3
+    # Files NFS derives each directory's POSIX ownership from its zero-byte
+    # marker object; this restore copies only the DOC keys, so a bundle whose
+    # markers were lost (a full-harvest wipe deletes them through the mount —
+    # if that run then dies and this restore rebuilds the tree, nothing ever
+    # re-creates them) would come back as bare prefixes, which the mount
+    # presents READ-ONLY: every later in-place write of a NEW doc or
+    # directory fails EACCES (seen live on the VW fork's generic/fpl — the
+    # bundle's first computation promotion could not be materialized).
+    ensure_dir_markers(
+        s3, bucket=bucket, data_domain=data_domain, dataset=dataset, keys=copied
+    )
     return copied, deleted
+
+
+#: The metadata the S3 Files mount stamps on a directory it creates. A marker
+#: carrying these presents the directory as owned by the harvest container
+#: (uid/gid 1000, drwxr-xr-x); a BARE prefix (no marker) presents read-only
+#: and refuses new entries. `fs-id` (which a mount-written marker also
+#: carries) is deliberately omitted: it names the mount association that
+#: created the marker — stale ids from long-dead associations are honored, so
+#: it is bookkeeping, and duplicating one across many directories risks
+#: confusing the mount's identity mapping.
+_DIR_MARKER_METADATA = {
+    "user-agent": "aws-s3-files",
+    "file-owner": "1000",
+    "file-group": "1000",
+    "file-permissions": "0040755",
+}
+
+
+def ensure_dir_markers(
+    s3, *, bucket: str, data_domain: str, dataset: str, keys: Iterable[str]
+) -> list[str]:
+    """PUT a directory marker for every directory the ``keys`` imply.
+
+    Walks each key's ancestor chain inside the bundle prefix (the dataset
+    root itself included) and creates the zero-byte ``<dir>/`` marker with
+    the aws-s3-files POSIX metadata wherever one is missing. Existing markers
+    are left untouched — they may carry richer mount-written metadata.
+    Returns the marker keys created.
+    """
+    prefix = bundle_prefix(data_domain, dataset)
+    dirs: set[str] = {prefix}
+    for key in keys:
+        if not key.startswith(prefix):
+            continue
+        parts = key[len(prefix) :].split("/")[:-1]  # drop the filename
+        for i in range(1, len(parts) + 1):
+            dirs.add(prefix + "/".join(parts[:i]) + "/")
+    now_ns = f"{time.time_ns()}ns"
+    metadata = {
+        **_DIR_MARKER_METADATA,
+        "file-btime": now_ns,
+        "file-atime": now_ns,
+        "file-mtime": now_ns,
+    }
+    created: list[str] = []
+    for d in sorted(dirs):
+        try:
+            s3.head_object(Bucket=bucket, Key=d)
+            continue  # marker already present (possibly mount-written)
+        except Exception as e:  # noqa: BLE001 - only a clean 404 means "absent"
+            code = str(
+                (getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+            )
+            if code not in ("404", "NoSuchKey", "NotFound"):
+                raise
+        s3.put_object(Bucket=bucket, Key=d, Body=b"", Metadata=metadata)
+        created.append(d)
+    return created

@@ -16,7 +16,7 @@ def _by_name(tools):
     return {t.name: t for t in tools}
 
 
-def test_unscoped_exposes_all_ten_tools_with_location_args():
+def test_unscoped_exposes_all_read_tools_with_location_args():
     tools = _by_name(make_agent_tools(FakeConsumptionTools()))
     assert set(tools) == {
         "list_domains",
@@ -29,6 +29,10 @@ def test_unscoped_exposes_all_ten_tools_with_location_args():
         "grep",
         "semantic_search",
         "get_bundle_diff",
+        # Bundle reads, so ungated like the rest; run_computation is NOT here
+        # (per-run SQL opt-in — see make_run_computation_tool).
+        "list_computations",
+        "describe_computation",
     }
     # read_page keeps its location args when unscoped.
     assert set(tools["read_page"].args) == {
@@ -258,3 +262,94 @@ def test_submit_annotation_unscoped_takes_dataset_args():
     assert table.items[0]["pk"] == "ANNO#sales#orders#sub-9"
     err = _json.loads(tool.func(note="x", data_domain="", dataset="orders"))
     assert "required" in err["error"]
+
+
+# --- run_computation (per-run gated, policy-checked) --------------------------
+
+
+def test_run_computation_tool_scoped_schema_and_delegation():
+    from chat.tools import make_run_computation_tool
+
+    fake = FakeConsumptionTools()
+    tool = make_run_computation_tool(
+        fake, dataset_scope={"data_domain": "sales", "dataset": "orders"}
+    )
+    assert tool.name == "run_computation"
+    assert set(tool.args) == {"name", "parameters"}  # location args injected
+    out = tool.invoke({"name": "season_points", "parameters": {"season": 2024}})
+    assert out["executed"] is True
+    name, kwargs = fake.calls[-1]
+    assert name == "run_computation"
+    assert kwargs["data_domain"] == "sales" and kwargs["dataset"] == "orders"
+    assert kwargs["parameters"] == {"season": 2024}
+
+
+def test_run_computation_policy_note_rides_after_payload():
+    import json as _json
+
+    from chat.tools import make_run_computation_tool
+
+    class _Future:
+        def result(self, timeout=None):
+            return "<system-reminder>okf_policy: flagged</system-reminder>"
+
+    class _Checker:
+        wait_budget_s = 1
+
+        def __init__(self):
+            self.submitted = []
+
+        def submit(self, sql):
+            self.submitted.append(sql)
+            return _Future()
+
+        def should_wait(self, sql):
+            return True
+
+    checker = _Checker()
+    tool = make_run_computation_tool(
+        FakeConsumptionTools(),
+        dataset_scope={"data_domain": "sales", "dataset": "orders"},
+        policy_checker=checker,
+    )
+    out = tool.invoke({"name": "season_points"})
+    # The checker judged the POST-SUBSTITUTION statement that actually ran.
+    assert checker.submitted == ["SELECT 1"]
+    payload, _, note = out.partition("\n\n")
+    assert _json.loads(payload)["executed"] is True
+    assert "okf_policy" in note
+
+
+def test_run_computation_policy_skips_unexecuted_receipts():
+    from chat.tools import make_run_computation_tool
+
+    class _Unexecuted(FakeConsumptionTools):
+        def run_computation(self, *a, **k):
+            return {"executed": False, "executed_sql": "SELECT 1", "note": "n"}
+
+    class _Checker:
+        def submit(self, sql):  # pragma: no cover - must not be called
+            raise AssertionError("policy check must not run for unexecuted receipts")
+
+    tool = make_run_computation_tool(
+        _Unexecuted(),
+        dataset_scope={"data_domain": "sales", "dataset": "orders"},
+        policy_checker=_Checker(),
+    )
+    out = tool.invoke({"name": "x"})
+    assert out["executed"] is False
+
+
+def test_submit_annotation_description_teaches_computation_proposals():
+    # Proposing a new Attested Computation is a first-class use of the
+    # annotation queue — the description must teach it, or the model never
+    # routes "make this canonical/runnable" asks through the tool.
+    from chat.tools import make_submit_annotation_tool
+
+    for scope in (None, {"data_domain": "sales", "dataset": "orders"}):
+        tool = make_submit_annotation_tool(
+            _FakeTable(), dataset_scope=scope, user_sub="sub-123"
+        )
+        desc = tool.description.lower()
+        assert "computation" in desc
+        assert "references/computations/" in tool.description
