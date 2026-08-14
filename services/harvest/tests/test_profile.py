@@ -324,3 +324,123 @@ def test_source_without_atoms_is_a_clean_no_op(tmp_path: Path):
                          cache=read_cached_profiles(tmp_path), cfg=CFG)
     assert out["files"] == []
 
+
+
+# ---------------------------------------------------------------------------
+# domains.json — the machine-readable enum domains the semantic layer folds
+# ---------------------------------------------------------------------------
+
+
+def _domains(root: Path) -> dict:
+    import json
+
+    return json.loads((root / PROFILE_DIR / "domains.json").read_text())
+
+
+def test_domains_json_written_with_exhaustive_flag(tmp_path: Path):
+    # A FULL scan that returned FEWER groups than the top-K cap (2 < topk=3)
+    # proves the GROUP BY enumerated the whole column -> exhaustive, with the
+    # count taken from the values we actually hold (never approx_distinct).
+    src = _Src(
+        agg={"_n": "100", "nn_0": "100", "d_0": "2", "mn_0": "A", "mx_0": "B"},
+        topk={"status": [{"v": "A", "n": "70"}, {"v": "B", "n": "30"}]},
+    )
+    meta = {"races": _meta(("status", "string"), size=500)}
+    write_profiles(src, tmp_path, tables_meta=meta,
+                   cache=read_cached_profiles(tmp_path), cfg=CFG)
+    entry = _domains(tmp_path)["tables"]["races"]
+    assert entry["columns"]["status"] == {
+        "values": ["A", "B"], "distinct": 2, "exhaustive": True,
+    }
+    assert entry["profiled_at"]
+
+
+def test_domains_at_the_topk_cap_are_never_exhaustive(tmp_path: Path):
+    # Exactly `topk` groups came back: the column may hold more values the
+    # LIMIT cut off. `d_0` (approx_distinct, ~2% error) must NOT be trusted to
+    # settle it — a real 4-distinct column whose estimate reads 3 would
+    # otherwise be stamped provably exhaustive.
+    src = _Src(
+        agg={"_n": "100", "nn_0": "100", "d_0": "3", "mn_0": "A", "mx_0": "C"},
+        topk={"status": [
+            {"v": "A", "n": "50"}, {"v": "B", "n": "30"}, {"v": "C", "n": "20"},
+        ]},
+    )
+    write_profiles(src, tmp_path, tables_meta={
+        "races": _meta(("status", "string"), size=500)
+    }, cache=read_cached_profiles(tmp_path), cfg=CFG)
+    col = _domains(tmp_path)["tables"]["races"]["columns"]["status"]
+    assert col["exhaustive"] is False and col["values"] == ["A", "B", "C"]
+
+
+def test_domain_values_are_verbatim_and_drop_the_null_group(tmp_path: Path):
+    # The SHEET truncates long values and prints NULL as a word; the machine
+    # domains must not — a truncated literal matches nothing, and `= 'NULL'`
+    # is not how SQL matches nulls.
+    long_value = "x" * 120
+    src = _Src(
+        agg={"_n": "10", "nn_0": "9", "d_0": "2", "mn_0": "a", "mx_0": "z"},
+        topk={"path": [
+            {"v": long_value, "n": "8"}, {"v": None, "n": "1"},
+        ]},
+    )
+    write_profiles(src, tmp_path, tables_meta={
+        "races": _meta(("path", "string"), size=500)
+    }, cache=read_cached_profiles(tmp_path), cfg=CFG)
+    col = _domains(tmp_path)["tables"]["races"]["columns"]["path"]
+    assert col["values"] == [long_value]  # full length, no "…"
+    assert "NULL" not in col["values"]
+    # The rendered sheet still shows its display forms.
+    sheet = (tmp_path / PROFILE_DIR / "races.md").read_text()
+    assert "…" in sheet and "NULL" in sheet
+
+
+def test_domains_from_samples_or_truncated_lists_are_not_exhaustive(tmp_path: Path):
+    topk = {"status": [{"v": "A", "n": "5"}, {"v": "B", "n": "3"}, {"v": "C", "n": "1"}]}
+    # Sampled (over the byte threshold): never exhaustive.
+    src = _Src(
+        agg={"_n": "50", "nn_0": "50", "d_0": "3", "mn_0": "A", "mx_0": "C"},
+        topk=topk,
+    )
+    write_profiles(src, tmp_path / "a", tables_meta={
+        "races": _meta(("status", "string"), size=10**12)
+    }, cache=read_cached_profiles(tmp_path / "a"), cfg=CFG)
+    assert (
+        _domains(tmp_path / "a")["tables"]["races"]["columns"]["status"]["exhaustive"]
+        is False
+    )
+    # Full scan but top-K-truncated (4 distinct, 3 fetched): not exhaustive.
+    src2 = _Src(
+        agg={"_n": "100", "nn_0": "100", "d_0": "4", "mn_0": "A", "mx_0": "D"},
+        topk=topk,
+    )
+    write_profiles(src2, tmp_path / "b", tables_meta={
+        "races": _meta(("status", "string"), size=500)
+    }, cache=read_cached_profiles(tmp_path / "b"), cfg=CFG)
+    assert (
+        _domains(tmp_path / "b")["tables"]["races"]["columns"]["status"]["exhaustive"]
+        is False
+    )
+
+
+def test_domains_carry_forward_on_incremental_reuse(tmp_path: Path):
+    meta = {"races": _meta(("status", "string"), size=500)}
+    src = _Src(
+        agg={"_n": "100", "nn_0": "100", "d_0": "3", "mn_0": "A", "mx_0": "C"},
+        topk={"status": [
+            {"v": "A", "n": "50"}, {"v": "B", "n": "30"}, {"v": "C", "n": "20"},
+        ]},
+    )
+    write_profiles(src, tmp_path / ".metadata", tables_meta=meta,
+                   cache=read_cached_profiles(tmp_path), cfg=CFG)
+    # Incremental with nothing changed: the sheet reuses, and the domain entry
+    # must survive the carry (a fresh source that would return NO values
+    # proves it came from the cache, not a re-probe).
+    cache = read_cached_profiles(tmp_path)
+    src2 = _Src(agg={}, topk={})
+    write_profiles(src2, tmp_path / ".metadata", tables_meta=meta,
+                   cache=cache, profile_mode="incremental",
+                   changed_tables=frozenset(), cfg=CFG)
+    entry = _domains(tmp_path / ".metadata")["tables"]["races"]
+    assert entry["columns"]["status"]["values"] == ["A", "B", "C"]
+    assert src2.queries == []  # nothing re-probed

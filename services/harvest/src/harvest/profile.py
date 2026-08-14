@@ -40,6 +40,7 @@ engine samples; without it a too-large table is skipped, never full-scanned).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import time
@@ -55,6 +56,15 @@ log = logging.getLogger(__name__)
 
 PROFILE_DIR = "profile"
 MANIFEST_NAME = "manifest.tsv"
+#: Machine-readable companion to the sheets: the enum-like columns' observed
+#: value lists ({table: {column: {values, distinct, exhaustive}}} + a
+#: per-table profiled_at). The sheets are for the authoring agent; this file
+#: feeds the Attested Computations ADVISORY parameter-value check (a miss
+#: warns, never refuses — data may have evolved since the scan; see
+#: okf_core.computations) plus lint's enum-vs-evidence check and the UI's
+#: type-ahead. Carried across runs under the sheets' fingerprint policy,
+#: like relationships/evidence.json.
+_DOMAINS_NAME = "domains.json"
 _MANIFEST_HEADER = "table\tfingerprint\tstatus\tsample_pct\tprofiled_at"
 
 #: Types eligible for profiling (top-level, primitive). Two type vocabularies
@@ -127,6 +137,9 @@ class _CachedProfiles:
     fingerprints: dict[str, str] = field(default_factory=dict)
     manifest_rows: dict[str, str] = field(default_factory=dict)  # table -> raw row
     sheets: dict[str, str] = field(default_factory=dict)         # table -> markdown
+    # table -> machine-readable enum domains (see _DOMAINS_NAME) — carried
+    # forward for reused sheets under the same fingerprint policy.
+    domains: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def table_fingerprint(meta: dict[str, Any], *, data_shape: str = "") -> str:
@@ -163,6 +176,15 @@ def read_cached_profiles(dataset_root: str | Path) -> _CachedProfiles:
     """Load the previous run's profile dir (call BEFORE the ``.metadata`` wipe)."""
     cache = _CachedProfiles()
     root = Path(dataset_root) / ".metadata" / PROFILE_DIR
+    dom_file = root / _DOMAINS_NAME
+    if dom_file.is_file():
+        try:
+            data = json.loads(dom_file.read_text(encoding="utf-8"))
+            for table, entry in (data.get("tables") or {}).items():
+                if isinstance(entry, dict):
+                    cache.domains[table] = entry
+        except (OSError, UnicodeDecodeError, ValueError):
+            pass  # corrupt domains = none (the sheets are still the cache)
     manifest = root / MANIFEST_NAME
     if not manifest.is_file():
         return cache
@@ -262,8 +284,12 @@ class TableProfiler:
             return self._approx(col_sql)
         return f"COUNT(DISTINCT {col_sql})"
 
-    def profile_table(self, table: str, meta: dict[str, Any]) -> tuple[str, str]:
-        """Return ``(markdown_sheet, sample_pct)`` — sample_pct "" = full scan.
+    def profile_table(
+        self, table: str, meta: dict[str, Any]
+    ) -> tuple[str, str, dict[str, Any]]:
+        """Return ``(markdown_sheet, sample_pct, domains)`` — sample_pct "" =
+        full scan; ``domains`` maps enum-like columns to their observed value
+        lists (``{values, distinct, exhaustive}``) for ``domains.json``.
 
         Raises on query failure; the caller records the error in the manifest.
         """
@@ -325,6 +351,8 @@ class TableProfiler:
             key=lambda ic: _to_int(agg.get(f"d_{ic[0]}")),
         )[: cfg.max_enum_queries]
         topk: dict[str, list[tuple[str, int]]] = {}
+        # Same groups UNFORMATTED, for the machine-readable domains below.
+        raw_topk: dict[str, list[Any]] = {}
         for i, c in enum_candidates:
             if self.out_of_budget():
                 break
@@ -339,6 +367,37 @@ class TableProfiler:
             topk[c.get("name") or ""] = [
                 (_fmt_value(r.get("v")), _to_int(r.get("n"))) for r in vals
             ]
+            raw_topk[c.get("name") or ""] = [r.get("v") for r in vals]
+
+        # Machine-readable domains for the computations advisory layer. Two rules make these
+        # values usable as SQL literals, unlike the sheet's display strings:
+        #
+        # * VERBATIM values — the sheet truncates at `_VALUE_MAX_CHARS` with a
+        #   `…` suffix and renders NULL as the word "NULL". A truncated value
+        #   can never match the real data (the advisory would warn about a
+        #   value that exists, and the UI would suggest one that returns zero
+        #   rows), and `= 'NULL'` is not how SQL matches nulls (`is null` is).
+        # * EXHAUSTIVE is proven by the GROUP BY, not by comparing against the
+        #   APPROXIMATE distinct count: asking for `topk` groups and getting
+        #   fewer means the scan enumerated the whole column. `d_<i>` is
+        #   `approx_distinct` (~2% error), so `distinct <= len(values)` could
+        #   stamp a cap-truncated list "exhaustive". When the proof holds, the
+        #   count is the exact number of values we hold.
+        domains: dict[str, Any] = {}
+        for i, c in enum_candidates:
+            name = c.get("name") or ""
+            groups = raw_topk.get(name)
+            if not groups:
+                continue
+            values = [str(v) for v in groups if v is not None]
+            if not values:
+                continue
+            exhaustive = not sample_pct and len(groups) < cfg.topk
+            domains[name] = {
+                "values": values,
+                "distinct": len(values) if exhaustive else _to_int(agg.get(f"d_{i}")),
+                "exhaustive": exhaustive,
+            }
 
         return (
             _render_sheet(
@@ -346,6 +405,7 @@ class TableProfiler:
                 sample_pct=sample_pct, cfg=cfg, size_hint=size,
             ),
             sample_pct,
+            domains,
         )
 
 
@@ -469,6 +529,9 @@ def write_profiles(
     profile_root = meta_root / PROFILE_DIR
     now = datetime.now(timezone.utc).isoformat()
     manifest_lines = [_MANIFEST_HEADER]
+    # Machine-readable enum domains (see _DOMAINS_NAME): fresh probes add
+    # entries, reused sheets carry theirs forward.
+    domains: dict[str, dict[str, Any]] = {}
     mp = getattr(source, "metadata_profile", None)
     shape_keys = tuple(getattr(mp, "bytesize_param_keys", ()) or ()) + tuple(
         getattr(mp, "rowcount_param_keys", ()) or ()
@@ -502,6 +565,9 @@ def write_profiles(
             manifest_lines.append(
                 f"{table}\t{fp}\tcached\t{old[3]}\t{old[4]}"
             )
+            cached_domains = cache.domains.get(table)
+            if cached_domains:
+                domains[table] = cached_domains
             out["cached"] += 1
             out["files"].append(f"profile/{table}.md")
             continue
@@ -510,7 +576,7 @@ def write_profiles(
             out["skipped"] += 1
             continue
         try:
-            sheet, sample_pct = profiler.profile_table(table, meta)
+            sheet, sample_pct, table_domains = profiler.profile_table(table, meta)
         except Exception as e:  # noqa: BLE001 - per-table best-effort
             log.info("Profile failed for table %s: %s", table, e)
             manifest_lines.append(
@@ -520,10 +586,18 @@ def write_profiles(
             continue
         write_text(profile_root / f"{table}.md", sheet)
         manifest_lines.append(f"{table}\t{fp}\tok\t{sample_pct}\t{now}")
+        if table_domains:
+            domains[table] = {"profiled_at": now, "columns": table_domains}
         out["profiled"] += 1
         out["files"].append(f"profile/{table}.md")
 
     _tick(total_tables, "done")
     if out["files"] or out["skipped"]:
         write_text(profile_root / MANIFEST_NAME, "\n".join(manifest_lines) + "\n")
+        write_text(
+            profile_root / _DOMAINS_NAME,
+            json.dumps({"version": 1, "tables": domains}, indent=1, sort_keys=True)
+            + "\n",
+        )
+        out["files"].append(f"profile/{_DOMAINS_NAME}")
     return out

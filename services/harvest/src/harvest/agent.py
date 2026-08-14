@@ -475,6 +475,7 @@ def build_harvest_agent(
     step_emitter: Any = None,
     cross_target: dict[str, Any] | None = None,
     supervisor_prompt: str | None = None,
+    frozen_paths: frozenset[str] = frozenset(),
 ) -> HarvestAgent:
     """Build the harvest deep agent (see the module docstring for the wiring).
 
@@ -635,10 +636,17 @@ def build_harvest_agent(
     # guidance on when to use it — the same reason the lint gate is gated here.
     full_harvest = cross_target is None and supervisor_prompt is None
 
+    # ``frozen_paths`` (resolved by the RUNNER at run start —
+    # harvest.verification.frozen_computation_paths): human-VERIFIED
+    # computation docs, immutable to every agent in every mode. On every
+    # WRITING guard variant below — supervisor, authors, fixer — so no
+    # dispatch path can touch a doc a human attested (the read-only guard
+    # refuses all writes anyway).
     guard = OKFGuardMiddleware(
         engine,
         read_current=_make_read_current(dataset_root),
         writable_prefix=writable_prefix,
+        frozen_paths=frozen_paths,
     )
     # The SUPERVISOR's own guard: identical, plus `delete` for retiring a stale
     # doc (one .md file, never a dot-dir or a directory — see okf_guard). In
@@ -653,6 +661,7 @@ def build_harvest_agent(
         read_current=_make_read_current(dataset_root),
         writable_prefix=writable_prefix,
         allow_delete=True,
+        frozen_paths=frozen_paths,
     )
     # The verify-and-report sub-agents' guard: refuses EVERY write/edit (and,
     # like the main guard, the recursive `delete` deepagents ≥0.7 exposes).
@@ -675,6 +684,7 @@ def build_harvest_agent(
         read_current=_make_read_current(dataset_root),
         writable_prefix=writable_prefix,
         write_allowlist=current_fix_allowlist,
+        frozen_paths=frozen_paths,
     )
     # Tool-boundary safety net: a raising tool (e.g. a PermissionError from the
     # S3 Files mount mid-write) becomes a ToolMessage(status="error") the model
@@ -733,7 +743,13 @@ def build_harvest_agent(
     # judgment (see stats_tool.py) — deliberately NOT in the sub-agent specs.
     main_tools.append(make_stats_tool(dataset_root))
     if cross_target is None:
-        main_tools.append(make_lint_tool(source, dataset_root))
+        # frozen_paths: the SAME folded∪overlay union the guards enforce —
+        # lint must downgrade findings on overlay-only-frozen docs too, or an
+        # un-folded Verify click leaves the gate demanding a fix the guard
+        # refuses (the wedge the downgrade exists to prevent).
+        main_tools.append(
+            make_lint_tool(source, dataset_root, frozen_paths=frozen_paths)
+        )
     if full_harvest:
         # The deterministic review workflow (ONE call replaces the old
         # cluster→eval→Promise.all orchestration): clusters computed here,

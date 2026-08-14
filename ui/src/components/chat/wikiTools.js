@@ -24,6 +24,7 @@ import {
   MessageCircleQuestionIcon,
   ScanSearchIcon,
   SearchIcon,
+  SigmaIcon,
   TerminalIcon,
   TextSearchIcon,
   WrenchIcon,
@@ -44,6 +45,11 @@ const ICONS = {
   grep: TextSearchIcon,
   // run_sql = a live query against the catalog (terminal/prompt glyph)
   run_sql: TerminalIcon,
+  // Attested Computations: canonical parameterized SQL (sigma = a blessed
+  // aggregate, deliberately distinct from run_sql's ad-hoc terminal)
+  list_computations: SigmaIcon,
+  describe_computation: SigmaIcon,
+  run_computation: SigmaIcon,
   // web_search = the one tool that reads OUTSIDE the org (globe, deliberately
   // distinct from the wiki's own search glyphs)
   web_search: GlobeIcon,
@@ -120,6 +126,18 @@ export function toolLabel(toolName, args, running) {
       const t = s(a.title)
       const label = t ? `“${t}”` : ""
       return running ? `Charting ${label}`.trim() : `Charted ${label}`.trim()
+    }
+    case "list_computations":
+      return running ? "Listing computations" : "Computations"
+    case "describe_computation": {
+      const n = s(a.name)
+      return running ? `Reading computation ${n}` : `Computation ${n}`
+    }
+    case "run_computation": {
+      const n = s(a.name)
+      return running
+        ? `Computing ${n}`.trim()
+        : `Computed ${n}`.trim()
     }
     case "web_search": {
       // Any period lives in the query text itself (the tool has no date args —
@@ -330,6 +348,73 @@ export function parseToolResult(toolName, rawContent) {
         rows: rows.map((r) => {
           const out = {}
           for (const name of cols) out[name] = r[name] == null ? "NULL" : r[name]
+          return out
+        }),
+      }
+    }
+    case "list_computations": {
+      const arr = Array.isArray(content?.computations) ? content.computations : []
+      return {
+        summary: plural(arr.length, "computation"),
+        kind: "table",
+        columns: [
+          { key: "computation", header: "Computation", mono: true },
+          { key: "title", header: "Title", wrap: true },
+          { key: "runtime", header: "Runtime", mono: true },
+          { key: "verification", header: "Verification", mono: true },
+        ],
+        rows: arr.map((c) => ({
+          computation: c.computation,
+          title: c.title,
+          runtime: c.runtime,
+          verification: c.verification,
+        })),
+      }
+    }
+    case "describe_computation": {
+      const params = Array.isArray(content?.parameters) ? content.parameters : []
+      return {
+        summary: content?.error
+          ? "not found"
+          : `${plural(params.length, "parameter")} · ${s(content?.verification) || "unverified"}`,
+        kind: "table",
+        columns: [
+          { key: "name", header: "Parameter", mono: true },
+          { key: "type", header: "Type", mono: true },
+          { key: "required", header: "Required", mono: true },
+          { key: "example", header: "Example", mono: true, wrap: true },
+        ],
+        rows: params.map((p) => ({
+          name: p.name,
+          type: p.type,
+          required: p.required ? "yes" : "no",
+          example: p.example == null ? "" : String(p.example),
+        })),
+      }
+    }
+    case "run_computation": {
+      // The receipt: POSITIONAL rows (unlike run_sql's dict rows) + the
+      // verification status a consumer should weigh alongside the numbers.
+      if (content?.error) return { summary: "refused", kind: "raw", raw: content }
+      const cols = Array.isArray(content?.columns) ? content.columns : []
+      const rows = Array.isArray(content?.rows) ? content.rows : []
+      const badge = s(content?.verification)
+      if (!content?.executed) {
+        return { summary: badge ? `not executed · ${badge}` : "not executed", kind: "raw", raw: content }
+      }
+      return {
+        summary:
+          plural(content?.row_count ?? rows.length, "row") +
+          (content?.truncated ? "+" : "") +
+          (badge ? ` · ${badge}` : ""),
+        kind: "table",
+        columns: cols.map((name) => ({ key: name, header: name, mono: true })),
+        rows: rows.map((r) => {
+          const out = {}
+          cols.forEach((name, i) => {
+            const v = Array.isArray(r) ? r[i] : r?.[name]
+            out[name] = v == null ? "NULL" : v
+          })
           return out
         }),
       }

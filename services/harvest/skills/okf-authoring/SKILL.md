@@ -129,10 +129,19 @@ an adversarial review — over the finished bundle.
      definitions). Every extracted fact that becomes its own doc lives under a
      **fact-typed parent folder** (`references/metrics/`, `references/joins/`,
      `references/enums/`, `references/named_sets/`, `references/glossary/`,
-     `references/known_issues/`), one doc per item. This folder scheme is
+     `references/known_issues/`, `references/computations/`), one doc per item.
+     This folder scheme is
      **canonical** — it is what keeps bundles uniform across every harvest — so
      don't file a reference doc directly under `references/` or invent another
      folder. See `references/fact-types.md` (Routing summary) for the full table.
+     A **recurring, parameterizable question** answered by one canonical
+     read-only statement — `.context/` names a KPI, or the same question shape
+     recurs in the provided context — is an **Attested Computation**
+     (`references/computations/<slug>.md`, `type: Attested Computation`):
+     consumers execute it by passing typed parameter values, and a human can
+     verify it. See the template in `references/templates.md` for its rules
+     (one statement, scalar `@holes`, examples required, never set the
+     `verified` fields).
    - Flat at root — fine for small bundles of non-reference concepts.
 3. **Pick `type` values.** Short, descriptive, self-explanatory strings:
    `Glue Table`, `Glue Database`, `API Endpoint`, `Metric`, `Playbook`,

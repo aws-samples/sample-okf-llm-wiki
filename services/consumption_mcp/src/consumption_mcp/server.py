@@ -36,19 +36,34 @@ def build_clients(config: ConsumptionConfig):
     s3vectors = boto3.client("s3vectors", region_name=region)
     bedrock_runtime = boto3.client("bedrock-runtime", region_name=region)
     ddb = boto3.resource("dynamodb", region_name=region).Table(config.registry_table)
-    return s3, s3vectors, bedrock_runtime, ddb
+    # Engine clients exist only when the deployment enables computation
+    # execution (var.enable_attested_computations) — without the flag the IAM
+    # grant is absent too, so a client here would only produce AccessDenied.
+    athena = (
+        boto3.client("athena", region_name=region)
+        if config.computations_enabled
+        else None
+    )
+    redshift_data = (
+        boto3.client("redshift-data", region_name=region)
+        if config.computations_enabled and config.redshift_enabled
+        else None
+    )
+    return s3, s3vectors, bedrock_runtime, ddb, athena, redshift_data
 
 
 def build_tools(config: ConsumptionConfig | None = None) -> ConsumptionTools:
     """Assemble a :class:`ConsumptionTools` from env-resolved clients + config."""
     config = config or ConsumptionConfig.from_env()
-    s3, s3vectors, bedrock_runtime, ddb = build_clients(config)
+    s3, s3vectors, bedrock_runtime, ddb, athena, redshift_data = build_clients(config)
     return ConsumptionTools(
         s3=s3,
         s3vectors=s3vectors,
         bedrock_runtime=bedrock_runtime,
         ddb=ddb,
         config=config,
+        athena=athena,
+        redshift_data=redshift_data,
     )
 
 
@@ -205,6 +220,50 @@ def register_tools(mcp, tools: ConsumptionTools) -> None:
             type=type,
             tags=tags,
             top_k=top_k,
+        )
+
+    @mcp.tool()
+    def list_computations(data_domain: str, dataset: str) -> dict:
+        """List the dataset's Attested Computations: canonical, human-verified,
+        parameterized read-only SQL you run by passing typed parameter values.
+
+        Each entry carries the parameter contracts and a verification status
+        (`verified` = a named human attested this exact statement;
+        `unverified`; `stale` = the doc changed after verification). Prefer a
+        matching computation over deriving your own SQL — it is the blessed
+        answer to that question shape.
+        """
+        return tools.list_computations(data_domain, dataset)
+
+    @mcp.tool()
+    def describe_computation(name: str, data_domain: str, dataset: str) -> dict:
+        """One computation's full contract: parameters (type/required/default/
+        enum/example), the frozen SQL with its `@parameter` holes, the content
+        hash, and verification status. Read the concept doc
+        (`references/computations/<name>`) via read_page for the business
+        definition and linked concepts.
+        """
+        return tools.describe_computation(name, data_domain, dataset)
+
+    @mcp.tool()
+    def run_computation(
+        name: str,
+        data_domain: str,
+        dataset: str,
+        parameters: dict | None = None,
+    ) -> dict:
+        """Execute an Attested Computation by supplying parameter VALUES only.
+
+        The platform validates values against the declared contracts (type,
+        enum, min/max — violations are refused with the legal alternatives),
+        renders typed literals into the sanctioned SQL, and runs read-only
+        under row/time caps. The receipt carries the exact `executed_sql`, the
+        `computation_sha256`, the verification status, and `warnings` for
+        values outside profiled domains (it still runs — data evolves; 0 rows
+        plus a warning usually means a typo'd value).
+        """
+        return tools.run_computation(
+            name, data_domain, dataset, parameters=parameters
         )
 
 

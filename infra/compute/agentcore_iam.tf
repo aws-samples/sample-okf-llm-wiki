@@ -437,10 +437,101 @@ resource "aws_iam_role_policy" "harvest" {
 # QueryVectors-with-filter/metadata 403 trap means we MUST also grant GetVectors.
 
 data "aws_iam_policy_document" "consumption" {
+  # checkov:skip=CKV_AWS_108:Only when var.enable_attested_computations — ComputationsTableDataRead s3:GetObject must be "*" because a Glue table's storage location can be any bucket; read-only (no Put to source) and the SQL reaching Athena is the wiki's frozen statement with typed literals substituted, never caller SQL.
+  # checkov:skip=CKV_AWS_111:Only when var.enable_attested_computations — Athena/S3 write is scoped to the dedicated results bucket; the remaining broad grants are read/list metadata actions that don't support ARN scoping (same residual as the chat SQL grant).
+  # checkov:skip=CKV_AWS_356:glue read + athena query are catalog/workgroup-level actions that cannot be pinned to one resource ARN (same residual as harvest_data); run_computation substitutes typed, validated values into sanctioned statements only.
   statement {
     sid       = "BundleBucketRead"
     actions   = ["s3:GetObject", "s3:ListBucket"]
     resources = [local.d.bundle_bucket_arn, "${local.d.bundle_bucket_arn}/*"]
+  }
+
+  # Optional Attested Computations execution (var.enable_attested_computations):
+  # the SAME read-only ceiling as the chat SQL grant — catalog-wide Glue/Athena
+  # READ, results-bucket write, broad source-data READ (a Glue table's location
+  # can be any bucket), nothing writable on source. Only the wiki's frozen
+  # statements (typed literals substituted by the platform) reach Athena —
+  # run_computation never forwards caller SQL.
+  dynamic "statement" {
+    for_each = var.enable_attested_computations ? [1] : []
+    content {
+      sid = "ComputationsGlueRead"
+      actions = [
+        "glue:GetDatabase", "glue:GetDatabases",
+        "glue:GetTable", "glue:GetTables",
+        "glue:GetPartitions", "glue:GetPartition", "glue:BatchGetPartition",
+        "glue:GetTableVersions",
+      ]
+      resources = ["*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_attested_computations ? [1] : []
+    content {
+      sid = "ComputationsAthenaQuery"
+      actions = [
+        "athena:StartQueryExecution", "athena:GetQueryExecution",
+        "athena:GetQueryResults", "athena:StopQueryExecution",
+      ]
+      resources = ["*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_attested_computations ? [1] : []
+    content {
+      sid       = "ComputationsAthenaResultsWrite"
+      actions   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:GetBucketLocation"]
+      resources = [aws_s3_bucket.athena_results.arn, "${aws_s3_bucket.athena_results.arn}/*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_attested_computations ? [1] : []
+    content {
+      sid       = "ComputationsTableDataRead"
+      actions   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
+      resources = ["*"]
+    }
+  }
+
+  # Lake Formation-governed catalogs: the query engine calls GetDataAccess for
+  # LF-vended short-lived S3 creds. Mirrors the chat SQL grant; only when BOTH
+  # computations and LF are enabled.
+  dynamic "statement" {
+    for_each = var.enable_attested_computations && var.enable_lakeformation ? [1] : []
+    content {
+      sid       = "ComputationsLakeFormationDataAccess"
+      actions   = ["lakeformation:GetDataAccess"]
+      resources = ["*"]
+    }
+  }
+
+  # Redshift-runtime computations execute via the Data API against the mapping
+  # row's own connection descriptor. Same ceiling shape as the harvest's
+  # RedshiftDataApi grant (actions not ARN-scopable); the secret read is
+  # NAME-PREFIX-scoped like every other Redshift consumer.
+  dynamic "statement" {
+    for_each = var.enable_attested_computations && var.enable_redshift ? [1] : []
+    content {
+      sid = "ComputationsRedshiftDataApi"
+      actions = [
+        "redshift-data:ExecuteStatement",
+        "redshift-data:DescribeStatement",
+        "redshift-data:GetStatementResult",
+        "redshift-data:CancelStatement",
+      ]
+      resources = ["*"]
+    }
+  }
+  dynamic "statement" {
+    for_each = var.enable_attested_computations && var.enable_redshift ? [1] : []
+    content {
+      sid       = "ComputationsRedshiftSecretRead"
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = local.redshift_secret_resources
+    }
   }
 
   statement {

@@ -1407,3 +1407,58 @@ def test_read_history_end_event_carries_token_stats():
     assert stats["cache_read_input_tokens"] == 50
     # 25+5 (ephemeral buckets beat the zeroed cache_creation) + 3 (native shape)
     assert stats["cache_creation_input_tokens"] == 33
+
+
+def test_run_computation_is_always_bound_even_without_sql():
+    """run_computation rides EVERY run — no deploy flag, no per-run SQL opt-in
+    (the sanctioned path must not cost the raw-SQL opt-in); run_sql stays
+    opt-in-gated. Same harness as the render_chart always-wired test."""
+    import chat.config as chat_config_mod
+    import chat.graph as chat_graph_mod
+    import chat.tools as chat_tools
+    from chat.config import ChatConfig
+    from consumption_mcp.tools import ConsumptionConfig
+
+    from .fakes import FakeConsumptionTools
+
+    captured = {}
+
+    def fake_build_graph(model, tools, checkpointer, *, system_prompt=None, middleware=None):
+        captured["names"] = [t.name for t in tools]
+        captured["prompt"] = system_prompt
+        return object()
+
+    cfg = ChatConfig(
+        bundle_bucket="b", vector_bucket="v", vector_index="i",
+        registry_table="r", checkpoint_table="cp", threads_table="th",
+        catalog=[], sql_enabled=False,
+    )
+    cons_cfg = ConsumptionConfig(
+        bundle_bucket="b", vector_bucket="v", vector_index="i", registry_table="r"
+    )
+    orig = (
+        chat_graph_mod.build_graph,
+        chat_config_mod.build_chat_model,
+        chat_tools.build_consumption_tools,
+    )
+    try:
+        chat_graph_mod.build_graph = fake_build_graph
+        chat_config_mod.build_chat_model = lambda *a, **k: object()
+        chat_tools.build_consumption_tools = lambda **kw: FakeConsumptionTools()
+        build_agent = server.make_agent_factory(
+            cfg, cons_cfg,
+            {"s3": None, "s3vectors": None, "bedrock_runtime": None, "ddb": None},
+        )
+        # NO features (no SQL opt-in) and sql_enabled=False: still bound.
+        build_agent("us.anthropic.claude-opus-4-8", "high", None, object(), features=set())
+    finally:
+        (
+            chat_graph_mod.build_graph,
+            chat_config_mod.build_chat_model,
+            chat_tools.build_consumption_tools,
+        ) = orig
+
+    assert "run_computation" in captured["names"]
+    assert "run_sql" not in captured["names"]  # ad-hoc SQL stays opt-in
+    # The prompt block rides along so the model knows the tool exists.
+    assert "<computations_tool>" in captured["prompt"]

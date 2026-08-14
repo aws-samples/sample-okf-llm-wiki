@@ -49,6 +49,23 @@ def finalize_bundle(
     """
     root = Path(dataset_root)
 
+    # 0) Fold the off-mount verification overlay into computation docs (see
+    # harvest.verification — the human's Verify/Unverify clicks land in the
+    # overlay because the mount is the bundle tree's sole writer; THIS is the
+    # sanctioned write-back, after all authoring so the full-harvest wipe
+    # can't eat a just-folded stamp). Best-effort: a fold failure must not
+    # fail a finished run — the overlay keeps serving the truth meanwhile.
+    try:
+        from harvest.verification import fold_verification_overlay
+
+        fold_verification_overlay(
+            root, data_domain=data_domain, dataset=dataset
+        )
+    except Exception:  # noqa: BLE001 - overlay-served state remains correct
+        logging.getLogger(__name__).warning(
+            "verification overlay fold-in failed (non-fatal)", exc_info=True
+        )
+
     # 1) Regenerate index.md files (progressive disclosure). The writer/remover
     # are fsutil's, not raw pathlib: these land on the S3 Files (NFS) mount,
     # where an in-place rewrite of an existing index can come back EACCES —

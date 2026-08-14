@@ -135,10 +135,17 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
         read_only: bool = False,
         allow_delete: bool = False,
         write_allowlist: Callable[[], frozenset[str] | None] | None = None,
+        frozen_paths: frozenset[str] = frozenset(),
     ):
         super().__init__()
         self.engine = engine
         self._read_current = read_current
+        # Human-VERIFIED computation docs (root-relative paths, resolved at
+        # run start — harvest.verification.frozen_computation_paths): frozen
+        # to EVERY agent, every tool (write/edit/delete). A verified stamp an
+        # agent could edit under would be theater; only a human Unverify (the
+        # Control API overlay tombstone) unlocks the doc for the NEXT run.
+        self._frozen_paths = frozenset(frozen_paths)
         # Cross-dataset mode: confine EVERY write/edit to this root-relative
         # subtree (e.g. "external/<domain>/<dataset>/"). The rest of the bundle
         # is read-only context for the run. None (all other modes) = inert.
@@ -191,6 +198,20 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
 
         if name not in _GUARDED_TOOLS:
             return None
+
+        # FROZEN verified computations: refused before every other rule, for
+        # every guarded tool — the refusal text is governance, not mechanics.
+        if file_path and _normalized_rel(file_path) in self._frozen_paths:
+            return self._refuse(
+                request,
+                f"Refused: `{file_path}` is a HUMAN-VERIFIED Attested "
+                f"Computation and is FROZEN — its stamp attests this exact "
+                f"statement, so no agent may modify or delete it. If your "
+                f"evidence says it is wrong or stale (schema drift, a better "
+                f"formulation), REPORT that in your reply/summary so a human "
+                f"can Unverify it in the UI; the next run may edit it after "
+                f"that. `{file_path}` was not touched.",
+            )
 
         # The delete tool (deepagents ≥0.7 exposes it whenever the backend
         # supports it, and it is RECURSIVE). Only the full-harvest supervisor's
@@ -354,12 +375,14 @@ class OKFGuardMiddleware(AgentMiddleware):  # type: ignore[misc]
                 args["content"] = decision.new_content
             return None
 
-        # edit_file
+        # edit_file — replace_all rides along: the engine must simulate the
+        # SAME replacement the backend will perform (deepagents forwards it).
         decision = self.engine.guard_edit_file(
             args.get("old_string", ""),
             args.get("new_string", ""),
             existing,
             rel_path=_normalized_rel(file_path),
+            replace_all=bool(args.get("replace_all", False)),
         )
         if not decision.allow:
             return self._refuse(request, decision.message)

@@ -230,4 +230,77 @@ data "aws_iam_policy_document" "control_api" {
       resources = local.redshift_secret_resources
     }
   }
+
+  # Optional Attested Computations execution (var.enable_attested_computations):
+  # the UI's Run modal POSTs to /bundle/.../computations/{slug}/run and the
+  # Lambda executes the wiki's FROZEN statement with typed literals substituted
+  # — never caller SQL. Same read-only ceiling as the consumption/chat SQL
+  # grants: catalog-wide Glue/Athena READ, results-bucket write, broad
+  # source-data READ (a Glue table's location can be any bucket), nothing
+  # writable on source. The verification overlay writes ride the existing
+  # bundle-bucket PutObject grant above (verification/ is in the same bucket,
+  # outside the mounted okf/ prefix).
+  dynamic "statement" {
+    for_each = var.enable_attested_computations ? [1] : []
+    content {
+      sid = "ComputationsGlueRead"
+      actions = [
+        "glue:GetDatabase", "glue:GetTable",
+        "glue:GetPartitions", "glue:GetPartition", "glue:BatchGetPartition",
+        "glue:GetTableVersions",
+      ]
+      resources = ["*"]
+    }
+  }
+  dynamic "statement" {
+    for_each = var.enable_attested_computations ? [1] : []
+    content {
+      sid = "ComputationsAthenaQuery"
+      actions = [
+        "athena:StartQueryExecution", "athena:GetQueryExecution",
+        "athena:GetQueryResults", "athena:StopQueryExecution",
+      ]
+      resources = ["*"]
+    }
+  }
+  dynamic "statement" {
+    for_each = var.enable_attested_computations ? [1] : []
+    content {
+      sid       = "ComputationsAthenaResultsWrite"
+      actions   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:GetBucketLocation"]
+      resources = [aws_s3_bucket.athena_results.arn, "${aws_s3_bucket.athena_results.arn}/*"]
+    }
+  }
+  dynamic "statement" {
+    for_each = var.enable_attested_computations ? [1] : []
+    content {
+      sid       = "ComputationsTableDataRead"
+      actions   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
+      resources = ["*"]
+    }
+  }
+  dynamic "statement" {
+    for_each = var.enable_attested_computations && var.enable_lakeformation ? [1] : []
+    content {
+      sid       = "ComputationsLakeFormationDataAccess"
+      actions   = ["lakeformation:GetDataAccess"]
+      resources = ["*"]
+    }
+  }
+  # Redshift-runtime computations execute via the Data API against the mapping
+  # row's own connection descriptor. The secret read rides the
+  # RedshiftSecretRead grant above; redshift-data actions can't be ARN-scoped.
+  dynamic "statement" {
+    for_each = var.enable_attested_computations && var.enable_redshift ? [1] : []
+    content {
+      sid = "ComputationsRedshiftDataApi"
+      actions = [
+        "redshift-data:ExecuteStatement",
+        "redshift-data:DescribeStatement",
+        "redshift-data:GetStatementResult",
+        "redshift-data:CancelStatement",
+      ]
+      resources = ["*"]
+    }
+  }
 }

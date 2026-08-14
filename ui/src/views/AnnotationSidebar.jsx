@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   CheckCircle2Icon,
+  CopyIcon,
+  ExternalLinkIcon,
   FileTextIcon,
   MessageSquarePlusIcon,
   PlayIcon,
+  TextSelectIcon,
   Trash2Icon,
   XCircleIcon,
 } from "lucide-react"
@@ -21,6 +24,13 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu"
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -28,11 +38,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import {
-  Popover,
-  PopoverAnchor,
-  PopoverContent,
-} from "@/components/ui/popover"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
@@ -46,9 +51,11 @@ import { Textarea } from "@/components/ui/textarea"
 
 // The annotation feature for BrowseView, kept in one file so the Browse diff
 // stays small. Two pieces that share the annotations list + refresh:
-//  - <SelectionAnnotator>: wraps the rendered doc; on a text selection it floats
-//    an "Annotate" button (PopoverAnchor pinned to the selection rect) that opens
-//    a note composer.
+//  - <SelectionAnnotator>: wraps the rendered doc in a RIGHT-CLICK context
+//    menu (Annotate — first, selection-only — then Copy / Open Link / Open
+//    Link in New Tab / Select All); Annotate opens a modal note composer.
+//    (Replaced the old select-then-popover: it fired on EVERY selection,
+//    which punished plain copy-selecting.)
 //  - <AnnotationSidebar>: lists the caller's annotations for this dataset and
 //    runs the annotation-mode re-harvest.
 // A shared hook owns fetch/create/delete so both stay in sync.
@@ -79,7 +86,16 @@ export function useAnnotations(api, domain, dataset) {
   return { items, loading, error, reload: load }
 }
 
-// Wrap the rendered doc; capture selections and offer an Annotate affordance.
+// Compact sizing for the doc context menu's items — the vendored default
+// (min-h-7 / text-sm / size-4 icons) reads oversized for a browser-style
+// right-click menu; tailwind-merge drops the conflicting defaults.
+const _menuItem = "min-h-6 py-1 text-xs [&_svg:not([class*='size-'])]:size-3.5"
+
+// Wrap the rendered doc in a right-click CONTEXT MENU. Annotate leads the
+// menu when the right-click happened over a text selection; the standard
+// browser affordances the native menu would have offered (Copy, Open Link,
+// Open Link in New Tab, Select All) follow, so hijacking contextmenu costs
+// the reader nothing.
 export function SelectionAnnotator({
   api,
   domain,
@@ -89,35 +105,52 @@ export function SelectionAnnotator({
   children,
 }) {
   const containerRef = useRef(null)
-  // The pending selection anchor + the popover's virtual anchor. Radix's
-  // PopoverAnchor reads `virtualRef.current` (a measurable with
-  // getBoundingClientRect), so `virtualRef` MUST be a ref OBJECT — not the
-  // measurable itself. We keep a STABLE virtualRef whose getBoundingClientRect
-  // reads the latest captured rect from `rectRef`, so the popover floats over
-  // the selection and the anchor resolves once (no per-selection ref churn).
+  // Menu context, snapshotted AT right-click time: Radix opens the menu on
+  // the same contextmenu event and focusing it can collapse the live
+  // selection, so the anchor (quote/prefix/suffix/block_line), the raw
+  // selection text (for Copy), and the link under the cursor are all frozen
+  // before the menu renders.
   const [anchor, setAnchor] = useState(null)
-  const [open, setOpen] = useState(false)
+  const [selectionText, setSelectionText] = useState("")
+  const [linkTarget, setLinkTarget] = useState(null)
+  const [composerOpen, setComposerOpen] = useState(false)
   const [note, setNote] = useState("")
   const [saving, setSaving] = useState(false)
 
-  const rectRef = useRef(null)
-  const virtualRef = useRef({
-    getBoundingClientRect: () =>
-      rectRef.current || { top: 0, left: 0, bottom: 0, right: 0, width: 0, height: 0 },
-  })
-
-  const onMouseUp = useCallback(() => {
-    const cap = captureSelection(containerRef.current)
-    if (cap) {
-      // Snapshot the selection rect BEFORE opening (focusing the textarea
-      // collapses the live selection, but this frozen rect keeps the popover
-      // pinned where the text was).
-      rectRef.current = cap.rect
-      setAnchor(cap)
-      setNote("")
-      setOpen(true)
-    }
+  const onContextMenu = useCallback((e) => {
+    setAnchor(captureSelection(containerRef.current))
+    setSelectionText(window.getSelection()?.toString() ?? "")
+    const a = e.target instanceof Element ? e.target.closest("a[href]") : null
+    setLinkTarget(a && containerRef.current?.contains(a) ? a : null)
   }, [])
+
+  const copySelection = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(selectionText)
+    } catch {
+      toast.error("Could not copy the selection")
+    }
+  }, [selectionText])
+
+  const selectAll = useCallback(() => {
+    const root = containerRef.current
+    if (!root) return
+    const range = document.createRange()
+    range.selectNodeContents(root)
+    const sel = window.getSelection()
+    sel?.removeAllRanges()
+    sel?.addRange(range)
+  }, [])
+
+  // Open Link CLICKS the real anchor so a concept link keeps its SPA
+  // navigation (the markdown renderer's onClick), while an external link
+  // follows its href; new-tab always goes through window.open on the
+  // resolved absolute href (a concept link's #hash lands the app there).
+  const openLink = useCallback(() => linkTarget?.click(), [linkTarget])
+  const openLinkNewTab = useCallback(() => {
+    if (linkTarget?.href)
+      window.open(linkTarget.href, "_blank", "noopener,noreferrer")
+  }, [linkTarget])
 
   const submit = useCallback(async () => {
     const text = note.trim()
@@ -131,7 +164,7 @@ export function SelectionAnnotator({
         block_line: anchor.block_line,
       })
       toast.success("Annotation added")
-      setOpen(false)
+      setComposerOpen(false)
       setAnchor(null)
       setNote("")
       onCreated?.()
@@ -143,30 +176,82 @@ export function SelectionAnnotator({
   }, [api, domain, dataset, conceptId, note, anchor, onCreated])
 
   return (
-    <div ref={containerRef} onMouseUp={onMouseUp}>
-      {children}
-      <Popover
-        open={open}
+    <>
+      <ContextMenu>
+        {/* select-text OVERRIDES the trigger wrapper's baked-in select-none
+            (tailwind-merge drops the conflict) — this wraps the whole doc,
+            and Annotate/Copy exist precisely to act on a text selection. */}
+        <ContextMenuTrigger asChild className="select-text">
+          {/* asChild merges this onContextMenu with Radix's own — ours runs
+              first, so the snapshot lands before the menu opens. */}
+          <div ref={containerRef} onContextMenu={onContextMenu}>
+            {children}
+          </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent className="w-44">
+          {anchor && (
+            <>
+              <ContextMenuItem
+                className={_menuItem}
+                onSelect={() => {
+                  setNote("")
+                  setComposerOpen(true)
+                }}
+              >
+                <MessageSquarePlusIcon />
+                Annotate
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+            </>
+          )}
+          <ContextMenuItem
+            className={_menuItem}
+            disabled={!selectionText}
+            onSelect={copySelection}
+          >
+            <CopyIcon />
+            Copy
+          </ContextMenuItem>
+          {linkTarget && (
+            <>
+              <ContextMenuItem className={_menuItem} onSelect={openLink}>
+                <ExternalLinkIcon />
+                Open Link
+              </ContextMenuItem>
+              <ContextMenuItem className={_menuItem} onSelect={openLinkNewTab}>
+                <ExternalLinkIcon />
+                Open Link in New Tab
+              </ContextMenuItem>
+            </>
+          )}
+          <ContextMenuSeparator />
+          <ContextMenuItem className={_menuItem} onSelect={selectAll}>
+            <TextSelectIcon />
+            Select All
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+
+      {/* The note composer — a modal now (the old rect-pinned popover fired
+          on every selection; the menu makes annotating deliberate). */}
+      <Dialog
+        open={composerOpen}
         onOpenChange={(o) => {
-          setOpen(o)
-          if (!o) setAnchor(null)
+          setComposerOpen(o)
+          if (!o) setNote("")
         }}
       >
-        <PopoverAnchor virtualRef={virtualRef} />
-        {/* collisionPadding keeps a gap from the viewport edge; capping height to
-            Radix's computed available-height (+ overflow-y-auto) means a selection
-            near the bottom gets a scrollable popover that stays on-screen instead
-            of spilling past the fold. */}
-        <PopoverContent
-          side="top"
-          align="center"
-          collisionPadding={12}
-          className="flex max-h-[var(--radix-popover-content-available-height)] w-80 flex-col gap-3 overflow-y-auto"
-        >
-          <div className="flex items-center gap-2 text-sm font-medium">
-            <MessageSquarePlusIcon className="size-4" />
-            Annotate this passage
-          </div>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <MessageSquarePlusIcon className="size-4" />
+              Annotate this passage
+            </DialogTitle>
+            <DialogDescription>
+              Feedback about the selected text. The next annotation harvest
+              verifies it against live data before applying.
+            </DialogDescription>
+          </DialogHeader>
           {anchor?.quote && (
             <blockquote className="max-h-24 overflow-y-auto border-l-2 border-border pl-2 text-xs text-muted-foreground italic">
               “{anchor.quote}”
@@ -179,11 +264,11 @@ export function SelectionAnnotator({
             placeholder="What's wrong or missing here? The harvester will verify it against the data."
             className="min-h-[90px] text-sm"
           />
-          <div className="flex justify-end gap-2">
+          <DialogFooter>
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => setOpen(false)}
+              onClick={() => setComposerOpen(false)}
               disabled={saving}
             >
               Cancel
@@ -192,10 +277,10 @@ export function SelectionAnnotator({
               {saving ? <Spinner /> : null}
               Save
             </Button>
-          </div>
-        </PopoverContent>
-      </Popover>
-    </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 

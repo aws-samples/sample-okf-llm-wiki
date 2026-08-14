@@ -52,7 +52,10 @@ def _explain_key(stmt: str) -> str:
 
 
 def _explain_step(
-    source: Source, fences: list[SqlFence], explained_ok: set[str]
+    source: Source,
+    fences: list[SqlFence],
+    explained_ok: set[str],
+    frozen_paths: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Any], list[LintFinding]]:
     """Run ``EXPLAIN`` for every runnable, non-templated ```sql statement.
 
@@ -110,13 +113,25 @@ def _explain_step(
                 msg = str(e)
                 if len(msg) > _ENGINE_ERROR_CHARS:
                     msg = msg[: _ENGINE_ERROR_CHARS - 1] + "…"
+                # A human-verified computation is FROZEN to agents: its EXPLAIN
+                # failure (schema drift under the frozen SQL) is real but
+                # unfixable by this run — as an error it would wedge the
+                # fix-to-zero gate. Warn, with the governance route.
+                frozen = fence.path in frozen_paths
                 findings.append(
                     LintFinding(
-                        "error",
+                        "warning" if frozen else "error",
                         "sql-explain-failed",
                         fence.path,
                         f"EXPLAIN failed for the ```sql fence starting "
-                        f"`{_snippet(stmt)}`: {msg}",
+                        f"`{_snippet(stmt)}`: {msg}"
+                        + (
+                            " This computation is human-verified (FROZEN) — "
+                            "report it; a human must unverify it in the UI "
+                            "before a harvest can repair it."
+                            if frozen
+                            else ""
+                        ),
                     )
                 )
             else:
@@ -153,8 +168,8 @@ def _explain_step(
         "status": (
             "issues" if findings else ("incomplete" if unvalidated else "ok")
         ),
-        "errors": len(findings),
-        "warnings": 0,
+        "errors": sum(1 for f in findings if f.severity == "error"),
+        "warnings": sum(1 for f in findings if f.severity == "warning"),
         "note": "; ".join(notes),
     }
     if unvalidated:
@@ -162,7 +177,11 @@ def _explain_step(
     return step, findings
 
 
-def make_lint_tool(source: Source, dataset_root: Path) -> Any:
+def make_lint_tool(
+    source: Source,
+    dataset_root: Path,
+    frozen_paths: frozenset[str] = frozenset(),
+) -> Any:
     from langchain_core.tools import tool
 
     root = Path(dataset_root)
@@ -197,6 +216,35 @@ def make_lint_tool(source: Source, dataset_root: Path) -> Any:
             # parsed-bundle context instead of re-walking and re-parsing every
             # doc a second time per gate call.
             report = _lint_offline(root, collect_fences=True)
+            # FROZEN computations: the builder-provided set (the runner's
+            # folded∪overlay union — the same set the write guard enforces)
+            # plus a fresh disk scan for stamps folded since agent build.
+            # Their findings downgrade to warnings below: real, surfaced,
+            # but unfixable by any agent this run.
+            try:
+                from okf_core.computations import find_computations, is_frozen
+
+                frozen_now = frozen_paths | frozenset(
+                    rel
+                    for rel, comp, _errs in find_computations(root)
+                    if comp is not None and is_frozen(comp)
+                )
+            except Exception:  # noqa: BLE001 - freezing is a severity nicety here
+                frozen_now = frozen_paths
+            # The offline computations step scanned only folded stamps
+            # (okf_core is overlay-blind) — downgrade its error findings on
+            # overlay-frozen docs here, same message contract as in-step.
+            for s in report.steps:
+                if s.name != "computations":
+                    continue
+                for f in s.findings:
+                    if f.severity == "error" and f.path in frozen_now:
+                        f.severity = "warning"
+                        f.message += (
+                            " This computation is human-verified (FROZEN) — "
+                            "a human must unverify it in the UI before a "
+                            "harvest can repair it."
+                        )
             steps: list[dict[str, Any]] = []
             for s in report.steps:
                 entry: dict[str, Any] = {
@@ -220,7 +268,7 @@ def make_lint_tool(source: Source, dataset_root: Path) -> Any:
                     else collect_sql_fences(root)  # collection failed: retry here
                 )
                 explain_entry, explain_findings = _explain_step(
-                    source, fences, explained_ok
+                    source, fences, explained_ok, frozen_now
                 )
             except Exception as e:  # noqa: BLE001 — failed step, not a lost report
                 explain_findings = []
@@ -242,7 +290,7 @@ def make_lint_tool(source: Source, dataset_root: Path) -> Any:
             result: dict[str, Any] = {
                 "ok": (
                     report.ok
-                    and not explain_findings
+                    and not any(f.severity == "error" for f in explain_findings)
                     and explain_entry["status"] != "failed"
                     # Cap/budget-skipped statements = the gate didn't finish;
                     # ok would falsely bless SQL it never looked at. The note

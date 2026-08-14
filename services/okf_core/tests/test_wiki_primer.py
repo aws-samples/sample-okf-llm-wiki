@@ -46,5 +46,8 @@ def test_each_primer_names_only_the_tools_its_surface_has():
 def test_primers_stay_short():
     # "On point, not super long" is part of the contract: a primer the agent
     # skims past is dead weight in every solve's context. Budget, not vibes.
+    # (Raised 3000 -> 3300 when the MCP surface gained the Attested
+    # Computations tool trio — one nav line + a folder mention; any further
+    # growth must trim, not extend.)
     for primer in (wp.MCP_PRIMER, wp.SOLVER_PRIMER):
-        assert len(primer) < 3000, f"primer grew to {len(primer)} chars"
+        assert len(primer) < 3300, f"primer grew to {len(primer)} chars"

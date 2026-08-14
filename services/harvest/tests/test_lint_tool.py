@@ -168,10 +168,11 @@ def test_lint_gate_is_wired_to_every_main_agent_except_cross():
     # Full + scoped supervisors get the tool; cross runs stay excluded (their
     # writes are pair-confined, so bundle-wide errors would be unfixable).
     assert "full_harvest = cross_target is None and supervisor_prompt is None" in src
-    assert (
-        "if cross_target is None:\n        main_tools.append(make_lint_tool(source, dataset_root))"
-        in src
-    )
+    assert "if cross_target is None:" in src
+    assert "make_lint_tool(source, dataset_root, frozen_paths=frozen_paths)" in src
+    # The lint gate append must sit INSIDE the non-cross branch.
+    branch = src.index("if cross_target is None:")
+    assert src.index("make_lint_tool(", branch) > branch
     assert "tools=main_tools," in src
     # Sub-agent specs keep all_tools (no bundle-wide scan in their hands).
     assert src.count('"tools": all_tools') >= 4

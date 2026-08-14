@@ -363,3 +363,55 @@ def test_interrupted_harvest_leaves_no_current_version(aws):
     # current: the live marker version is the in_progress write.
     assert [m.version_id for m in markers] == [v2, v1]
     assert not any(m.is_current for m in markers)
+
+
+def test_restore_recreates_directory_markers_for_the_mount(aws):
+    """A restored tree must come back MOUNT-WRITABLE: the S3 Files NFS derives
+    a directory's POSIX ownership from its zero-byte marker object, and a
+    bundle whose markers were lost (a full-harvest wipe that died, then a
+    repromote) presents every authored dir read-only — every later in-place
+    write of a NEW doc/dir fails EACCES (seen live on generic/fpl)."""
+    bucket = "test-bundles-restore-markers"
+    _make_bucket(aws, bucket)
+    # One published harvest with a NESTED reference doc (two dir levels).
+    _mark(aws, bucket, "in_progress", started_at="2026-01-01T00:00:00+00:00")
+    _put(aws, bucket, "tables/a.md", _doc("A", "alpha"))
+    _put(aws, bucket, "references/joins/a__b.md", _doc("AB", "join"))
+    _mark(
+        aws, bucket, "complete", completed_at="2026-01-01T01:00:00+00:00",
+        tables=["a"], table_versions={"a": "1"},
+    )
+    # An existing marker with its own (mount-written) metadata must survive.
+    aws.put_object(
+        Bucket=bucket,
+        Key=f"{PREFIX}tables/",
+        Body=b"",
+        Metadata={"user-agent": "aws-s3-files", "file-owner": "1000",
+                  "file-group": "1000", "file-permissions": "0040755",
+                  "fs-id": "fs-test:42:1", "file-mtime": "1ns"},
+    )
+    m1 = sv.list_complete_markers(
+        aws, bucket=bucket, data_domain=DOMAIN, dataset=DATASET
+    )[0]
+    snap = sv.snapshot_at(
+        aws, bucket=bucket, data_domain=DOMAIN, dataset=DATASET, marker=m1
+    )
+    live = sv.live_snapshot(aws, bucket=bucket, data_domain=DOMAIN, dataset=DATASET)
+    sv.restore_snapshot(
+        aws, bucket=bucket, data_domain=DOMAIN, dataset=DATASET,
+        snapshot=snap, live=live,
+    )
+    # Every directory the restored keys imply has a marker — the dataset root
+    # included — carrying the aws-s3-files POSIX metadata (owner 1000, 0755).
+    for d in (PREFIX, f"{PREFIX}references/", f"{PREFIX}references/joins/"):
+        meta = aws.head_object(Bucket=bucket, Key=d)["Metadata"]
+        assert meta["file-owner"] == "1000", d
+        assert meta["file-permissions"] == "0040755", d
+        assert meta["user-agent"] == "aws-s3-files", d
+    # The pre-existing marker was left untouched (its fs-id survives).
+    kept = aws.head_object(Bucket=bucket, Key=f"{PREFIX}tables/")["Metadata"]
+    assert kept.get("fs-id") == "fs-test:42:1"
+    assert kept.get("file-mtime") == "1ns"
+    # Marker objects never leak into the doc-set views.
+    now = sv.live_snapshot(aws, bucket=bucket, data_domain=DOMAIN, dataset=DATASET)
+    assert all(k.endswith(".md") for k in now)

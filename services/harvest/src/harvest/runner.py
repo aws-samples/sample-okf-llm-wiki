@@ -34,7 +34,13 @@ from harvest.ar_build import (
     publish_rebuild_event,
 )
 from harvest.finalize import finalize_bundle, mark_in_progress
-from harvest.fsutil import clean_authored_output, remove_tree, write_text
+from harvest.fsutil import (
+    clean_authored_output,
+    ensure_authored_dirs,
+    remove_tree,
+    write_text,
+)
+from harvest.verification import frozen_computation_paths
 from harvest.metadata_export import export_metadata, export_target_metadata
 from harvest.prompts import (
     build_annotation_supervisor_prompt,
@@ -375,6 +381,16 @@ def run_full_harvest(
         mark_in_progress(
             dataset_root, data_domain=data_domain, dataset=dataset, timestamp=started
         )
+        # NOTE: a full harvest does NOT freeze human-verified computations —
+        # it is the destructive mode, so the wipe takes them like every other
+        # authored doc and the agent re-authors from source. Their
+        # verification therefore returns to the human's queue (a re-authored
+        # fence carries no stamp; an un-folded overlay click whose hash still
+        # matches an identically re-authored fence survives, which is why the
+        # prompts ask authors to preserve a fence the schema still supports).
+        # Freezing here would also DEADLOCK: the doc is gone, so a frozen path
+        # could never be re-authored. The in-place modes (incremental,
+        # annotation, cross) do freeze — see their build sites below.
         removed = clean_authored_output(dataset_root)
         if removed:
             log.info(
@@ -702,12 +718,23 @@ def run_incremental_harvest(
             f"and nothing goes stale. Preserve existing schema fields and citations "
             f"(augmentation guard).{diff_note}"
         )
+        # In-place run: pre-create the canonical authored folders so no agent
+        # write needs a brand-new directory (the backend's raw mkdir has
+        # failed EACCES live on the materialized mount — see fsutil).
+        ensure_authored_dirs(dataset_root)
+        # Human-VERIFIED computations are FROZEN to every agent (guard-
+        # refused write/edit/delete); resolved fresh per run — folded stamps
+        # plus the off-mount overlay.
+        frozen = frozen_computation_paths(
+            dataset_root, data_domain=data_domain, dataset=dataset
+        )
         with _sandbox_for(dataset_root) as sandbox:
             built = build_harvest_agent(
                 source,
                 dataset_root,
                 sandbox=sandbox,
                 step_emitter=emitter,
+                frozen_paths=frozen,
                 subagent_config=subagent_model_config,
                 reviewer_config=reviewer_model_config,
                 # Scoped system prompt: the full-harvest supervisor body would
@@ -961,12 +988,26 @@ def run_cross_harvest(
             target_domain_description=target_domain_description,
             target_domain_context=target_domain_context,
         )
+        # In-place run: pre-create the canonical folders plus THIS pair's
+        # external/ subtree (the only place a cross run may write) so no
+        # agent write needs a brand-new directory on the materialized mount.
+        ensure_authored_dirs(
+            dataset_root,
+            extra=(external_pair_prefix(target_data_domain, target_dataset),),
+        )
+        # Human-VERIFIED computations are FROZEN to every agent (guard-
+        # refused write/edit/delete); resolved fresh per run — folded stamps
+        # plus the off-mount overlay.
+        frozen = frozen_computation_paths(
+            dataset_root, data_domain=data_domain, dataset=dataset
+        )
         with _sandbox_for(dataset_root) as sandbox:
             built = build_harvest_agent(
                 source,
                 dataset_root,
                 sandbox=sandbox,
                 step_emitter=emitter,
+                frozen_paths=frozen,
                 cross_target={
                     "data_domain": target_data_domain,
                     "dataset": target_dataset,
@@ -1245,6 +1286,17 @@ def run_annotation_harvest(
         emitter = _build_emitter(
             data_domain=data_domain, dataset=dataset, session_id=session_id
         )
+        # In-place run: pre-create the canonical authored folders so a
+        # promotion (e.g. the bundle's first Attested Computation) never
+        # needs a brand-new directory — the backend's raw mkdir has failed
+        # EACCES live on the materialized mount (see fsutil).
+        ensure_authored_dirs(dataset_root)
+        # Human-VERIFIED computations are FROZEN to every agent (guard-
+        # refused write/edit/delete) — an annotation against one is assessed
+        # and REPORTED, never applied, until a human unverifies it.
+        frozen = frozen_computation_paths(
+            dataset_root, data_domain=data_domain, dataset=dataset
+        )
         with _sandbox_for(dataset_root) as sandbox:
             built = build_harvest_agent(
                 source,
@@ -1253,6 +1305,7 @@ def run_annotation_harvest(
                 step_emitter=emitter,
                 subagent_config=subagent_model_config,
                 reviewer_config=reviewer_model_config,
+                frozen_paths=frozen,
                 supervisor_prompt=build_annotation_supervisor_prompt(
                     results_rel=ANNOTATION_RESULTS_REL,
                     profile=source.prompt_profile,

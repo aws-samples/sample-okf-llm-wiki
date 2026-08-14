@@ -45,7 +45,9 @@ def _author(
     doc = OKFDocument(frontmatter=frontmatter, body=body)
     path = concept_id_to_path(root, tuple(concept_id.split("/")))
     existing = path.read_text(encoding="utf-8") if path.exists() else None
-    decision = engine.guard_write_file(doc.serialize(), existing)
+    decision = engine.guard_write_file(
+        doc.serialize(), existing, rel_path=f"{concept_id}.md"
+    )
     assert decision.allow, f"guard rejected {concept_id}: {decision.message}"
     path.parent.mkdir(parents=True, exist_ok=True)
     # The middleware writes decision.new_content (normalized) when present.
@@ -134,6 +136,29 @@ def test_offline_harvest_produces_valid_bundle(tmp_path):
         f"# Citations\n- {db_meta['resource']}\n",
     )
 
+    # 2b) Author an Attested Computation (guard-gated: the write-time shape
+    #     check + the verification-field rule both run inside guard_write_file).
+    _author(
+        engine,
+        root,
+        "references/computations/races_in_season",
+        {
+            "type": "Attested Computation",
+            "title": "Races in a season",
+            "description": "How many championship races a season held.",
+            "runtime": "athena",
+            "parameters": [
+                {"name": "season", "type": "integer", "required": True,
+                 "example": 2009, "column": "races.year"}
+            ],
+            "verified": None,
+            "verified_by": None,
+        },
+        "Counts the rows of [races](../../tables/races.md) for one season.\n\n"
+        "# Computation\n\n"
+        "```sql\nSELECT COUNT(*) AS races FROM races WHERE year = @season\n```\n",
+    )
+
     # 3) Impact analysis: who links to races? -> results (the agent's key tool).
     backlinks = link_graph.get_backlinks("tables/races")
     ids = {b["id"] for b in backlinks}
@@ -180,6 +205,25 @@ def test_offline_harvest_produces_valid_bundle(tmp_path):
     assert not (root / METADATA_DIR / "index.md").read_text().startswith("---")
     indexed = set(regenerate_indexes(root))
     assert not any(METADATA_DIR in p.relative_to(root).parts for p in indexed)
+
+    # The authored computation is a valid, hashable computation doc: lint's
+    # dedicated step passes, the shared parser accepts it, and the EXPLAIN
+    # fence collector re-enters it with the example value substituted.
+    from okf_core.computations import parse_computation_text
+    from okf_core.lint import collect_sql_fences, lint_bundle
+    from okf_core.stats import bundle_stats
+
+    report = lint_bundle(root)
+    comp_step = next(s for s in report.steps if s.name == "computations")
+    assert comp_step.status == "ok", [f.message for f in comp_step.findings]
+    comp_rel = "references/computations/races_in_season.md"
+    comp, errors = parse_computation_text(
+        comp_rel, (root / comp_rel).read_text(encoding="utf-8")
+    )
+    assert errors == [] and comp.sha256
+    comp_fences = [f for f in collect_sql_fences(root) if f.path == comp_rel]
+    assert comp_fences and "year = 2009" in comp_fences[0].statements[0]
+    assert bundle_stats(root)["references"]["computations"] == 1
 
     # Index files were generated and group by type (as in the golden bundle).
     tables_index = (root / "tables" / "index.md").read_text()

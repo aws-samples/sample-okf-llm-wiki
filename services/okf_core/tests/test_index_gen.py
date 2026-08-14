@@ -112,3 +112,28 @@ def test_write_heals_a_read_only_index(tmp_path):
     written = regenerate_indexes(tmp_path, write_file=healing_write)
     assert stale in written
     assert "Races" in stale.read_text()
+
+
+def test_empty_precreated_dirs_never_reach_a_parent_index(tmp_path):
+    # An in-place run pre-creates the canonical folder skeleton up front
+    # (fsutil.ensure_authored_dirs) so no agent write needs a brand-new
+    # directory on the mount. A skeleton dir NO doc landed in must stay
+    # invisible: it never materializes as an S3 prefix, so listing it in the
+    # parent index would publish a dangling `computations/index.md` link.
+    _write(tmp_path, "references/joins/a__b.md", "Reference", "A-B", "join")
+    (tmp_path / "references" / "computations").mkdir(parents=True)
+    regenerate_indexes(tmp_path)
+    refs_index = (tmp_path / "references" / "index.md").read_text()
+    assert "computations" not in refs_index
+    assert not (tmp_path / "references" / "computations" / "index.md").exists()
+    # A doc landing there flips it into a listed, indexed subdirectory.
+    _write(
+        tmp_path,
+        "references/computations/rev.md",
+        "Attested Computation",
+        "Rev",
+        "d",
+    )
+    regenerate_indexes(tmp_path)
+    assert "computations" in (tmp_path / "references" / "index.md").read_text()
+    assert (tmp_path / "references" / "computations" / "index.md").is_file()

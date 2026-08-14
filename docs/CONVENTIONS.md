@@ -18,6 +18,9 @@ okf/<data_domain>/
     │                                 #   named_sets/ glossary/ known_issues/
     │                                 #   recipes/ (mandatory query transforms,
     │                                 #   authored only when a dataset needs one)
+    │                                 #   computations/ (type: Attested
+    │                                 #   Computation — see "Attested
+    │                                 #   Computations" below)
     │                                 #   (one doc per item; see okf-authoring skill)
     ├── external/<d>/<ds>/…           # type: Cross-Dataset Reference — one subtree
     │                                 #   per counterpart dataset, written ONLY by a
@@ -153,6 +156,60 @@ mode. Rules:
   event path.
 - A cross re-run of the same pair replaces that pair's subtree wholesale; other
   pairs' subtrees are untouched.
+
+### Attested Computations (`references/computations/`)
+
+Frozen, parameterized, read-only SQL authored at harvest and executed by
+filling typed `@parameter` holes — never by editing the statement (design:
+docs/ATTESTED_COMPUTATIONS.md; pure rules: `okf_core/computations.py`; shared
+S3/engine runner: `okf_aws/computation_run.py`).
+
+- **Doc contract** (write-guard-enforced): `type: Attested Computation`,
+  directly under `references/computations/` (flat; the filename is the slug);
+  `runtime: athena | redshift`; `parameters` list (`name`/`type`/`required`,
+  `example` required, optional `default`/`enum`/`min`/`max`/`column`; an
+  optional parameter must carry a `default`); ONE SELECT/WITH statement in a
+  ```sql fence under `# Computation`, every `@hole` declared and every
+  declared parameter used.
+- **Content hash**: sha256 over the fence text (trailing-whitespace-stripped
+  lines), the canonical JSON of `parameters`, and the `runtime` string
+  (`computation_sha256`). Human verification signs this hash; any edit changes
+  it and the stamp reads `stale`.
+- **Verification triple** (`verified` / `verified_by` / `verified_sha256`):
+  null until a human acts. Agents can never set them — the guard refuses any
+  write that sets a non-null value it isn't PRESERVING verbatim from the
+  existing doc. **A verified computation is FROZEN in the in-place modes**
+  (incremental / annotation / cross): the runner resolves the verified set at
+  run start (`harvest/verification.frozen_computation_paths` — folded stamps
+  ∪ overlay, hash-checked), the guard refuses agent write/edit/delete on
+  those docs, and lint downgrades their findings to warnings ("a human must
+  unverify"). Human Unverify is the only unlock. A **full harvest is exempt**
+  — `clean_authored_output` is unconditional (no keep-list) and the agent
+  re-authors from source, so verification returns to the human's queue unless
+  the fence was reproduced verbatim AND its overlay click had not yet folded
+  in. Verify/Unverify flips land in the **off-mount overlay**
+  `verification/<domain>/<dataset>.json` (`{version, entries: {slug: {slug,
+  sha256, verified, verified_by}}}`; unverify writes a `revoked` tombstone) —
+  never on the doc: the mount is the bundle tree's sole writer. The runtime
+  folds the overlay into doc frontmatter inside `finalize_bundle` (every
+  mode, after authoring, before the commit marker — `harvest/verification.py`);
+  serving merges doc + overlay with the overlay winning, and a hash mismatch
+  on either side surfaces as `stale`.
+- **Execution surfaces** (one runner, three fronts): consumption MCP tools
+  `list_computations` / `describe_computation` / `run_computation` (execution
+  gated by `OKF_COMPUTATIONS_ENABLED` ⟵ `var.enable_attested_computations`,
+  default **false**); chat's `run_computation` (ALWAYS bound; executes
+  only under `var.enable_chat_sql`'s grants, policy checker when armed); Control API
+  `GET/POST /bundle/{d}/{ds}/computations[/{slug}][/run|/verify|/unverify]`
+  (verify identity comes from the JWT, never the body). Declared
+  `enum`/`min`/`max` are CONTRACT (refused); profiled domains
+  (`.metadata/profile/domains.json`, written by the profile pass) are ADVISORY
+  (warn-and-run). Every run returns the receipt: `executed_sql` (verbatim),
+  `computation_sha256`, `verification`, `engine_query_id`, `warnings`.
+- **Lint**: the `computations` step validates doc shape, `column` bindings
+  against the snapshot, and declared enums against the profile evidence; the
+  EXPLAIN gate re-enters each valid computation with its `example` values
+  substituted (raw `@hole` fences classify as templated and are never sent).
 
 ## Bundle versions & repromote
 
@@ -1502,6 +1559,8 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
 | `OKF_BENCHMARK_GRADER_TIMEOUT_S` | per-query timeout in seconds for the SQL EX grader's Athena executions (default `60`). A timed-out query is best-effort cancelled (`stop_query_execution`) so it doesn't keep holding a workgroup slot; the timeout classifies as TRANSIENT (retried with backoff, never memoized). Grading only — the harvest's own `sample_rows`/`run_sql` keep their own timeout. `mode: "benchmark"` runs only |
 | `OKF_BENCHMARK_GRADER_MAX_ROWS` | row cap on one grading query's result set (default `50000`). Past the cap collection stops and the outcome is classified — gold → DISCARDED ("gold result exceeds N rows"), prediction → FAIL — instead of buffering an unbounded result. Grading only. `mode: "benchmark"` runs only |
 | `OKF_POLICY_BUILD_ENABLED` | (harvest, incremental) `"true"` → author and refresh policy documents from the wiki (default `false`). The runner's post-complete follow-on build and the rebuild authority both no-op when unset — an ALREADY-authored document keeps being usable, since usability is decided by the row's `ar_build_status` + fingerprint, not by this flag. Set from `var.enable_policy_build` |
+| `OKF_COMPUTATIONS_ENABLED` | (consumption MCP + Control API) `"true"` → `run_computation` EXECUTES (Athena / Redshift Data API); unset/false → it returns the rendered SQL with a note, and no engine client is built (the IAM grant is absent too). From `var.enable_attested_computations`, default **false** — machine-vended MCP creds must not gain source-data read from a routine apply. The CHAT surface deliberately ignores this flag: its `run_computation` is ALWAYS bound (the sanctioned path never costs the raw-SQL opt-in) and EXECUTES only when `var.enable_chat_sql` granted the clients — without them it returns the rendered SQL un-executed |
+| `OKF_COMPUTATION_MAX_ROWS` / `OKF_COMPUTATION_TIMEOUT_S` | `run_computation` result-row cap (default `200`; the rest truncate with `truncated: true`) and per-execution timeout in seconds (default `120`, best-effort engine cancel on expiry). Row cap set from `var.computation_max_rows`; the timeout is env-read only |
 | `OKF_USER_POOL_ID` | Cognito user pool id (the Control API vends and revokes M2M app clients in this pool) |
 | `OKF_MCP_SCOPE` | the custom scope (`okf-mcp/invoke`) granted to vended M2M clients; must match the consumption authorizer's `allowed_scopes` |
 | `OKF_HARVEST_LOG_GROUP` | the harvest runtime's CloudWatch log group the Control API reads to serve the live step feed (`GET /harvest/{domain}/{dataset}/events`). Derived by Terraform as `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT` (overridable via `var.harvest_log_group`). Unset/incorrect → the feed returns an empty batch; status polling is unaffected |

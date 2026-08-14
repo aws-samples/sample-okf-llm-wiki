@@ -239,6 +239,104 @@ COUNT(DISTINCT user_id)
 
 ---
 
+## Attested Computation (`references/computations/<slug>.md`)
+
+A recurring, parameterizable question frozen as ONE canonical read-only
+statement (OKF v0.2 "Attested Computation"). Consumers never edit the SQL —
+they pass typed values for the `@parameter` holes and the platform validates,
+substitutes, and executes. A human can later VERIFY it in the UI; that stamp
+signs a content hash of the fence + parameters + runtime, so any later edit
+visibly voids it.
+
+Rules (each one is enforced by the write guard or lint — a violation is a
+refused write, not a style nit):
+
+- **One complete SELECT/WITH statement, not a menu.** Windows, CTEs,
+  self-joins — all fine. Variants ("by region OR by month") are separate
+  computations.
+- **Holes are scalar values only** (`@month`, `@region`, `@threshold`), never
+  SQL fragments. Every `@hole` must be declared in `parameters` and every
+  declared parameter must appear in the statement.
+- **Every parameter needs `type` + `example`** (lint EXPLAINs the statement
+  with the examples substituted); an optional parameter needs a `default`;
+  add `column: table.column` when the hole filters one column (it powers the
+  advisory value check + UI type-ahead).
+- **Constraints must come from evidence** — declare an `enum`/`min`/`max`
+  only from the profile sheets (`.metadata/profile/`), `.context/` policy, or
+  live verification; lint cross-checks declared enums against
+  `.metadata/profile/domains.json`. Never invent bounds.
+- **Never set `verified` / `verified_by` / `verified_sha256`** — leave them
+  null. Verification is a human act; the guard refuses agent-set values.
+- **A HUMAN-VERIFIED computation is FROZEN in an in-place run** (a scoped
+  re-harvest, an annotation, a cross run): the write guard refuses every
+  agent write, edit, or delete to it — the stamp attests that exact
+  statement. Do not try; REPORT the problem (your summary / a finding) so a
+  human can Unverify it in the UI, which unlocks it for the next run. A FULL
+  harvest rebuilds from source and freezes nothing, so you re-author
+  computations there — reproduce a still-valid fence and its parameters
+  VERBATIM: an identical statement keeps the human's verification valid,
+  while a reworded one correctly returns it to their review queue.
+- **Run the exact statement live** (example values substituted) before
+  writing, like any other authored SQL.
+- **The prose is a concept doc, not a SQL container**: define what it
+  computes in business terms and LINK the tables it reads, the join docs
+  whose relationships it exercises, the enum/named-set references whose codes
+  appear in its filters, and the glossary/metric docs it implements.
+
+```markdown
+---
+type: Attested Computation
+title: Revenue, month vs same month in prior years
+description: Recognized revenue for a month, alongside the same month 1-3 years back.
+runtime: athena
+parameters:
+  - {name: month, type: date, required: true, example: "2026-07-01"}
+  - {name: region, type: string, required: false, default: "EMEA",
+     enum: [EMEA, NA, APAC], column: customers.region}
+verified: null
+verified_by: null
+timestamp: 2026-05-28T00:00:00Z
+---
+
+Recognized revenue (see [gross revenue](../glossary/gross_revenue.md)) for the
+requested month and the same month one, two, and three years back, for one
+[region](../enums/region.md). Reads
+[order_items](../../tables/order_items.md) joined to
+[orders](../../tables/orders.md) (see the
+[join doc](../joins/order_items__orders.md)); excludes cancelled orders.
+
+# Computation
+
+```sql
+WITH monthly AS (
+  SELECT date_trunc('month', o.order_date) AS m,
+         SUM(oi.quantity * oi.unit_price)  AS revenue
+  FROM order_items oi
+  JOIN orders o ON oi.order_id = o.order_id
+  JOIN customers c ON o.customer_id = c.customer_id
+  WHERE o.status <> 'cancelled' AND c.region = @region
+  GROUP BY 1
+)
+SELECT m, revenue
+FROM monthly
+WHERE m IN (@month,
+            @month - INTERVAL '1' YEAR,
+            @month - INTERVAL '2' YEAR,
+            @month - INTERVAL '3' YEAR)
+ORDER BY m DESC
+```
+
+# Citations
+- .context/kpi_definitions.pdf
+```
+
+A computation and a metric reference are complements, not rivals: the metric
+doc (`references/metrics/`) remains the prose home of a definition and its
+canonical expression; a metric worth executing on demand ALSO gets a
+computation doc, and the two link each other.
+
+---
+
 ## Join reference (`references/joins/<a>__<b>.md`)
 
 One canonical file per table pair, the two table names sorted alphabetically and

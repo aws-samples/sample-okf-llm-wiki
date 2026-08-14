@@ -128,6 +128,51 @@ class FakeConsumptionTools:
             "versions": [],
         }
 
+    def list_computations(self, data_domain: str, dataset: str) -> dict:
+        """List the dataset's Attested Computations."""
+        self._record("list_computations", data_domain=data_domain, dataset=dataset)
+        return {"data_domain": data_domain, "dataset": dataset, "computations": []}
+
+    def describe_computation(self, name: str, data_domain: str, dataset: str) -> dict:
+        """One computation's full contract."""
+        # appended directly: _record's first positional is also called `name`.
+        self.calls.append(
+            (
+                "describe_computation",
+                {"name": name, "data_domain": data_domain, "dataset": dataset},
+            )
+        )
+        return {"computation": name, "parameters": []}
+
+    def run_computation(
+        self,
+        name: str,
+        data_domain: str,
+        dataset: str,
+        parameters: dict | None = None,
+    ) -> dict:
+        """Execute a computation by filling its typed parameter holes."""
+        self.calls.append(
+            (
+                "run_computation",
+                {
+                    "name": name,
+                    "data_domain": data_domain,
+                    "dataset": dataset,
+                    "parameters": parameters,
+                },
+            )
+        )
+        return {
+            "computation": name,
+            "executed": True,
+            "executed_sql": "SELECT 1",
+            "rows": [["1"]],
+            "row_count": 1,
+            "verification": "unverified",
+            "warnings": [],
+        }
+
 
 CHAT_CATALOG = [
     {

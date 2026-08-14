@@ -42,6 +42,9 @@ def test_register_tools_registers_all(tools):
         "semantic_search",
         "glob",
         "grep",
+        "list_computations",
+        "describe_computation",
+        "run_computation",
     }
 
 

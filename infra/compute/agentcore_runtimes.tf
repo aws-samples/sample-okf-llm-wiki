@@ -189,6 +189,16 @@ resource "aws_bedrockagentcore_agent_runtime" "consumption" {
   environment_variables = merge(local.common_env, local.otel_common_env, {
     AWS_REGION               = var.region
     OTEL_RESOURCE_ATTRIBUTES = "service.name=${var.name_prefix}_consumption"
+    # Attested Computations execution (run_computation). When off, the flag is
+    # empty and the tool returns the rendered SQL without running it.
+    OKF_COMPUTATIONS_ENABLED = tostring(var.enable_attested_computations)
+    OKF_ATHENA_WORKGROUP     = var.enable_attested_computations ? var.athena_workgroup : ""
+    OKF_ATHENA_OUTPUT        = var.enable_attested_computations ? local.athena_output : ""
+    OKF_COMPUTATION_MAX_ROWS = tostring(var.computation_max_rows)
+    # Redshift execution mirrors ITS grant (computations && redshift): without
+    # this the server would build a Data API client it has no permission to
+    # use, turning the intended render-only note into an AccessDenied.
+    OKF_REDSHIFT_ENABLED = tostring(var.enable_attested_computations && var.enable_redshift)
   })
 
   tags = var.tags

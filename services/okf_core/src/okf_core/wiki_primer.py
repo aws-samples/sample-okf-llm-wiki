@@ -39,8 +39,8 @@ types, join keys, coded values, units, caveats.
 tested SQL), `metrics/` (official definitions and formulas), `named_sets/` \
 (canonical filters/lifecycles), `glossary/`, `known_issues/`, `recipes/` \
 (mandatory query transforms, e.g. a dedup — apply verbatim; present only when \
-the dataset needs one), and `usage_guardrails.md` (the dataset's do's and \
-don'ts).
+the dataset needs one), `computations/` (runnable parameterized SQL), and `usage_guardrails.md` (the dataset's do's \
+and don'ts).
 - `external/<domain>/<dataset>/` — documented relationships to OTHER datasets \
 (shared keys, how to join across, semantic overlaps).
 """
@@ -93,6 +93,8 @@ meaning, then `read_page` the hits.
 every page that references a concept — the fastest route from a table to the \
 join docs, metrics, and caveats that mention it. Prefer it over guessing \
 paths.
+- Check `list_computations` before deriving SQL: `run_computation` runs a \
+blessed statement with typed values — report its `verified`/`stale` status.
 """
     + _SHARED_TAIL
 )

@@ -51,15 +51,28 @@ def _model_description(doc: str | None, fallback: str) -> str:
 
 
 def build_consumption_tools(
-    *, s3, s3vectors, bedrock_runtime, ddb, config: ConsumptionConfig
+    *,
+    s3,
+    s3vectors,
+    bedrock_runtime,
+    ddb,
+    config: ConsumptionConfig,
+    athena=None,
+    redshift_data=None,
 ) -> ConsumptionTools:
-    """Assemble a :class:`ConsumptionTools` from injected clients (live or fake)."""
+    """Assemble a :class:`ConsumptionTools` from injected clients (live or fake).
+
+    ``athena``/``redshift_data`` power ``run_computation`` execution; absent,
+    it returns the rendered SQL without running (the chat wires them from its
+    own SQL-flag-gated clients — same grants run_sql rides)."""
     return ConsumptionTools(
         s3=s3,
         s3vectors=s3vectors,
         bedrock_runtime=bedrock_runtime,
         ddb=ddb,
         config=config,
+        athena=athena,
+        redshift_data=redshift_data,
     )
 
 
@@ -116,6 +129,9 @@ def _make_tool(
 
 
 # The read tools the agent gets, in a sensible discovery order.
+# list/describe_computation ride here UNGATED: they are bundle reads (the
+# docs are read_page-able anyway); only run_computation executes source SQL
+# and sits behind the per-run opt-in (make_run_computation_tool).
 _TOOL_NAMES = (
     "list_domains",
     "list_declared_domains",
@@ -127,7 +143,73 @@ _TOOL_NAMES = (
     "grep",
     "semantic_search",
     "get_bundle_diff",
+    "list_computations",
+    "describe_computation",
 )
+
+
+def make_run_computation_tool(
+    tools: ConsumptionTools,
+    *,
+    dataset_scope: dict[str, str] | None = None,
+    policy_checker: Any = None,
+) -> StructuredTool:
+    """The chat-side ``run_computation`` — ALWAYS bound, never opt-in gated.
+
+    A computation is the SANCTIONED execution path (frozen statement, typed
+    validated values, caps), so unlike ``run_sql`` it rides every run — the
+    per-run SQL opt-in must not be the price of the safe tier. Execution
+    capability still follows the deployment: without the chat SQL flag the
+    engine clients are absent and the receipt returns the rendered SQL
+    un-executed. Delegates to :meth:`ConsumptionTools.run_computation` (the
+    exact same validated-substitution path the MCP serves). The policy checker
+    (when armed) sees the receipt's ``executed_sql`` — the real statement that
+    ran, holes filled — and its note rides back after the payload exactly like
+    run_sql's (split into a shield step by the stream)."""
+
+    def run_computation(
+        name: str,
+        data_domain: str,
+        dataset: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> Any:
+        """Execute one of the dataset's Attested Computations by passing typed
+        parameter VALUES (see list_computations / describe_computation) —
+        never by writing SQL. The platform validates values against the
+        declared contracts, renders them into the sanctioned statement, and
+        runs read-only under caps. Prefer a matching computation over deriving
+        SQL with run_sql: it is the blessed, human-verifiable answer to that
+        question shape (the receipt's `verification` field says whether a
+        human attested it). The receipt carries the exact `executed_sql` and
+        `warnings` for values outside profiled domains (0 rows + a warning
+        usually means a typo'd value).
+        """
+        receipt = tools.run_computation(
+            name, data_domain, dataset, parameters=parameters
+        )
+        sql = receipt.get("executed_sql") if isinstance(receipt, dict) else None
+        if policy_checker is None or not sql or not receipt.get("executed"):
+            return receipt
+        # The statement is only known post-substitution, so unlike run_sql the
+        # check can't race the engine — submit after and wait within the same
+        # advisory budget. Failures fail open (results return untouched).
+        try:
+            future = policy_checker.submit(sql)
+            should_wait = getattr(policy_checker, "should_wait", None)
+            wait = bool(should_wait(sql)) if should_wait else True
+        except Exception:  # noqa: BLE001 - the check is advisory
+            log.warning("policy check submit failed (non-fatal)", exc_info=True)
+            return receipt
+        if not wait:
+            return receipt
+        from chat.sql import _await_policy_note
+
+        note = _await_policy_note(future, policy_checker)
+        if note:
+            return json.dumps(receipt) + "\n\n" + note
+        return receipt
+
+    return _make_tool(run_computation, dataset_scope)
 
 
 def make_submit_annotation_tool(annotations_table, *, user_sub, dataset_scope=None):
@@ -150,11 +232,18 @@ def make_submit_annotation_tool(annotations_table, *, user_sub, dataset_scope=No
     # this nested string's 8-space continuation indent on every request.
     _DOC = inspect.cleandoc(
         """File wiki feedback on the user's behalf when the conversation uncovers a
-        doc problem (a wrong join, a stale enum, a missing caveat). ALWAYS confirm
+        doc problem (a wrong join, a stale enum, a missing caveat) — or an
+        improvement to request: PROPOSING A NEW ATTESTED COMPUTATION is a
+        first-class use (the user keeps asking the same parameterizable question,
+        or wants a metric made canonical and runnable). ALWAYS confirm
         with the user first (ask_human or a direct question) before filing — this
         writes feedback in their name. `note` is the feedback text (be specific:
-        what is wrong and what the data actually shows). `concept_id` targets one
-        page (e.g. `tables/races`); leave it empty for dataset-level feedback that
+        what is wrong and what the data actually shows; for a computation
+        proposal, state the question shape, the parameters it should take, and
+        the intended logic/SQL — the next annotation harvest authors and
+        verifies it as `references/computations/<slug>.md`). `concept_id` targets one
+        page (e.g. `tables/races`, or the related metric doc for a
+        computation proposal); leave it empty for dataset-level feedback that
         doesn't belong to a single page. The note enters the user's annotation
         queue and steers the next annotation-mode re-harvest."""
     )
