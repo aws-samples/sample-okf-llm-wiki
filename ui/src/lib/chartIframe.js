@@ -151,6 +151,21 @@ function helperSource() {
   }
   function seriesColor(i) { return SERIES[i % SERIES.length]; }
 
+  // HOVER emphasis for solid categorical fills: Chart.js's default hover shift
+  // (helpers.getHoverColor) moves the color a few percent — it reads as "no
+  // change" on our theme fills in BOTH modes. Mix the fill a quarter of the
+  // way toward the theme FOREGROUND instead: clearly darker in light mode,
+  // clearly lighter in dark, with no alpha games (an alpha'd hover would blend
+  // with the page behind the frame and drift between themes).
+  function mixTriple(a, b, t) {
+    var pa = String(a).split(",").map(Number);
+    var pb = String(b).split(",").map(Number);
+    return pa.map(function (v, i) { return Math.round(v + (pb[i] - v) * t); }).join(", ");
+  }
+  function hoverTriple(triple) {
+    return mixTriple(triple, P.foreground || "23,23,23", 0.25);
+  }
+
   // Locale separators for TOOLTIP values ("3545697" -> "3,545,697"): Chart.js
   // formats axis ticks with Intl but tooltips print the raw parsed number.
   // Non-numeric values pass through untouched.
@@ -361,6 +376,10 @@ function helperSource() {
           },
           borderColor: rgb(P.card || "255,255,255"),
           borderWidth: 1,
+          // Hover = an OUTLINE, not a fill shift: the cell's fill intensity
+          // encodes the value, so changing it on hover would lie about the data.
+          hoverBorderColor: rgb(P.foreground || "23,23,23"),
+          hoverBorderWidth: 2,
           width: function (c) { var a = c.chart.chartArea; return a ? Math.max(4, (a.right - a.left) / Math.max(1, xs.length) - 2) : 8; },
           height: function (c) { var a = c.chart.chartArea; return a ? Math.max(4, (a.bottom - a.top) / Math.max(1, ys.length) - 2) : 8; }
         }] },
@@ -396,6 +415,13 @@ function helperSource() {
         if (totals[i]) return rgb(P.foreground || "23,23,23", 0.7);
         return d >= 0 ? rgb(SERIES[2], 0.9) : rgb(SERIES[9], 0.9);
       });
+      // Hover: hue toward foreground for the +/- bars; totals (already
+      // foreground ink) just firm up their alpha.
+      var whover = wd.map(function (d, i) {
+        if (d == null) return "transparent";
+        if (totals[i]) return rgb(P.foreground || "23,23,23", 0.95);
+        return rgb(hoverTriple(d >= 0 ? SERIES[2] : SERIES[9]), 0.9);
+      });
       var wOpts = applyCartesianOpts({
         scales: scalesLinear,
         plugins: { legend: { display: false }, tooltip: { callbacks: {
@@ -404,7 +430,7 @@ function helperSource() {
       }, spec);
       return {
         type: "bar",
-        data: { labels: labels, datasets: [{ label: spec.title || "", data: bars, backgroundColor: wcolors, borderWidth: 0, borderRadius: 3 }] },
+        data: { labels: labels, datasets: [{ label: spec.title || "", data: bars, backgroundColor: wcolors, hoverBackgroundColor: whover, borderWidth: 0, borderRadius: 3 }] },
         options: wOpts
       };
     }
@@ -418,14 +444,18 @@ function helperSource() {
       for (var fi = 0; fi < fd.length; fi++) {
         if (fd[fi] != null) { first = fd[fi] || 1e-9; break; }
       }
+      // Stage fade shared by fill + hover: the hover keeps each stage's alpha
+      // (the fade IS the funnel reading) and shifts only the hue.
+      var fAlpha = fd.map(function (_, i) {
+        return Math.max(0.25, 1 - i * (0.65 / Math.max(1, fd.length - 1)));
+      });
       return {
         type: "bar",
         data: { labels: labels, datasets: [{
           label: spec.title || "",
           data: fd.map(function (v) { return v == null ? null : [-v / 2, v / 2]; }),
-          backgroundColor: fd.map(function (v, i) {
-            return rgb(SERIES[0], Math.max(0.25, 1 - i * (0.65 / Math.max(1, fd.length - 1))));
-          }),
+          backgroundColor: fd.map(function (_, i) { return rgb(SERIES[0], fAlpha[i]); }),
+          hoverBackgroundColor: fd.map(function (_, i) { return rgb(hoverTriple(SERIES[0]), fAlpha[i]); }),
           borderWidth: 0, borderRadius: 4, barPercentage: 0.98, categoryPercentage: 0.95
         }] },
         options: {
@@ -475,6 +505,7 @@ function helperSource() {
           label: spec.title || "",
           data: (series[0] || {}).data || [],
           backgroundColor: rgb(SERIES[0], 0.25),
+          hoverBackgroundColor: rgb(SERIES[0], 0.45),
           borderColor: rgb(SERIES[0]),
           borderWidth: 1.5,
           outlierBackgroundColor: rgb(SERIES[0])
@@ -497,6 +528,7 @@ function helperSource() {
           label: s0.name || "",
           data: s0.data || [],
           backgroundColor: (s0.data || []).map(function (_, i) { return rgb(seriesColor(i), polar ? 0.7 : undefined); }),
+          hoverBackgroundColor: (s0.data || []).map(function (_, i) { return rgb(hoverTriple(seriesColor(i)), polar ? 0.7 : undefined); }),
           borderColor: rgb(P.card || "255,255,255"),
           borderWidth: 2
         }] },
@@ -771,6 +803,9 @@ function helperSource() {
         // crispness re-raster uses). Lines keep 2 — that IS the stroke.
         borderWidth: (sType === "bar") ? 0 : 2,
         borderRadius: (sType === "bar") ? 4 : 0,
+        // Bars (incl. histogram buckets + combo bars) get the explicit hover
+        // fill; lines/areas keep the default point-radius growth.
+        hoverBackgroundColor: (sType === "bar") ? rgb(hoverTriple(seriesColor(i))) : undefined,
         tension: 0.3,
         pointRadius: (sType === "line") ? 2 : 0,
         // Mixed charts: lines/areas draw ABOVE bars (Chart.js draws higher
