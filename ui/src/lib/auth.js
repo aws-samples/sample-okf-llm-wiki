@@ -64,7 +64,7 @@ export function signInPreservingRoute(auth) {
 // The path (with hash) the callback page should land on after sign-in. Consumes
 // the saved hash so it applies once.
 export function consumeReturnPath() {
-  let hash = ""
+  let hash
   try {
     hash = sessionStorage.getItem(RETURN_HASH_KEY) || ""
     if (hash) sessionStorage.removeItem(RETURN_HASH_KEY)

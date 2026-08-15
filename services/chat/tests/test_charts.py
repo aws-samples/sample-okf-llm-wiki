@@ -41,6 +41,13 @@ def test_chart_tool_description_documents_the_render_api():
     # Every supported chart type is offered to the model.
     for t in SUPPORTED_CHART_TYPES:
         assert t in RENDER_CHART_DESC
+    # The newer renderer types carry their load-bearing spec fields in the
+    # contract too — without these the model can name the type but can't
+    # author it (heatmap axis orders, waterfall total rows, gauge range/center
+    # text, combo's right-hand axis, boxplot's five-number keys, reference
+    # lines).
+    for kw in ("xCats", "yCats", "totals", "median", "y2Label", "references"):
+        assert kw in RENDER_CHART_DESC
     # The load-bearing guardrails: real data only + colors come from the app
     # palette. These are what keep charts truthful + on-brand.
     low = RENDER_CHART_DESC.lower()

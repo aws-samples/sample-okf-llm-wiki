@@ -99,6 +99,11 @@ data "aws_iam_policy_document" "incremental" {
 # Control API: list Glue, read/write registry, read/write bundle + presign
 # uploads, read freshness, invoke the harvest runtime.
 data "aws_iam_policy_document" "control_api" {
+  source_policy_documents = concat(
+    var.enable_attested_computations ? [data.aws_iam_policy_document.computations_execution_core.json] : [],
+    var.enable_attested_computations && var.enable_lakeformation ? [data.aws_iam_policy_document.computations_execution_lakeformation.json] : [],
+    var.enable_attested_computations && var.enable_redshift ? [data.aws_iam_policy_document.computations_execution_redshift.json] : [],
+  )
   # checkov:skip=CKV_AWS_356:glue:GetDatabases/GetTables (read-only catalog listing for the "register a dataset" picker) targets the whole catalog by design — the API lists across all databases. InvokeAgentRuntime IS scoped to the single harvest runtime (local.harvest_invoke_resources); StopRuntimeSession stays "*" (see its statement below). logs:FilterLogEvents is already scoped to the AgentCore runtime log-group namespace; DynamoDB/S3/Cognito grants below are resource-scoped. The Redshift picker list actions (redshift:DescribeClusters/redshift-serverless:ListWorkgroups/redshift-data:ListDatabases) don't support resource-level scoping; secretsmanager:GetSecretValue is scoped to the var.redshift_secret_name_prefix name pattern (mappings are self-describing, so per-mapping secrets can't be enumerated at deploy time).
   statement {
     actions   = ["glue:GetDatabases", "glue:GetTables"]
@@ -231,76 +236,7 @@ data "aws_iam_policy_document" "control_api" {
     }
   }
 
-  # Optional Attested Computations execution (var.enable_attested_computations):
-  # the UI's Run modal POSTs to /bundle/.../computations/{slug}/run and the
-  # Lambda executes the wiki's FROZEN statement with typed literals substituted
-  # — never caller SQL. Same read-only ceiling as the consumption/chat SQL
-  # grants: catalog-wide Glue/Athena READ, results-bucket write, broad
-  # source-data READ (a Glue table's location can be any bucket), nothing
-  # writable on source. The verification overlay writes ride the existing
-  # bundle-bucket PutObject grant above (verification/ is in the same bucket,
-  # outside the mounted okf/ prefix).
-  dynamic "statement" {
-    for_each = var.enable_attested_computations ? [1] : []
-    content {
-      sid = "ComputationsGlueRead"
-      actions = [
-        "glue:GetDatabase", "glue:GetTable",
-        "glue:GetPartitions", "glue:GetPartition", "glue:BatchGetPartition",
-        "glue:GetTableVersions",
-      ]
-      resources = ["*"]
-    }
-  }
-  dynamic "statement" {
-    for_each = var.enable_attested_computations ? [1] : []
-    content {
-      sid = "ComputationsAthenaQuery"
-      actions = [
-        "athena:StartQueryExecution", "athena:GetQueryExecution",
-        "athena:GetQueryResults", "athena:StopQueryExecution",
-      ]
-      resources = ["*"]
-    }
-  }
-  dynamic "statement" {
-    for_each = var.enable_attested_computations ? [1] : []
-    content {
-      sid       = "ComputationsAthenaResultsWrite"
-      actions   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:GetBucketLocation"]
-      resources = [aws_s3_bucket.athena_results.arn, "${aws_s3_bucket.athena_results.arn}/*"]
-    }
-  }
-  dynamic "statement" {
-    for_each = var.enable_attested_computations ? [1] : []
-    content {
-      sid       = "ComputationsTableDataRead"
-      actions   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
-      resources = ["*"]
-    }
-  }
-  dynamic "statement" {
-    for_each = var.enable_attested_computations && var.enable_lakeformation ? [1] : []
-    content {
-      sid       = "ComputationsLakeFormationDataAccess"
-      actions   = ["lakeformation:GetDataAccess"]
-      resources = ["*"]
-    }
-  }
-  # Redshift-runtime computations execute via the Data API against the mapping
-  # row's own connection descriptor. The secret read rides the
-  # RedshiftSecretRead grant above; redshift-data actions can't be ARN-scoped.
-  dynamic "statement" {
-    for_each = var.enable_attested_computations && var.enable_redshift ? [1] : []
-    content {
-      sid = "ComputationsRedshiftDataApi"
-      actions = [
-        "redshift-data:ExecuteStatement",
-        "redshift-data:DescribeStatement",
-        "redshift-data:GetStatementResult",
-        "redshift-data:CancelStatement",
-      ]
-      resources = ["*"]
-    }
-  }
+  # Computation execution (the UI's Run modal): the SHARED ceiling
+  # (computations_iam.tf) merged via source_policy_documents above, behind
+  # var.enable_attested_computations.
 }

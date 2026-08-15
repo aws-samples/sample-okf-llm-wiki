@@ -27,6 +27,9 @@ export function buildTimelineSteps(contentSegments) {
         toolInput: segment.input,
         isToolComplete: segment.isComplete,
         toolError: segment.error,
+        // Optional collapse count (the canvas-jobs drawer folds consecutive
+        // same-tool calls into one step) — renders as a ×N suffix.
+        toolCount: segment.count,
       })
     } else if (segment.type === "steer" && segment.content) {
       // A harness steering note — its own timeline step (bulb marker).

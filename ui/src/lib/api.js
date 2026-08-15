@@ -14,7 +14,7 @@ async function request(token, method, path, body) {
     body: body != null ? JSON.stringify(body) : undefined,
   })
   if (!res.ok) {
-    let detail = ""
+    let detail
     try {
       detail = (await res.json()).error || ""
     } catch {

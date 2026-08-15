@@ -455,28 +455,32 @@
     display: none;
   }
 
-  /* Thin, transparent-track scrollbar for native overflow panes (the live feed).
-     The default track paints an opaque bar that looks heavy against the card;
-     make it transparent and give the thumb a subtle, theme-aware tint. */
-  .okf-thin-scroll {
+  /* Thin, transparent-track scrollbar — GLOBAL. Every native overflow pane
+     (the transcript, drawers, tile tables, the page itself) gets the same
+     slim pill automatically; the default opaque track read heavy against
+     cards, and per-pane opt-in (`.okf-thin-scroll`, now redundant — kept in
+     markup harmlessly) kept missing new surfaces (the canvas jobs drawer,
+     TableTile). Chart iframes are separate documents: chartIframe.js embeds
+     the same rules with build-time palette literals. */
+  * {
     scrollbar-width: thin; /* Firefox */
     scrollbar-color: var(--border) transparent; /* thumb / track */
   }
-  .okf-thin-scroll::-webkit-scrollbar {
+  *::-webkit-scrollbar {
     width: 8px;
     height: 8px;
   }
-  .okf-thin-scroll::-webkit-scrollbar-track {
+  *::-webkit-scrollbar-track {
     background: transparent;
   }
-  .okf-thin-scroll::-webkit-scrollbar-thumb {
+  *::-webkit-scrollbar-thumb {
     background-color: var(--border);
     border-radius: 9999px;
     /* Inset the thumb so it reads as a slim pill on the transparent track. */
     border: 2px solid transparent;
     background-clip: padding-box;
   }
-  .okf-thin-scroll::-webkit-scrollbar-thumb:hover {
+  *::-webkit-scrollbar-thumb:hover {
     background-color: var(--muted-foreground);
     background-clip: padding-box;
   }
