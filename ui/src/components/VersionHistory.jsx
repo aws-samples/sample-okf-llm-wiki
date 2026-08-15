@@ -519,7 +519,6 @@ class DiffBoundary extends Component {
     return { hasError: true }
   }
   componentDidCatch(error) {
-    // eslint-disable-next-line no-console
     console.error("[VersionHistory] diff render error:", error)
   }
   render() {
@@ -588,7 +587,6 @@ function RichDiff({ vh, file }) {
   return (
     <div
       className="okf-prose okf-richdiff p-4"
-      // eslint-disable-next-line react/no-danger
       dangerouslySetInnerHTML={{ __html: state.html }}
     />
   )

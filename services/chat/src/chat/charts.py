@@ -50,6 +50,13 @@ SUPPORTED_CHART_TYPES = (
     "polarArea",
     "sankey",
     "treemap",
+    "combo",
+    "heatmap",
+    "waterfall",
+    "funnel",
+    "gauge",
+    "histogram",
+    "boxplot",
 )
 
 # The authoring contract the model sees. This is where the whole "how to write a
@@ -70,7 +77,8 @@ HOW IT RENDERS: your `code` is the BODY of a function receiving `el` — stateme
 `el` is the <canvas> to draw into — already in the DOM, don't create your own. `spec` is a plain object:
 
     renderChart(el, {
-      type: "bar",                       // bar | line | area | pie | doughnut | radar | scatter | bubble | polarArea | sankey | treemap
+      type: "bar",                       // bar | line | area | pie | doughnut | radar | scatter | bubble | polarArea
+                                         // | sankey | treemap | combo | heatmap | waterfall | funnel | gauge | histogram | boxplot
       title: "Race wins by constructor", // optional heading above the chart
       labels: ["Ferrari", "McLaren", "Mercedes"],   // category / x-axis labels
       series: [                          // one entry per series
@@ -80,12 +88,17 @@ HOW IT RENDERS: your `code` is the BODY of a function receiving `el` — stateme
       // horizontal: true (bar/line/area — swaps the axes; use it for long
       // category names and ranked "top N" lists),
       // axes: true|false (value-axis gridlines; defaults false on horizontal
-      // charts — a clean ranked list — true on vertical)
+      // charts — a clean ranked list — true on vertical),
+      // references: [{value, label}] — dashed target line on the value axis
+      // ({from, to, label} draws a shaded band instead; axis: "x" to pin it
+      // to the x axis) — cartesian charts only
     });
 
-Types whose `data` shape differs, all omitting `labels`: scatter takes [{x, y}]; bubble [{x, y, r}] (r = radius in px, scaled to your third dimension); sankey (flow between stages) one series of [{from, to, flow}] edges, node names as strings, flow = magnitude; treemap (share of total) one series of [{label, value}] leaves plus an optional `group` for one nesting level. polarArea takes one series like pie, each slice's RADIUS encoding the value.
+Types whose `data` shape differs, all omitting `labels`: scatter takes [{x, y}]; bubble [{x, y, r}] (r = radius in px, scaled to your third dimension); sankey (flow between stages) one series of [{from, to, flow}] edges, node names as strings, flow = magnitude; treemap (share of total) one series of [{label, value}] leaves plus an optional `group` for one nesting level. polarArea takes one series like pie, each slice's RADIUS encoding the value. heatmap (two categories x a magnitude) takes one series of [{x, y, v}] cells PLUS `xCats`/`yCats` arrays on the spec fixing each axis's category order (a null `v` renders as a visible "no data" cell — don't substitute 0). gauge (one value against a range) takes series: [{ data: [value] }] plus `min`/`max` on the spec and an optional `text` — the pre-formatted center label (e.g. "87%"); without it the raw number is drawn.
 
-MIXED charts: a per-series `type` (bar | line | area) overlays that series on the base type — monthly bars with a cumulative line is type: "bar", series: [{ name: "Monthly", data: [...] }, { name: "Cumulative", type: "line", data: [...] }].
+Single-series types that KEEP `labels`: waterfall — data = the signed DELTAS in order (the helper computes the running-sum bar positions; add `totals: [...]` on the spec, a boolean per label, to mark rows that are running TOTALS — drawn from zero in neutral ink); funnel — labels = the stages in order, data = each stage's size (the tooltip adds % of the first stage); histogram — labels = bucket labels you already computed (bin in SQL, e.g. width_bucket), data = the counts, drawn gapless; boxplot — data = one {min, q1, median, q3, max} object per label, the five-number summary computed in SQL (e.g. approx_percentile), never raw rows.
+
+MIXED charts: type "combo" draws bars + lines over one x-axis with a per-series `type` (bar | line | area) — monthly bars with a cumulative line is type: "combo", series: [{ name: "Monthly", type: "bar", data: [...] }, { name: "Cumulative", type: "line", data: [...] }]. When a line's unit differs from the bars' (counts vs. a rate), set y2: true on that series and `y2Label` on the spec — it rides a right-hand value axis. A per-series `type` on a plain bar/line base overlays the same way.
 
 A complete `code` value:
 

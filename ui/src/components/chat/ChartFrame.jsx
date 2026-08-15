@@ -26,8 +26,9 @@
 import { AlertTriangleIcon } from "lucide-react"
 import { Component, useEffect, useMemo, useRef, useState } from "react"
 
+import { VisualExportMenu } from "@/components/VisualExportMenu"
 import { buildChartSrcdoc, resolveChartPalette } from "@/lib/chartIframe"
-import { cn } from "@/lib/utils"
+import { requestChartExport } from "@/lib/visualExport"
 
 // A compact, INLINE error note shown when a chart can't render (bad code, bad
 // spec, or a frame-build failure). Kept chrome-light (no card/border) to match the
@@ -62,7 +63,6 @@ class ChartBoundary extends Component {
   }
   componentDidCatch(error) {
     // Contained: log for debugging, don't rethrow.
-    // eslint-disable-next-line no-console
     console.error("[ChartFrame] render error:", error)
   }
   render() {
@@ -225,7 +225,16 @@ function ChartGenerating({ active }) {
 // so without this beat the skeleton would just flash.
 const MIN_GENERATING_MS = 900
 
-function ChartFrameInner({ code, title, live, boxHeight = 340 }) {
+function ChartFrameInner({
+  code,
+  title,
+  live,
+  boxHeight = 340,
+  exportRef,
+  exportTitle,
+  exportBg = "background",
+  exportMenu = true,
+}) {
   const iframeRef = useRef(null)
   // Default matches what the frame will report (#chartbox boxHeight + 8px wrap
   // padding, see chartIframe.js) so the placeholder footprint == the reveal.
@@ -374,6 +383,25 @@ function ChartFrameInner({ code, title, live, boxHeight = 340 }) {
     }
   }, [status, srcDoc])
 
+  // Hand the export capability to a host that renders its own kebab (canvas
+  // tiles keep it in the card header, next to the title): once the frame has
+  // drawn, exportRef.current is a getPng hook the tile's menu can call.
+  useEffect(() => {
+    if (!exportRef) return undefined
+    exportRef.current =
+      status === "ok"
+        ? (opts) =>
+            requestChartExport(iframeRef.current, {
+              title: exportTitle || title || "",
+              bg: exportBg,
+              ...opts,
+            })
+        : null
+    return () => {
+      exportRef.current = null
+    }
+  }, [status, exportRef, exportTitle, exportBg, title])
+
   if (status === "error") {
     return <ChartError title={title} message={errorMsg} />
   }
@@ -389,7 +417,7 @@ function ChartFrameInner({ code, title, live, boxHeight = 340 }) {
     // transparent (see chartIframe.js), so the chart sits directly on the chat
     // surface like a paragraph, not a contained widget. Just vertical rhythm.
     <div
-      className="relative my-3"
+      className="group/chart relative my-3"
       style={{ height: `${height}px`, transition: "height 0.4s ease" }}
     >
       {theater ? <ChartGenerating active={!showChart} /> : null}
@@ -416,6 +444,23 @@ function ChartFrameInner({ code, title, live, boxHeight = 340 }) {
         }}
       />
       )}
+      {/* Inline charts render their own kebab, floating over the top-right
+          corner (there's no card header to put it in); canvas tiles pass
+          exportMenu={false} and mount the menu beside their title instead. */}
+      {exportMenu && showChart ? (
+        <div className="absolute top-1 right-1 opacity-0 transition-opacity focus-within:opacity-100 group-hover/chart:opacity-100">
+          <VisualExportMenu
+            title={title}
+            getPng={(opts) =>
+              requestChartExport(iframeRef.current, {
+                title: title || "",
+                bg: exportBg,
+                ...opts,
+              })
+            }
+          />
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -430,6 +475,10 @@ export function ChartFrame({
   live = false,
   pending = false,
   height = 340,
+  exportRef,
+  exportTitle,
+  exportBg = "background",
+  exportMenu = true,
 }) {
   const codeStr = typeof code === "string" ? code : ""
   if (!codeStr && !pending) {
@@ -449,6 +498,10 @@ export function ChartFrame({
         title={title}
         live={live}
         boxHeight={height}
+        exportRef={exportRef}
+        exportTitle={exportTitle}
+        exportBg={exportBg}
+        exportMenu={exportMenu}
       />
     </ChartBoundary>
   )

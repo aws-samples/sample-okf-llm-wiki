@@ -2955,9 +2955,6 @@ const HarvestFeed = memo(function HarvestFeed({
   running,
   aborted,
   draining = false,
-  api,
-  domain,
-  dataset,
   onOpenSquare,
 }) {
   const viewportRef = useRef(null)

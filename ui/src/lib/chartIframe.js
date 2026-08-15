@@ -21,11 +21,15 @@
 // React wrapper (ChartFrame.jsx) sizes the iframe and shows a contained error.
 
 import CHART_JS_SRC from "@/vendor/chart.umd.min.js?raw"
-// Plugin controllers for the two non-core chart types (see vendor/README.md).
-// Their UMD builds self-register against the global `Chart`, so inlining them
-// after the core lib is all the wiring the frame needs.
+// Plugin controllers/plugins for the non-core chart types (see
+// vendor/README.md). sankey/treemap self-register against the global `Chart`;
+// annotation/matrix/boxplot expose globals and are registered explicitly in
+// renderChart (Chart.register dedupes, so re-registering is safe).
 import CHART_SANKEY_SRC from "@/vendor/chartjs-chart-sankey.min.js?raw"
 import CHART_TREEMAP_SRC from "@/vendor/chartjs-chart-treemap.min.js?raw"
+import CHART_ANNOTATION_SRC from "@/vendor/chartjs-plugin-annotation.min.js?raw"
+import CHART_MATRIX_SRC from "@/vendor/chartjs-chart-matrix.min.js?raw"
+import CHART_BOXPLOT_SRC from "@/vendor/chartjs-chart-boxplot.min.js?raw"
 
 // The palette + UI tokens we resolve from the app theme and hand to the frame.
 // --chart-1..10 are the series palette; the rest style axes/legend/tooltip so
@@ -147,6 +151,31 @@ function helperSource() {
   }
   function seriesColor(i) { return SERIES[i % SERIES.length]; }
 
+  // HOVER emphasis for solid categorical fills: Chart.js's default hover shift
+  // (helpers.getHoverColor) moves the color a few percent — it reads as "no
+  // change" on our theme fills in BOTH modes. Mix the fill a quarter of the
+  // way toward the theme FOREGROUND instead: clearly darker in light mode,
+  // clearly lighter in dark, with no alpha games (an alpha'd hover would blend
+  // with the page behind the frame and drift between themes).
+  function mixTriple(a, b, t) {
+    var pa = String(a).split(",").map(Number);
+    var pb = String(b).split(",").map(Number);
+    return pa.map(function (v, i) { return Math.round(v + (pb[i] - v) * t); }).join(", ");
+  }
+  function hoverTriple(triple) {
+    return mixTriple(triple, P.foreground || "23,23,23", 0.25);
+  }
+
+  // Locale separators for TOOLTIP values ("3545697" -> "3,545,697"): Chart.js
+  // formats axis ticks with Intl but tooltips print the raw parsed number.
+  // Non-numeric values pass through untouched.
+  function fmtNum(v) {
+    var n = typeof v === "number" ? v
+      : (typeof v === "string" && v.trim() !== "" ? Number(v) : NaN);
+    if (typeof n !== "number" || !isFinite(n)) return v == null ? "" : String(v);
+    return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
+  }
+
   // WCAG relative luminance of an "r,g,b" triple — picks readable label ink for
   // text drawn ON a solid series fill (treemap tiles). Threshold 0.19 is where
   // white-on-fill and dark-on-fill contrast cross over.
@@ -198,10 +227,45 @@ function helperSource() {
   // Map the agent's spec → a Chart.js config. Colors always come from the palette
   // (the spec's own colors are ignored unless the model set them explicitly, which
   // the authoring contract discourages). Supports bar/line/area/pie/doughnut/
-  // radar/scatter/bubble/polarArea plus the inlined plugin types sankey/treemap,
-  // horizontal bar/line/area (spec.horizontal → indexAxis "y"), and mixed charts
-  // (a per-series 'type' of bar|line|area overlaid on the base); anything else
-  // throws a clear error the wrapper surfaces.
+  // radar/scatter/bubble/polarArea, the inlined plugin types sankey/treemap/
+  // heatmap (matrix)/boxplot, the derived types combo/waterfall/funnel/gauge/
+  // histogram (built from bar/doughnut primitives), horizontal bar/line/area
+  // (spec.horizontal → indexAxis "y"), and mixed charts (a per-series 'type' of
+  // bar|line|area overlaid on the base); anything else throws a clear error the
+  // wrapper surfaces. This set must stay in step with SUPPORTED_CHART_TYPES in
+  // services/chat/src/chat/charts.py and CHART_WIDGETS in lib/canvasBind.js.
+  // options.references -> chartjs-plugin-annotation config: dashed lines at
+  // literal values, translucent boxes for from/to bands. Values are config
+  // LITERALS (lint-validated) — nothing is derived here.
+  function referenceAnnotations(spec) {
+    var refs = spec.references;
+    if (!refs || !refs.length) return null;
+    var out = {};
+    refs.forEach(function (ref, i) {
+      var axis = ref.axis === "x" ? "x" : "y";
+      var labelCfg = ref.label ? {
+        display: true, content: String(ref.label),
+        position: axis === "y" ? "end" : "start",
+        backgroundColor: rgb(P.card || "255,255,255", 0.85),
+        color: rgb(P.mutedForeground || "115,115,115"),
+        font: { size: 10, weight: "600" }, padding: 3
+      } : { display: false };
+      if (ref.value != null) {
+        out["ref" + i] = {
+          type: "line", scaleID: axis, value: ref.value,
+          borderColor: rgb(P.foreground || "23,23,23", 0.55),
+          borderWidth: 1.5, borderDash: [5, 4], label: labelCfg
+        };
+      } else {
+        var box = { type: "box", backgroundColor: rgb(SERIES[0], 0.08), borderWidth: 0, label: labelCfg };
+        if (axis === "y") { box.yMin = ref.from; box.yMax = ref.to; }
+        else { box.xMin = ref.from; box.xMax = ref.to; }
+        out["ref" + i] = box;
+      }
+    });
+    return out;
+  }
+
   function toConfig(spec) {
     if (!spec || typeof spec !== "object") throw new Error("chart spec must be an object");
     var type = spec.type;
@@ -249,6 +313,216 @@ function helperSource() {
       }
     };
 
+    // Shared finishing for the early-return cartesian branches (heatmap,
+    // waterfall, boxplot, scatter/bubble): the same 'references' -> annotation
+    // and 'axes' -> value-gridline toggles the bar/line fallthrough applies.
+    // An option the lint blesses must RENDER on every widget that declares it
+    // — these branches used to return before either was applied, so a target
+    // line the author (and the CI's screenshot loop) asked for never appeared.
+    function applyCartesianOpts(opts, spec) {
+      var annos = referenceAnnotations(spec);
+      if (annos) {
+        opts.plugins = opts.plugins || {};
+        opts.plugins.annotation = { annotations: annos };
+      }
+      if (spec.axes != null && !spec.axes && opts.scales && opts.scales.y) {
+        opts.scales.y.grid = { display: false };
+      }
+      return opts;
+    }
+
+    // Slice/spoke tooltips (pie/doughnut/polarArea/radar): the category name
+    // plus the locale-formatted value (defaults printed the raw number).
+    function _sliceLabel(c) {
+      var p = c.parsed;
+      var v = p != null && typeof p === "object" ? p.r : p;
+      return (c.label ? c.label + ": " : "") + fmtNum(v);
+    }
+
+    // A SQL NULL is a data fact, not a zero: coercing it fabricates a number
+    // the query never returned (the module contract is "the values shown are
+    // the query's numbers untouched"). Null/NaN map to null — Chart.js and
+    // the branch code render a gap instead.
+    function numOrNull(v) {
+      if (v == null || v === "") return null;
+      var n = Number(v);
+      return isFinite(n) ? n : null;
+    }
+
+    if (type === "heatmap") {
+      // series[0].data = [{x, y, v}]; first-seen category orders injected as
+      // xCats/yCats; cell color = primary ramp scaled to the value range.
+      // Null cells paint a faint neutral (visibly "no data", never a
+      // saturated "low") and don't shape the ramp.
+      var hd = (series[0] || {}).data || [];
+      var xs = spec.xCats || [], ys = spec.yCats || [];
+      var vmax = -Infinity, vmin = Infinity;
+      hd.forEach(function (pt) {
+        var v = numOrNull(pt && pt.v);
+        if (v == null) return;
+        if (v > vmax) vmax = v; if (v < vmin) vmin = v;
+      });
+      if (!isFinite(vmin)) { vmin = 0; vmax = 1; }
+      return {
+        type: "matrix",
+        data: { datasets: [{
+          label: spec.title || "",
+          data: hd,
+          backgroundColor: function (c) {
+            var v = numOrNull((c.raw || {}).v);
+            if (v == null) return rgb(P.mutedForeground || "115,115,115", 0.07);
+            var t = vmax > vmin ? (v - vmin) / (vmax - vmin) : 1;
+            return rgb(SERIES[0], 0.12 + 0.78 * t);
+          },
+          borderColor: rgb(P.card || "255,255,255"),
+          borderWidth: 1,
+          // Hover = an OUTLINE, not a fill shift: the cell's fill intensity
+          // encodes the value, so changing it on hover would lie about the data.
+          hoverBorderColor: rgb(P.foreground || "23,23,23"),
+          hoverBorderWidth: 2,
+          width: function (c) { var a = c.chart.chartArea; return a ? Math.max(4, (a.right - a.left) / Math.max(1, xs.length) - 2) : 8; },
+          height: function (c) { var a = c.chart.chartArea; return a ? Math.max(4, (a.bottom - a.top) / Math.max(1, ys.length) - 2) : 8; }
+        }] },
+        options: applyCartesianOpts({
+          scales: {
+            x: { type: "category", labels: xs, offset: true, grid: { display: false }, border: { display: false }, ticks: mutedTicks,
+                 title: spec.xLabel ? { display: true, text: spec.xLabel } : { display: false } },
+            y: { type: "category", labels: ys, offset: true, grid: { display: false }, border: { display: false }, ticks: mutedTicks,
+                 title: spec.yLabel ? { display: true, text: spec.yLabel } : { display: false } }
+          },
+          plugins: { legend: { display: false }, tooltip: { callbacks: {
+            title: function () { return ""; },
+            label: function (c) { var r = c.raw || {}; return r.x + " / " + r.y + ": " + (r.v == null ? "no data" : fmtNum(r.v)); }
+          } } }
+        }, spec)
+      };
+    }
+
+    if (type === "waterfall") {
+      // Floating bars from SQL DELTAS: bar POSITIONS are running sums (layout
+      // arithmetic only); the values shown are the query's numbers untouched.
+      // spec.totals[i] marks running-total rows (drawn from zero, neutral ink).
+      var wd = ((series[0] || {}).data || []).map(numOrNull);
+      var totals = spec.totals || [];
+      var run = 0;
+      var bars = wd.map(function (d, i) {
+        if (d == null) return null; // unknown delta: a GAP, not a +0 step
+        if (totals[i]) { run = d; return [0, d]; }
+        var seg = [run, run + d]; run += d; return seg;
+      });
+      var wcolors = wd.map(function (d, i) {
+        if (d == null) return "transparent";
+        if (totals[i]) return rgb(P.foreground || "23,23,23", 0.7);
+        return d >= 0 ? rgb(SERIES[2], 0.9) : rgb(SERIES[9], 0.9);
+      });
+      // Hover: hue toward foreground for the +/- bars; totals (already
+      // foreground ink) just firm up their alpha.
+      var whover = wd.map(function (d, i) {
+        if (d == null) return "transparent";
+        if (totals[i]) return rgb(P.foreground || "23,23,23", 0.95);
+        return rgb(hoverTriple(d >= 0 ? SERIES[2] : SERIES[9]), 0.9);
+      });
+      var wOpts = applyCartesianOpts({
+        scales: scalesLinear,
+        plugins: { legend: { display: false }, tooltip: { callbacks: {
+          label: function (c) { return (totals[c.dataIndex] ? "total: " : "") + fmtNum(wd[c.dataIndex]); }
+        } } }
+      }, spec);
+      return {
+        type: "bar",
+        // borderSkipped:false — these bars FLOAT (segments of a running sum),
+        // so the default start-edge skip would square one end of each bar.
+        data: { labels: labels, datasets: [{ label: spec.title || "", data: bars, backgroundColor: wcolors, hoverBackgroundColor: whover, borderSkipped: false, borderWidth: 0, borderRadius: 3 }] },
+        options: wOpts
+      };
+    }
+
+    if (type === "funnel") {
+      // Symmetric floating horizontal bars — a funnel with no plugin. Bars
+      // center on 0 spanning [-v/2, +v/2]; the value axis is hidden (values
+      // live in the tooltip, with the %-of-first conversion).
+      var fd = ((series[0] || {}).data || []).map(numOrNull);
+      var first = 1;
+      for (var fi = 0; fi < fd.length; fi++) {
+        if (fd[fi] != null) { first = fd[fi] || 1e-9; break; }
+      }
+      // Stage fade shared by fill + hover: the hover keeps each stage's alpha
+      // (the fade IS the funnel reading) and shifts only the hue.
+      var fAlpha = fd.map(function (_, i) {
+        return Math.max(0.25, 1 - i * (0.65 / Math.max(1, fd.length - 1)));
+      });
+      return {
+        type: "bar",
+        data: { labels: labels, datasets: [{
+          label: spec.title || "",
+          data: fd.map(function (v) { return v == null ? null : [-v / 2, v / 2]; }),
+          backgroundColor: fd.map(function (_, i) { return rgb(SERIES[0], fAlpha[i]); }),
+          hoverBackgroundColor: fd.map(function (_, i) { return rgb(hoverTriple(SERIES[0]), fAlpha[i]); }),
+          // Floating bars have no base, but Chart.js still skips the radius
+          // on the "start" edge by default — left corners squared, right
+          // rounded. borderSkipped:false rounds all four.
+          borderSkipped: false,
+          borderWidth: 0, borderRadius: 4, barPercentage: 0.98, categoryPercentage: 0.95
+        }] },
+        options: {
+          indexAxis: "y",
+          scales: {
+            x: { display: false },
+            y: { grid: { display: false }, border: { display: false }, ticks: mutedTicks }
+          },
+          plugins: { legend: { display: false }, tooltip: { callbacks: {
+            label: function (c) {
+              var v = fd[c.dataIndex];
+              return fmtNum(v) + " (" + Math.round((v / first) * 100) + "% of " + (labels[0] || "first") + ")";
+            }
+          } } }
+        }
+      };
+    }
+
+    if (type === "gauge") {
+      // Semicircle doughnut over [min, max]; the pre-formatted value is drawn
+      // in the arc's mouth by the okfGaugeText plugin.
+      var gmin = Number(spec.min) || 0;
+      var gmax = Number(spec.max);
+      var gval = Number(((series[0] || {}).data || [])[0]);
+      var frac = Math.max(0, Math.min(1, (gval - gmin) / ((gmax - gmin) || 1)));
+      return {
+        type: "doughnut",
+        data: { labels: [spec.title || "", ""], datasets: [{
+          data: [frac, 1 - frac],
+          backgroundColor: [rgb(SERIES[0]), rgb(P.mutedForeground || "115,115,115", 0.15)],
+          borderWidth: 0
+        }] },
+        options: {
+          rotation: -90, circumference: 180, cutout: "72%",
+          okfGauge: { text: spec.text != null ? String(spec.text) : String(gval) },
+          plugins: { legend: { display: false }, tooltip: { enabled: false } }
+        }
+      };
+    }
+
+    if (type === "boxplot") {
+      // PRE-COMPUTED five-number summaries per category (from the SQL) — the
+      // plugin renders stats, it never derives them from raw values.
+      return {
+        type: "boxplot",
+        data: { labels: labels, datasets: [{
+          label: spec.title || "",
+          data: (series[0] || {}).data || [],
+          backgroundColor: rgb(SERIES[0], 0.25),
+          hoverBackgroundColor: rgb(SERIES[0], 0.45),
+          borderColor: rgb(SERIES[0]),
+          borderWidth: 1.5,
+          outlierBackgroundColor: rgb(SERIES[0])
+        }] },
+        options: applyCartesianOpts(
+          { scales: scalesLinear, plugins: { legend: { display: false } } },
+          spec
+        )
+      };
+    }
+
     if (type === "pie" || type === "doughnut" || type === "polarArea") {
       var s0 = series[0] || { data: [] };
       // polarArea slices overlap the radial grid, so they get a light alpha
@@ -260,13 +534,15 @@ function helperSource() {
           label: s0.name || "",
           data: s0.data || [],
           backgroundColor: (s0.data || []).map(function (_, i) { return rgb(seriesColor(i), polar ? 0.7 : undefined); }),
+          hoverBackgroundColor: (s0.data || []).map(function (_, i) { return rgb(hoverTriple(seriesColor(i)), polar ? 0.7 : undefined); }),
           borderColor: rgb(P.card || "255,255,255"),
           borderWidth: 2
         }] },
         options: polar
-          ? { plugins: { legend: { position: "right" } },
+          ? { plugins: { legend: { position: "right" }, tooltip: { callbacks: { label: _sliceLabel } },
+              },
               scales: { r: { grid: { color: gridColor(0.16) }, ticks: { display: false } } } }
-          : { plugins: { legend: { position: "right" } } }
+          : { plugins: { legend: { position: "right" }, tooltip: { callbacks: { label: _sliceLabel } } } }
       };
     }
 
@@ -281,7 +557,17 @@ function helperSource() {
                    backgroundColor: rgb(seriesColor(i), bubble ? 0.6 : undefined),
                    borderColor: rgb(seriesColor(i)) };
         }) },
-        options: { scales: scalesLinear }
+        options: applyCartesianOpts({
+          scales: scalesLinear,
+          plugins: { tooltip: { callbacks: {
+            label: function (c) {
+              var p = c.parsed || {};
+              var r = bubble && c.raw && c.raw.r != null ? ", r " + fmtNum(c.raw.r) : "";
+              return (c.dataset.label ? c.dataset.label + ": " : "")
+                + "(" + fmtNum(p.x) + ", " + fmtNum(p.y) + r + ")";
+            }
+          } } }
+        }, spec)
       };
     }
 
@@ -334,7 +620,12 @@ function helperSource() {
       return {
         type: "sankey",
         data: { datasets: [skDs] },
-        options: { plugins: { legend: { display: false } } }
+        options: { plugins: { legend: { display: false }, tooltip: { callbacks: {
+          label: function (c) {
+            var f = (c.dataset.data || [])[c.dataIndex] || {};
+            return f.from + " → " + f.to + ": " + fmtNum(f.flow);
+          }
+        } } } }
       };
     }
 
@@ -436,7 +727,17 @@ function helperSource() {
             }
           }
         }] },
-        options: { plugins: { legend: { display: false } } }
+        options: { plugins: { legend: { display: false }, tooltip: { callbacks: {
+          // The plugin default titles "value" (the key name) and prints the
+          // raw number — show "name: 1,284,099" per hovered level instead.
+          title: function () { return ""; },
+          label: function (c) {
+            var o = (c.raw && c.raw._data) || {};
+            var v = c.raw && c.raw.v;
+            var name = o.label != null ? String(o.label) : "";
+            return name ? name + ": " + fmtNum(v) : fmtNum(v);
+          }
+        } } } }
       };
     }
 
@@ -451,7 +752,15 @@ function helperSource() {
         // Radial tick labels (the backdropped numbers up the first spoke) are
         // hidden like the y-axis: values live in the tooltip. Point labels
         // (the category names around the web) stay.
-        options: { scales: { r: { grid: { color: gridColor(0.16) }, angleLines: { color: gridColor(0.16) }, ticks: { display: false } } } }
+        options: {
+          scales: { r: { grid: { color: gridColor(0.16) }, angleLines: { color: gridColor(0.16) }, ticks: { display: false } } },
+          plugins: { tooltip: { callbacks: {
+            label: function (c) {
+              return (c.dataset.label ? c.dataset.label + ": " : "")
+                + fmtNum(c.parsed && c.parsed.r);
+            }
+          } } }
+        }
       };
     }
 
@@ -460,7 +769,10 @@ function helperSource() {
     // with a cumulative line. spec.horizontal flips the index axis (ranked
     // "top N" lists with long category names read better as horizontal bars).
     var isArea = type === "area";
-    var chartType = isArea ? "line" : type;
+    var isHisto = type === "histogram";
+    // combo = bars + lines over one x (per-series types set by the binder);
+    // histogram = a gapless bar over pre-binned buckets.
+    var chartType = isArea ? "line" : (type === "combo" || isHisto) ? "bar" : type;
     if (chartType !== "line" && chartType !== "bar") {
       throw new Error("unsupported chart type: " + JSON.stringify(type));
     }
@@ -497,10 +809,20 @@ function helperSource() {
         // crispness re-raster uses). Lines keep 2 — that IS the stroke.
         borderWidth: (sType === "bar") ? 0 : 2,
         borderRadius: (sType === "bar") ? 4 : 0,
+        // Bars (incl. histogram buckets + combo bars) get the explicit hover
+        // fill; lines/areas keep the default point-radius growth.
+        hoverBackgroundColor: (sType === "bar") ? rgb(hoverTriple(seriesColor(i))) : undefined,
         tension: 0.3,
-        pointRadius: (sType === "line") ? 2 : 0
+        pointRadius: (sType === "line") ? 2 : 0,
+        // Mixed charts: lines/areas draw ABOVE bars (Chart.js draws higher
+        // 'order' first, i.e. further back) — a combo's trend line was
+        // disappearing behind the columns.
+        order: (sType === "bar") ? 2 : 1
       };
       if (sIsArea) base.fill = true;
+      // Combo lines may ride the right-hand scale (see y2 below).
+      if (s.y2) base.yAxisID = "y2";
+      if (isHisto) { base.barPercentage = 1; base.categoryPercentage = 1; base.borderRadius = 0; }
       // A reference line (e.g. "average"): dashed, no points, no area.
       if (s.dashed) {
         base.borderDash = [6, 4];
@@ -546,15 +868,7 @@ function helperSource() {
         okfMarker: true,
         okfLabels: mLabels
       });
-      markerTooltip = {
-        callbacks: {
-          label: function (ctx) {
-            var l = ctx.dataset && ctx.dataset.okfLabels && ctx.dataset.okfLabels[ctx.dataIndex];
-            if (l != null) return l;
-            return (ctx.dataset.label ? ctx.dataset.label + ": " : "") + ctx.formattedValue;
-          }
-        }
-      };
+      markerTooltip = true;
     }
 
     var lineOpts = horizontal
@@ -566,8 +880,40 @@ function helperSource() {
     if (chartType === "line") {
       lineOpts.interaction = { mode: "index", intersect: false };
     }
+    lineOpts.plugins = lineOpts.plugins || {};
     if (markerTooltip) {
-      lineOpts.plugins = { legend: { labels: { filter: function (item) { return item.text !== "extremes"; } } }, tooltip: markerTooltip };
+      lineOpts.plugins.legend = { labels: { filter: function (item) { return item.text !== "extremes"; } } };
+    }
+    // One label callback for every cartesian chart: marker callouts keep
+    // their own text; everything else gets the VALUE-axis number with locale
+    // separators (fmtNum) — the default tooltip printed it raw.
+    lineOpts.plugins.tooltip = {
+      callbacks: {
+        label: function (ctx) {
+          var l = ctx.dataset && ctx.dataset.okfLabels && ctx.dataset.okfLabels[ctx.dataIndex];
+          if (l != null) return l;
+          var p = ctx.parsed || {};
+          var v = horizontal ? p.x : p.y;
+          return (ctx.dataset.label ? ctx.dataset.label + ": " : "") + fmtNum(v);
+        }
+      }
+    };
+    // A combo's lines on the RIGHT scale (grid off — the left grid rules).
+    if (!horizontal && series.some(function (s) { return s.y2; })) {
+      lineOpts.scales = Object.assign({}, lineOpts.scales);
+      lineOpts.scales.y2 = {
+        position: "right",
+        title: spec.y2Label ? { display: true, text: spec.y2Label } : { display: false },
+        beginAtZero: true,
+        grid: { display: false },
+        border: { display: false },
+        ticks: { display: false }
+      };
+    }
+    var annos = referenceAnnotations(spec);
+    if (annos) {
+      lineOpts.plugins = lineOpts.plugins || {};
+      lineOpts.plugins.annotation = { annotations: annos };
     }
     return {
       type: chartType,
@@ -659,13 +1005,41 @@ function helperSource() {
     // ratio watchers re-rendered — the clamp, not stale rasters, was the blur.
     return Math.min(8, Math.max(2, base * vp));
   }
+  // Draws the gauge's pre-formatted value in the semicircle's mouth.
+  var okfGaugeText = {
+    id: "okfGaugeText",
+    afterDraw: function (chart) {
+      var g = chart.options && chart.options.okfGauge;
+      if (!g || !g.text) return;
+      var area = chart.chartArea;
+      var ctx = chart.ctx;
+      ctx.save();
+      ctx.textAlign = "center";
+      ctx.textBaseline = "alphabetic";
+      ctx.fillStyle = rgb(P.foreground || "23,23,23");
+      ctx.font = "600 " + Math.max(16, Math.round((area.bottom - area.top) / 4)) + "px " + getComputedStyle(document.body).fontFamily;
+      ctx.fillText(g.text, (area.left + area.right) / 2, area.bottom - 4);
+      ctx.restore();
+    }
+  };
+
   var _lastRatio = 0;
   var _lastSpec = null;
   window.renderChart = function (el, spec) {
     if (!window.Chart) throw new Error("charting library failed to load");
     if (!el) throw new Error("renderChart needs the provided canvas element");
     applyDefaults(window.Chart);
-    try { window.Chart.register(okfMarkerLines, okfBadges); } catch (e) {}
+    try { window.Chart.register(okfMarkerLines, okfBadges, okfGaugeText); } catch (e) {}
+    // annotation/matrix/boxplot UMDs expose globals without reliably
+    // self-registering; register() dedupes, so this is safe every call.
+    try {
+      var annP = window["chartjs-plugin-annotation"];
+      if (annP) window.Chart.register(annP.default || annP);
+      var mxP = window["chartjs-chart-matrix"];
+      if (mxP) window.Chart.register(mxP.MatrixController, mxP.MatrixElement);
+      var bxP = window.ChartBoxPlot;
+      if (bxP) window.Chart.register(bxP.BoxPlotController, bxP.BoxAndWiskers);
+    } catch (e) {}
     if (_chart) { _chart.destroy(); _chart = null; }
     _lastSpec = spec;
     var cfg = toConfig(spec);
@@ -740,6 +1114,61 @@ function helperSource() {
       onZoom();
     });
   })();
+
+  // Export: the host asks for a PNG of the current chart (the kebab menu's
+  // copy/download — see lib/visualExport.js). The visible raster is tuned to
+  // the SCREEN (its ratio tracks zoom/dPR), so we re-render OFFSCREEN at the
+  // requested export ratio instead of reading the live canvas, composite the
+  // theme surface underneath (the frame body is transparent — a bare export
+  // would paste invisibly on white or dark), and post the dataURL back. The
+  // host may pass a title (canvas tiles keep theirs in the card header, not
+  // the spec) so the exported image is self-describing.
+  window.addEventListener("message", function (e) {
+    if (e.source !== window.parent) return;
+    var d = e.data;
+    if (!d || d.source !== "okf-chart-host" || d.type !== "export") return;
+    function reply(msg) {
+      try { parent.postMessage(Object.assign({ source: "okf-chart", status: "export", id: d.id }, msg), "*"); } catch (err) {}
+    }
+    var tmp = null;
+    try {
+      if (!_chart || !_lastSpec) { reply({ error: "no chart rendered yet" }); return; }
+      var w = Math.max(1, Math.round(_chart.width));
+      var h = Math.max(1, Math.round(_chart.height));
+      var scale = Math.min(4, Math.max(1, Number(d.scale) || 2));
+      var c = document.createElement("canvas");
+      c.width = w; c.height = h; // responsive:false → these ARE the display size
+      var cfg = toConfig(_lastSpec);
+      cfg.options = cfg.options || {};
+      cfg.options.plugins = cfg.options.plugins || {};
+      var t = _lastSpec.title || d.title;
+      if (t) {
+        cfg.options.plugins.title = { display: true, text: String(t), color: rgb(P.foreground || "23,23,23"),
+          font: { size: 13, weight: "600" }, padding: { bottom: 12 } };
+      }
+      cfg.options.responsive = false;
+      cfg.options.animation = false; // draw synchronously so toDataURL sees ink
+      cfg.options.devicePixelRatio = scale;
+      tmp = new window.Chart(c, cfg);
+      // bg "transparent" skips the surface fill (clipboard/SVG exports paste
+      // onto arbitrary backgrounds); note the INK stays theme-resolved — a
+      // dark-mode chart carries near-white text wherever it lands.
+      if (d.bg !== "transparent") {
+        var ctx = c.getContext("2d");
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalCompositeOperation = "destination-over";
+        ctx.fillStyle = rgb((d.bg === "background" ? P.background : P.card) || "255,255,255");
+        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.restore();
+      }
+      reply({ dataUrl: c.toDataURL("image/png"), width: w, height: h });
+    } catch (err) {
+      reply({ error: (err && err.message) ? String(err.message) : "export failed" });
+    } finally {
+      if (tmp) { try { tmp.destroy(); } catch (err) {} }
+    }
+  });
   `
 }
 
@@ -792,8 +1221,14 @@ export function buildChartSrcdoc({ code, palette, fontFamily, height = 340 }) {
   const lib = neutralizeScriptClose(CHART_JS_SRC)
   const sankey = neutralizeScriptClose(CHART_SANKEY_SRC)
   const treemap = neutralizeScriptClose(CHART_TREEMAP_SRC)
+  const annotation = neutralizeScriptClose(CHART_ANNOTATION_SRC)
+  const matrix = neutralizeScriptClose(CHART_MATRIX_SRC)
+  const boxplot = neutralizeScriptClose(CHART_BOXPLOT_SRC)
   const paletteJson = neutralizeScriptClose(JSON.stringify(palette || {}))
   const family = (fontFamily || "system-ui, sans-serif").replace(/"/g, "'")
+  // Scrollbar tints for the frame's own document (see the <style> note).
+  const scrollThumb = palette?.border || "229, 229, 229"
+  const scrollThumbHover = palette?.mutedForeground || "115, 115, 115"
   // CSP: no default sources, inline scripts/styles only (we embed everything), NO
   // network of any kind (connect/img/font/frame all denied) — the frame draws to a
   // canvas and talks to the parent solely via postMessage. This is defense-in-depth
@@ -812,6 +1247,22 @@ export function buildChartSrcdoc({ code, palette, fontFamily, height = 340 }) {
   #chartbox { position: relative; width: 100%; height: ${Number(height) || 340}px; }
   body { font-family: ${family}; -webkit-font-smoothing: antialiased; }
   canvas { max-width: 100%; }
+  /* The app's global thin scrollbar (index.css), re-declared here because a
+     srcdoc iframe is a SEPARATE document — page CSS (and its vars) never
+     reach it. Palette literals are the theme tokens resolved at build time. */
+  * { scrollbar-width: thin; scrollbar-color: rgb(${scrollThumb}) transparent; }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background-color: rgb(${scrollThumb});
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(${scrollThumbHover});
+    background-clip: padding-box;
+  }
 </style>
 </head>
 <body>
@@ -820,6 +1271,9 @@ export function buildChartSrcdoc({ code, palette, fontFamily, height = 340 }) {
 <script>${lib}</script>
 <script>${sankey}</script>
 <script>${treemap}</script>
+<script>${annotation}</script>
+<script>${matrix}</script>
+<script>${boxplot}</script>
 <script>${helperSource()}</script>
 <script>${bootstrapSource(code)}</script>
 </body>

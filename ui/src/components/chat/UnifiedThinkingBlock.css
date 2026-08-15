@@ -108,6 +108,24 @@
   padding-bottom: 0;
 }
 
+/* While a group streams, the single absolute .timeline-line runs to the
+   container's bottom as a "more coming" affordance. Below a final TOOL step
+   (a one-line header with nothing beneath the marker) that tail reads as a
+   dangling stub — mask the line's column from the marker's lower edge down
+   with the page bg, same trick the marker itself uses. Scoped by :has() to
+   tool steps only: a final THINKING step keeps the rail, its text flows
+   below the marker and the line is that text's guide. */
+.timeline-item.last:has(.tool-result-content)::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 24px; /* the marker mask's lower edge (top -4px + height 28px) */
+  bottom: -8px; /* past the timeline's own bottom padding, where the line ends */
+  width: var(--marker-size);
+  background-color: var(--unified-page-bg);
+  z-index: 0; /* over the z-0 line by paint order; under the z-1 marker */
+}
+
 .timeline-marker {
   position: absolute;
   left: 0;
@@ -427,4 +445,13 @@
   color: var(--unified-text-primary);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* Hosted on a CARD surface (the canvas-jobs drawer): the marker pads mask the
+   timeline line with --unified-page-bg, and on bg-card the default (page
+   background) reads as grey boxes behind every icon. The variable is declared
+   ON .unified-thinking-block, so an ancestor override can never win — this
+   host class must sit on the block's wrapper to re-point it. */
+.unified-on-card .unified-thinking-block {
+  --unified-page-bg: var(--card);
 }

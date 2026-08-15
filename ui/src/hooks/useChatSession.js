@@ -139,7 +139,6 @@ export function useChatSession({
           // Reveal a slice; leave the remainder at the queue head for next frame.
           emit.push({ ...head, content: head.content.slice(0, budget) })
           q[0] = { ...head, content: head.content.slice(budget) }
-          budget = 0
           break
         }
       } else {

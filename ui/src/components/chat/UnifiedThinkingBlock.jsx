@@ -224,7 +224,7 @@ function SqlResultTabs({ sql, resultNode }) {
 // header is a shadcn Marker: a text-shimmer MarkerContent while running, and a
 // chevron when there's detail. (The tool's icon lives on the timeline marker,
 // not in the header.)
-function ToolResultIndicator({ toolName, input, content, isComplete, error }) {
+function ToolResultIndicator({ toolName, input, content, isComplete, error, count }) {
   // web_search and ask_human open EXPANDED: for web_search the sources are the
   // substance of the step; for ask_human the user's answers ARE the point (the
   // form never echoes the selection into the transcript, so it must show inline).
@@ -233,8 +233,15 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error }) {
     toolName === "web_search" || toolName === "ask_human"
   )
 
+  // No result payload ⇒ NO summary. The canvas-jobs drawer replays a step feed
+  // that stores tool names + args only, and parsing `undefined` invents
+  // falsehoods from the empty shape ("0 computations", "not executed") — a
+  // summary must never claim more than the data behind it.
   const view = useMemo(
-    () => (isComplete && !error ? parseToolResult(toolName, content) : null),
+    () =>
+      isComplete && !error && content != null
+        ? parseToolResult(toolName, content)
+        : null,
     [toolName, content, isComplete, error]
   )
 
@@ -245,6 +252,8 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error }) {
   if (error) headerText = `${prettyName(toolName)} failed`
   else if (!isComplete) headerText = label
   else headerText = view?.summary ? `${label} · ${view.summary}` : label
+  // Collapsed repeats (canvas-jobs drawer): one step, a ×N badge.
+  if (count > 1) headerText = `${headerText} ×${count}`
 
   // run_sql always gets its executed-query disclosure once complete — even a
   // zero-row or errored query is worth inspecting.
@@ -440,6 +449,7 @@ const ToolStep = memo(function ToolStep({ step, isLast }) {
           content={step.toolContent}
           isComplete={step.isToolComplete}
           error={step.toolError}
+          count={step.toolCount}
         />
       </div>
     </div>
@@ -491,8 +501,14 @@ function headerLabel(steps) {
   return toolLabel(last.toolName, last.toolInput, !last.isToolComplete)
 }
 
-export function UnifiedThinkingBlock({ contentBlocks = [], isGroupComplete = false }) {
-  const [expanded, setExpanded] = useState(false)
+export function UnifiedThinkingBlock({
+  contentBlocks = [],
+  isGroupComplete = false,
+  // Non-chat hosts (the canvas-jobs drawer): no collapsible header, the
+  // timeline always visible — the steps ARE the content there, not an aside.
+  chromeless = false,
+}) {
+  const [expanded, setExpanded] = useState(chromeless)
 
   // Signature over the segments so mergedSteps recomputes when ANYTHING changes:
   // a new segment, a tool completing, a tool's content growing. The OLD key used
@@ -500,13 +516,16 @@ export function UnifiedThinkingBlock({ contentBlocks = [], isGroupComplete = fal
   // (their state lives in .toolName/.id/.input/.content) — so a second tool, or a
   // tool's result arriving, didn't change the key and the memo returned the STALE
   // timeline: earlier tools "overwritten"/dropped. This captures tool identity.
+  // `count` must ride too: the canvas-jobs drawer folds a repeated tool into ONE
+  // segment whose only live change is the ×N counter — same index/id/name/state,
+  // so without it the key froze and the badge only moved on a page refresh.
   const contentKey = useMemo(
     () =>
       contentBlocks
         .map((s, i) =>
           s.type === "text" || s.type === "steer" || s.type === "policy"
             ? `${i}:${s.type}:${s.content?.length || 0}`
-            : `${i}:${s.id || ""}:${s.toolName || ""}:${s.isComplete ? 1 : 0}:${s.error ? 1 : 0}`
+            : `${i}:${s.id || ""}:${s.toolName || ""}:${s.isComplete ? 1 : 0}:${s.error ? 1 : 0}:${s.count || 0}`
         )
         .join("|"),
     [contentBlocks]
@@ -526,6 +545,7 @@ export function UnifiedThinkingBlock({ contentBlocks = [], isGroupComplete = fal
 
   return (
     <div className="unified-thinking-block">
+      {chromeless ? null : (
       <div className="unified-block-header">
         <Marker asChild>
           <button type="button" onClick={toggle} aria-expanded={expanded}>
@@ -547,6 +567,7 @@ export function UnifiedThinkingBlock({ contentBlocks = [], isGroupComplete = fal
           </button>
         </Marker>
       </div>
+      )}
 
       <div className={`unified-content-container ${expanded ? "expanded" : "collapsed"}`}>
         <div className="unified-content-wrapper">
