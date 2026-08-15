@@ -430,7 +430,9 @@ function helperSource() {
       }, spec);
       return {
         type: "bar",
-        data: { labels: labels, datasets: [{ label: spec.title || "", data: bars, backgroundColor: wcolors, hoverBackgroundColor: whover, borderWidth: 0, borderRadius: 3 }] },
+        // borderSkipped:false — these bars FLOAT (segments of a running sum),
+        // so the default start-edge skip would square one end of each bar.
+        data: { labels: labels, datasets: [{ label: spec.title || "", data: bars, backgroundColor: wcolors, hoverBackgroundColor: whover, borderSkipped: false, borderWidth: 0, borderRadius: 3 }] },
         options: wOpts
       };
     }
@@ -456,6 +458,10 @@ function helperSource() {
           data: fd.map(function (v) { return v == null ? null : [-v / 2, v / 2]; }),
           backgroundColor: fd.map(function (_, i) { return rgb(SERIES[0], fAlpha[i]); }),
           hoverBackgroundColor: fd.map(function (_, i) { return rgb(hoverTriple(SERIES[0]), fAlpha[i]); }),
+          // Floating bars have no base, but Chart.js still skips the radius
+          // on the "start" edge by default — left corners squared, right
+          // rounded. borderSkipped:false rounds all four.
+          borderSkipped: false,
           borderWidth: 0, borderRadius: 4, barPercentage: 0.98, categoryPercentage: 0.95
         }] },
         options: {
