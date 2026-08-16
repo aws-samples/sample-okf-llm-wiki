@@ -13,6 +13,7 @@ import { memo, useMemo } from "react"
 import { AgentAvatar } from "@/components/chat/AgentAvatar"
 import { ChartFrame } from "@/components/chat/ChartFrame"
 import { Markdown } from "@/components/chat/Markdown"
+import { ReportCard } from "@/components/chat/ReportCard"
 import { ResponseActions } from "@/components/chat/ResponseActions"
 import { UnifiedThinkingBlock } from "@/components/chat/UnifiedThinkingBlock"
 import { buildMessageBlocks } from "@/lib/buildMessageBlocks"
@@ -28,6 +29,10 @@ function blockSig(block) {
   // keeps two charts in one turn distinct so neither is skipped by the memo.
   if (block.type === "chart")
     return `c:${block.id || ""}:${block.pending ? 1 : 0}:${block.code?.length || 0}`
+  // report: the card's rendered state is fully determined by these fields —
+  // reportId/isComplete flip when the ack folds in, error when the save fails.
+  if (block.type === "report")
+    return `r:${block.id || ""}:${block.pending ? 1 : 0}:${block.reportId || ""}:${block.isComplete ? 1 : 0}:${block.error || ""}`
   // think: signature over each segment. Include the segment INDEX and the tool
   // ID — otherwise two calls to the SAME tool (e.g. read_page twice) with no
   // reasoning text between them produce an identical signature, the memo skips
@@ -57,6 +62,7 @@ const Block = memo(
     webSources,
     wikiSources,
     onOpenDoc,
+    onOpenReport,
   }) {
     if (block.type === "think") {
       return (
@@ -77,6 +83,21 @@ const Block = memo(
           title={block.title}
           live={live}
           pending={Boolean(block.pending)}
+        />
+      )
+    }
+    // A report the agent composed/re-presented — an inline artifact card.
+    // Clicking a ready card opens the chat page's inline report panel via
+    // onOpenReport (threaded down from ChatPanel, same chain as onOpenDoc).
+    if (block.type === "report") {
+      return (
+        <ReportCard
+          title={block.title}
+          reportId={block.reportId}
+          pending={Boolean(block.pending)}
+          error={block.error}
+          isComplete={block.isComplete}
+          onOpenReport={onOpenReport}
         />
       )
     }
@@ -105,6 +126,7 @@ const Block = memo(
     prev.webSources === next.webSources &&
     prev.wikiSources === next.wikiSources &&
     prev.onOpenDoc === next.onOpenDoc &&
+    prev.onOpenReport === next.onOpenReport &&
     blockSig(prev.block) === blockSig(next.block)
 )
 
@@ -114,6 +136,7 @@ function ChatMessageImpl({
   datasetScope,
   wikiSources,
   onOpenDoc,
+  onOpenReport,
 }) {
   const aiEvents = turn.aiMessage || []
   const isEnd = aiEvents.length > 0 && aiEvents[aiEvents.length - 1]?.end === true
@@ -189,7 +212,9 @@ function ChatMessageImpl({
                 ? `think-${i}`
                 : block.type === "chart"
                   ? `chart-${block.id || i}`
-                  : `text-${i}`
+                  : block.type === "report"
+                    ? `report-${block.id || i}`
+                    : `text-${i}`
             return (
               <Block
                 key={key}
@@ -200,6 +225,7 @@ function ChatMessageImpl({
                 webSources={webSources}
                 wikiSources={wikiSources}
                 onOpenDoc={onOpenDoc}
+                onOpenReport={onOpenReport}
               />
             )
           })}

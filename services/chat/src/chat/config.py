@@ -129,6 +129,12 @@ class ChatConfig:
     # behalf). Same table the Control API + harvest reconcile use. Defaulted
     # (dataclass ordering) but always set from OKF_ANNOTATIONS_TABLE in from_env.
     annotations_table: str = "okf-annotations"
+
+    # Report authoring (create_report / present_report). The harness path is
+    # the chart-render page baked into the image (empty = no Chromium render
+    # path: chart blocks are refused; markdown/table/kpi reports still work).
+    report_harness_path: str = ""
+    report_max_bytes: int = 8_000_000
     default_effort: str = DEFAULT_EFFORT
     default_max_tokens: int = DEFAULT_MAX_TOKENS
 
@@ -200,6 +206,8 @@ class ChatConfig:
             vector_index=env["OKF_VECTOR_INDEX"],
             registry_table=env.get("OKF_REGISTRY_TABLE", "okf-registry"),
             annotations_table=env.get("OKF_ANNOTATIONS_TABLE", "okf-annotations"),
+            report_harness_path=env.get("OKF_CHAT_REPORT_HARNESS_PATH", ""),
+            report_max_bytes=int(env.get("OKF_CHAT_REPORT_MAX_BYTES", "") or 8_000_000),
             checkpoint_table=env.get("OKF_CHAT_CHECKPOINT_TABLE", "okf-chat-checkpoints"),
             threads_table=env.get("OKF_CHAT_THREADS_TABLE", "okf-chat"),
             catalog=parse_catalog(env.get("OKF_CHAT_MODEL_CATALOG")),

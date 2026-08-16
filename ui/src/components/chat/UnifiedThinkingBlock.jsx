@@ -26,6 +26,7 @@ import { RollingText } from "@/components/RollingText"
 import { SourceIcon } from "@/components/chat/SourceIcon"
 import { buildTimelineSteps, mergeThinkingSteps } from "@/components/chat/timelineParser"
 import {
+  NO_RESULT_TOOLS,
   parseToolResult,
   prettyName,
   toolIcon,
@@ -233,16 +234,21 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error, coun
     toolName === "web_search" || toolName === "ask_human"
   )
 
+  // NO_RESULT tools (report_skill / create_report) never expand: their results
+  // are acks/instructions, not evidence — the step is its label. Errors still
+  // expand (a create_report refusal must stay inspectable).
+  const noResult = NO_RESULT_TOOLS.has(toolName)
+
   // No result payload ⇒ NO summary. The canvas-jobs drawer replays a step feed
   // that stores tool names + args only, and parsing `undefined` invents
   // falsehoods from the empty shape ("0 computations", "not executed") — a
   // summary must never claim more than the data behind it.
   const view = useMemo(
     () =>
-      isComplete && !error && content != null
+      isComplete && !error && !noResult && content != null
         ? parseToolResult(toolName, content)
         : null,
-    [toolName, content, isComplete, error]
+    [toolName, content, isComplete, error, noResult]
   )
 
   // Header text: while running, the tool+args label; done, that label + a

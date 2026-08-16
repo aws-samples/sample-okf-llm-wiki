@@ -7,6 +7,7 @@
     "dev": "vite",
     "dev:env": "../scripts/deploy.sh dev-env",
     "build": "vite build",
+    "build:report-harness": "BUILD_REPORT_HARNESS=1 vite build",
     "lint": "eslint .",
     "format": "prettier --write \"**/*.{js,jsx,css}\"",
     "preview": "vite preview"

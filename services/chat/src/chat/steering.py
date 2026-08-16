@@ -8,17 +8,17 @@ adapter merges into the tool-result user message (``langchain-aws`` merges a
 human message that follows a user-role entry), so the wire shape stays valid
 and the prompt-cache prefix is untouched.
 
-The three signals, in priority order:
+The two signals, in priority order:
 
 - **repetition** — the model re-issued an EXACT tool call it already made this
   turn (same tool, same args). Its result is already in context; re-running it
   means the model has lost track.
 - **futility** — the last N calls to the same tool all errored. Retrying
   variations is the death spiral; the docs are the way out.
-- **silence** — N model calls without any user contact: no user-facing text
-  and no answered ``ask_human`` form (an answered form IS interaction and
-  resets the count). Heads-down digging is normal early; unbounded, it's a
-  hole.
+
+(A third signal — **silence**, N model calls without user-facing text — was
+retired: report authoring made long heads-down tool stretches legitimate, so
+the nudge fired exactly when the agent was doing its job.)
 
 Discipline (agreed with the operator): once per signal kind per turn, a
 cooldown of a few model calls after ANY injection so the correction has room
@@ -52,7 +52,7 @@ except Exception:  # pragma: no cover - only when langchain is absent
     _HAVE_LANGCHAIN = False
 
 #: additional_kwargs key marking a harness-injected steering message. The value
-#: is the signal kind ("repetition" / "futility" / "silence").
+#: is the signal kind ("repetition" / "futility").
 STEERING_MARKER = "okf_steering"
 
 #: Every marker that identifies a harness-INJECTED HumanMessage: steering
@@ -66,12 +66,6 @@ _INJECTED_MARKER_KEYS = (STEERING_MARKER, "okf_policy")
 # by its own middleware — excluded from repetition tracking.
 _REPETITION_EXEMPT = frozenset({"ask_human"})
 
-# Tools whose SUCCESSFUL result is itself user interaction: an answered
-# ask_human means the user just read a form and replied, so the silence count
-# restarts there. An errored result (a malformed set the user never saw) does
-# not reset.
-_SILENCE_RESET_TOOLS = frozenset({"ask_human"})
-
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -82,8 +76,6 @@ def _env_int(name: str, default: int) -> int:
 
 #: Consecutive same-tool errors before the futility reminder fires.
 ERROR_STREAK = _env_int("OKF_CHAT_STEERING_ERROR_STREAK", 3)
-#: Model calls without user-facing text before the silence reminder fires.
-SILENCE_CALLS = _env_int("OKF_CHAT_STEERING_SILENCE_CALLS", 10)
 #: Model calls after ANY injection before another reminder may fire.
 COOLDOWN_CALLS = _env_int("OKF_CHAT_STEERING_COOLDOWN_CALLS", 3)
 
@@ -143,16 +135,6 @@ def _futility_text(tool: str, streak: int) -> str:
     )
 
 
-def _silence_text(calls: int) -> str:
-    return (
-        f"You have made {calls} model calls this turn without producing any "
-        "user-facing text. Take stock in your thinking: restate the question, "
-        "summarize what is established with evidence, and either finish with "
-        "the answer, state the one specific step that remains, or ask the user "
-        "the one thing you need."
-    )
-
-
 def _is_steering(msg: Any) -> bool:
     """True for ANY injected message (steering or policy note) — see markers."""
     kwargs = getattr(msg, "additional_kwargs", None) or {}
@@ -161,24 +143,6 @@ def _is_steering(msg: Any) -> bool:
 
 def _is_genuine_user(msg: Any) -> bool:
     return isinstance(msg, HumanMessage) and not _is_steering(msg)
-
-
-def _has_user_text(msg: Any) -> bool:
-    """True when an AIMessage carries user-facing text (not just tool calls).
-
-    Converse content is a block list (``{"type": "text", ...}`` alongside
-    ``reasoning_content``); GPT content is a plain string. Reasoning blocks are
-    NOT user-facing text.
-    """
-    content = getattr(msg, "content", None)
-    if isinstance(content, str):
-        return bool(content.strip())
-    if isinstance(content, list):
-        return any(
-            isinstance(b, dict) and b.get("type") == "text" and str(b.get("text", "")).strip()
-            for b in content
-        )
-    return False
 
 
 def _is_error_result(msg: Any) -> bool:
@@ -302,21 +266,6 @@ def detect(messages: list[Any]) -> Signal | None:
         streak += 1
     if streak >= ERROR_STREAK and streak_tool and "futility" not in fired_kinds:
         return Signal("futility", _futility_text(streak_tool, streak))
-
-    # silence — model calls since the user last saw something: assistant text
-    # or an answered ask_human form (its result IS user interaction).
-    calls_since_text = 0
-    for msg in window:
-        if isinstance(msg, AIMessage):
-            calls_since_text = 0 if _has_user_text(msg) else calls_since_text + 1
-        elif (
-            isinstance(msg, ToolMessage)
-            and (getattr(msg, "name", None) or "") in _SILENCE_RESET_TOOLS
-            and not _is_error_result(msg)
-        ):
-            calls_since_text = 0
-    if calls_since_text >= SILENCE_CALLS and "silence" not in fired_kinds:
-        return Signal("silence", _silence_text(calls_since_text))
 
     return None
 

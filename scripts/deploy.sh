@@ -229,6 +229,11 @@ stage_images() {
   CONSUMPTION_URI="$(build_push consumption_mcp okf-consumption)"
   # The chat container builds from the same services/ context; its Dockerfile
   # copies okf_core + okf_aws + consumption_mcp (reused in-process) + chat.
+  # The report harness (create_report's chart rasterizer page) is built FIRST
+  # and staged into the build context — the Dockerfile COPYs chat/.harness.
+  ( cd "$ROOT/ui" && { [ -d node_modules ] || npm ci >&2; } && npm run build:report-harness >&2 )
+  rm -rf "$ROOT/services/chat/.harness"
+  cp -R "$ROOT/ui/dist-report-harness" "$ROOT/services/chat/.harness"
   CHAT_URI="$(build_push chat okf-chat)"
   # Persist for the compute stage.
   grep -v -E '^(HARVEST_IMAGE_URI|CONSUMPTION_IMAGE_URI|CHAT_IMAGE_URI)=' "$CONFIG" > "$CONFIG.tmp" 2>/dev/null || true

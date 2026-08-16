@@ -74,6 +74,7 @@ export function ChatThread({
   datasetScope,
   onScopeChange,
   onOpenDoc,
+  onOpenReport,
   composerLeftSlot,
   disabled,
 }) {
@@ -287,6 +288,7 @@ export function ChatThread({
                     datasetScope={datasetScope}
                     wikiSources={wikiSources}
                     onOpenDoc={onOpenDoc}
+                    onOpenReport={onOpenReport}
                   />
                 </div>
               )

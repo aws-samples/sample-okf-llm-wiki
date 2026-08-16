@@ -508,6 +508,13 @@ export function makeApi(token) {
         { annotations }
       ),
 
+    // Reports (immutable HTML artifacts the chat agent composes). The id carries
+    // its own coordinates (rep~<domain>~<dataset>~<stamp>~<suffix>); the response
+    // is presigned S3 GETs — {report_id, data_domain, dataset, html_url, pdf_url,
+    // blocks_url}, pdf_url "" when the PDF pass was skipped.
+    getReport: (reportId) =>
+      request(token, "GET", `/report/${encodeURIComponent(reportId)}`),
+
     // Chat conversations (the per-user sidebar list). The chat RUNTIME writes the
     // index rows; the Control API serves this read/rename/delete side, scoped to
     // the caller's Cognito sub. Rename is PUT (not PATCH) to match the API GW CORS

@@ -5983,3 +5983,71 @@ def unverify_computation(
     }
     computation_run.save_overlay(s3, bucket, data_domain, dataset, entries)
     return {"computation": slug, "verification": "unverified"}
+
+
+# ---------------------------------------------------------------------------
+# Reports — chat-authored HTML reports (see okf_core.reports)
+# ---------------------------------------------------------------------------
+
+_REPORT_PRESIGN_EXPIRY_SECONDS = 300
+
+
+def get_report(s3, *, bucket: str, report_id: str) -> dict[str, Any]:
+    """Presigned GETs for one report's artifacts.
+
+    No database row exists: the COMPOSITE report id resolves the S3 keys, and
+    a missing HTML object IS "no such report". The pdf/blocks urls are empty
+    when their objects are absent (a deployment without Chromium ships
+    HTML-only reports). Presigned rather than inline because a composed
+    report (data-URI chart PNGs) can exceed the Lambda response cap — the
+    benchmark-artifact pattern.
+    """
+    from okf_core import reports as rp
+
+    parsed = rp.parse_report_id(report_id)
+    if not parsed:
+        raise ApiError(404, f"no such report: {report_id}")
+    prefix = rp.report_s3_prefix(
+        parsed["domain"], parsed["dataset"], parsed["stamp"], parsed["suffix"]
+    )
+
+    def _exists(key: str) -> bool:
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+            return True
+        except Exception:  # noqa: BLE001 - absent and unreadable serve the same
+            return False
+
+    def _sign(key: str, *, attachment: str = "") -> str:
+        params: dict[str, Any] = {"Bucket": bucket, "Key": key}
+        if attachment:
+            # Cross-origin presigns ignore an anchor's `download` attribute —
+            # the response disposition is what makes the browser SAVE the file
+            # instead of navigating to it.
+            params["ResponseContentDisposition"] = f'attachment; filename="{attachment}"'
+        try:
+            return s3.generate_presigned_url(
+                "get_object",
+                Params=params,
+                ExpiresIn=_REPORT_PRESIGN_EXPIRY_SECONDS,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise ApiError(502, f"could not presign the report: {e}") from e
+
+    html_key = rp.report_html_key(prefix)
+    if not _exists(html_key):
+        raise ApiError(404, f"no such report: {report_id}")
+    pdf_key = rp.report_pdf_key(prefix)
+    blocks_key = rp.report_blocks_key(prefix)
+    return {
+        "report_id": report_id,
+        "data_domain": parsed["domain"],
+        "dataset": parsed["dataset"],
+        "html_url": _sign(html_key),
+        "pdf_url": (
+            _sign(pdf_key, attachment=f"{parsed['dataset']}-report-{parsed['stamp']}.pdf")
+            if _exists(pdf_key)
+            else ""
+        ),
+        "blocks_url": _sign(blocks_key) if _exists(blocks_key) else "",
+    }

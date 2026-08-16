@@ -1079,7 +1079,7 @@ def test_steps_evidence_excludes_injected_notes():
 
     turn = _behaviour_turn() + [
         HumanMessage(content="<system-reminder>steer</system-reminder>",
-                     additional_kwargs={STEERING_MARKER: "silence"}),
+                     additional_kwargs={STEERING_MARKER: "repetition"}),
         HumanMessage(content="<system-reminder>policy</system-reminder>",
                      additional_kwargs={pc.POLICY_MARKER: "behavioural"}),
     ]
