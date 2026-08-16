@@ -832,6 +832,12 @@ def _r_list_benchmark_reports(cfg, params, body, query, caller):
     )
 
 
+def _r_get_report(cfg, params, body, query, caller):
+    return 200, handlers.get_report(
+        cfg.s3, bucket=cfg.bucket, report_id=params["report_id"]
+    )
+
+
 def _r_get_benchmark_report(cfg, params, body, query, caller):
     return 200, handlers.get_benchmark_report(
         cfg.s3,
@@ -1290,6 +1296,9 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
         _r_apply_report_annotations,
     ),
     ("GET", "/benchmark/{domain}/{dataset}/runs/{report_id}", _r_get_benchmark_report),
+    # Chat-authored HTML reports (okf_core.reports): the composite id resolves
+    # the S3 artifacts; the response is presigned GET urls, nothing inline.
+    ("GET", "/report/{report_id}", _r_get_report),
     (
         "DELETE",
         "/benchmark/{domain}/{dataset}/runs/{report_id}",

@@ -717,7 +717,7 @@ def test_history_renders_steering_as_steer_events_not_user_turns():
         AIMessage(content="digging"),
         HumanMessage(
             content="<system-reminder>step back</system-reminder>",
-            additional_kwargs={STEERING_MARKER: "silence"},
+            additional_kwargs={STEERING_MARKER: "repetition"},
         ),
         AIMessage(content="the answer"),
     ]

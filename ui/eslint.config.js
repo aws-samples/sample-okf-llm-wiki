@@ -9,9 +9,10 @@ import { defineConfig, globalIgnores } from 'eslint/config'
 // this repo matched NOTHING, so `npm run lint` green-lit every commit while
 // checking zero files.
 export default defineConfig([
-  // dist-harness is build output like dist; src/vendor is inlined third-party
-  // minified code (?raw imports for the chart srcdoc) — not ours to lint.
-  globalIgnores(['dist', 'dist-harness', 'src/vendor']),
+  // dist-harness/dist-report-harness are build output like dist; src/vendor is
+  // inlined third-party minified code (?raw imports for the chart srcdoc) —
+  // not ours to lint.
+  globalIgnores(['dist', 'dist-harness', 'dist-report-harness', 'src/vendor']),
   {
     files: ['**/*.{js,jsx}'],
     extends: [

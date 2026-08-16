@@ -535,6 +535,16 @@ data "aws_iam_policy_document" "chat" {
     resources = [local.d.bundle_bucket_arn, "${local.d.bundle_bucket_arn}/*"]
   }
 
+  # create_report writes its artifacts (blocks.json / report.html /
+  # report.pdf) under the reports/ prefix — OUTSIDE the mounted okf/ bundle
+  # prefix, so this write grant never touches wiki content (the bundle stays
+  # read-only to chat) and nothing here meets the harvest lease or reindex.
+  statement {
+    sid       = "ReportArtifactsWrite"
+    actions   = ["s3:PutObject"]
+    resources = ["${local.d.bundle_bucket_arn}/reports/*"]
+  }
+
   # Titan embed for semantic_search AND the chat LLM (InvokeModel +
   # WithResponseStream for token streaming). Both are the bedrock:* namespace.
   statement {

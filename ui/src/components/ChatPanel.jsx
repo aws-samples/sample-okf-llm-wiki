@@ -14,6 +14,7 @@ import { ChatHistory } from "@/components/ChatHistory"
 import { ChatThread } from "@/components/ChatThread"
 import { DocPeek } from "@/components/chat/DocPeek"
 import { PanelShell } from "@/components/chat/PanelShell"
+import { ReportPanel } from "@/components/chat/ReportPanel"
 import { CHAT_CONFIGURED } from "@/lib/chatApi"
 import { useChatSession } from "@/hooks/useChatSession"
 import { usePanelWidth } from "@/hooks/usePanelWidth"
@@ -33,6 +34,7 @@ function Conversation({
   datasetsLoading,
   onScopeChange,
   onOpenDoc,
+  onOpenReport,
 }) {
   const {
     chatTurns,
@@ -112,6 +114,7 @@ function Conversation({
       datasetScope={conv.datasetScope}
       onScopeChange={onScopeChange}
       onOpenDoc={onOpenDoc}
+      onOpenReport={onOpenReport}
     />
   )
 }
@@ -122,6 +125,12 @@ function Conversation({
 const PEEK_WIDTH_KEY = "okf.chat.docPeekWidth"
 const PEEK_MIN = 320
 const PEEK_DEFAULT = 576
+
+// Report panel width bounds (px) — its own slot/preference, wider by default
+// than the doc peek: it hosts a print-styled document, not a wiki page.
+const REPORT_WIDTH_KEY = "okf.chat.reportWidth"
+const REPORT_MIN = 360
+const REPORT_DEFAULT = 672
 
 export function ChatPanel({
   api,
@@ -148,7 +157,7 @@ export function ChatPanel({
 
   const getToken = () => auth?.user?.access_token
 
-  // ONE side-panel slot: the citation-opened doc reader. `open` is separate
+  // Doc-peek slot: the citation-opened doc reader. `open` is separate
   // from the target so closing collapses the clip while the content stays
   // MOUNTED (no blank panel mid-animation), and reopening the same doc is
   // instant. A conversation switch clears it — another thread's doc is stale
@@ -163,9 +172,27 @@ export function ChatPanel({
     setPeekTarget(target)
     setSlot({ open: true })
   }, [])
+
+  // Second slot: the inline report reader (a ready ReportCard click). Same
+  // open/target split as the doc peek, with one twist: every open sets a FRESH
+  // target object — opening a report while another is showing replaces the
+  // content, and re-opening the SAME report re-fires the panel's fetch (its
+  // presigned URLs are minutes-lived). A conversation switch clears it too.
+  const [reportSlot, setReportSlot] = useState({ open: false })
+  const [reportTarget, setReportTarget] = useState(null)
+  const closeReport = useCallback(
+    () => setReportSlot((cur) => ({ ...cur, open: false })),
+    []
+  )
+  const openReport = useCallback(({ reportId, title }) => {
+    setReportTarget({ reportId, title })
+    setReportSlot({ open: true })
+  }, [])
   useEffect(() => {
     setSlot({ open: false })
     setPeekTarget(null)
+    setReportSlot({ open: false })
+    setReportTarget(null)
   }, [conv.threadId])
 
   // Resizable width: dragged from the panel's left-edge handle, persisted as a
@@ -179,6 +206,15 @@ export function ChatPanel({
     storageKey: PEEK_WIDTH_KEY,
     min: PEEK_MIN,
     defaultWidth: PEEK_DEFAULT,
+  })
+  const {
+    width: reportWidth,
+    dragging: reportDragging,
+    startResize: startReportResize,
+  } = usePanelWidth({
+    storageKey: REPORT_WIDTH_KEY,
+    min: REPORT_MIN,
+    defaultWidth: REPORT_DEFAULT,
   })
 
   if (!CHAT_CONFIGURED) {
@@ -208,6 +244,7 @@ export function ChatPanel({
           datasetsLoading={datasetsLoading}
           onScopeChange={onScopeChange}
           onOpenDoc={openDoc}
+          onOpenReport={openReport}
         />
       </div>
 
@@ -237,6 +274,34 @@ export function ChatPanel({
               onClose={closePanel}
               onResizeStart={startPeekResize}
               resizing={peekDragging}
+            />
+          ) : null}
+        </div>
+      </div>
+
+      {/* The report panel — an agent-composed document opened from a ready
+          ReportCard. Same clip + resize arrangement as the doc peek above,
+          with its own wider width preference (it reads like a PDF pane). */}
+      <div
+        className={cn(
+          "h-full shrink-0 overflow-hidden",
+          !reportDragging &&
+            "transition-[width] duration-300 ease-in-out motion-reduce:transition-none"
+        )}
+        style={{ width: reportSlot.open ? reportWidth : 0 }}
+        aria-hidden={!reportSlot.open}
+      >
+        <div
+          className={cn("h-full", !reportSlot.open && "invisible")}
+          style={{ width: reportWidth }}
+        >
+          {reportTarget ? (
+            <ReportPanel
+              api={api}
+              target={reportTarget}
+              onClose={closeReport}
+              onResizeStart={startReportResize}
+              resizing={reportDragging}
             />
           ) : null}
         </div>

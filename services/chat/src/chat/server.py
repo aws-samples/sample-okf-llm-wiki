@@ -724,6 +724,10 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     athena_client = clients.pop("athena", None)
     redshift_data_client = clients.pop("redshift_data", None)
     annotations_table = clients.pop("annotations", None)
+    # The raw S3 client doubles as the report-artifact writer (create_report
+    # puts the composed HTML/PDF under the reports/ prefix) — grabbed, not
+    # popped: build_consumption_tools needs it too.
+    s3_client = clients.get("s3")
     tools_impl = build_consumption_tools(
         config=consumption_config,
         athena=athena_client,
@@ -735,6 +739,32 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     # gateway's MCP session id, so a fresh client per turn would pay an extra
     # handshake round trip on every search. None when not deploy-enabled.
     web_search_engine = build_web_search_engine(chat_config)
+
+    # The report chart renderer is likewise a per-process lazy singleton
+    # (Chromium + its loopback server are heavyweight and reusable across
+    # runs). None when the image carries no harness — create_report then
+    # refuses chart blocks with a clear error; text/table/kpi reports work.
+    _renderer_box: list[Any] = []
+
+    def _report_renderer() -> Any:
+        if not _renderer_box:
+            import os as _os
+
+            renderer = None
+            path = getattr(chat_config, "report_harness_path", "") or ""
+            if path and _os.path.exists(path):
+                try:
+                    from chat.report_render import ChartRenderer
+
+                    renderer = ChartRenderer(harness_path=path)
+                except Exception:  # noqa: BLE001 - degrade to chartless reports
+                    import logging as _logging
+
+                    _logging.getLogger("chat.server").warning(
+                        "report chart renderer unavailable", exc_info=True
+                    )
+            _renderer_box.append(renderer)
+        return _renderer_box[0]
 
     def _sql_engine() -> AthenaSQL | None:
         if not (chat_config.sql_enabled and athena_client is not None):
@@ -839,6 +869,26 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                     annotations_table, user_sub=user_sub, dataset_scope=scope
                 ),
             ]
+        # Report authoring: available on every run with a verified subject —
+        # create_report composes/render-verifies/saves from THIS conversation's
+        # evidence (no delegated runtime; the chat loop is the research loop).
+        # No per-run opt-in and no prompt block — the tools' descriptions
+        # carry the whole contract. The renderer is a per-process singleton
+        # (Chromium launches once, not per run).
+        if s3_client is not None and user_sub and chat_config.bundle_bucket:
+            from chat.reports import make_report_tools
+
+            agent_tools = [
+                *agent_tools,
+                *make_report_tools(
+                    s3_client,
+                    _report_renderer(),
+                    bundle_bucket=chat_config.bundle_bucket,
+                    user_sub=user_sub,
+                    dataset_scope=scope,
+                    max_report_bytes=chat_config.report_max_bytes,
+                ),
+            ]
         # The prompt blocks for the optional tools wired below, in the order they
         # are appended to the base prompt (see graph.compose_system_prompt: the
         # deployment-constant ones go first so the cached prefix stays long).
@@ -926,7 +976,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # non-Bedrock model (a Mantle GPT catalog entry).
         # AskHumanMiddleware owns the human-in-the-loop interrupt for ask_human.
         # SteeringMiddleware injects derailment <system-reminder>s (repetition /
-        # futility / silence — see chat.steering); env kill switch, default on.
+        # futility — see chat.steering); env kill switch, default on.
         middleware = [BedrockPromptCachingMiddleware(), AskHumanMiddleware()]
         # Guardrails-first read gate: read_page on a dataset is DENIED until
         # that dataset's references/usage_guardrails has been read in this

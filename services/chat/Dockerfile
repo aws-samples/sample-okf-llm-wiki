@@ -6,7 +6,9 @@
 FROM public.ecr.aws/docker/library/python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    OKF_CHAT_REPORT_HARNESS_PATH=/app/harness/report-harness.html \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 
 WORKDIR /app
 
@@ -20,9 +22,21 @@ COPY chat/requirements.txt /app/chat/requirements.txt
 RUN pip install --no-cache-dir -e /app/okf_core \
     && pip install --no-cache-dir -e /app/okf_aws \
     && pip install --no-cache-dir -e /app/consumption_mcp \
-    && pip install --no-cache-dir -r /app/chat/requirements.txt
+    && pip install --no-cache-dir -r /app/chat/requirements.txt \
+    # Chromium for create_report's chart rasterization + PDF print
+    # (--with-deps pulls the apt libraries; ARM64 builds exist upstream).
+    && playwright install --with-deps chromium \
+    # Inter for the composed report (okf_core.reports puts it first in the
+    # font stack) — without a real UI font the PDF pass falls back to the
+    # image's DejaVu Sans, which reads dated next to the app.
+    && apt-get update && apt-get install -y --no-install-recommends fonts-inter \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY chat /app/chat
+# deploy.sh builds ui/dist-report-harness (the flagged Vite entry over
+# chartIframe.js) and stages it at services/chat/.harness/ before this build —
+# the page create_report's renderer loads to rasterize chart blocks.
+COPY chat/.harness /app/harness
 RUN pip install --no-cache-dir -e /app/chat
 
 # HTTP-protocol AgentCore agents serve /invocations + /ping on 0.0.0.0:8080. The

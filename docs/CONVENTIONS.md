@@ -1512,6 +1512,44 @@ appends a sha256 suffix to a readable `okf-<domain>-<dataset>-` prefix.
   are preserved. The rule is: delete every top-level entry whose name does not
   start with `.`.
 
+## Reports (chat-authored)
+
+`create_report` (a chat tool; see `chat/reports.py`) lets the MAIN chat agent
+compose an immutable HTML report from evidence gathered in the conversation —
+there is no delegated runtime and no job row; the chat loop itself is the
+research loop. The pure contract (block schema, composer, id/key helpers)
+lives in `okf_core/reports.py`.
+
+- **Blocks are config, not code**: `markdown | chart | table | kpi`; chart
+  blocks carry the same declarative `renderChart` spec as chat charts.
+  Figure blocks carry `provenance` — `{kind: "computation", slug, params?}`
+  (VERIFIED badge) or `{kind: "adhoc_sql", sql}` (EXPLORATORY badge, SQL
+  disclosed in the report).
+- **The save is atomic and render-verified**: lint → every chart rasterized
+  through the baked harness page in headless Chromium (a chart that fails
+  refuses the save) → one self-contained HTML (inline CSS, data-URI PNGs,
+  print stylesheet) → PDF printed from that same HTML → S3 puts.
+- **No database row.** The public report id is composite —
+  `rep~<domain>~<dataset>~<YYYYMMDDTHHMMSSZ>~<hex8>` — so serving resolves S3
+  keys from the id alone (`okf_core.reports.parse_report_id`).
+- **S3 layout** (bundle bucket, OUTSIDE the mounted `okf/` prefix — never
+  meets the harvest lease or reindex):
+  `reports/<domain>/<dataset>/<stamp>-<suffix>/{blocks.json, report.html,
+  report.pdf}`. `blocks.json` is the self-describing source (title, request,
+  coordinates, `created_by`, blocks) — future re-rendering never needs the
+  agent.
+- **Serving**: `GET /report/{report_id}` (control API) returns presigned GET
+  urls `{html_url, pdf_url, blocks_url}` — presigned because a composed
+  report can exceed the Lambda response cap; `pdf_url` is `""` on a
+  deployment without Chromium. The UI lifts `create_report` /
+  `present_report` tool calls into inline report cards; the viewer renders
+  the HTML in an iframe with NO `allow-scripts`.
+- **Env**: `OKF_CHAT_REPORT_HARNESS_PATH` (the harness page in the chat
+  image; empty = chart blocks refused, text/table/kpi reports still work),
+  `OKF_CHAT_REPORT_MAX_BYTES` (composed-HTML cap, default 8000000). IAM: the
+  chat role holds `s3:PutObject` on `reports/*` only — the wiki stays
+  read-only to chat.
+
 ## Environment variables
 
 | Variable | Meaning |
