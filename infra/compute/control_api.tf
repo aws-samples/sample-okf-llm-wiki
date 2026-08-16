@@ -48,7 +48,8 @@ module "control_api_fn" {
     OKF_CHAT_THREADS_TABLE    = local.d.chat_table
     OKF_CHAT_CHECKPOINT_TABLE = local.d.chat_checkpoints_table
     # Long-term memory management routes (empty = feature off, routes 404).
-    OKF_CHAT_MEMORY_ID = var.enable_chat_memory ? local.d.chat_memory_id : ""
+    OKF_CHAT_MEMORY_ID         = var.enable_chat_memory ? local.d.chat_memory_id : ""
+    OKF_CHAT_MEMORY_DEFAULT_ON = tostring(var.chat_memory_default_on)
     # Bus for the repromote-success `policy_rebuild` publish. Doubles as the
     # accelerator's deploy switch: empty string = build the events client not
     # at all, publish nothing, never flag a row stale. "default" — this stack

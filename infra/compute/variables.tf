@@ -576,3 +576,16 @@ variable "enable_chat_memory" {
     the memory routes.
   EOT
 }
+
+variable "chat_memory_default_on" {
+  type        = bool
+  default     = true
+  description = <<-EOT
+    What a MISSING per-user memory switch row means. true = opt-out (memory is
+    on until the user turns it off — the default); false = opt-in (memory
+    stays off until the user explicitly enables it on the Memory page). Read
+    by BOTH the chat runtime (recall/write gating) and the control API (the
+    switch state the Memory page shows) as OKF_CHAT_MEMORY_DEFAULT_ON, so the
+    two can never disagree. Flipping it never touches rows users already set.
+  EOT
+}

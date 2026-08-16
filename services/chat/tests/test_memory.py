@@ -266,6 +266,28 @@ def test_user_enabled_defaults_on_when_row_missing_or_unreadable():
     assert _memory(ddb=None).user_enabled("u1") is True
 
 
+def test_user_enabled_opt_in_deploy_flips_the_missing_row_default():
+    # OKF_CHAT_MEMORY_DEFAULT_ON=false: a missing row (and an UNREADABLE one —
+    # degrade to the deployment's policy, never its opposite) means OFF until
+    # the user explicitly enables; an explicit row still wins either way.
+    def _opt_in(ddb):
+        return ChatMemory(
+            FakeAgentCore(),
+            memory_id="mem-abc",
+            ddb=ddb,
+            threads_table="okf-chat",
+            default_enabled=False,
+        )
+
+    assert _opt_in(FakeDdb()).user_enabled("u1") is False
+    assert _opt_in(FakeDdb(fail=True)).user_enabled("u1") is False
+    assert _opt_in(None).user_enabled("u1") is False
+    assert (
+        _opt_in(FakeDdb(item={"memory_enabled": {"BOOL": True}})).user_enabled("u1")
+        is True
+    )
+
+
 def test_user_enabled_reads_the_settings_row():
     ddb = FakeDdb({"memory_enabled": {"BOOL": False}})
     mem = _memory(ddb=ddb)

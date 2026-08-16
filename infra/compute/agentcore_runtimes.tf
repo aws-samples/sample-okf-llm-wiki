@@ -326,7 +326,10 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     # it composes with the per-user switch stored on the chat table (see
     # chat/memory.py). No separate ENABLED flag: a boolean nothing reads
     # would invite "flipped it off, still remembering" incidents.
-    OKF_CHAT_MEMORY_ID = var.enable_chat_memory ? local.d.chat_memory_id : ""
+    # DEFAULT_ON = what a missing switch row means (opt-out vs opt-in) —
+    # deploy policy, read by the control API too so the page agrees.
+    OKF_CHAT_MEMORY_ID         = var.enable_chat_memory ? local.d.chat_memory_id : ""
+    OKF_CHAT_MEMORY_DEFAULT_ON = tostring(var.chat_memory_default_on)
 
     OTEL_RESOURCE_ATTRIBUTES = "service.name=${var.name_prefix}_chat"
 

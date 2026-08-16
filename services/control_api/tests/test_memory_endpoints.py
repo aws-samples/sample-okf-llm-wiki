@@ -207,6 +207,22 @@ def test_settings_put_is_per_user(mcfg, aws):
     assert _body(got) == {"enabled": True}
 
 
+def test_settings_default_follows_deploy_policy(mcfg, aws):
+    # OKF_CHAT_MEMORY_DEFAULT_ON=false (opt-in deploy): a user with no
+    # settings row reads as DISABLED; an explicit enable still wins.
+    mcfg.chat_memory_default_on = False
+    resp = route(_event("GET", "/memory/settings", sub="alice"), mcfg)
+    assert _body(resp) == {"enabled": False}
+    route(
+        _event("PUT", "/memory/settings", sub="alice", body={"enabled": True}), mcfg
+    )
+    resp = route(_event("GET", "/memory/settings", sub="alice"), mcfg)
+    assert _body(resp) == {"enabled": True}
+    # the list route reports the same default for a rowless user
+    listed = route(_event("GET", "/memory", sub="bob"), mcfg)
+    assert _body(listed)["enabled"] is False
+
+
 @pytest.mark.parametrize("bad", ["false", 1, 0, None, [True]])
 def test_settings_put_rejects_non_boolean(mcfg, bad):
     resp = route(

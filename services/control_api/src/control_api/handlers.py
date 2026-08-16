@@ -5827,8 +5827,15 @@ def _memory_settings_key(user_sub: str) -> dict[str, Any]:
     }
 
 
-def _get_memory_enabled(ddb, *, threads_table: str, user_sub: str) -> bool:
-    """The per-user switch; missing row/attr = ENABLED (memory is opt-out)."""
+def _get_memory_enabled(
+    ddb, *, threads_table: str, user_sub: str, default_on: bool = True
+) -> bool:
+    """The per-user switch; missing row/attr = the DEPLOY DEFAULT.
+
+    ``default_on`` (OKF_CHAT_MEMORY_DEFAULT_ON — the same env the chat
+    runtime reads, so the switch this page shows agrees with what the
+    runtime does): True = opt-out, False = opt-in.
+    """
     item = (
         ddb.get_item(
             TableName=threads_table, Key=_memory_settings_key(user_sub)
@@ -5838,18 +5845,26 @@ def _get_memory_enabled(ddb, *, threads_table: str, user_sub: str) -> bool:
     flag = item.get("memory_enabled") or {}
     if "BOOL" in flag:
         return bool(flag["BOOL"])
-    return True
+    return default_on
 
 
 def get_memory_settings(
-    ddb, *, memory_id: str, threads_table: str, user_sub: str | None
+    ddb,
+    *,
+    memory_id: str,
+    threads_table: str,
+    user_sub: str | None,
+    default_on: bool = True,
 ) -> dict[str, Any]:
     """GET /memory/settings — just the caller's switch."""
     _require_memory_configured(memory_id)
     user_sub = _require_user_sub(user_sub)
     return {
         "enabled": _get_memory_enabled(
-            ddb, threads_table=threads_table, user_sub=user_sub
+            ddb,
+            threads_table=threads_table,
+            user_sub=user_sub,
+            default_on=default_on,
         )
     }
 
@@ -5881,7 +5896,13 @@ def _parsed_memory_record(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def list_memory(
-    memory, ddb, *, memory_id: str, threads_table: str, user_sub: str | None
+    memory,
+    ddb,
+    *,
+    memory_id: str,
+    threads_table: str,
+    user_sub: str | None,
+    default_on: bool = True,
 ) -> dict[str, Any]:
     """GET /memory — the caller's switch + every record in their namespace.
 
@@ -5909,7 +5930,10 @@ def list_memory(
         kwargs["nextToken"] = token
     return {
         "enabled": _get_memory_enabled(
-            ddb, threads_table=threads_table, user_sub=user_sub
+            ddb,
+            threads_table=threads_table,
+            user_sub=user_sub,
+            default_on=default_on,
         ),
         "records": records,
     }

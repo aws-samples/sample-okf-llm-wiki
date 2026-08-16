@@ -88,6 +88,7 @@ class Config:
         chat_checkpoint_table: str = "okf-chat-checkpoints",
         agentcore_memory=None,
         chat_memory_id: str = "",
+        chat_memory_default_on: bool = True,
         events=None,
         athena=None,
         computations_enabled: bool = False,
@@ -114,6 +115,7 @@ class Config:
         # row rides the chat threads table via the plain ddb client.
         self.agentcore_memory = agentcore_memory
         self.chat_memory_id = chat_memory_id
+        self.chat_memory_default_on = chat_memory_default_on
         self.s3 = s3
         self.ddb = ddb
         self.glue = glue
@@ -218,6 +220,13 @@ class Config:
                 else None
             ),
             chat_memory_id=os.environ.get("OKF_CHAT_MEMORY_ID", ""),
+            # What a MISSING per-user switch row means (opt-out vs opt-in) —
+            # the SAME env the chat runtime reads, so the switch the Memory
+            # page shows agrees with what the runtime does.
+            chat_memory_default_on=os.environ.get(
+                "OKF_CHAT_MEMORY_DEFAULT_ON", "true"
+            ).lower()
+            not in ("false", "0", ""),
             # OKF_EVENT_BUS_NAME doubles as the accelerator's deploy switch:
             # unset/empty means no rebuild authority is listening, so repromote
             # publishes nothing and never flips a row to stale.
@@ -1050,6 +1059,7 @@ def _r_get_memory(cfg, params, body, query, caller):
         memory_id=cfg.chat_memory_id,
         threads_table=cfg.chat_threads_table,
         user_sub=caller.sub,
+        default_on=cfg.chat_memory_default_on,
     )
 
 
@@ -1059,6 +1069,7 @@ def _r_get_memory_settings(cfg, params, body, query, caller):
         memory_id=cfg.chat_memory_id,
         threads_table=cfg.chat_threads_table,
         user_sub=caller.sub,
+        default_on=cfg.chat_memory_default_on,
     )
 
 
