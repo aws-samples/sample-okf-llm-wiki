@@ -38,6 +38,7 @@ from okf_aws import s3_versions
 from okf_core import annotations as anno
 from okf_core import chat_threads as ct
 from okf_core import guidance as gd
+from okf_core import memory_records as mem
 from okf_core import policy_rebuild
 from okf_core.domain import DOMAIN_DATASET
 from okf_core.graph_json import build_graph_json
@@ -5616,8 +5617,15 @@ def list_chat_threads(
     user_sub = _require_user_sub(user_sub)
     kwargs: dict[str, Any] = {
         "TableName": threads_table,
-        "KeyConditionExpression": "pk = :pk",
-        "ExpressionAttributeValues": {":pk": {"S": ct.thread_pk(user_sub)}},
+        # The partition also holds POLICY# report rows and the SETTINGS#memory
+        # switch row — okf_core.chat_threads: a Query for conversations MUST
+        # constrain the sk prefix (an unconstrained Query once surfaced the
+        # settings row as a phantom conversation titled "SETTINGS#memory").
+        "KeyConditionExpression": "pk = :pk AND begins_with(sk, :skp)",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": ct.thread_pk(user_sub)},
+            ":skp": {"S": ct.THREAD_SK_PREFIX},
+        },
     }
     items: list[dict[str, Any]] = []
     while True:
@@ -5768,6 +5776,247 @@ def delete_chat_thread(
         namespaced_thread_id=f"{user_sub}:{thread_id}",
     )
     return {"deleted": True, "thread_id": thread_id}
+
+
+# --------------------------------------------------------------------------- #
+# Long-term chat memory (the Memory page) — AgentCore Memory records + switch
+# --------------------------------------------------------------------------- #
+#
+# The chat RUNTIME owns memory extraction/recall (chat.memory); these handlers
+# are the human inspection/management surface. Records live in AgentCore Memory
+# under the CALLER's namespace (derived from the verified JWT sub, NEVER a
+# request parameter, through the SHARED ``okf_core.memory_records`` helpers —
+# the runtime sanitizes the sub for CreateEvent's actorId pattern and the
+# namespace resolves from that actorId, so deriving from the raw sub here
+# would list an EMPTY page while chat kept remembering). The structured record
+# fields are parsed by the same module, so the two sides cannot drift. The
+# per-user enable/disable switch is a settings row on the chat threads table
+# (``pk=CHAT#<sub>, sk=SETTINGS#memory``, ``memory_enabled`` BOOL; missing row
+# = enabled). ``memory_id`` empty (OKF_CHAT_MEMORY_ID unset) = the feature is
+# off end to end, so every route here is a 404.
+
+# Edited memory text cap: a record is a distilled fact, not a document. Also
+# keeps a rewrite comfortably inside the provider's content limits.
+MEMORY_TEXT_MAX_CHARS = 8000
+
+
+def _memory_namespace(user_sub: str) -> str:
+    """The caller's AgentCore Memory namespace (CONVENTIONS.md: ``wiki/<sub>``)."""
+    return mem.memory_namespace(user_sub)
+
+
+_MISSING = object()
+
+
+def _require_memory_configured(memory_id: str, memory: Any = _MISSING) -> None:
+    """404 unless the memory feature is deployed (OKF_CHAT_MEMORY_ID set).
+
+    404 (not 500) on purpose: with the deploy gate off the routes simply do not
+    exist — the UI hides the page, and probing it reveals nothing. Record
+    routes also pass their client: an id without a client (mis-wired config)
+    degrades to the same 404, never an AttributeError 500.
+    """
+    if not memory_id or memory is None:
+        raise ApiError(404, "chat memory is not enabled")
+
+
+def _memory_settings_key(user_sub: str) -> dict[str, Any]:
+    return {
+        "pk": {"S": ct.thread_pk(user_sub)},
+        "sk": {"S": ct.MEMORY_SETTINGS_SK},
+    }
+
+
+def _get_memory_enabled(ddb, *, threads_table: str, user_sub: str) -> bool:
+    """The per-user switch; missing row/attr = ENABLED (memory is opt-out)."""
+    item = (
+        ddb.get_item(
+            TableName=threads_table, Key=_memory_settings_key(user_sub)
+        ).get("Item")
+        or {}
+    )
+    flag = item.get("memory_enabled") or {}
+    if "BOOL" in flag:
+        return bool(flag["BOOL"])
+    return True
+
+
+def get_memory_settings(
+    ddb, *, memory_id: str, threads_table: str, user_sub: str | None
+) -> dict[str, Any]:
+    """GET /memory/settings — just the caller's switch."""
+    _require_memory_configured(memory_id)
+    user_sub = _require_user_sub(user_sub)
+    return {
+        "enabled": _get_memory_enabled(
+            ddb, threads_table=threads_table, user_sub=user_sub
+        )
+    }
+
+
+def set_memory_settings(
+    ddb, *, memory_id: str, threads_table: str, user_sub: str | None, enabled: Any
+) -> dict[str, Any]:
+    """PUT /memory/settings — write the caller's switch row.
+
+    ``enabled`` must be a JSON boolean — truthiness coercion here would let
+    ``{"enabled": "false"}`` silently ENABLE memory.
+    """
+    _require_memory_configured(memory_id)
+    user_sub = _require_user_sub(user_sub)
+    if not isinstance(enabled, bool):
+        raise ApiError(400, "enabled must be a boolean")
+    ddb.put_item(
+        TableName=threads_table,
+        Item={**_memory_settings_key(user_sub), "memory_enabled": {"BOOL": enabled}},
+    )
+    return {"enabled": enabled}
+
+
+def _parsed_memory_record(raw: dict[str, Any]) -> dict[str, Any]:
+    """Shared parse → ``{id, type, dataset, expires, text, expired}``."""
+    parsed = mem.parse_record(raw)
+    parsed["expired"] = mem.is_expired(parsed)
+    return parsed
+
+
+def list_memory(
+    memory, ddb, *, memory_id: str, threads_table: str, user_sub: str | None
+) -> dict[str, Any]:
+    """GET /memory — the caller's switch + every record in their namespace.
+
+    Paginates ``list_memory_records`` to exhaustion (a page is at most 100
+    records; the UI wants the complete set). Each record carries a computed
+    ``expired`` flag but is NOT auto-deleted here — this page is the inspection
+    surface (the chat runtime owns lazy TTL deletion on recall), and a user
+    looking at their memories should see what the store actually holds.
+    """
+    _require_memory_configured(memory_id, memory=memory)
+    user_sub = _require_user_sub(user_sub)
+    kwargs: dict[str, Any] = {
+        "memoryId": memory_id,
+        "namespace": _memory_namespace(user_sub),
+        "maxResults": 100,
+    }
+    records: list[dict[str, Any]] = []
+    while True:
+        resp = memory.list_memory_records(**kwargs)
+        for raw in resp.get("memoryRecordSummaries") or resp.get("memoryRecords") or []:
+            records.append(_parsed_memory_record(raw))
+        token = resp.get("nextToken")
+        if not token:
+            break
+        kwargs["nextToken"] = token
+    return {
+        "enabled": _get_memory_enabled(
+            ddb, threads_table=threads_table, user_sub=user_sub
+        ),
+        "records": records,
+    }
+
+
+def _get_owned_memory_record(
+    memory, *, memory_id: str, user_sub: str, record_id: str
+) -> dict[str, Any]:
+    """Fetch one record and verify it lives in the CALLER's namespace.
+
+    A record that doesn't exist and a record that belongs to ANOTHER user
+    surface as the SAME 404 — existence must not be probeable across users, and
+    nothing of a foreign record's content is ever echoed back.
+    """
+    try:
+        resp = memory.get_memory_record(
+            memoryId=memory_id, memoryRecordId=record_id
+        )
+    except Exception as e:  # noqa: BLE001 - map a missing record to 404
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in ("ResourceNotFoundException", "ValidationException"):
+            raise ApiError(404, f"no such memory record: {record_id}") from e
+        raise
+    record = (resp or {}).get("memoryRecord") or {}
+    if _memory_namespace(user_sub) not in (record.get("namespaces") or []):
+        raise ApiError(404, f"no such memory record: {record_id}")
+    return record
+
+
+def update_memory_record(
+    memory,
+    *,
+    memory_id: str,
+    user_sub: str | None,
+    record_id: str,
+    text: Any,
+) -> dict[str, Any]:
+    """PATCH /memory/{record_id} — edit the record's TEXT, preserving identity.
+
+    The structured fields (type/dataset/expires) are the record's
+    machine-readable identity — the recall filters and the TTL key off them —
+    so an edit rewrites only the free text and RE-SUPPLIES everything else:
+    the stored record's real ``metadata`` rides the update verbatim (whether
+    BatchUpdateMemoryRecords merges or replaces is undocumented, and a
+    replace that stripped ``type`` would make a personal record invisible to
+    every recall path while still displaying on the Memory page), and the
+    canonical header is re-emitted via ``format_header`` as the drift
+    fallback.
+    """
+    _require_memory_configured(memory_id, memory=memory)
+    user_sub = _require_user_sub(user_sub)
+    text = (text or "").strip() if isinstance(text, str) else ""
+    if not text:
+        raise ApiError(400, "missing required field: text")
+    if len(text) > MEMORY_TEXT_MAX_CHARS:
+        raise ApiError(
+            400, f"text too long (max {MEMORY_TEXT_MAX_CHARS} characters)"
+        )
+    record = _get_owned_memory_record(
+        memory, memory_id=memory_id, user_sub=user_sub, record_id=record_id
+    )
+    parsed = mem.parse_record(record)
+    header = mem.format_header(
+        type=parsed["type"], dataset=parsed["dataset"], expires=parsed["expires"]
+    )
+    full = f"{header}\n{text}"
+    update: dict[str, Any] = {
+        "memoryRecordId": record_id,
+        "timestamp": datetime.now(timezone.utc),
+        "content": {"text": full},
+        "namespaces": [_memory_namespace(user_sub)],
+    }
+    metadata = record.get("metadata")
+    if isinstance(metadata, dict) and metadata:
+        update["metadata"] = metadata
+    resp = memory.batch_update_memory_records(
+        memoryId=memory_id, records=[update]
+    )
+    # Per-record failures come back as failedRecords in a 200, NOT an
+    # exception — returning the edited record regardless would fabricate a
+    # success while the store never changed (e.g. the record was deleted
+    # between the ownership GET and this update by the chat runtime's
+    # lazy-TTL sweep or async consolidation).
+    failed = (resp or {}).get("failedRecords") or []
+    if failed:
+        detail = str(failed[0].get("errorMessage") or "update failed")
+        raise ApiError(409, f"memory record update failed: {detail}")
+    return _parsed_memory_record(
+        {
+            "memoryRecordId": record_id,
+            "content": {"text": full},
+            "metadata": metadata if isinstance(metadata, dict) else {},
+        }
+    )
+
+
+def delete_memory_record(
+    memory, *, memory_id: str, user_sub: str | None, record_id: str
+) -> dict[str, Any]:
+    """DELETE /memory/{record_id} — after verifying the caller owns it."""
+    _require_memory_configured(memory_id, memory=memory)
+    user_sub = _require_user_sub(user_sub)
+    _get_owned_memory_record(
+        memory, memory_id=memory_id, user_sub=user_sub, record_id=record_id
+    )
+    memory.delete_memory_record(memoryId=memory_id, memoryRecordId=record_id)
+    return {"deleted": record_id}
 
 
 # --------------------------------------------------------------------------- #

@@ -604,6 +604,25 @@ data "aws_iam_policy_document" "chat" {
     resources = [local.d.chat_checkpoints_table_arn, local.d.chat_table_arn]
   }
 
+  # Long-term memory (durable agent_memory.tf): the runtime writes turn events,
+  # semantically recalls records at turn start, and lazy-deletes expired ones on
+  # recall (the TTL design — Roadmap §10). List/Update stay on the CONTROL API
+  # role (the management page), not here: the runtime never enumerates or edits.
+  # Gated like every optional feature's grants: enable_chat_memory off means
+  # the role carries no memory verbs at all.
+  dynamic "statement" {
+    for_each = var.enable_chat_memory ? [1] : []
+    content {
+      sid = "ChatMemoryRuntime"
+      actions = [
+        "bedrock-agentcore:CreateEvent",
+        "bedrock-agentcore:RetrieveMemoryRecords",
+        "bedrock-agentcore:DeleteMemoryRecord",
+      ]
+      resources = [local.d.chat_memory_arn]
+    }
+  }
+
   # Checkpoint S3 offload: DynamoDBSaver spills checkpoint blobs > the 400KB
   # DynamoDB item cap into this dedicated bucket (OKF_CHAT_CHECKPOINT_BUCKET)
   # and reads/deletes them on checkpoint load/cleanup.

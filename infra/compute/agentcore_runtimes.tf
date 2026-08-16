@@ -320,6 +320,14 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     # openai.* value or a Converse id (the default) both just work.
     OKF_CHAT_POLICY_CHECK_MODEL = var.chat_policy_check_model
 
+    # Long-term memory (durable agent_memory.tf): per-user preferences +
+    # question→computation bindings. Empty id = feature off (the runtime
+    # builds no memory client) — the id IS the deploy-time master gate, and
+    # it composes with the per-user switch stored on the chat table (see
+    # chat/memory.py). No separate ENABLED flag: a boolean nothing reads
+    # would invite "flipped it off, still remembering" incidents.
+    OKF_CHAT_MEMORY_ID = var.enable_chat_memory ? local.d.chat_memory_id : ""
+
     OTEL_RESOURCE_ATTRIBUTES = "service.name=${var.name_prefix}_chat"
 
     # LangChain/LangGraph spans via the langsmith SDK's native OTEL bridge (same

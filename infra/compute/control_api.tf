@@ -47,6 +47,8 @@ module "control_api_fn" {
     # reads/renames/deletes for the UI (GET/PUT/DELETE /chat/threads).
     OKF_CHAT_THREADS_TABLE    = local.d.chat_table
     OKF_CHAT_CHECKPOINT_TABLE = local.d.chat_checkpoints_table
+    # Long-term memory management routes (empty = feature off, routes 404).
+    OKF_CHAT_MEMORY_ID = var.enable_chat_memory ? local.d.chat_memory_id : ""
     # Bus for the repromote-success `policy_rebuild` publish. Doubles as the
     # accelerator's deploy switch: empty string = build the events client not
     # at all, publish nothing, never flag a row stale. "default" — this stack
@@ -62,7 +64,9 @@ resource "aws_apigatewayv2_api" "control" {
 
   cors_configuration {
     allow_origins = ["*"] # tighten to the CloudFront URL post-deploy
-    allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    # PATCH: the memory-record edit route (PATCH /memory/{record_id}). Keep in
+    # sync with CORS_HEADERS in services/control_api/src/control_api/app.py.
+    allow_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
     allow_headers = ["authorization", "content-type"]
     max_age       = 300
   }

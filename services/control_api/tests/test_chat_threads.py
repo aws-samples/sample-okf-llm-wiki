@@ -123,6 +123,32 @@ def test_list_paginates_across_query_pages(cfg, aws):
     assert calls == [None, {"pk": {"S": "cursor"}}]
 
 
+def test_list_excludes_non_thread_rows_in_the_partition(cfg, aws):
+    # The CHAT#<sub> partition also holds the SETTINGS#memory switch row and
+    # POLICY# report rows — without the begins_with(sk, THREAD#) constraint
+    # the switch row surfaced as a phantom conversation titled
+    # "SETTINGS#memory" (undeletable: delete targets THREAD#<id>).
+    _seed_thread(aws["ddb"], "alice", "c1", title="real", updated_at="2026-07-15T01:00:00+00:00")
+    aws["ddb"].put_item(
+        TableName=CHAT_THREADS,
+        Item={
+            "pk": {"S": ct.thread_pk("alice")},
+            "sk": {"S": ct.MEMORY_SETTINGS_SK},
+            "memory_enabled": {"BOOL": True},
+        },
+    )
+    aws["ddb"].put_item(
+        TableName=CHAT_THREADS,
+        Item={
+            "pk": {"S": ct.thread_pk("alice")},
+            "sk": {"S": "POLICY#c1#0"},
+            "verdict": {"S": "ok"},
+        },
+    )
+    resp = route(_event("GET", "/chat/threads", sub="alice"), cfg)
+    assert [t["thread_id"] for t in _body(resp)["threads"]] == ["c1"]
+
+
 def test_list_requires_auth(cfg, aws):
     # No sub in claims -> 401 (never an unscoped scan).
     ev = {"requestContext": {"http": {"method": "GET", "path": "/chat/threads"},

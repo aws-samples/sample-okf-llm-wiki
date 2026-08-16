@@ -120,6 +120,105 @@ class FakeAgentCore:
         return json.loads(self.calls[-1]["payload"].decode())
 
 
+class _MemoryRecordNotFound(Exception):
+    """Mimic botocore's ClientError shape for a missing memory record."""
+
+    def __init__(self, record_id: str):
+        super().__init__(f"Memory record {record_id} not found.")
+        self.response = {"Error": {"Code": "ResourceNotFoundException"}}
+
+
+class FakeAgentCoreMemory:
+    """bedrock-agentcore Memory data-plane fake (the Memory page's routes).
+
+    Seeded with raw record dicts (``memoryRecordId``, ``content.text``,
+    ``namespaces``). ``list_memory_records`` filters by the requested namespace
+    and, when ``page_size`` is set, paginates in fixed-size pages via an
+    integer-offset ``nextToken`` so the handlers' exhaustion loop is exercised.
+    get/update/delete on an unknown id raise the botocore-shaped
+    ResourceNotFoundException. Every call is recorded for asserts.
+    """
+
+    def __init__(
+        self,
+        records: list[dict[str, Any]] | None = None,
+        page_size: int | None = None,
+    ):
+        self.records: dict[str, dict[str, Any]] = {
+            r["memoryRecordId"]: dict(r) for r in (records or [])
+        }
+        self._page_size = page_size
+        self.list_calls: list[dict[str, Any]] = []
+        self.get_calls: list[dict[str, Any]] = []
+        self.update_calls: list[dict[str, Any]] = []
+        self.delete_calls: list[dict[str, Any]] = []
+
+    def list_memory_records(self, **kwargs) -> dict:
+        self.list_calls.append(kwargs)
+        ns = kwargs.get("namespace")
+        matched = [
+            dict(r)
+            for r in self.records.values()
+            if ns is None or ns in (r.get("namespaces") or [])
+        ]
+        if self._page_size is None:
+            return {"memoryRecordSummaries": matched}
+        start = int(kwargs.get("nextToken", "0"))
+        page = matched[start : start + self._page_size]
+        resp: dict[str, Any] = {"memoryRecordSummaries": page}
+        nxt = start + self._page_size
+        if nxt < len(matched):
+            resp["nextToken"] = str(nxt)
+        return resp
+
+    def get_memory_record(self, **kwargs) -> dict:
+        self.get_calls.append(kwargs)
+        record_id = kwargs.get("memoryRecordId")
+        if record_id not in self.records:
+            raise _MemoryRecordNotFound(record_id)
+        return {"memoryRecord": dict(self.records[record_id])}
+
+    def batch_update_memory_records(self, **kwargs) -> dict:
+        self.update_calls.append(kwargs)
+        successful = []
+        failed = []
+        for update in kwargs.get("records", []):
+            record_id = update["memoryRecordId"]
+            # Per the service model, a missing record is a per-record entry in
+            # failedRecords inside a 200 response — NOT an exception. The
+            # handler must check, or it fabricates a success.
+            if record_id not in self.records:
+                failed.append(
+                    {
+                        "memoryRecordId": record_id,
+                        "errorMessage": f"no such record: {record_id}",
+                    }
+                )
+                continue
+            stored = self.records[record_id]
+            if update.get("content"):
+                stored["content"] = dict(update["content"])
+            if update.get("namespaces"):
+                stored["namespaces"] = list(update["namespaces"])
+            # Pessimistic REPLACE semantics for metadata (the real behavior is
+            # undocumented): an update that omits it strips the stored fields,
+            # so a handler that forgets to re-supply metadata loses type/
+            # dataset/expires here exactly as it might live.
+            stored["metadata"] = (
+                dict(update["metadata"]) if update.get("metadata") else {}
+            )
+            successful.append({"memoryRecordId": record_id, "status": "SUCCEEDED"})
+        return {"successfulRecords": successful, "failedRecords": failed}
+
+    def delete_memory_record(self, **kwargs) -> dict:
+        self.delete_calls.append(kwargs)
+        record_id = kwargs.get("memoryRecordId")
+        if record_id not in self.records:
+            raise _MemoryRecordNotFound(record_id)
+        del self.records[record_id]
+        return {"memoryRecordId": record_id}
+
+
 class _CognitoResourceNotFound(Exception):
     """Mimic botocore's ClientError shape for Cognito's ResourceNotFoundException."""
 

@@ -23,9 +23,11 @@ Deleting a conversation removes this row AND purges the checkpoint via the
 saver's ``delete_thread`` (see the Control API).
 
 The same partition also holds the per-turn **policy-check reports** (the
-Automated Reasoning sidebar) under a ``POLICY#`` sort key — same table, same
+Automated Reasoning sidebar) under a ``POLICY#`` sort key and the per-user
+**memory switch** row (``sk = SETTINGS#memory``) — same table, same
 user-scoped partition, so one module owns the whole key space and a
-conversation delete knows what else to sweep.
+conversation delete knows what else to sweep. Consequence: a Query for
+conversations must constrain ``begins_with(sk, THREAD_SK_PREFIX)``.
 """
 
 from __future__ import annotations
@@ -40,6 +42,18 @@ DELETED_TTL_SECONDS = 24 * 60 * 60  # 1 day
 
 # Bounds on stored free-text so a hostile/oversized title can't bloat the row.
 TITLE_MAX = 200
+
+# Sort-key prefix for conversation rows. The partition ALSO holds POLICY#
+# report rows and the SETTINGS#memory switch row, so a Query for conversations
+# MUST constrain ``begins_with(sk, THREAD_SK_PREFIX)`` — an unconstrained Query
+# returns those rows too (a settings row once surfaced as a phantom
+# conversation titled "SETTINGS#memory" in the sidebar).
+THREAD_SK_PREFIX = "THREAD#"
+
+# The per-user long-term-memory switch row's sort key (``memory_enabled``
+# BOOL; missing row = enabled). Written by the Control API (the Memory page),
+# read by the chat runtime at turn start.
+MEMORY_SETTINGS_SK = "SETTINGS#memory"
 
 
 def thread_pk(user_sub: str) -> str:
@@ -58,7 +72,7 @@ def thread_sk(thread_id: str) -> str:
     """Sort key: ``THREAD#<thread_id>`` (the client-facing conversation id)."""
     if not thread_id:
         raise ValueError("thread_sk requires a non-empty thread_id")
-    return f"THREAD#{thread_id}"
+    return f"{THREAD_SK_PREFIX}{thread_id}"
 
 
 def derive_title(first_message: str | None, *, fallback: str = "New conversation") -> str:

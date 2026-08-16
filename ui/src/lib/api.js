@@ -20,9 +20,13 @@ async function request(token, method, path, body) {
     } catch {
       detail = await res.text().catch(() => "")
     }
-    throw new Error(
+    const err = new Error(
       `${method} ${path} -> ${res.status}${detail ? `: ${detail}` : ""}`
     )
+    // Carry the HTTP status so callers can branch on it (e.g. the Memory page
+    // treats a 404 as "memory not enabled on this deployment", not a failure).
+    err.status = res.status
+    throw err
   }
   const ct = res.headers.get("content-type") || ""
   return ct.includes("application/json") ? res.json() : res.text()
@@ -514,6 +518,21 @@ export function makeApi(token) {
     // blocks_url}, pdf_url "" when the PDF pass was skipped.
     getReport: (reportId) =>
       request(token, "GET", `/report/${encodeURIComponent(reportId)}`),
+
+    // Agent memory (the chat agent's long-term memory of THIS user, scoped
+    // server-side to the caller's Cognito sub). GET /memory returns
+    // {enabled, records}; the settings pair toggles save/recall (records are
+    // kept while off). Every route 404s when the deployment has memory
+    // disabled — the Memory page branches on err.status for that.
+    getMemory: () => request(token, "GET", "/memory"),
+    getMemorySettings: () => request(token, "GET", "/memory/settings"),
+    setMemorySettings: (enabled) =>
+      request(token, "PUT", "/memory/settings", { enabled }),
+    // Edits ONLY the text; returns the updated record.
+    updateMemory: (id, text) =>
+      request(token, "PATCH", `/memory/${encodeURIComponent(id)}`, { text }),
+    deleteMemory: (id) =>
+      request(token, "DELETE", `/memory/${encodeURIComponent(id)}`),
 
     // Chat conversations (the per-user sidebar list). The chat RUNTIME writes the
     // index rows; the Control API serves this read/rename/delete side, scoped to
