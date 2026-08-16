@@ -1772,12 +1772,27 @@ async def _produce_run_chunks(
             and answer_parts
         ):
             try:
+                # The turn's curated question (the policy machinery's rolling
+                # rewrite — context-resolved, standalone) rides the event's
+                # annotation: extraction is async and its window over past
+                # events is the service's business, so an elliptical turn must
+                # carry its own context. _curated_now() never blocks: curated
+                # when the rewrite landed (prewarm kicked it at turn start),
+                # the raw question otherwise — which write_turn drops as
+                # adding nothing over the USER message.
+                curated_q = ""
+                if checker is not None:
+                    try:
+                        curated_q = checker._curated_now()
+                    except Exception:  # noqa: BLE001 - advisory context
+                        curated_q = ""
                 memory.write_turn_async(
                     user_sub=user_sub,
                     session_id=internal_id,
                     thread_id=client_thread_id,
                     user_text=prompt or memory_raw_q,
                     answer_text="".join(answer_parts),
+                    curated_question=curated_q,
                     # The raw observation, not a rendered annotation: the
                     # write thread composes it citation-first (validated
                     # against this snapshot + the thread ledger + the pin).

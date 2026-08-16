@@ -768,6 +768,49 @@ def test_write_turn_merges_observed_datasets_into_the_ledger():
     assert merged == ["old/one", "bird/formula_1"]
 
 
+def test_write_turn_carries_curated_question_in_the_annotation():
+    # Extraction is async — an elliptical turn must be self-contained, so the
+    # harness's context-resolved question rides the trusted block (the raw
+    # wording stays the USER message: meanings extract from the user's words).
+    mem = _memory()
+    mem.write_turn(
+        user_sub="u1",
+        session_id="s",
+        user_text="and last month?",
+        answer_text="Down 3%.",
+        observation={"datasets": [], "governed": []},
+        curated_question="How did EMEA group revenue in July 2026 compare to June?",
+    )
+    note = _event_annotation(mem)
+    assert note.startswith(ANNOTATION_PREFIX)
+    assert (
+        "curated-question: How did EMEA group revenue in July 2026 compare to June?"
+        in note
+    )
+    # The raw user text is still the USER message, untouched.
+    texts = [
+        p["conversational"]["content"]["text"]
+        for p in mem._client.events[-1]["payload"]
+    ]
+    assert texts[0] == "and last month?"
+
+
+def test_write_turn_drops_curated_question_identical_to_raw():
+    # _curated_now() falls back to the RAW question when the rewrite hasn't
+    # landed — identical text adds nothing over the USER message, so no
+    # annotation line (and with nothing else observed, no annotation at all).
+    mem = _memory()
+    mem.write_turn(
+        user_sub="u1",
+        session_id="s",
+        user_text="how did the group perform?",
+        answer_text="Fine.",
+        observation={"datasets": [], "governed": []},
+        curated_question="how did the group perform?",
+    )
+    assert _event_annotation(mem) == ""
+
+
 def test_write_turn_resolved_by_rides_regardless_of_citation_level():
     # Bindings stay observation-only evidence: citations are docs-only and
     # must never suppress (or mint) a resolved-by line.

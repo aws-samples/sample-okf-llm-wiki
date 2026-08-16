@@ -62,6 +62,13 @@ locals {
     explicitly stating what they mean. A preference or interpretation the user
     gave in a clarification answer counts as accepted.
 
+    A [[okf-harness]] annotation may carry a "curated-question:" line — the
+    harness's context-resolved form of what the user was asking (follow-ups
+    like "and last month?" resolved against the conversation). Use it to
+    understand WHAT the user's message refers to. The user's own words remain
+    the USER messages: meanings, preferences, and phrasing must be extracted
+    from the user's wording, never from the curated form.
+
     NEVER extract facts about the data itself — table locations, join keys,
     column meanings, metric definitions, data caveats. Those belong to the wiki
     and must never enter memory.

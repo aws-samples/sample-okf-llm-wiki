@@ -1636,7 +1636,13 @@ USER — never facts about the data (tables/joins/metrics belong to the wiki):
   the observed `datasets-touched` list when no citation validates (an
   unbacked citation is a model claim, never laundered into the trusted
   block). `resolved-by` lines (which governed tool resolved the turn) ride
-  regardless — bindings stay observation-only evidence.
+  regardless — bindings stay observation-only evidence. The annotation also
+  carries a `curated-question:` line — the policy machinery's
+  context-resolved rewrite of the turn's question — whenever it differs from
+  the raw text: extraction is asynchronous, so an elliptical turn ("and last
+  month?") must be self-contained in its own event; the raw wording stays
+  the USER message (meanings extract from the user's words, never the
+  rewrite).
   Paused (`ask_human`) turns persist their observation + folded clarification
   rounds in a `memory_pending` JSON blob on the THREAD row
   (`chat.threads.write_memory_pending`; each pause overwrites, the resume
