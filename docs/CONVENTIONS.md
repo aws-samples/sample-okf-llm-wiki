@@ -1059,11 +1059,14 @@ conversation pin. Advisory and best-effort.
 **Memory settings.** `pk = "CHAT#<user_sub>"`, `sk = "SETTINGS#memory"`
 (`okf_core.chat_threads.MEMORY_SETTINGS_SK`), attr
 `memory_enabled` (BOOL). The per-user switch for long-term memory: **missing
-row (or attr) = enabled** — memory is opt-out. Written by the Control API
-(`PUT /memory/settings`, the Memory page's master switch); read by the chat
-runtime at turn start (`chat.memory.ChatMemory.user_enabled`, which also
-treats a FAILED read as enabled — an unreadable row must not silently disable
-the feature). Off = the runtime neither recalls nor writes events; existing
+row (or attr) = the deploy default** (`OKF_CHAT_MEMORY_DEFAULT_ON`, from
+`var.chat_memory_default_on` — true means opt-out/default-on, false means
+opt-in/default-off; flipping the var never touches rows users already set).
+Written by the Control API (`PUT /memory/settings`, the Memory page's master
+switch); read by the chat runtime at turn start
+(`chat.memory.ChatMemory.user_enabled`, which also treats a FAILED read as
+the deploy default — an unreadable row must not silently flip a user's
+memory in either direction). Off = the runtime neither recalls nor writes events; existing
 memory records are untouched — though the server still STRIPS the previous
 turn's recall injection from ongoing threads, so switching off silences
 already-injected context too. Because this row shares the `CHAT#<sub>`
@@ -1722,6 +1725,7 @@ USER — never facts about the data (tables/joins/metrics belong to the wiki):
 | `OKF_WEB_SEARCH_TOOL_NAME` | the gateway-side tool name, `<target-name>___WebSearch` (AgentCore prefixes every tool with its target's name, joined by THREE underscores). Set by Terraform to save a round trip; empty → the runtime discovers it via `tools/list` and caches it |
 | `OKF_WEB_SEARCH_MAX_RESULTS` | default results per search when the agent doesn't pick a count via the tool's `max_results` arg (default `10`; 1–25). There is no date parameter — the connector ranks by relevance and the agent steers time through the query text, reading each result's `publishedDate` |
 | `OKF_CHAT_MEMORY_ID` | (chat runtime + Control API) the AgentCore Memory resource id for long-term chat memory (see "Long-term chat memory"). Set from `var.enable_chat_memory ? chat_memory_id : ""` — empty disables the feature end to end: the runtime builds no memory client (no recall, no event writes) and the Control API's `/memory*` routes return 404. The extraction/consolidation prompts + model live on the DURABLE stack's strategy resource (`var.chat_memory_model`), not in env |
+| `OKF_CHAT_MEMORY_DEFAULT_ON` | (chat runtime + Control API) what a MISSING per-user memory switch row means: `true` (default) = opt-out — memory on until the user switches it off; `false` = opt-in — off until explicitly enabled on the Memory page. Set from `var.chat_memory_default_on` on BOTH services so the switch the page shows agrees with what the runtime does; rows users already set are never affected |
 | `OKF_CHAT_GUARDRAILS_GATE_ENABLED` | (chat runtime, env-read — not Terraform-plumbed) default `true` → `read_page` on any page of a dataset is DENIED at the tool boundary until that dataset's `references/usage_guardrails` has been read in the thread (`chat.guardrails_gate.GuardrailsGateMiddleware`). Per-dataset marks live in CHECKPOINTED agent state (`guardrails_read` channel, dict-merge reducer), so resumes remember; the guardrails read itself always passes and marks on any completed attempt (a guardrails-less legacy bundle can't lock out). Browse/search tools are never gated. `"false"`/`"0"`/`"no"`/`"off"` disables |
 | `OKF_CHAT_POLICY_CHECK_ENABLED` | (chat runtime) `"true"` → the mid-turn policy checks may be armed per run via `features: ["sql", "policy:*"]` (default `false`). Unset → no checker is ever constructed, whatever the client sends — the master gate above the per-run opt-in, set from `var.enable_policy_checks` |
 | `OKF_CHAT_POLICY_CHECK_MODEL` | (chat runtime) the policy checks' model id, serving BOTH the curated-question rewrite (no reasoning pass — extraction) and the JUDGE fleets. Default `global.anthropic.claude-sonnet-5` — judges run classifier-style on every family (thinking off + temperature 0 on Anthropic, reasoning `"none"` on openai.* ids like `openai.gpt-5.6-terra`, forced `report_violations` either way); from `var.chat_policy_check_model`, which also drives the chat role's Mantle grants, so an openai.* value needs no extra wiring. Code-level companions (env-read, not Terraform-plumbed): `OKF_CHAT_POLICY_SHARD_SIZE` (default `10` — policies per mini-judge), `OKF_CHAT_POLICY_QUERY_TIMEOUT_S` (default `60` — residual wait after the query returns) and `OKF_CHAT_POLICY_QUERY_MAX_PER_TURN` (default `3` — judged analytical queries per turn). Deploy-time only — deliberately NOT validated against `OKF_CHAT_MODEL_CATALOG`, which is the trust boundary for CLIENT-supplied models |

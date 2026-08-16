@@ -38,9 +38,11 @@ validation-at-use guard — memory must degrade to the status quo, never to a
 wrong answer).
 
 Per-user switch: a settings row on the chat threads table
-(``pk=CHAT#<sub>, sk=SETTINGS#memory``, ``memory_enabled`` BOOL). Missing row
-= enabled — memory is opt-out. The row is written by the Control API (the
-Memory page); this module only reads it.
+(``pk=CHAT#<sub>, sk=SETTINGS#memory``, ``memory_enabled`` BOOL). A missing
+row means the DEPLOY DEFAULT (``OKF_CHAT_MEMORY_DEFAULT_ON``): opt-out when
+true (memory on until the user switches it off — the default), opt-in when
+false (off until the user explicitly enables it). The row is written by the
+Control API (the Memory page); this module only reads it.
 """
 
 from __future__ import annotations
@@ -266,12 +268,14 @@ class ChatMemory:
         ddb: Any = None,
         threads_table: str = "",
         namespace_prefix: str = "wiki",
+        default_enabled: bool = True,
     ) -> None:
         self._client = client
         self._memory_id = memory_id
         self._ddb = ddb
         self._threads_table = threads_table
         self._prefix = namespace_prefix
+        self._default_enabled = default_enabled
 
     def _namespace(self, user_sub: str) -> str:
         # The shared derivation (okf_core.memory_records) — same sanitized id
@@ -281,13 +285,15 @@ class ChatMemory:
     # -- per-user switch --------------------------------------------------
 
     def user_enabled(self, user_sub: str) -> bool:
-        """The Memory page's per-user switch; missing row/attr = ENABLED.
+        """The Memory page's per-user switch; missing row/attr = the DEPLOY
+        DEFAULT (``default_enabled`` — opt-out when True, opt-in when False).
 
-        A FAILED read also returns True: memory is a default-on convenience,
-        and an unreadable settings row must not silently disable it.
+        A FAILED read also returns the default: an unreadable settings row
+        must not silently flip a user's memory in either direction — it
+        degrades to the deployment's stated policy, never its opposite.
         """
         if self._ddb is None or not self._threads_table:
-            return True
+            return self._default_enabled
         try:
             item = (
                 self._ddb.get_item(
@@ -302,10 +308,10 @@ class ChatMemory:
             flag = item.get("memory_enabled") or {}
             if "BOOL" in flag:
                 return bool(flag["BOOL"])
-            return True
+            return self._default_enabled
         except Exception:  # noqa: BLE001 - never fail the turn on settings
-            log.warning("memory settings read failed (default on)", exc_info=True)
-            return True
+            log.warning("memory settings read failed (deploy default)", exc_info=True)
+            return self._default_enabled
 
     # -- turn start: recall -------------------------------------------------
 
@@ -681,4 +687,5 @@ def make_chat_memory(chat_config: Any, clients: dict[str, Any]) -> ChatMemory | 
         memory_id=memory_id,
         ddb=clients.get("dynamodb"),
         threads_table=getattr(chat_config, "threads_table", "") or "",
+        default_enabled=bool(getattr(chat_config, "memory_default_on", True)),
     )

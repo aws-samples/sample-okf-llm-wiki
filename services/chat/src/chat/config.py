@@ -141,6 +141,13 @@ class ChatConfig:
     # deploy-time master gate; each user has their own switch on top (a
     # settings row on the threads table, written by the Control API).
     memory_id: str = ""
+    # What a MISSING per-user switch row means: True = opt-out (memory on
+    # until the user turns it off — the default), False = opt-in (memory
+    # stays off until the user explicitly enables it on the Memory page).
+    # Deploy policy, not user state — OKF_CHAT_MEMORY_DEFAULT_ON, set from
+    # var.chat_memory_default_on. The Control API reads the same env so the
+    # switch the Memory page shows agrees with what the runtime does.
+    memory_default_on: bool = True
     default_effort: str = DEFAULT_EFFORT
     default_max_tokens: int = DEFAULT_MAX_TOKENS
 
@@ -215,6 +222,8 @@ class ChatConfig:
             report_harness_path=env.get("OKF_CHAT_REPORT_HARNESS_PATH", ""),
             report_max_bytes=int(env.get("OKF_CHAT_REPORT_MAX_BYTES", "") or 8_000_000),
             memory_id=env.get("OKF_CHAT_MEMORY_ID", ""),
+            memory_default_on=env.get("OKF_CHAT_MEMORY_DEFAULT_ON", "true").lower()
+            not in ("false", "0", ""),
             checkpoint_table=env.get("OKF_CHAT_CHECKPOINT_TABLE", "okf-chat-checkpoints"),
             threads_table=env.get("OKF_CHAT_THREADS_TABLE", "okf-chat"),
             catalog=parse_catalog(env.get("OKF_CHAT_MODEL_CATALOG")),
