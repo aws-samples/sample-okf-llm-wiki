@@ -30,6 +30,48 @@ def test_memory_namespace_derives_from_the_sanitized_id():
     assert memory_namespace("sub:colon", prefix="other") == "other/sub_colon"
 
 
+def test_placeholders_and_sentinel_dates_degrade_to_unset():
+    # Observed live (Sonnet 4.6 extraction): the model fills fields it was
+    # told to OMIT — dataset/expires_at "N/A", and "9999-12-31" to mean
+    # "never expires". All of it must parse as unset: the record survives,
+    # the noise goes (no "Valid until N/A" chips, no phantom temporal
+    # records polluting the Temporal-only filter).
+    p = parse_record(
+        {
+            "memoryRecordId": "m1",
+            "content": {"text": "Prefers concise answers"},
+            "metadata": {
+                "type": {"stringValue": "stated"},
+                "dataset": {"stringValue": "N/A"},
+                "expires_at": {"stringValue": "9999-12-31"},
+            },
+        }
+    )
+    assert p["dataset"] == "" and p["expires"] == ""
+    assert p["text"] == "Prefers concise answers"
+
+    # Placeholder expiry + unparseable window text: same degrade.
+    for bad in ("N/A", "none", "sometime next year"):
+        q = parse_record(
+            {
+                "memoryRecordId": "m2",
+                "content": {"text": "T"},
+                "metadata": {"expires_at": {"stringValue": bad}},
+            }
+        )
+        assert q["expires"] == "", bad
+
+    # A real window is untouched.
+    ok = parse_record(
+        {
+            "memoryRecordId": "m3",
+            "content": {"text": "T"},
+            "metadata": {"expires_at": {"stringValue": "2026-09-30"}},
+        }
+    )
+    assert ok["expires"] == "2026-09-30"
+
+
 def test_type_from_metadata_flags_filterable_records():
     real = parse_record(
         {
