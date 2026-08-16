@@ -62,6 +62,13 @@ locals {
     explicitly stating what they mean. A preference or interpretation the user
     gave in a clarification answer counts as accepted.
 
+    A [[okf-harness]] annotation may carry a "curated-question:" line — the
+    harness's context-resolved form of what the user was asking (follow-ups
+    like "and last month?" resolved against the conversation). Use it to
+    understand WHAT the user's message refers to. The user's own words remain
+    the USER messages: meanings, preferences, and phrasing must be extracted
+    from the user's wording, never from the curated form.
+
     NEVER extract facts about the data itself — table locations, join keys,
     column meanings, metric definitions, data caveats. Those belong to the wiki
     and must never enter memory.
@@ -188,7 +195,7 @@ resource "awscc_bedrockagentcore_memory" "chat" {
             extraction_config = {
               llm_extraction_config = {
                 definition                 = "The domain/dataset this memory is specific to, when it is specific to one."
-                llm_extraction_instruction = "For bindings, copy the dataset value from the [[okf-harness]] annotation VERBATIM. For stated preferences, set it ONLY when the preference is specific to one dataset's semantics, and only to a value in the annotation's datasets-cited list (or its datasets-touched list when no cited line is present — the harness emits one or the other, cited being the answer's own validated attribution). Otherwise OMIT this field entirely. Never invent a dataset id from conversation wording."
+                llm_extraction_instruction = "For bindings, copy the dataset value from the [[okf-harness]] annotation VERBATIM. For stated preferences, set it ONLY when the preference is specific to one dataset's semantics, and only to a value in the annotation's datasets-cited list (or its datasets-touched list when no cited line is present — the harness emits one or the other, cited being the answer's own validated attribution). Otherwise the field must be ABSENT from your output — never fill it with a placeholder such as 'N/A', 'none', or 'generic'. Never invent a dataset id from conversation wording."
               }
             }
           },
@@ -198,7 +205,7 @@ resource "awscc_bedrockagentcore_memory" "chat" {
             extraction_config = {
               llm_extraction_config = {
                 definition                 = "The ABSOLUTE date (YYYY-MM-DD) after which this memory no longer applies, when the user stated or clearly implied a validity window."
-                llm_extraction_instruction = "Resolve relative windows ('until end of September', 'this quarter') against the event timestamp into a YYYY-MM-DD date. OMIT this field when no validity window was expressed."
+                llm_extraction_instruction = "Resolve relative windows ('until end of September', 'this quarter') against the event timestamp into a YYYY-MM-DD date. Most memories have NO validity window: for those the field must be ABSENT from your output — never a placeholder like 'N/A' or 'none', and never a sentinel far-future date such as 9999-12-31 to mean 'does not expire'. Only a window the user actually stated or clearly implied earns this field."
               }
             }
           },

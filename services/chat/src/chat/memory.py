@@ -124,10 +124,16 @@ def _cited_datasets(answer_text: str) -> list[str]:
     return out
 
 
+#: Cap on the annotation's curated-question line (curated questions are one
+#: standalone sentence; anything near this is malformed).
+CURATED_MAX_CHARS = 1000
+
+
 def _render_annotation(
     datasets: list[str],
     governed: list[dict[str, Any]],
     cited: list[str] | None = None,
+    curated: str = "",
 ) -> str:
     """The ``[[okf-harness]]`` block; ``''`` = nothing to annotate.
 
@@ -137,8 +143,18 @@ def _render_annotation(
     answered from one must not offer the extractor three. The observed list
     is the fallback when no citation validates. ``resolved-by`` lines ride
     regardless: they are the binding evidence, and citations are docs-only.
+
+    ``curated`` is the harness's context-resolved form of the user's question
+    (the policy machinery's rolling rewrite) — extraction is asynchronous and
+    its window over past events is the service's business, so an elliptical
+    turn ("and last month?") may reach the extractor without its antecedent;
+    this line is what makes the event self-contained. The user's own words
+    stay in the USER message — meanings are extracted from those, never from
+    the rewrite.
     """
     lines = [f"{ANNOTATION_PREFIX} harness observation (trusted, not conversation):"]
+    if curated:
+        lines.append(f"curated-question: {curated[:CURATED_MAX_CHARS]}")
     if cited:
         lines.append(f"datasets-cited: {json.dumps(cited)}")
     elif datasets:
@@ -512,6 +528,7 @@ class ChatMemory:
         observation: dict[str, Any] | None = None,
         thread_id: str = "",
         pin: str = "",
+        curated_question: str = "",
         clarifications: list[dict[str, str]] | None = None,
     ) -> None:
         """One ``create_event`` per finished turn — the extraction feedstock.
@@ -533,12 +550,19 @@ class ChatMemory:
         datasets then merge into the thread ledger, which is what lets a
         LATER no-tool follow-up's citation still resolve its dataset.
         """
+        # The curated question rides the annotation only when it actually
+        # adds context — identical to the raw text (the rewrite hadn't
+        # landed, or the turn was already standalone) is noise.
+        curated = (curated_question or "").strip()
+        if curated == (user_text or "").strip():
+            curated = ""
         annotation = self._compose_annotation(
             observation,
             answer_text or "",
             user_sub=user_sub,
             thread_id=thread_id,
             pin=pin,
+            curated=curated,
         )
         # Every piece is excerpt-capped, not just the answer: an oversized
         # user paste would otherwise blow the CreateEvent payload limit and
@@ -583,6 +607,7 @@ class ChatMemory:
         user_sub: str,
         thread_id: str,
         pin: str,
+        curated: str = "",
     ) -> str:
         if not isinstance(observation, dict):
             return ""
@@ -597,7 +622,9 @@ class ChatMemory:
             if thread_id:
                 valid |= set(self._read_datasets_ledger(user_sub, thread_id))
             cited = [d for d in cited if d in valid]
-        return _render_annotation(datasets, governed, cited=cited or None)
+        return _render_annotation(
+            datasets, governed, cited=cited or None, curated=curated
+        )
 
     def _read_datasets_ledger(self, user_sub: str, thread_id: str) -> list[str]:
         if self._ddb is None or not self._threads_table or not thread_id:

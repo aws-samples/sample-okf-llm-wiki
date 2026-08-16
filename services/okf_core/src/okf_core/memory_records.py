@@ -79,6 +79,33 @@ def _metadata_str(value: Any) -> str:
     return str(value) if value is not None else ""
 
 
+#: Values a weaker extractor emits INSTEAD of omitting a field it was told to
+#: omit (observed live: dataset "N/A", expires_at "N/A") — all mean "unset".
+_PLACEHOLDERS = frozenset({"", "-", "n/a", "na", "none", "null", "unknown"})
+
+
+def _clean_dataset(value: str) -> str:
+    v = (value or "").strip()
+    return "" if v.lower() in _PLACEHOLDERS else v
+
+
+def _clean_expires(value: str) -> str:
+    """A usable YYYY-MM-DD window, or '' — placeholders, unparseable text, and
+    max-date sentinels (observed live: "9999-12-31" for "never expires") all
+    mean the memory simply has no window. Dropping the WINDOW, never the
+    memory, is the same stance :func:`is_expired` takes on a mangled date."""
+    v = (value or "").strip()
+    if v.lower() in _PLACEHOLDERS:
+        return ""
+    try:
+        parsed = date.fromisoformat(v)
+    except ValueError:
+        return ""
+    if parsed.year >= 9999:
+        return ""
+    return v
+
+
 def parse_record(record: dict[str, Any]) -> dict[str, Any]:
     """Normalize one raw memory record to ``{id, type, dataset, expires, text}``.
 
@@ -147,6 +174,11 @@ def parse_record(record: dict[str, Any]) -> dict[str, Any]:
         mexpires = _metadata_str(meta.get("expires_at"))
         if mexpires:
             out["expires"] = mexpires
+    # Final scrub over EVERY source (header, content JSON, real metadata):
+    # placeholder values and sentinel dates an extractor emitted instead of
+    # omitting the field degrade to unset — the record stays, its noise goes.
+    out["dataset"] = _clean_dataset(out["dataset"])
+    out["expires"] = _clean_expires(out["expires"])
     return out
 
 
