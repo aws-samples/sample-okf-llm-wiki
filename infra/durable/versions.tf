@@ -14,6 +14,14 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.0"
     }
+    # Cloud Control provider — ONLY for the AgentCore Memory resource
+    # (agent_memory.tf): hashicorp/aws doesn't expose the per-record metadata
+    # schema yet, awscc (generated from the CloudFormation schema) does.
+    # Same credential chain/region as the aws provider.
+    awscc = {
+      source  = "hashicorp/awscc"
+      version = "~> 1.0"
+    }
   }
 
   # Remote state in S3 with native lockfile (DynamoDB locking is deprecated).
@@ -25,5 +33,9 @@ terraform {
 }
 
 provider "aws" {
+  region = var.region
+}
+
+provider "awscc" {
   region = var.region
 }

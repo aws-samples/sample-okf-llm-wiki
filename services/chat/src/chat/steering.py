@@ -56,11 +56,12 @@ except Exception:  # pragma: no cover - only when langchain is absent
 STEERING_MARKER = "okf_steering"
 
 #: Every marker that identifies a harness-INJECTED HumanMessage: steering
-#: nudges plus the behavioural policy notes (``chat.policy_check.POLICY_MARKER``
-#: — the string is duplicated here rather than imported to avoid a module
-#: cycle; a test pins the two equal). None of these may open a turn slice,
-#: reset the counters, or render as a user bubble.
-_INJECTED_MARKER_KEYS = (STEERING_MARKER, "okf_policy")
+#: nudges, the behavioural policy notes (``chat.policy_check.POLICY_MARKER``),
+#: and the long-term-memory recall context (``chat.memory.MEMORY_MARKER``) —
+#: the strings are duplicated here rather than imported to avoid module
+#: cycles; tests pin them equal. None of these may open a turn slice, reset
+#: the counters, or render as a user bubble.
+_INJECTED_MARKER_KEYS = (STEERING_MARKER, "okf_policy", "okf_memory")
 
 # ask_human legitimately repeats (a re-ask after a malformed set) and is owned
 # by its own middleware — excluded from repetition tracking.

@@ -1039,6 +1039,38 @@ reloading a chat days later still chains context; absent attrs mean
 raw-question semantics with no background (`chat.threads.read_policy_state` /
 `write_policy_state`).
 
+**Memory pause blob.** THREAD rows also carry an optional `memory_pending`
+attr (S, JSON `{obs, qa}`): the long-term-memory context of a turn paused on
+`ask_human` — the harness observation so far plus the clarification rounds
+already folded. Written at every pause (each pause overwrites), read by the
+resume (`chat.threads.write_memory_pending` / `read_memory_pending`), never
+cleared — the next pause's overwrite is the freshness contract. Best-effort
+like all memory touchpoints.
+
+**Memory datasets ledger.** THREAD rows also carry an optional
+`memory_datasets` attr (S, JSON list, capped at 32): every dataset the
+harness has observed a tool touch in this thread, merged at each turn's
+memory-event write (`chat.threads.read_memory_datasets` /
+`merge_memory_datasets`). It is the citation-validation set: a later no-tool
+turn's answer citation counts toward the annotation's `datasets-cited` line
+only if its dataset appears here, was observed this turn, or is the
+conversation pin. Advisory and best-effort.
+
+**Memory settings.** `pk = "CHAT#<user_sub>"`, `sk = "SETTINGS#memory"`
+(`okf_core.chat_threads.MEMORY_SETTINGS_SK`), attr
+`memory_enabled` (BOOL). The per-user switch for long-term memory: **missing
+row (or attr) = enabled** — memory is opt-out. Written by the Control API
+(`PUT /memory/settings`, the Memory page's master switch); read by the chat
+runtime at turn start (`chat.memory.ChatMemory.user_enabled`, which also
+treats a FAILED read as enabled — an unreadable row must not silently disable
+the feature). Off = the runtime neither recalls nor writes events; existing
+memory records are untouched — though the server still STRIPS the previous
+turn's recall injection from ongoing threads, so switching off silences
+already-injected context too. Because this row shares the `CHAT#<sub>`
+partition, the conversation list Query constrains
+`begins_with(sk, "THREAD#")` (an unconstrained Query would surface it as a
+phantom conversation).
+
 **Legacy: policy-check reports.** v2's post-turn panel persisted one
 `sk = "POLICY#<thread_id>#<turn_key>"` row per checked turn. v3 removed the
 panel — these rows are **no longer written or read**; existing ones are inert
@@ -1550,6 +1582,82 @@ lives in `okf_core/reports.py`.
   chat role holds `s3:PutObject` on `reports/*` only — the wiki stays
   read-only to chat.
 
+## Long-term chat memory
+
+Per-user memory on **Bedrock AgentCore Memory** (`infra/durable/agent_memory.tf`
+— one memory resource + one CUSTOM user-preference strategy whose extraction/
+consolidation prompts are the design's rulebook). Memory stores facts about the
+USER — never facts about the data (tables/joins/metrics belong to the wiki):
+
+- **Three record kinds, one namespace per user**: `stated` preferences
+  (presentation/workflow/language, plus meanings the user assigns to terms),
+  `personal` context (name/role/team — only what the user states about
+  themselves), and `binding` records (how this user's recurring question maps
+  to a governed artifact — a verified computation or metric, with the
+  parameter SHAPE, never literal values). The namespace is
+  `wiki/<sanitized-sub>` — derived via `okf_core.memory_records
+  .memory_namespace` in BOTH services (the strategy resolves `{actorId}` from
+  CreateEvent's actorId, which is sanitized to `[a-zA-Z0-9][a-zA-Z0-9-_]*`;
+  deriving from the raw sub anywhere would split write and read).
+- **Structured record fields are REAL metadata** (`type` / `dataset` /
+  `expires_at`, LLM-extracted per the strategy's `metadata_schema` — the ONE
+  awscc-managed resource in the repo, because hashicorp/aws doesn't expose
+  the schema yet). `type`+`dataset` are indexed → server-side retrieval
+  filters; `expires_at` is client-checked (unset-OR-future isn't expressible
+  in AND-composed filters). A legacy content-header line
+  (`[type:...] [dataset:...] [expires:...]`) is parsed as FALLBACK for
+  drifted extractions. Parser shared via `okf_core.memory_records`
+  (chat runtime + control API both use it — never parse ad hoc).
+- **Runtime touchpoints** (`chat.memory`): at turn START semantic retrieval
+  (query = raw prompt + previous turn's curated question; `maxResults`
+  explicit — the API's default page is 20), then client-side lazy-TTL
+  (expired records are DELETED on recall) and dataset scoping (pinned chat →
+  TWO filtered calls: generic `dataset NOT_EXISTS` + the pin `EQUALS_TO`,
+  INTERLEAVED dataset-first so neither pool starves the other; unpinned →
+  one unfiltered call), injected as a marker-carrying HumanMessage
+  (`okf_memory` — skipped by history rebuild and steering's turn accounting).
+  The per-turn injection (marker value `recall`) is REPLACED each turn — the
+  server strips the previous one from checkpointed state via `RemoveMessage`
+  before injecting fresh, so an edit/delete on the Memory page (or the
+  switch going off) actually changes ongoing threads. `personal` records are
+  the exception: fetched once (`recall_personal`, server-side `type` filter),
+  injected on the thread's FIRST turn (marker value `personal`), carried by
+  history. The whole turn-start prep runs in a worker thread
+  (`asyncio.to_thread`) — a memory-API brownout must never stall the shared
+  event loop. At turn END one `create_event` carrying the turn text
+  (every piece excerpt-capped) + a `[[okf-harness]]` annotation of observed
+  facts so extraction judges only acceptance and phrasing, never the factual
+  core. The annotation's dataset resolution is two-level and either/or:
+  **level 1** parses the answer's `<c src="dd/ds/…">` citations and keeps the
+  pairs the harness can corroborate (observed this turn, in the thread's
+  cumulative `memory_datasets` ledger, or the conversation pin) — a
+  `datasets-cited` line that REPLACES the touched list (attribution beats
+  exploration, and it survives no-tool follow-ups); **level 2** falls back to
+  the observed `datasets-touched` list when no citation validates (an
+  unbacked citation is a model claim, never laundered into the trusted
+  block). `resolved-by` lines (which governed tool resolved the turn) ride
+  regardless — bindings stay observation-only evidence.
+  Paused (`ask_human`) turns persist their observation + folded clarification
+  rounds in a `memory_pending` JSON blob on the THREAD row
+  (`chat.threads.write_memory_pending`; each pause overwrites, the resume
+  reads) so multi-round clarifications and pre-pause governed calls survive
+  the invocation boundary; cancelled and ERRORED turns write no event.
+- **A recalled binding is a HINT**: the injection instructs the model to
+  re-verify the artifact (describe it; only VERIFIED may answer) — memory
+  degrades to normal exploration, never to a wrong answer.
+- **Management** (control API + the Memory page): `GET /memory` (list, with
+  parsed header fields + `expired` flag), `GET/PUT /memory/settings` (the
+  per-user switch — see the `okf-chat` settings row above), `PATCH
+  /memory/{id}` (edit text; the record's real `metadata` is re-supplied
+  verbatim and the header re-emitted, and a `failedRecords` entry in the 200
+  response surfaces as a 409 — never a fabricated success), `DELETE
+  /memory/{id}`. Namespace is always derived from the caller's JWT sub,
+  never a parameter.
+- **Env**: `OKF_CHAT_MEMORY_ID` on the chat runtime AND the control API
+  (empty = feature off: no client, no recall, routes 404). Deploy gate
+  `var.enable_chat_memory`; extraction model `var.chat_memory_model`
+  (durable stack).
+
 ## Environment variables
 
 | Variable | Meaning |
@@ -1607,6 +1715,7 @@ lives in `okf_core/reports.py`.
 | `OKF_WEB_SEARCH_REGION` | region the gateway lives in, i.e. the region `web_search`'s SigV4 is signed for (default `us-east-1`). **Independent of `AWS_REGION`** — the web-search connector is only offered in us-east-1, so a query leaves the deployment's region (it never leaves AWS) |
 | `OKF_WEB_SEARCH_TOOL_NAME` | the gateway-side tool name, `<target-name>___WebSearch` (AgentCore prefixes every tool with its target's name, joined by THREE underscores). Set by Terraform to save a round trip; empty → the runtime discovers it via `tools/list` and caches it |
 | `OKF_WEB_SEARCH_MAX_RESULTS` | default results per search when the agent doesn't pick a count via the tool's `max_results` arg (default `10`; 1–25). There is no date parameter — the connector ranks by relevance and the agent steers time through the query text, reading each result's `publishedDate` |
+| `OKF_CHAT_MEMORY_ID` | (chat runtime + Control API) the AgentCore Memory resource id for long-term chat memory (see "Long-term chat memory"). Set from `var.enable_chat_memory ? chat_memory_id : ""` — empty disables the feature end to end: the runtime builds no memory client (no recall, no event writes) and the Control API's `/memory*` routes return 404. The extraction/consolidation prompts + model live on the DURABLE stack's strategy resource (`var.chat_memory_model`), not in env |
 | `OKF_CHAT_GUARDRAILS_GATE_ENABLED` | (chat runtime, env-read — not Terraform-plumbed) default `true` → `read_page` on any page of a dataset is DENIED at the tool boundary until that dataset's `references/usage_guardrails` has been read in the thread (`chat.guardrails_gate.GuardrailsGateMiddleware`). Per-dataset marks live in CHECKPOINTED agent state (`guardrails_read` channel, dict-merge reducer), so resumes remember; the guardrails read itself always passes and marks on any completed attempt (a guardrails-less legacy bundle can't lock out). Browse/search tools are never gated. `"false"`/`"0"`/`"no"`/`"off"` disables |
 | `OKF_CHAT_POLICY_CHECK_ENABLED` | (chat runtime) `"true"` → the mid-turn policy checks may be armed per run via `features: ["sql", "policy:*"]` (default `false`). Unset → no checker is ever constructed, whatever the client sends — the master gate above the per-run opt-in, set from `var.enable_policy_checks` |
 | `OKF_CHAT_POLICY_CHECK_MODEL` | (chat runtime) the policy checks' model id, serving BOTH the curated-question rewrite (no reasoning pass — extraction) and the JUDGE fleets. Default `global.anthropic.claude-sonnet-5` — judges run classifier-style on every family (thinking off + temperature 0 on Anthropic, reasoning `"none"` on openai.* ids like `openai.gpt-5.6-terra`, forced `report_violations` either way); from `var.chat_policy_check_model`, which also drives the chat role's Mantle grants, so an openai.* value needs no extra wiring. Code-level companions (env-read, not Terraform-plumbed): `OKF_CHAT_POLICY_SHARD_SIZE` (default `10` — policies per mini-judge), `OKF_CHAT_POLICY_QUERY_TIMEOUT_S` (default `60` — residual wait after the query returns) and `OKF_CHAT_POLICY_QUERY_MAX_PER_TURN` (default `3` — judged analytical queries per turn). Deploy-time only — deliberately NOT validated against `OKF_CHAT_MODEL_CATALOG`, which is the trust boundary for CLIENT-supplied models |

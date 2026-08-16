@@ -23,6 +23,7 @@ convenience (sidebar) plus advisory context (policy checks).
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -207,3 +208,148 @@ def write_policy_state(
         )
     except Exception:  # noqa: BLE001 - advisory context, never fatal
         log.warning("policy state write failed (non-fatal)", exc_info=True)
+
+
+# --------------------------------------------------------------------------- #
+# Long-term memory: the ask_human pause blob
+# --------------------------------------------------------------------------- #
+
+#: Size cap on the serialized blob — the turn observation is a handful of
+#: dataset ids + governed-call summaries and the Q&A pairs are excerpt-capped
+#: upstream, so anything near this is malformed; drop rather than bloat the row.
+MEMORY_PENDING_MAX = 32000
+
+
+def write_memory_pending(
+    ddb,
+    *,
+    threads_table: str,
+    user_sub: str,
+    thread_id: str,
+    obs: dict[str, Any] | None,
+    qa: list[dict[str, str]] | None,
+) -> None:
+    """Persist the turn's memory context across an ask_human pause.
+
+    A paused turn's invocation dies with its generator, and the RESUME is a
+    separate invocation (possibly on a different container) — without this
+    blob, governed-tool observations made before the pause and every
+    clarification round except the last would vanish from the turn's memory
+    event. Written at EVERY pause (each pause overwrites the previous blob,
+    so a stale blob from an abandoned pause can never leak into a later
+    turn's resume — the read only ever follows the most recent pause).
+    Best-effort like every memory touchpoint.
+    """
+    try:
+        blob = json.dumps({"obs": obs or {}, "qa": qa or []})
+        if len(blob) > MEMORY_PENDING_MAX:
+            log.warning("memory pending blob oversized (dropped)")
+            return
+        ddb.update_item(
+            TableName=threads_table,
+            Key={
+                "pk": {"S": ct.thread_pk(user_sub)},
+                "sk": {"S": ct.thread_sk(thread_id)},
+            },
+            UpdateExpression="SET memory_pending = :mp",
+            ExpressionAttributeValues={":mp": {"S": blob}},
+        )
+    except Exception:  # noqa: BLE001 - advisory context, never fatal
+        log.warning("memory pending write failed (non-fatal)", exc_info=True)
+
+
+#: Cap on the per-thread observed-datasets ledger (``memory_datasets``) — a
+#: thread that has genuinely touched more than this many datasets keeps the
+#: most recent; the ledger is a citation-validation set, not an audit log.
+MEMORY_DATASETS_MAX = 32
+
+
+def read_memory_datasets(
+    ddb, *, threads_table: str, user_sub: str, thread_id: str
+) -> list[str]:
+    """The thread's cumulative observed-dataset ledger (``memory_datasets``).
+
+    Every dataset the harness has OBSERVED a tool touch in this thread, across
+    turns. Exists so a no-tool follow-up's answer citation can still be
+    corroborated (chat.memory composes the turn annotation citation-first,
+    but only citations the harness can back). Never raises.
+    """
+    try:
+        item = (
+            ddb.get_item(
+                TableName=threads_table,
+                Key={
+                    "pk": {"S": ct.thread_pk(user_sub)},
+                    "sk": {"S": ct.thread_sk(thread_id)},
+                },
+            ).get("Item")
+            or {}
+        )
+        raw = (item.get("memory_datasets") or {}).get("S") or ""
+        if not raw:
+            return []
+        data = json.loads(raw)
+        return [str(d) for d in data if d] if isinstance(data, list) else []
+    except Exception:  # noqa: BLE001 - unreadable degrades to empty
+        log.warning("memory datasets read failed (non-fatal)", exc_info=True)
+        return []
+
+
+def merge_memory_datasets(
+    ddb,
+    *,
+    threads_table: str,
+    user_sub: str,
+    thread_id: str,
+    datasets: list[str],
+) -> None:
+    """Union the turn's observed datasets into the thread ledger.
+
+    Read-modify-write, advisory: a lost race costs at most one turn's
+    additions to the validation set, and the next turn re-merges. Best-effort
+    like every memory touchpoint.
+    """
+    try:
+        current = read_memory_datasets(
+            ddb, threads_table=threads_table, user_sub=user_sub, thread_id=thread_id
+        )
+        merged = current + [d for d in datasets if d and d not in current]
+        if merged == current:
+            return
+        merged = merged[-MEMORY_DATASETS_MAX:]
+        ddb.update_item(
+            TableName=threads_table,
+            Key={
+                "pk": {"S": ct.thread_pk(user_sub)},
+                "sk": {"S": ct.thread_sk(thread_id)},
+            },
+            UpdateExpression="SET memory_datasets = :md",
+            ExpressionAttributeValues={":md": {"S": json.dumps(merged)}},
+        )
+    except Exception:  # noqa: BLE001 - advisory context, never fatal
+        log.warning("memory datasets write failed (non-fatal)", exc_info=True)
+
+
+def read_memory_pending(
+    ddb, *, threads_table: str, user_sub: str, thread_id: str
+) -> dict[str, Any] | None:
+    """The pause blob for a resume: ``{obs, qa}``, or ``None``. Never raises."""
+    try:
+        item = (
+            ddb.get_item(
+                TableName=threads_table,
+                Key={
+                    "pk": {"S": ct.thread_pk(user_sub)},
+                    "sk": {"S": ct.thread_sk(thread_id)},
+                },
+            ).get("Item")
+            or {}
+        )
+        raw = (item.get("memory_pending") or {}).get("S") or ""
+        if not raw:
+            return None
+        blob = json.loads(raw)
+        return blob if isinstance(blob, dict) else None
+    except Exception:  # noqa: BLE001 - unreadable degrades to absent
+        log.warning("memory pending read failed (non-fatal)", exc_info=True)
+        return None

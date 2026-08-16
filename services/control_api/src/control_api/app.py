@@ -35,7 +35,9 @@ CORS_HEADERS = {
     "content-type": "application/json",
     "access-control-allow-origin": "*",
     "access-control-allow-headers": "authorization,content-type",
-    "access-control-allow-methods": "GET,PUT,POST,DELETE,OPTIONS",
+    # Must stay in sync with the API GW cors_configuration.allow_methods in
+    # infra/compute/control_api.tf (the preflight responder).
+    "access-control-allow-methods": "GET,PUT,POST,PATCH,DELETE,OPTIONS",
 }
 
 
@@ -84,6 +86,8 @@ class Config:
         annotations_table: str = "okf-annotations",
         chat_threads_table: str = "okf-chat",
         chat_checkpoint_table: str = "okf-chat-checkpoints",
+        agentcore_memory=None,
+        chat_memory_id: str = "",
         events=None,
         athena=None,
         computations_enabled: bool = False,
@@ -104,6 +108,12 @@ class Config:
         # reads/renames/deletes for the UI.
         self.chat_threads_table = chat_threads_table
         self.chat_checkpoint_table = chat_checkpoint_table
+        # Long-term chat memory (the Memory page): a bedrock-agentcore
+        # data-plane client for the record CRUD + the AgentCore Memory resource
+        # id. Empty id = feature off (the /memory* routes 404); the settings
+        # row rides the chat threads table via the plain ddb client.
+        self.agentcore_memory = agentcore_memory
+        self.chat_memory_id = chat_memory_id
         self.s3 = s3
         self.ddb = ddb
         self.glue = glue
@@ -199,6 +209,15 @@ class Config:
             chat_checkpoint_table=os.environ.get(
                 "OKF_CHAT_CHECKPOINT_TABLE", "okf-chat-checkpoints"
             ),
+            # Client built only when the memory feature is deployed (mirrors
+            # events/athena): an unset OKF_CHAT_MEMORY_ID means the durable
+            # stack created no Memory resource and the routes must 404.
+            agentcore_memory=(
+                boto3.client("bedrock-agentcore", region_name=region)
+                if os.environ.get("OKF_CHAT_MEMORY_ID")
+                else None
+            ),
+            chat_memory_id=os.environ.get("OKF_CHAT_MEMORY_ID", ""),
             # OKF_EVENT_BUS_NAME doubles as the accelerator's deploy switch:
             # unset/empty means no rebuild authority is listening, so repromote
             # publishes nothing and never flips a row to stale.
@@ -1017,6 +1036,61 @@ def _r_delete_chat_thread(cfg, params, body, query, caller):
     )
 
 
+# -- Long-term chat memory (the Memory page) ---------------------------------
+#
+# SECURITY: every route derives the AgentCore Memory namespace from the
+# CALLER's verified sub (wiki/<sub>) — never from a request parameter — and the
+# record routes verify ownership (the record's namespaces) before touching it.
+
+
+def _r_get_memory(cfg, params, body, query, caller):
+    return 200, handlers.list_memory(
+        cfg.agentcore_memory,
+        cfg.ddb,
+        memory_id=cfg.chat_memory_id,
+        threads_table=cfg.chat_threads_table,
+        user_sub=caller.sub,
+    )
+
+
+def _r_get_memory_settings(cfg, params, body, query, caller):
+    return 200, handlers.get_memory_settings(
+        cfg.ddb,
+        memory_id=cfg.chat_memory_id,
+        threads_table=cfg.chat_threads_table,
+        user_sub=caller.sub,
+    )
+
+
+def _r_put_memory_settings(cfg, params, body, query, caller):
+    return 200, handlers.set_memory_settings(
+        cfg.ddb,
+        memory_id=cfg.chat_memory_id,
+        threads_table=cfg.chat_threads_table,
+        user_sub=caller.sub,
+        enabled=(body or {}).get("enabled"),
+    )
+
+
+def _r_update_memory_record(cfg, params, body, query, caller):
+    return 200, handlers.update_memory_record(
+        cfg.agentcore_memory,
+        memory_id=cfg.chat_memory_id,
+        user_sub=caller.sub,
+        record_id=params["record_id"],
+        text=(body or {}).get("text"),
+    )
+
+
+def _r_delete_memory_record(cfg, params, body, query, caller):
+    return 200, handlers.delete_memory_record(
+        cfg.agentcore_memory,
+        memory_id=cfg.chat_memory_id,
+        user_sub=caller.sub,
+        record_id=params["record_id"],
+    )
+
+
 def _r_cancel_harvest(cfg, params, body, query, caller):
     if not cfg.harvest_runtime_arn:
         raise ApiError(500, "OKF_HARVEST_RUNTIME_ARN not configured")
@@ -1315,11 +1389,19 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("DELETE", "/benchmark/{domain}/{dataset}/qbanks/{qbank_id}", _r_delete_qbank),
     # Chat conversations (per-user sidebar list). thread_id is a single opaque
     # segment (a UUID the SPA generates), so it's a clean path param. Rename is
-    # PUT (not PATCH) because the API Gateway CORS allow_methods + the CORS_HEADERS
-    # above enumerate GET/PUT/POST/DELETE/OPTIONS — PATCH would fail preflight.
+    # PUT (not PATCH) — historical: PATCH wasn't in the CORS allow_methods
+    # until the memory routes added it, and there's no reason to churn the API.
     ("GET", "/chat/threads", _r_list_chat_threads),
     ("PUT", "/chat/threads/{thread_id}", _r_rename_chat_thread),
     ("DELETE", "/chat/threads/{thread_id}", _r_delete_chat_thread),
+    # Long-term chat memory (the Memory page). All routes 404 when the deploy
+    # gate (OKF_CHAT_MEMORY_ID) is off. Fixed-suffix /memory/settings precedes
+    # the {record_id} routes so "settings" is never captured as a record id.
+    ("GET", "/memory/settings", _r_get_memory_settings),
+    ("PUT", "/memory/settings", _r_put_memory_settings),
+    ("GET", "/memory", _r_get_memory),
+    ("PATCH", "/memory/{record_id}", _r_update_memory_record),
+    ("DELETE", "/memory/{record_id}", _r_delete_memory_record),
     ("GET", "/bundle/{domain}/{dataset}/graph", _r_bundle_graph),
     ("GET", "/bundle/{domain}/{dataset}/file", _r_bundle_file),
     ("GET", "/bundle/{domain}/{dataset}/computations", _r_list_computations),

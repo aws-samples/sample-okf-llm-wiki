@@ -563,3 +563,16 @@ variable "tags" {
   type    = map(string)
   default = { project = "okf-on-aws", managed_by = "terraform" }
 }
+
+variable "enable_chat_memory" {
+  type        = bool
+  default     = true
+  description = <<-EOT
+    Long-term chat memory (AgentCore Memory, durable stack agent_memory.tf):
+    per-user stated preferences + question→computation bindings, recalled at
+    turn start and written as events at turn end. Deploy-time MASTER gate —
+    each user additionally has their own on/off switch (the Memory page). Off:
+    the runtime builds no memory client and the control API returns 404 for
+    the memory routes.
+  EOT
+}

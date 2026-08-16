@@ -135,6 +135,12 @@ class ChatConfig:
     # path: chart blocks are refused; markdown/table/kpi reports still work).
     report_harness_path: str = ""
     report_max_bytes: int = 8_000_000
+
+    # Long-term memory (AgentCore Memory — chat.memory). Empty id = feature
+    # off: no client is built, no recall, no event writes. The id is the
+    # deploy-time master gate; each user has their own switch on top (a
+    # settings row on the threads table, written by the Control API).
+    memory_id: str = ""
     default_effort: str = DEFAULT_EFFORT
     default_max_tokens: int = DEFAULT_MAX_TOKENS
 
@@ -208,6 +214,7 @@ class ChatConfig:
             annotations_table=env.get("OKF_ANNOTATIONS_TABLE", "okf-annotations"),
             report_harness_path=env.get("OKF_CHAT_REPORT_HARNESS_PATH", ""),
             report_max_bytes=int(env.get("OKF_CHAT_REPORT_MAX_BYTES", "") or 8_000_000),
+            memory_id=env.get("OKF_CHAT_MEMORY_ID", ""),
             checkpoint_table=env.get("OKF_CHAT_CHECKPOINT_TABLE", "okf-chat-checkpoints"),
             threads_table=env.get("OKF_CHAT_THREADS_TABLE", "okf-chat"),
             catalog=parse_catalog(env.get("OKF_CHAT_MODEL_CATALOG")),

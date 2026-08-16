@@ -284,6 +284,7 @@ def _clarification_fold(
     try:
         from langchain_core.messages import HumanMessage
 
+        from chat.memory import MEMORY_MARKER
         from chat.policy_check import POLICY_MARKER
         from chat.steering import STEERING_MARKER
 
@@ -292,7 +293,14 @@ def _clarification_fold(
             if not isinstance(msg, HumanMessage):
                 continue
             kwargs = getattr(msg, "additional_kwargs", None) or {}
-            if kwargs.get(STEERING_MARKER) or kwargs.get(POLICY_MARKER):
+            # Memory recall context is injected AFTER the user message in the
+            # same turn input — this reversed scan for the turn's RAW question
+            # must skip it like every other harness-injected message.
+            if (
+                kwargs.get(STEERING_MARKER)
+                or kwargs.get(POLICY_MARKER)
+                or kwargs.get(MEMORY_MARKER)
+            ):
                 continue
             content = msg.content
             text = content if isinstance(content, str) else ""
@@ -324,6 +332,134 @@ def _clarification_fold(
     return raw_q, qa
 
 
+# --- long-term memory turn prep (sync, runs via asyncio.to_thread) -----------
+
+
+def _memory_turn_start(
+    memory: Any,
+    graph: Any,
+    cfg: dict,
+    chat_config: Any,
+    user_sub: str,
+    thread_id: str,
+    prompt: str,
+    scope: dict[str, str] | None,
+) -> tuple[bool, list[Any]]:
+    """Fresh-turn memory prep. SYNC and network-bound (DDB settings row,
+    checkpoint read, 1-3 retrieve calls, lazy-TTL deletes) — the caller MUST
+    run it via ``asyncio.to_thread`` so a memory-API brownout can only stall
+    this turn's worker thread, never the shared event loop.
+
+    Returns ``(user_enabled, messages)`` to extend the turn's graph input:
+    ``RemoveMessage`` entries stripping the PREVIOUS turn's per-turn recall
+    injection (replace-per-turn is the retraction contract — a record deleted
+    on the Memory page stops steering existing threads, and near-duplicate
+    reminder blocks don't accumulate in checkpointed history), then the fresh
+    injections. The strip runs even for a memory-DISABLED user: switching
+    memory off must also silence already-injected context. Personal context
+    (marker value ``"personal"``) is the exception — injected once on the
+    thread's first turn, carried by history, never stripped.
+    """
+    from langchain_core.messages import RemoveMessage
+
+    from chat.memory import MEMORY_MARKER
+
+    messages: list[Any] = []
+    state_msgs: list[Any] = []
+    try:
+        gstate = graph.get_state(cfg)
+        state_msgs = (gstate.values or {}).get("messages", []) if gstate else []
+    except Exception:  # noqa: BLE001 - an unreadable checkpoint skips the strip
+        state_msgs = []
+    for msg in state_msgs:
+        kwargs = getattr(msg, "additional_kwargs", None) or {}
+        if kwargs.get(MEMORY_MARKER) == "recall" and getattr(msg, "id", None):
+            messages.append(RemoveMessage(id=msg.id))
+
+    if not memory.user_enabled(user_sub):
+        return False, messages
+
+    # The retrieval query: the raw prompt plus the PREVIOUS turn's curated
+    # question when one exists, so elliptical follow-ups ("and last month?")
+    # retrieve with real context.
+    prev_curated = ""
+    ddb = getattr(memory, "_ddb", None)
+    if ddb is not None:
+        from chat.threads import read_policy_state
+
+        pstate = read_policy_state(
+            ddb,
+            threads_table=chat_config.threads_table,
+            user_sub=user_sub,
+            thread_id=thread_id,
+        )
+        prev_curated = (pstate or {}).get("curated_question") or ""
+    query = prompt + (f"\n{prev_curated}" if prev_curated else "")
+
+    # Personal context (name/role/team) is injected ONCE per thread: only on
+    # the FIRST turn — detected by the absence of checkpointed messages —
+    # because the injected message then lives in the checkpointed history for
+    # the rest of the thread. Later turns carry per-turn recall only
+    # (recall() excludes metadata-typed personal records).
+    if not state_msgs:
+        personal = memory.recall_personal(user_sub=user_sub)
+        if personal:
+            messages.append(memory.injection_message(personal, marker="personal"))
+    recalled = memory.recall(user_sub=user_sub, query=query, dataset_scope=scope)
+    if recalled:
+        messages.append(memory.injection_message(recalled, marker="recall"))
+    return True, messages
+
+
+def _memory_resume_start(
+    memory: Any, chat_config: Any, user_sub: str, thread_id: str
+) -> tuple[bool, dict[str, Any] | None]:
+    """Resume-path memory prep (SYNC — run via ``asyncio.to_thread``).
+
+    Returns ``(user_enabled, pause_blob)``; the blob restores the pre-pause
+    turn observation and any EARLIER clarification rounds
+    (``chat.threads.read_memory_pending``) so a multi-round ask_human turn's
+    memory event carries the whole exchange, not just the last round.
+    """
+    if not memory.user_enabled(user_sub):
+        return False, None
+    ddb = getattr(memory, "_ddb", None)
+    if ddb is None:
+        return True, None
+    from chat.threads import read_memory_pending
+
+    return True, read_memory_pending(
+        ddb,
+        threads_table=chat_config.threads_table,
+        user_sub=user_sub,
+        thread_id=thread_id,
+    )
+
+
+def _memory_persist_pending(
+    memory: Any,
+    chat_config: Any,
+    user_sub: str,
+    thread_id: str,
+    obs: Any,
+    qa: list[dict[str, str]],
+) -> None:
+    """Write the pause blob at an ask_human pause (SYNC — via ``to_thread``)."""
+    ddb = getattr(memory, "_ddb", None)
+    if ddb is None:
+        return
+    from chat.threads import write_memory_pending
+
+    write_memory_pending(
+        ddb,
+        threads_table=chat_config.threads_table,
+        user_sub=user_sub,
+        thread_id=thread_id,
+        obs=obs.snapshot() if obs is not None else {},
+        qa=qa,
+    )
+
+
 # --- stream chunk translation (the crux) -------------------------------------
 
 
@@ -340,8 +476,22 @@ _SCOPE_ARG_KEYS = ("data_domain", "dataset")
 # which chat.tools drops + injects the scope. The domain-discovery tools
 # (list_domains / list_declared_domains / search_domains) do NOT take a location,
 # so scope must NOT be stamped onto them (their labels would then read wrongly).
+# The GOVERNED tools (run_computation / query_metric) are included for more than
+# labels: memory's TurnObservation reads the folded args off the streamed chunk,
+# and without the fold a pinned conversation's binding would be stored with NO
+# dataset (the extraction prompt copies it from the annotation verbatim and
+# never invents one) — leaking that binding into every other dataset's chats.
 _LOCATION_TAKING_TOOLS = frozenset(
-    {"list_directory", "read_page", "get_backlinks", "glob", "grep", "semantic_search"}
+    {
+        "list_directory",
+        "read_page",
+        "get_backlinks",
+        "glob",
+        "grep",
+        "semantic_search",
+        "run_computation",
+        "query_metric",
+    }
 )
 
 
@@ -637,6 +787,25 @@ def build_deps(config: Any = None):
     # var.enable_redshift AND var.enable_chat_sql are set).
     if chat_config.sql_enabled and chat_config.redshift_enabled:
         clients["redshift_data"] = boto3.client("redshift-data", region_name=region)
+    # Long-term memory (chat.memory) — only when deploy-enabled. Short read
+    # timeout + no retries on the data-plane client: recall runs on the turn's
+    # critical path and must degrade to "no memories" fast, never stall a turn.
+    if getattr(chat_config, "memory_id", ""):
+        from botocore.config import Config as _BotoConfig
+
+        clients["agentcore_memory"] = boto3.client(
+            "bedrock-agentcore",
+            region_name=region,
+            # connect_timeout too: botocore's default is 60s, and a browning-
+            # out endpoint that HANGS the TCP connect would otherwise stall
+            # recall far longer than the read timeout suggests.
+            config=_BotoConfig(
+                read_timeout=5, connect_timeout=3, retries={"max_attempts": 1}
+            ),
+        )
+        # Low-level DynamoDB client for the per-user memory switch (settings
+        # row on the threads table — same client style threads.py expects).
+        clients["dynamodb"] = boto3.client("dynamodb", region_name=region)
     return chat_config, consumption_config, clients
 
 
@@ -724,6 +893,14 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     athena_client = clients.pop("athena", None)
     redshift_data_client = clients.pop("redshift_data", None)
     annotations_table = clients.pop("annotations", None)
+    # The long-term-memory clients ride the same dict so build_app's
+    # make_chat_memory can grab them, but build_consumption_tools doesn't
+    # know these kwargs — POP them before the **clients splat below (missing
+    # this crashed the runtime at boot: "unexpected keyword argument
+    # 'agentcore_memory'", found live — the offline tests inject their own
+    # clients dicts and never carried the keys).
+    clients.pop("agentcore_memory", None)
+    clients.pop("dynamodb", None)
     # The raw S3 client doubles as the report-artifact writer (create_report
     # puts the composed HTML/PDF under the reports/ prefix) — grabbed, not
     # popped: build_consumption_tools needs it too.
@@ -1094,6 +1271,7 @@ def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
         # usage gauge works identically on history.
         return {"end": True, "token_stats": turn_stats} if turn_stats else {"end": True}
 
+    from chat.memory import MEMORY_MARKER
     from chat.policy_check import POLICY_MARKER, policy_display
     from chat.steering import STEERING_MARKER, strip_reminder_tags
 
@@ -1106,6 +1284,10 @@ def _messages_to_turns(messages: list[Any]) -> list[dict[str, Any]]:
             # the same typed event the live stream emitted ("steer"/"policy"),
             # so the thinking timeline survives a history reload.
             marker_kwargs = getattr(msg, "additional_kwargs", None) or {}
+            # Long-term-memory recall context (chat.memory): model-facing
+            # background only — no typed event, nothing to re-render.
+            if marker_kwargs.get(MEMORY_MARKER):
+                continue
             if marker_kwargs.get(POLICY_MARKER):
                 if current is not None:
                     current["aiMessage"].append(
@@ -1288,6 +1470,7 @@ async def _produce_run_chunks(
     prompt: str,
     on_graph: Callable[[Any], None],
     resume_answers: Any = None,
+    memory: Any = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Drive one agent turn and YIELD raw typed chunk dicts (no SSE framing).
 
@@ -1316,12 +1499,28 @@ async def _produce_run_chunks(
     answer_parts: list[str] = []
     ask_pending = False
     cancelled = False
+    errored = False
     checker = None
+    # Long-term memory: per-user gate resolved at turn start; the observation
+    # collector watches the chunk stream for datasets touched + governed-tool
+    # resolutions (the [[okf-harness]] annotation seeded into the turn event).
+    memory_on = False
+    memory_obs = None
+    memory_raw_q = ""
+    memory_qa: list[dict[str, str]] = []
+    if memory is not None:
+        from chat.memory import TurnObservation
+
+        memory_obs = TurnObservation()
     cfg = {
         "configurable": {"thread_id": internal_id},
         "recursion_limit": RECURSION_LIMIT,
     }
     graph = None
+    # Assigned in the try below; pre-bound because the finally's memory write
+    # references it (the write gate only passes on paths where it WAS set,
+    # but a NameError in a finally block would mask the real outcome).
+    scope: dict[str, str] | None = None
     try:
         model, effort = chat_config.resolve_model_effort(
             input_data.get("model_id") or input_data.get("model"),
@@ -1398,9 +1597,35 @@ async def _produce_run_chunks(
             # evidence lives in the behavioural steps track). The resume
             # request carries no prompt, so the turn's raw question and the
             # asked prompts come from the checkpoint's pending state.
+            raw_q, qa = _clarification_fold(graph, cfg, resume_answers)
             if checker is not None:
-                raw_q, qa = _clarification_fold(graph, cfg, resume_answers)
                 checker.fold_clarifications(raw_q, qa)
+            # A resumed clarification turn WRITES memory (no recall — the
+            # turn's context already carries any): the Q&A exchange is the
+            # richest preference/intent evidence a turn produces, and the
+            # completed continuation is where it becomes final. The pause
+            # blob restores what the paused invocation saw: the pre-pause
+            # turn observation and any EARLIER clarification rounds (this
+            # fold only carries THIS resume's answers).
+            if memory is not None:
+                try:
+                    memory_on, pending = await asyncio.to_thread(
+                        _memory_resume_start,
+                        memory,
+                        chat_config,
+                        user_sub,
+                        client_thread_id,
+                    )
+                except Exception:  # noqa: BLE001 - memory must never fail a turn
+                    memory_on, pending = False, None
+                if memory_on:
+                    memory_raw_q = raw_q
+                    prior_qa = (pending or {}).get("qa") or []
+                    memory_qa = [
+                        p for p in prior_qa if isinstance(p, dict)
+                    ] + qa
+                    if memory_obs is not None:
+                        memory_obs.restore((pending or {}).get("obs"))
             graph_input: Any = Command(resume=resume_map)
         else:
             graph_input = {
@@ -1408,6 +1633,32 @@ async def _produce_run_chunks(
                     {"role": "user", "content": scoped_prompt(prompt, scope)}
                 ]
             }
+            # Long-term memory turn prep (fresh turns only — a resume
+            # continues a turn whose context already carries any recall):
+            # strip the previous turn's recall injection, then recall + inject
+            # fresh (_memory_turn_start). Sync + network-bound, so it runs in
+            # a worker thread — a memory-API brownout must never stall the
+            # shared event loop (every concurrent stream rides it).
+            if memory is not None:
+                try:
+                    memory_on, extra_msgs = await asyncio.to_thread(
+                        _memory_turn_start,
+                        memory,
+                        graph,
+                        cfg,
+                        chat_config,
+                        user_sub,
+                        client_thread_id,
+                        prompt,
+                        scope,
+                    )
+                    graph_input["messages"].extend(extra_msgs)
+                except Exception:  # noqa: BLE001 - memory must never fail a turn
+                    import logging as _logging
+
+                    _logging.getLogger("chat.server").warning(
+                        "memory recall wiring failed", exc_info=True
+                    )
 
         # Kick the policy cold start NOW, in parallel — most importantly the
         # curated-question rewrite, which runs on EVERY gated run (armed or
@@ -1447,6 +1698,8 @@ async def _produce_run_chunks(
                     # Accumulated for the policy checks' rolling context —
                     # the NEXT turn's rewrite needs THIS turn's final answer.
                     answer_parts.append(chunk.get("content") or "")
+                if memory_obs is not None:
+                    memory_obs.observe(chunk)
                 yield chunk
 
         # If the stream ended because the graph PAUSED on ask_human interrupt(s),
@@ -1458,6 +1711,24 @@ async def _produce_run_chunks(
             ask = _ask_human_chunk_from_state(graph, cfg)
             if ask is not None:
                 ask_pending = True
+                # Persist the turn's memory context across the pause (the
+                # resume is a separate invocation, possibly on a different
+                # container): the observation so far + the clarification
+                # rounds already folded. BEFORE the yield — a consumer that
+                # drops the stream after the ask must not lose the blob.
+                if memory is not None and memory_on:
+                    try:
+                        await asyncio.to_thread(
+                            _memory_persist_pending,
+                            memory,
+                            chat_config,
+                            user_sub,
+                            client_thread_id,
+                            memory_obs,
+                            memory_qa,
+                        )
+                    except Exception:  # noqa: BLE001 - advisory, never fatal
+                        pass
                 yield ask
     except asyncio.CancelledError:
         # Explicit stop — let the live-stream runner's on_cancel do the checkpoint
@@ -1466,6 +1737,7 @@ async def _produce_run_chunks(
         cancelled = True
         raise
     except Exception as exc:  # noqa: BLE001 - surface ANY failure as an error chunk
+        errored = True
         yield _error_chunk("agent_error", str(exc))
     finally:
         # Checker teardown runs on EVERY exit path — normal end, the early
@@ -1485,6 +1757,40 @@ async def _produce_run_chunks(
             # the live-stream registry (via the graph) keeps 8 idle threads
             # + its clients alive per conversation for the container's life.
             checker.close()
+        # Long-term memory: write the finished turn as an extraction event —
+        # a paused ask_human turn isn't final, and a cancelled or ERRORED one
+        # never completed (a partial pre-crash answer is not an exchange the
+        # user accepted — the extractor must not be fed it). Fire-and-forget
+        # so the stream end never waits on the memory API. memory_on is set
+        # where recall/resume prep ran, so a turn never double-writes.
+        if (
+            memory is not None
+            and memory_on
+            and not cancelled
+            and not errored
+            and not ask_pending
+            and answer_parts
+        ):
+            try:
+                memory.write_turn_async(
+                    user_sub=user_sub,
+                    session_id=internal_id,
+                    thread_id=client_thread_id,
+                    user_text=prompt or memory_raw_q,
+                    answer_text="".join(answer_parts),
+                    # The raw observation, not a rendered annotation: the
+                    # write thread composes it citation-first (validated
+                    # against this snapshot + the thread ledger + the pin).
+                    observation=memory_obs.snapshot() if memory_obs else None,
+                    pin=(
+                        f"{scope['data_domain']}/{scope['dataset']}"
+                        if scope
+                        else ""
+                    ),
+                    clarifications=memory_qa,
+                )
+            except Exception:  # noqa: BLE001 - advisory, never fatal
+                pass
 
     # Terminal end marker (always), with token stats + the checkpoint id.
     end_marker: dict[str, Any] = {"end": True}
@@ -1518,6 +1824,7 @@ async def stream_run(
     build_agent: Callable,
     checkpointer: Any,
     index_writer: Callable | None = None,
+    memory: Any = None,
 ) -> AsyncGenerator[str, None]:
     """SSE frames for a ``send`` turn — as a DETACHED run the client subscribes to.
 
@@ -1567,6 +1874,7 @@ async def stream_run(
         client_thread_id=client_thread_id,
         prompt=prompt,
         on_graph=lambda g: graph_holder.__setitem__("graph", g),
+        memory=memory,
     )
     live_streams.start(internal_id, source, user_message=prompt, on_cancel=_on_cancel)
 
@@ -1583,6 +1891,7 @@ async def answer_run(
     build_agent: Callable,
     checkpointer: Any,
     index_writer: Callable | None = None,
+    memory: Any = None,
 ) -> AsyncGenerator[str, None]:
     """SSE frames for an ``answer_human`` turn — resume a paused ask_human interrupt.
 
@@ -1628,6 +1937,7 @@ async def answer_run(
         prompt="",
         on_graph=lambda g: graph_holder.__setitem__("graph", g),
         resume_answers=answers,
+        memory=memory,
     )
     # user_message stays empty: this turn's question bubble already rendered on the
     # original send; resume only continues the assistant's answer.
@@ -1683,11 +1993,14 @@ def build_app(
     chat_config: Any = None,
     build_agent: Callable | None = None,
     index_writer: Callable | None = None,
+    memory: Any = None,
 ):
     """Build the FastAPI app wired to live deps. Requires fastapi + the stack.
 
-    ``chat_config`` / ``build_agent`` / ``index_writer`` are injectable for
-    tests; in the container they default to env-resolved live clients.
+    ``chat_config`` / ``build_agent`` / ``index_writer`` / ``memory`` are
+    injectable for tests; in the container they default to env-resolved live
+    clients (``memory`` stays None when the deploy gate is off — injected
+    build_agent without a config means no live clients, so no memory either).
     """
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
@@ -1695,6 +2008,13 @@ def build_app(
 
     if build_agent is None or chat_config is None:
         chat_config, consumption_config, clients = build_deps(chat_config)
+        # Memory grabs its clients BEFORE the factory, which POPS the
+        # memory-only keys out of the dict (they must not reach the
+        # build_consumption_tools splat).
+        if memory is None:
+            from chat.memory import make_chat_memory
+
+            memory = make_chat_memory(chat_config, clients)
         build_agent = make_agent_factory(chat_config, consumption_config, clients)
     if index_writer is None:
         index_writer = make_index_writer(chat_config)
@@ -1811,6 +2131,7 @@ def build_app(
                 build_agent=build_agent,
                 checkpointer=checkpointer,
                 index_writer=index_writer,
+                memory=memory,
             )
             return StreamingResponse(gen, media_type="text/event-stream", headers=sse_headers)
 
@@ -1840,6 +2161,7 @@ def build_app(
             build_agent=build_agent,
             checkpointer=checkpointer,
             index_writer=index_writer,
+            memory=memory,
         )
         return StreamingResponse(gen, media_type="text/event-stream", headers=sse_headers)
 

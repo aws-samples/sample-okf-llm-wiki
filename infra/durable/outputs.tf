@@ -125,3 +125,13 @@ output "chat_checkpoint_bucket" {
 output "chat_checkpoint_bucket_arn" {
   value = aws_s3_bucket.chat_checkpoints.arn
 }
+
+# AgentCore Memory for long-term chat memory (agent_memory.tf, awscc). The id
+# feeds the chat runtime + control API env; the ARN scopes their IAM statements.
+output "chat_memory_id" {
+  value = awscc_bedrockagentcore_memory.chat.memory_id
+}
+
+output "chat_memory_arn" {
+  value = awscc_bedrockagentcore_memory.chat.memory_arn
+}

@@ -3,6 +3,7 @@ import { toast } from "sonner"
 import { useAuth } from "react-oidc-context"
 import {
   BoxesIcon,
+  BrainIcon,
   CheckIcon,
   ChevronsUpDownIcon,
   DatabaseIcon,
@@ -104,6 +105,7 @@ import { POLICY_CHECK_ENABLED } from "@/lib/chatFeatures"
 import BenchmarkReportView from "@/views/BenchmarkReportView.jsx"
 import BrowseView from "@/views/BrowseView.jsx"
 import GraphView from "@/views/GraphView.jsx"
+import MemoryView from "@/views/MemoryView.jsx"
 
 // The console sections, in sidebar order. `needsSelection` gates the
 // dataset-scoped views so the breadcrumb can hint when nothing is picked.
@@ -492,7 +494,7 @@ function CollapsedNavTrigger({
               <ChatNav
                 key={item.key}
                 item={item}
-                active={section === "chat"}
+                section={section}
                 onNavigate={(k) => onNavigate?.(k)}
                 ctrl={chatCtrl}
                 tooltip={null}
@@ -659,12 +661,18 @@ function TopbarHeader({
 }
 
 // The Chat nav entry + its sub-controls. The Chat button behaves like any nav
-// item; when chat is the ACTIVE section its controls (new chat, history) reveal
-// as sub-items beneath it — driven by the shared chat controller so they operate
-// the same conversation the chat page renders. The model is fixed (Opus 5);
-// effort lives in the composer, so no model/effort controls here.
-function ChatNav({ item, active, onNavigate, ctrl, tooltip = item.label }) {
+// item; when chat (or its Memory sub-page) is the ACTIVE section its controls
+// (new chat, history, memory) reveal as sub-items beneath it — driven by the
+// shared chat controller so they operate the same conversation the chat page
+// renders. The model is fixed (Opus 5); effort lives in the composer, so no
+// model/effort controls here.
+function ChatNav({ item, section, onNavigate, ctrl, tooltip = item.label }) {
   const { historyOpen, setHistoryOpen } = ctrl
+  const active = section === "chat"
+  // Memory is chat's sub-page: keep the sub-menu open (and its row highlighted)
+  // while it's the active section, so the sidebar still shows where you are
+  // even though chat itself is no longer the section.
+  const showSub = active || section === "memory"
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
@@ -676,11 +684,16 @@ function ChatNav({ item, active, onNavigate, ctrl, tooltip = item.label }) {
         <span>{item.label}</span>
       </SidebarMenuButton>
 
-      {active ? (
+      {showSub ? (
         <SidebarMenuSub>
           <SidebarMenuSubItem>
             <SidebarMenuSubButton
-              onClick={ctrl.startNewChat}
+              onClick={() => {
+                ctrl.startNewChat()
+                // From the Memory sub-page, "New chat" also returns to chat —
+                // matching the global shortcut's behavior.
+                if (!active) onNavigate("chat")
+              }}
               className="cursor-pointer"
               title={`New chat (${NEW_CHAT_SHORTCUT_LABEL})`}
             >
@@ -700,11 +713,30 @@ function ChatNav({ item, active, onNavigate, ctrl, tooltip = item.label }) {
           <SidebarMenuSubItem>
             <SidebarMenuSubButton
               isActive={historyOpen}
-              onClick={() => setHistoryOpen((v) => !v)}
+              onClick={() => {
+                // The history panel lives on the chat page — opening it from
+                // the Memory sub-page navigates back to chat first.
+                if (!active) {
+                  onNavigate("chat")
+                  setHistoryOpen(true)
+                } else {
+                  setHistoryOpen((v) => !v)
+                }
+              }}
               className="cursor-pointer"
             >
               <HistoryIcon />
               <span>History</span>
+            </SidebarMenuSubButton>
+          </SidebarMenuSubItem>
+          <SidebarMenuSubItem>
+            <SidebarMenuSubButton
+              isActive={section === "memory"}
+              onClick={() => onNavigate("memory")}
+              className="cursor-pointer"
+            >
+              <BrainIcon />
+              <span>Memory</span>
             </SidebarMenuSubButton>
           </SidebarMenuSubItem>
         </SidebarMenuSub>
@@ -760,7 +792,11 @@ function RecentDatasetsMenu({
 }
 
 // Sections that live in the URL; anything else falls back to "domains".
-const SECTION_KEYS = new Set(NAV.map((n) => n.key))
+// "memory" is chat's SUB-PAGE (agent long-term memory): it has a URL section
+// of its own but no top-level NAV row — its nav affordance is the Memory
+// sub-item under Chat (see ChatNav). Not in NAV, so activeNav falls back to
+// chat's needsSelection:false — no dataset strip, centered column.
+const SECTION_KEYS = new Set([...NAV.map((n) => n.key), "memory"])
 
 function Console({ auth, api }) {
   const [datasets, setDatasets] = useState([])
@@ -1033,7 +1069,7 @@ function Console({ auth, api }) {
                     <ChatNav
                       key={item.key}
                       item={item}
-                      active={section === "chat"}
+                      section={section}
                       onNavigate={navigate}
                       ctrl={chat}
                     />
@@ -1249,6 +1285,15 @@ function Console({ auth, api }) {
                 // status stay fixed however long the list grows.
                 <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col p-1">
                   <ReasoningView api={api} selection={selection} />
+                </div>
+              ) : section === "memory" ? (
+                // Chat's Memory sub-page (agent long-term memory; not
+                // dataset-scoped — reached via the sidebar sub-item). Same
+                // full-height-column pattern: the card header, master switch,
+                // and filters stay fixed; only the record list scrolls (and
+                // windows itself — see MemoryView's PAGE_SIZE).
+                <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col p-1">
+                  <MemoryView api={api} />
                 </div>
               ) : (
                 // p-1 gives the cards' ring/shadow room so the vertical scroll

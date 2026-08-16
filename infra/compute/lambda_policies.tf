@@ -133,6 +133,24 @@ data "aws_iam_policy_document" "control_api" {
       local.d.chat_checkpoints_table_arn,
     ]
   }
+  # Long-term memory management (the Memory page): list a user's records,
+  # edit one in place, delete one. The runtime-side verbs (CreateEvent /
+  # RetrieveMemoryRecords) stay on the chat runtime role — this surface never
+  # writes events or performs semantic recall. Gated on the same flag as the
+  # runtime's grants and the OKF_CHAT_MEMORY_ID wiring.
+  dynamic "statement" {
+    for_each = var.enable_chat_memory ? [1] : []
+    content {
+      sid = "ChatMemoryManage"
+      actions = [
+        "bedrock-agentcore:ListMemoryRecords",
+        "bedrock-agentcore:GetMemoryRecord",
+        "bedrock-agentcore:BatchUpdateMemoryRecords",
+        "bedrock-agentcore:DeleteMemoryRecord",
+      ]
+      resources = [local.d.chat_memory_arn]
+    }
+  }
   statement {
     # GetObjectVersion + ListBucketVersions power the bundle version history /
     # diff / repromote endpoints (CopyObject with a source VersionId authorizes
