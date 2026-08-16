@@ -401,7 +401,11 @@ tbody tr:last-child td { border-bottom: none; }
 figure.tbl table { border: 1px solid var(--rpt-border); border-radius: 10px; overflow: hidden; border-spacing: 0; }
 .kpi-row { display: flex; gap: 14px; flex-wrap: wrap; margin: 26px 0; }
 .kpi { flex: 1 1 150px; border: 1px solid var(--rpt-border); border-radius: 10px; padding: 14px 16px; }
-.kpi .label { color: var(--rpt-muted); font-size: 12.5px; }
+/* min-height 2lh: labels routinely wrap at card widths (the 80-char cap is
+   ~3 lines at four-up) — reserving two lines keeps every card's VALUE on the
+   same line across the row instead of jumping per wrap. A 1-line label costs
+   one line of air; a rare 3-line label pushes only its own card. */
+.kpi .label { color: var(--rpt-muted); font-size: 12.5px; min-height: 2lh; }
 .kpi .value { font-size: 24px; font-weight: 650; letter-spacing: -0.01em; margin-top: 2px; }
 .kpi .delta { font-size: 12.5px; margin-top: 4px; color: var(--rpt-muted); }
 .kpi .delta.up { color: var(--rpt-up); }
@@ -424,6 +428,12 @@ footer.rpt { max-width: 760px; margin: 44px auto 0; border-top: 1px solid var(--
   body { padding: 0 3px; }
   figure, .kpi-row, figure.tbl { break-inside: avoid; }
   header.rpt { break-after: avoid; }
+  /* A heading must never strand at a page bottom while its content starts
+     the next page — it breaks FORWARD with what it introduces. (The stranded
+     case looked worse than an orphaned line: a section title floating over
+     whitespace, its first paragraph a page away.) */
+  h1, h2, h3, h4 { break-after: avoid; break-inside: avoid; }
+  p, li { orphans: 3; widows: 3; }
   a { color: inherit; text-decoration: none; }
   /* The PDF is the shareable executive copy: the methodology appendix (and
      the footnote marks that point into it) stays in the HTML viewer, where
