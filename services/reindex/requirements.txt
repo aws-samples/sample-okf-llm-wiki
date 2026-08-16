@@ -1,0 +1,6 @@
+# Runtime deps for the reindex zip Lambda.
+# okf-core and okf-aws are installed from local source in the packaging step.
+# boto3 is provided by the Lambda python3.12 runtime, but pin it so local/CI and
+# the deployed function agree.
+boto3>=1.43
+pyyaml>=6.0.3

@@ -1,0 +1,185 @@
+"""Regenerate ``index.md`` files for a bundle subtree.
+
+Ported from the reference producer. Each directory gets an ``index.md`` grouping
+its children by ``type`` for progressive disclosure. Directory descriptions are
+synthesized by an optional callable; the default is a deterministic fallback so
+this runs offline (the harvest agent can pass a Bedrock-backed synthesizer).
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from pathlib import Path
+from typing import Callable
+
+from okf_core.document import OKFDocument
+from okf_core.paths import is_reserved_rel_segments
+
+log = logging.getLogger(__name__)
+
+_INDEX_FILE = "index.md"
+
+
+def _load_doc(path: Path) -> OKFDocument | None:
+    try:
+        return OKFDocument.parse(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _build_index_text(entries: list[tuple[str, str, str, str]]) -> str:
+    # entries: (type, title, relative_link, description)
+    grouped: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+    for typ, title, link, desc in entries:
+        grouped[typ or "Other"].append((title, link, desc))
+
+    sections: list[str] = []
+    for typ in sorted(grouped):
+        lines = [f"# {typ}", ""]
+        for title, link, desc in sorted(grouped[typ], key=lambda e: e[0].lower()):
+            suffix = f" - {desc}" if desc else ""
+            lines.append(f"* [{title}]({link}){suffix}")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections) + "\n"
+
+
+# Directory names that are never OKF concept dirs and must not get an index.md
+# or contribute entries: dot-prefixed reserved dirs (.harvest, .context) and
+# deepagents' internal scratch dirs (defense-in-depth in case any leak to disk).
+# The reserved-directory rule (dot-dirs + deepagents scratch) is shared —
+# okf_core.paths.is_reserved_rel_segments — with lint and the link graph.
+
+
+def _is_ignored_rel(bundle_root: Path, path: Path) -> bool:
+    """True if any path segment below the bundle root is reserved/internal."""
+    try:
+        rel = path.relative_to(bundle_root)
+    except ValueError:
+        return False
+    return is_reserved_rel_segments(rel.parts)
+
+
+def _directories_to_index(bundle_root: Path) -> list[Path]:
+    dirs: set[Path] = set()
+    for md in bundle_root.rglob("*.md"):
+        if _is_ignored_rel(bundle_root, md.parent):
+            continue
+        cur = md.parent
+        while cur != bundle_root.parent:
+            dirs.add(cur)
+            if cur == bundle_root:
+                break
+            cur = cur.parent
+    return sorted(dirs)
+
+
+def _fallback_synth(rel_path: str, children: list[tuple[str, str]]) -> str:
+    titles = ", ".join(t for t, _ in children if t) or "no titled entries"
+    return f"Contains {len(children)} entries: {titles}."
+
+
+def _default_write(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+
+
+def _default_remove(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+def regenerate_indexes(
+    bundle_root: Path,
+    *,
+    synthesize: Callable[[str, list[tuple[str, str]]], str] | None = None,
+    write_file: Callable[[Path, str], None] | None = None,
+    remove_file: Callable[[Path], None] | None = None,
+) -> list[Path]:
+    """(Re)write every directory's ``index.md``. Returns the paths written.
+
+    ``synthesize(rel_path, [(title, desc), ...]) -> str`` produces the one-line
+    directory description; when omitted a deterministic listing is used.
+
+    ``write_file(path, text)`` / ``remove_file(path)`` override how an index is
+    written / a stale one dropped. The defaults are plain pathlib calls; the
+    harvest passes ``fsutil``'s, which are resilient on the S3 Files (NFS)
+    mount — a transient ESTALE is retried and an in-place rewrite the mount
+    refuses with ``PermissionError`` heals by unlinking first. That mattered
+    live: a raw rewrite of an existing ``references/enums/index.md`` failed
+    EACCES and took the whole harvest down at finalize, after all the authoring
+    was already done.
+    """
+    bundle_root = Path(bundle_root)
+    synth = synthesize or _fallback_synth
+    write = write_file or _default_write
+    remove = remove_file or _default_remove
+    written: list[Path] = []
+    if not bundle_root.exists():
+        return written
+
+    # Deepest directories first, so a parent can reuse a child's description.
+    directories = sorted(
+        _directories_to_index(bundle_root),
+        key=lambda p: (-len(p.relative_to(bundle_root).parts), str(p)),
+    )
+
+    dir_descriptions: dict[Path, str] = {}
+
+    for directory in directories:
+        entries: list[tuple[str, str, str, str]] = []
+        for child in sorted(directory.iterdir()):
+            if child.name == _INDEX_FILE:
+                continue
+            if child.is_file() and child.suffix == ".md":
+                doc = _load_doc(child)
+                if doc is None:
+                    continue
+                fm = doc.frontmatter
+                title = str(fm.get("title") or child.stem)
+                desc = str(fm.get("description") or "")
+                typ = str(fm.get("type") or "")
+                entries.append((typ, title, child.name, desc))
+            elif child.is_dir():
+                # Skip reserved (.harvest/.context) and internal scratch dirs so
+                # they never appear as bundle entries — and skip dirs holding no
+                # concept docs at all (e.g. an external/<domain>/ chain whose
+                # pair subtree was removed): an entry would link a phantom index.
+                if _is_ignored_rel(bundle_root, child):
+                    continue
+                if not any(child.rglob("*.md")):
+                    continue
+                desc = dir_descriptions.get(child, "")
+                entries.append(
+                    ("Subdirectories", child.name, f"{child.name}/{_INDEX_FILE}", desc)
+                )
+
+        index_path = directory / _INDEX_FILE
+        if not entries:
+            # A directory whose concepts were all removed (a cross-dataset pair
+            # re-run that authored nothing, a scoped cleanup) must not keep
+            # serving a stale generated index — consumers would walk a chain of
+            # phantom subdirectory links into a subtree that no longer exists.
+            # Deepest-first ordering means a child's stale index is deleted
+            # before its parent decides whether the child still counts.
+            # Best-effort: a stale generated index that the mount refuses to
+            # drop is a cosmetic wart (a phantom subdirectory link), never a
+            # reason to fail a finished harvest at finalize.
+            try:
+                remove(index_path)
+            except OSError:
+                log.warning("could not remove stale index %s", index_path, exc_info=True)
+            continue
+
+        write(index_path, _build_index_text(entries))
+        written.append(index_path)
+
+        if directory == bundle_root:
+            continue
+
+        pairs = [(title, desc) for _, title, _, desc in entries]
+        if len(pairs) == 1 and pairs[0][1]:
+            dir_descriptions[directory] = pairs[0][1]
+        else:
+            rel = str(directory.relative_to(bundle_root))
+            dir_descriptions[directory] = synth(rel, pairs)
+
+    return written

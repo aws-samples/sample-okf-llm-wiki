@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png?v=3" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=3" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=3" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=3" />
+    <title>Data wiki</title>
+    <!-- Apply the persisted theme BEFORE first paint. The React theme provider
+         only adds the class after mount, which flashed a white page in dark
+         mode on every refresh. Mirrors theme-provider.jsx exactly: localStorage
+         "theme" (light | dark | system), system = prefers-color-scheme. The
+         inline hexes mirror the two - -background tokens in src/index.css so
+         even the instant before the stylesheet loads paints in-theme; the
+         provider swaps the inline value for var(--background) on mount so
+         runtime toggles stay live. -->
+    <script>
+      ;(function () {
+        var theme = null
+        try {
+          theme = localStorage.getItem("theme")
+        } catch (e) {
+          /* storage blocked: fall through to the system preference */
+        }
+        if (theme !== "light" && theme !== "dark") {
+          theme = window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light"
+        }
+        var root = document.documentElement
+        root.classList.add(theme)
+        root.style.colorScheme = theme
+        root.style.backgroundColor = theme === "dark" ? "#121212" : "#F3F3F1"
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

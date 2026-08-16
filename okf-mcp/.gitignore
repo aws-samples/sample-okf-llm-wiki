@@ -1,0 +1,4 @@
+# Never commit secrets or cached tokens
+.okf/
+*token-cache*.json
+credentials

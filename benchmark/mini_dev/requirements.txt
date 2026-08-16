@@ -1,0 +1,19 @@
+# Python dependencies for the BIRD mini_dev OKF benchmark.
+#
+#   pip install -r requirements.txt
+#
+# fetch_data.py needs nothing beyond the stdlib. The pieces below are for:
+#   - load_bird_to_glue.py / load_all.py : boto3 (AWS), pyarrow (Parquet)
+#   - the bird-bench evaluators (run_eval.sh): func-timeout
+# mcp_query.py uses only the stdlib + the AWS CLI (for the Cognito client secret).
+
+boto3>=1.34
+pyarrow>=14
+func-timeout>=4.3
+
+# The bird-bench evaluators (fetched unmodified by fetch_data.py) import psycopg2
+# and pymysql at module load — even for SQLite grading — so they must be
+# importable. We only ever use the SQLite path; these are just to satisfy the
+# unmodified imports. psycopg2-binary ships prebuilt wheels (no Postgres headers).
+psycopg2-binary>=2.9
+pymysql>=1.1

@@ -1,0 +1,8 @@
+{
+  "name": "okf-mcp",
+  "description": "Connects Claude Code to the OKF Data wiki consumption MCP server (deployed on Bedrock AgentCore) and provides a skill to fetch/refresh its OAuth2 access token.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Edvin Hallvaxhiu & Aubrey Oosthuizen"
+  }
+}

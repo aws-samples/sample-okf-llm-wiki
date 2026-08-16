@@ -1,0 +1,3 @@
+# Runtime deps for the incremental orchestrator Lambda.
+# okf-core and okf-aws are installed from local source in the deployment package.
+boto3>=1.43

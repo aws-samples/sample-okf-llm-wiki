@@ -1,0 +1,5 @@
+[tools]
+# Vite 8 / rolldown require Node >=20.19 or >=22.12. Pin to the current LTS so
+# `deploy.sh` stage 5 (ui build) and local `npm run dev` don't fall back to an
+# unsupported Node (mise's default was 20.13.1, which breaks the rolldown build).
+node = "24.14.0"

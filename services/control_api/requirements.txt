@@ -1,0 +1,5 @@
+# Runtime deps for the Control API Lambda.
+# okf-core and okf-aws are installed from local source in the Lambda build.
+boto3>=1.43
+pyyaml>=6.0.3
+networkx>=3.4

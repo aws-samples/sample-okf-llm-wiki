@@ -1,0 +1,7 @@
+{
+  "okf": {
+    "type": "http",
+    "url": "${OKF_MCP_URL:-https://bedrock-agentcore.<AWS_REGION>.amazonaws.com/runtimes/arn%3Aaws%3Abedrock-agentcore%3A<AWS_REGION>%3A<AWS_ACCOUNT_ID>%3Aruntime%2Fokf_consumption-<RUNTIME_ID>/invocations?qualifier=DEFAULT}",
+    "headersHelper": "${CLAUDE_PLUGIN_ROOT}/scripts/okf-headers-helper.sh"
+  }
+}

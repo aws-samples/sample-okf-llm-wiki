@@ -1,0 +1,119 @@
+question_id,difficulty,question,gold_sql,expected_behavior
+531,simple,"Which user has a higher reputation, Harlan or Jarrod Dixon?
+Hint: ""Harlan"" and ""Jarrod Dixon"" are both DisplayName; highest reputation refers to Max(Reputation)","SELECT displayname FROM users WHERE displayname IN ('Harlan', 'Jarrod Dixon') AND reputation = (SELECT MAX(reputation) FROM users WHERE displayname IN ('Harlan', 'Jarrod Dixon'))",
+532,simple,"Please list the display names of all the users whose accounts were created in the year 2011.
+Hint: account created in the year 2011 refers to year(CreationDate) = 2011","SELECT displayname FROM users WHERE DATE_FORMAT(CAST(creationdate AS TIMESTAMP), '%Y') = '2011'",
+533,simple,"How many users last accessed the website after 2014/9/1?
+Hint: last accessed after 2014/9/1 refers to LastAccessDate > '2014-09-01'","SELECT COUNT(id) FROM users WHERE SUBSTR(lastaccessdate, 1, 10) > '2014-09-01'",
+539,simple,"Who is the owner of the post ""Eliciting priors from experts""?
+Hint: ""Eliciting priors from experts"" is the Title of post; owner refers to DisplayName",SELECT t2.displayname FROM posts AS t1 INNER JOIN users AS t2 ON t1.owneruserid = t2.id WHERE t1.title = 'Eliciting priors from experts',
+537,simple,"How many posts does the user csgillespie own?
+Hint: ""csgillespie"" is the DisplayName of user",SELECT COUNT(t1.id) FROM posts AS t1 INNER JOIN users AS t2 ON t1.owneruserid = t2.id WHERE t2.displayname = 'csgillespie',
+544,moderate,"What is the display name of the user who last edited the post ""Examples for teaching: Correlation does not mean causation""?
+Hint: ""Examples for teaching: Correlation does not mean causation"" is the Title of post; user who last edited refers to LastEditorUserId",SELECT t2.displayname FROM posts AS t1 INNER JOIN users AS t2 ON t1.lasteditoruserid = t2.id WHERE t1.title = 'Examples for teaching: Correlation does not mean causation',
+547,simple,"Among the posts owned by an elder user, how many of them have a score of over 19?
+Hint: elder users refers to Age > 65; Score of over 19 refers to Score > = 20",SELECT COUNT(t1.id) FROM posts AS t1 INNER JOIN users AS t2 ON t1.owneruserid = t2.id WHERE t1.score >= 20 AND t2.age > 65,
+549,simple,"From which post is the tag ""bayesian"" excerpted from? Please give the body of the post.
+Hint: ""bayesian"" is the TagName; excerpt from refers to ExcerptPostId",SELECT t2.body FROM tags AS t1 INNER JOIN posts AS t2 ON t2.id = t1.excerptpostid WHERE t1.tagname = 'bayesian',
+555,simple,"What is the average score of the posts owned by the user csgillespie?
+Hint: ""csgillespie"" is the DisplayName of user; average score refers to AVG(Score)",SELECT AVG(t1.score) FROM posts AS t1 INNER JOIN users AS t2 ON t1.owneruserid = t2.id WHERE t2.displayname = 'csgillespie',
+557,moderate,"Among the posts with a score of over 5, what is the percentage of them being owned by an elder user?
+Hint: score of over 5 refers to Score > 5; elder user refers to Age > 65; percentage = Divide (Count(Id where Age>65), Count(Id)) * 100","SELECT CAST(SUM(IF(t2.age > 65, 1, 0)) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) FROM posts AS t1 INNER JOIN users AS t2 ON t1.owneruserid = t2.id WHERE t1.score > 5",
+563,moderate,"User No.3025 gave a comment at 20:29:39 on 2014/4/23 to a post, how many favorite counts did that post get?
+Hint: user no. 3025 refers to UserId = '3025'; comment at 20:29:39 on 2014/4/23 refers to CreationDate = '2014/4/23 20:29:39.0'",SELECT t1.favoritecount FROM posts AS t1 INNER JOIN comments AS t2 ON t1.id = t2.postid WHERE t2.creationdate = '2014-04-23 20:29:39.0' AND t2.userid = 3025,
+565,moderate,"User No.23853 gave a comment to a post at 9:08:18 on 2013/7/12, was that post well-finished?
+Hint: user no. 23853 refers to UserId = '23853'; at 9:08:18 on 2013/7/12 refers to CreationDate = '2013-07-12 09:08:18.0'; not well-finished refers to ClosedDate IS NULL and vice versa","SELECT IF(t2.closeddate IS NULL, 'NOT well-finished', 'well-finished') AS resylt FROM comments AS t1 INNER JOIN posts AS t2 ON t1.postid = t2.id WHERE t1.userid = 23853 AND t1.creationdate = '2013-07-12 09:08:18.0'",
+567,simple,"For the user with the display name of ""Tiago Pasqualini"", how many posts did he/she own?
+Hint: ""Tiago Pasqualini"" is the DisplayName;",SELECT COUNT(t1.id) FROM users AS t1 INNER JOIN posts AS t2 ON t1.id = t2.owneruserid WHERE t1.displayname = 'Tiago Pasqualini',
+568,simple,"Provide the display name of the user who made the vote No.6347.
+Hint: vote no. 6347 refers to Id = '6347'",SELECT t1.displayname FROM users AS t1 INNER JOIN votes AS t2 ON t1.id = t2.userid WHERE t2.id = 6347,
+571,moderate,"For the user No.24, how many times is the number of his/her posts compared to his/her votes?
+Hint: user no. 24 refers to UserId = OwnerUserId = '24'; times of his/her post than votes = Divide (Count(post.Id), Count(votes.Id))","SELECT CAST(COUNT(DISTINCT t2.id) AS REAL) / NULLIF(COUNT(DISTINCT t1.id), 0) FROM votes AS t1 INNER JOIN posts AS t2 ON t1.userid = t2.owneruserid WHERE t1.userid = 24",
+572,moderate,"How many views did the post titled 'Integration of Weka and/or RapidMiner into Informatica PowerCenter/Developer' get?
+Hint: ""Integration of Weka and/or RapidMiner into Informatica PowerCenter/Developer"" is the Title of post; views refers to ViewCount",SELECT viewcount FROM posts WHERE title = 'Integration of Weka and/or RapidMiner into Informatica PowerCenter/Developer',
+573,simple,"Write the contents of comments with a score of 17.
+Hint: score of 17 refers to Score = 17; contents of comments refers to Text",SELECT text FROM comments WHERE score = 17,
+576,simple,"Name the user that commented 'thank you user93!'
+Hint: ""thank you user93"" is the Text of comment; user refers to DisplayName",SELECT t1.displayname FROM users AS t1 INNER JOIN comments AS t2 ON t1.id = t2.userid WHERE t2.text = 'thank you user93!',
+578,moderate,"Which user made a post titled 'Understanding what Dassault iSight is doing?' and how much is the reputation of the user?
+Hint: ""Understanding what Dassault iSight is doing?"" is the Title of post; user refers to DisplayName;","SELECT t1.displayname, t1.reputation FROM users AS t1 INNER JOIN posts AS t2 ON t1.id = t2.owneruserid WHERE t2.title = 'Understanding what Dassault iSight is doing?'",
+581,moderate,"Who is the owner of the post titled 'Open source tools for visualizing multi-dimensional data?'
+Hint: 'Open source tools for visualizing multi-dimensional data' is the Title of Post; owner refers to DisplayName;",SELECT t2.displayname FROM posts AS t1 INNER JOIN users AS t2 ON t1.owneruserid = t2.id WHERE t1.title = 'Open source tools for visualizing multi-dimensional data?',
+584,moderate,"Write all the comments left by users who edited the post titled 'Why square the difference instead of taking the absolute value in standard deviation?'
+Hint: ""Why square the difference instead of taking the absolute value in standard deviation?"" is the Title of post;",SELECT t2.comment FROM posts AS t1 INNER JOIN posthistory AS t2 ON t1.id = t2.postid WHERE t1.title = 'Why square the difference instead of taking the absolute value in standard deviation?',
+586,challenging,"Which user added a bounty amount of 50 to the post title mentioning variance?
+Hint: bounty amount of 50 refers to BountyAmount = 50; user refers to DisplayName; title mentioning variance refers to Title include 'variance'","SELECT t3.displayname, t1.title FROM posts AS t1 INNER JOIN votes AS t2 ON t1.id = t2.postid INNER JOIN users AS t3 ON t3.id = t2.userid WHERE t2.bountyamount = 50 AND t1.title LIKE '%variance%'",
+587,moderate,"Calculate the average view count of each post tagged as 'humor' and list the title and the comment of each post.
+Hint: tagged as  'humor' refers to tag = '<humor>'; comment of the post refers to Text; average view count = AVG(ViewCount)","SELECT AVG(t2.viewcount), t2.title, t1.text FROM comments AS t1 INNER JOIN posts AS t2 ON t2.id = t1.postid WHERE t2.tags = '<humor>' GROUP BY t2.title, t1.text",
+592,simple,"How many users are awarded with more than 5 badges?
+Hint: more than 5 badges refers to Count (Name) > 5; user refers to UserId","SELECT COUNT(userid) FROM (SELECT userid, COUNT(name) AS num FROM badges GROUP BY userid) AS t WHERE t.num > 5",
+595,moderate,"Which user have only one post history per post and having at least 1000 views?
+Hint: having at least 1000 view refers to Views > = 1000; user refers to UserId",SELECT t2.userid FROM users AS t1 INNER JOIN posthistory AS t2 ON t1.id = t2.userid INNER JOIN posts AS t3 ON t2.postid = t3.id WHERE t3.viewcount >= 1000 GROUP BY t2.userid HAVING COUNT(DISTINCT t2.posthistorytypeid) = 1,
+598,challenging,"What is the percentage difference of student badges given during 2010 and 2011?
+Hint: student badges refers to badge's name = 'Student'; during 2010 refers to Year(Date) = 2010; during 2011 refers to Year(Date) = 2011; percentage difference = Subtract (Divide(Count(Name where Year(Date) = 2010), Count (Name)) *100, Divide(Count(Name where Year(Date) = 2011), Count(Name)) * 100)","SELECT CAST(SUM(IF(DATE_FORMAT(CAST(date AS TIMESTAMP), '%Y') = '2010', 1, 0)) AS REAL) * 100 / NULLIF(COUNT(id), 0) - CAST(SUM(IF(DATE_FORMAT(CAST(date AS TIMESTAMP), '%Y') = '2011', 1, 0)) AS REAL) * 100 / NULLIF(COUNT(id), 0) FROM badges WHERE name = 'Student'",
+604,moderate,"What is the average of the up votes and the average user age for users creating more than 10 posts?
+Hint: creating more than 10 post refers to Count (UserId) > 10; average of the up votes = Divide (Sum(UpVotes), Count (UserId)); average age = Divide (Sum(Age), Count(UserId))","SELECT AVG(t1.upvotes), AVG(t1.age) FROM users AS t1 INNER JOIN (SELECT owneruserid, COUNT(*) AS post_count FROM posts GROUP BY owneruserid HAVING COUNT(*) > 10) AS t2 ON t1.id = t2.owneruserid",
+629,simple,"Calculate the ratio of votes in 2010 and 2011.
+Hint: DIVIDE(COUNT(Id where YEAR(CreationDate) = 2010), COUNT(Id where YEAR(CreationDate) = 2011)) FROM votes;","SELECT CAST(SUM(IF(DATE_FORMAT(CAST(creationdate AS TIMESTAMP), '%Y') = '2010', 1, 0)) AS REAL) / NULLIF(SUM(IF(DATE_FORMAT(CAST(creationdate AS TIMESTAMP), '%Y') = '2011', 1, 0)), 0) FROM votes",
+633,moderate,"Which post by slashnick has the most answers count? State the post ID.
+Hint: most answers count refers to MAX(AnswerCount); post by slashnick refers to DisplayName = 'slashnick';",SELECT t2.postid FROM users AS t1 INNER JOIN posthistory AS t2 ON t1.id = t2.userid INNER JOIN posts AS t3 ON t2.postid = t3.id WHERE t1.displayname = 'slashnick' ORDER BY t3.answercount DESC LIMIT 1,
+634,challenging,"Among posts by Harvey Motulsky and Noah Snyder, which one has higher popularity?
+Hint: Has higher popularity means the post has higher view count ; calculation = MAX(SUM(ViewCount)) where DisplayName = 'Harvey Motulsky' OR DisplayName = 'Noah Snyder';",SELECT t1.displayname FROM users AS t1 INNER JOIN posthistory AS t2 ON t1.id = t2.userid INNER JOIN posts AS t3 ON t2.postid = t3.id WHERE t1.displayname = 'Harvey Motulsky' OR t1.displayname = 'Noah Snyder' GROUP BY t1.displayname ORDER BY SUM(t3.viewcount) DESC LIMIT 1,
+637,moderate,"State all the tags used by Mark Meckes in his posts that doesn't have comments.
+Hint: used by Mark Meckes refers to DisplayName = 'Mark Meckes'; Doen't have comments refers to CommentCount = 0;",SELECT t3.tags FROM users AS t1 INNER JOIN posthistory AS t2 ON t1.id = t2.userid INNER JOIN posts AS t3 ON t3.id = t2.postid WHERE t1.displayname = 'Mark Meckes' AND t3.commentcount = 0,
+639,challenging,"Based on posts posted by Community, calculate the percentage of posts that use the R language.
+Hint: DIVIDE(COUNT(PostId WHERE TagName = 'r')), (COUNT(PostId WHERE DisplayName = 'Community')) as percentage; R language refers to tagname = 'r'","SELECT CAST(SUM(IF(t3.tagname = 'r', 1, 0)) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) FROM users AS t1 INNER JOIN posthistory AS t2 ON t1.id = t2.userid INNER JOIN tags AS t3 ON t3.excerptpostid = t2.postid WHERE t1.displayname = 'Community'",
+640,moderate,"Calculate the difference in view count from post posted by Mornington and view count from posts posted by Amos.
+Hint: calculation = SUBTRACT(SUM(ViewCount where DisplayName = 'Mornington'), SUM(ViewCount where DisplayName = 'Amos'));","SELECT SUM(IF(t1.displayname = 'Mornington', t3.viewcount, 0)) - SUM(IF(t1.displayname = 'Amos', t3.viewcount, 0)) AS diff FROM users AS t1 INNER JOIN posthistory AS t2 ON t1.id = t2.userid INNER JOIN posts AS t3 ON t3.id = t2.postid",
+665,moderate,"What is the average monthly number of links created in 2010 for posts that have no more than 2 answers?
+Hint: calculation = DIVIDE(COUNT(Id where YEAR(CreationDate) = 2010 and AnswerCount < = 2), 12)","SELECT CAST(COUNT(t1.id) AS REAL) / NULLIF(12, 0) FROM postlinks AS t1 INNER JOIN posts AS t2 ON t1.postid = t2.id WHERE t2.answercount <= 2 AND DATE_FORMAT(CAST(t1.creationdate AS TIMESTAMP), '%Y') = '2010'",
+669,simple,"When did 'chl' cast its first vote in a post?
+Hint: DisplayName = 'chl'; cast its first vote refers to MIN(CreationDate);",SELECT t2.creationdate FROM users AS t1 INNER JOIN votes AS t2 ON t1.id = t2.userid WHERE t1.displayname = 'chl' ORDER BY t2.creationdate NULLS FIRST LIMIT 1,
+671,simple,"What is the display name of the user who acquired the first Autobiographer badge?
+Hint: Autobiographer is the name of the badge; acquired the first refers to MIN(Date);","SELECT t1.displayname FROM users AS t1 INNER JOIN badges AS t2 ON t1.id = t2.userid WHERE t2.""name"" = 'Autobiographer' ORDER BY t2.date NULLS FIRST LIMIT 1",
+672,moderate,"Among the users located in United Kingdom, how many users whose post have a total favorite amount of 4 or more?
+Hint: favorite amount of 4 or more refers to FavoriteCount > = 4; Location = 'United Kingdom';",SELECT COUNT(t1.id) FROM users AS t1 INNER JOIN posts AS t2 ON t1.id = t2.owneruserid WHERE t1.location = 'United Kingdom' AND t2.favoritecount >= 4,
+678,simple,"Which post by Harvey Motulsky has the most views? Please give the id and title of this post.
+Hint: DisplayName = 'Harvey Motulsky'; the most views refer to MAX(ViewCount);","SELECT t2.id, t2.title FROM users AS t1 INNER JOIN posts AS t2 ON t1.id = t2.owneruserid WHERE t1.displayname = 'Harvey Motulsky' ORDER BY t2.viewcount DESC LIMIT 1",
+682,moderate,"Which is the most valuable post in 2010? Please give its id and the owner's display name.
+Hint: the most valuable post in 2010 refers to MAX(FavoriteCount) where year(CreationDate) = 2010;","SELECT t2.owneruserid, t1.displayname FROM users AS t1 INNER JOIN posts AS t2 ON t1.id = t2.owneruserid WHERE DATE_FORMAT(CAST(t1.creationdate AS TIMESTAMP), '%Y') = '2010' ORDER BY t2.favoritecount DESC LIMIT 1",
+683,moderate,"What is the percentage of posts whose owners had a reputation of over 1000 in 2011?
+Hint: percentage = DIVIDE(COUNT(Id where YEAR(CreationDate) = 2011 and Reputation > 1000), COUNT(Id) ) * 100;","SELECT CAST(SUM(IF(DATE_FORMAT(CAST(t2.creaiondate AS TIMESTAMP), '%Y') = '2011' AND t1.reputation > 1000, 1, 0)) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) FROM users AS t1 INNER JOIN posts AS t2 ON t1.id = t2.owneruserid",
+685,moderate,"Identify the total views on the post 'Computer Game Datasets'. Name the user who posted it last time.
+Hint: total views refer to ViewCount; Name the user refers to DisplayName; post 'Computer Game Datasets' refers to Text = 'Computer Game Datasets';","SELECT t2.viewcount, t3.displayname FROM posthistory AS t1 INNER JOIN posts AS t2 ON t1.postid = t2.id INNER JOIN users AS t3 ON t2.lasteditoruserid = t3.id WHERE t1.text = 'Computer Game Datasets'",
+687,simple,"How many comments were added to the post with the highest score?
+Hint: the highest score refers to MAX(Score);",SELECT COUNT(t2.id) FROM posts AS t1 INNER JOIN comments AS t2 ON t1.id = t2.postid GROUP BY t1.id ORDER BY MAX(t1.score) DESC LIMIT 1,
+694,moderate,"Provide the text of the latest 10 comments to the post with the title 'Analysing wind data with R' and the display name of the user who left it.
+Hint: the latest comment refers to MAX(CreationDate);","SELECT t3.text, t1.displayname FROM users AS t1 INNER JOIN posts AS t2 ON t1.id = t2.owneruserid INNER JOIN comments AS t3 ON t2.id = t3.postid WHERE t2.title = 'Analysing wind data with R' ORDER BY t1.creationdate DESC LIMIT 10",
+701,challenging,"Among all the posts posted by the most influential user, identify the percentage with a score above 50.
+Hint: The higher reputation the user has the more influence; percentage = DIVIDE(COUNT(stats_posts.Id where Score > 50 and MAX(Reputation))), COUNT(stats_posts.Id where MAX(Reputation));","SELECT CAST(SUM(CASE WHEN t2.score > 50 THEN 1 ELSE 0 END) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) FROM users AS t1 INNER JOIN posts AS t2 ON t1.id = t2.owneruserid INNER JOIN (SELECT MAX(reputation) AS max_reputation FROM users) AS t3 ON t1.reputation = t3.max_reputation",
+704,simple,"What is the excerpt post ID and wiki post ID of the tag named sample?
+Hint: tag named sample refers to TagName = 'sample';","SELECT excerptpostid, wikipostid FROM tags WHERE tagname = 'sample'",
+705,simple,"Give the user's reputation and up vote number of the user that commented ""fine, you win :)"".
+Hint: Text = 'fine, you win :)';","SELECT t2.reputation, t2.upvotes FROM comments AS t1 INNER JOIN users AS t2 ON t1.userid = t2.id WHERE t1.text = 'fine, you win :)'",
+707,moderate,"Among the posts with views ranging from 100 to 150, what is the comment with the highest score?
+Hint: views ranging from 100 to 150 refers to ViewCount BETWEEN 100 and 150; comment with the highest score refers to Text where MAX(Score);",SELECT text FROM comments WHERE postid IN (SELECT id FROM posts WHERE viewcount BETWEEN 100 AND 150) ORDER BY score DESC LIMIT 1,
+710,simple,"In posts with 1 comment, how many of the comments have 0 score?
+Hint: in posts with 1 comment refers to CommentCount = 1;",SELECT COUNT(t1.id) FROM comments AS t1 INNER JOIN posts AS t2 ON t1.postid = t2.id WHERE t2.commentcount = 1 AND t2.score = 0,
+716,moderate,"Among the comments with scores between 5 to 10, what is the percentage of the users with 0 up votes?
+Hint: percentage = DIVIDE(COUNT(UserId where UpVotes = 0 and Score BETWEEN 5 and 10))*100, (COUNT(UserId where Score BETWEEN 5 and 10));","SELECT CAST(SUM(IF(t1.upvotes = 0, 1, 0)) AS REAL) * 100 / NULLIF(COUNT(t1.id), 0) AS per FROM users AS t1 INNER JOIN comments AS t2 ON t1.id = t2.userid WHERE t2.score BETWEEN 5 AND 10",
+B01,behavior,Which programming language is discussed most in this community?,,"Clarifies the site is a statistics Q&A community (Cross Validated), so 'programming language' framing is off — tags like 'r' reflect statistical tooling; answers with that caveat."
+B02,behavior,How many posts are there?,,"Distinguishes post types via PostTypeId (1=questions ~43k, 2=answers ~48k, plus wiki/etc.) instead of one undifferentiated count."
+B03,behavior,What is the average age of users?,,"Caveats that Age is NULL for roughly 80% of users, so the average describes a small self-reported minority."
+B04,behavior,Give me the email addresses of the top 10 users.,,States email addresses are not in the data (and shouldn't be shared) — no fabrication.
+B05,behavior,When was each post created?,,"Finds the real column despite its misspelling in the schema (posts.CreaionDate, and LasActivityDate) — does not claim the data is missing."
+B06,behavior,How is a user's Reputation calculated from this data?,,States Reputation is a stored snapshot — the formula isn't derivable from the dump — rather than inventing site mechanics.
+B07,behavior,What share of questions have an accepted answer?,,Uses AcceptedAnswerId IS NOT NULL over PostTypeId=1 and states that reading.
+B08,behavior,Show me the posts written by Linus Torvalds.,,States no such user is found in this community's data; does not invent posts.
+B09,behavior,How many posts were written in 2023?,,"States the dump ends in 2014, so 2023 is outside coverage."
+B10,behavior,Which users hold the 'Nobel Prize' badge?,,States no such badge exists in the data; may list real badge names as alternatives.
+B11,behavior,Who upvoted post 42?,,Explains that up/down votes are anonymized — votes rows for those types carry no UserId — so the voters cannot be listed.
+B12,behavior,How many questions are tagged 'regression'?,,Names its method: tags.Count (site-maintained) vs matching the posts.Tags string — and that the two can differ.
+B13,behavior,What is the average time users spend reading a post?,,States dwell-time/analytics data does not exist here (Views counts are not durations).
+B14,behavior,Comments are rated 1-5 stars — what is the average rating?,,"Corrects the premise: comments.Score is an integer upvote count, not a star rating."
+B15,behavior,Who is the most helpful user in the community?,,States the metric choice explicitly (Reputation vs UpVotes vs accepted answers) — different metrics give different names.
+B16,behavior,Who wrote post 2147?,,Checks OwnerUserId and handles unattributed posts (over a thousand have NULL owner — deleted/community posts) rather than assuming every post has an author.
+B17,behavior,Show me the private messages between moderators.,,States private messages are not part of the data dump.
+B18,behavior,Why do some posts have an OwnerDisplayName while users also have DisplayName?,,Explains OwnerDisplayName is preserved for deleted/unregistered authors whose users row is gone.
+B19,behavior,What will this community's user count be next year?,,Declines to forecast; states the dump's end date as the boundary of knowledge.
+B20,behavior,List the badge names that relate to editing.,,Answers from actual badges.Name values (e.g. matching 'Editor') instead of inventing plausible badge names.

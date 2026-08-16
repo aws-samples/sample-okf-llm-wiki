@@ -1,0 +1,985 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/inter";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: "Inter Variable", sans-serif;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-10: var(--chart-10);
+  --color-chart-9: var(--chart-9);
+  --color-chart-8: var(--chart-8);
+  --color-chart-7: var(--chart-7);
+  --color-chart-6: var(--chart-6);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  /* LIGHT-mode neutrals are shadcn STONE (warm gray, hue ~50-106). The
+       soft-gray-page structure is kept: --background stays at the same
+       lightness as always (page reads a step darker than the white cards),
+       hue in the stone family. Light-mode ONLY — dark mode is pure
+       achromatic neutral (see .dark). */
+  --background: oklch(0.9626 0.0021 106.4); /* #F3F3F1 — soft warm-gray page */
+  --foreground: oklch(0.147 0.004 49.25);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.147 0.004 49.25);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.147 0.004 49.25);
+  --primary: oklch(
+    0.5 0.134 242.749
+  ); /* sky-700 — the brand accent (was cyan-700) */
+  --primary-foreground: oklch(0.977 0.013 236.62); /* sky-50 */
+  --secondary: oklch(0.97 0.001 106.424);
+  --secondary-foreground: oklch(0.216 0.006 56.043);
+  --muted: oklch(0.963 0.002 106.4);
+  --muted-foreground: oklch(0.553 0.013 58.071);
+  --accent: oklch(0.963 0.002 106.4);
+  --accent-foreground: oklch(0.216 0.006 56.043);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.923 0.003 48.717);
+  --input: oklch(0.923 0.003 48.717);
+  --ring: oklch(0.709 0.01 56.259);
+  /* Chart palette for LIGHT mode — anchored on the app's BRAND SKY (--primary,
+       hue ~242; the sidebar accent shares the family), so charts read as the
+       Categorical (identity) hues, NOT a single-hue blue ramp: an all-blue chart
+       spends only lightness to tell series apart, which collapses on a screen
+       or in a photo/printout. --chart-1 stays the brand hue (matches --primary,
+       hue 242) so a single-series chart still reads as "the app's color"; slots
+       2-5 use distinct hue FAMILIES (orange / aqua-green / amber / magenta) —
+       adjacent-pair validated (dataviz skill's validate_palette.js: CVD ΔE ≥ 8,
+       normal-vision floor ≥ 15, both hard-pass here at 9.0/19.4 light,
+       8.2/19.0 dark) so neighbors stay distinguishable under color-vision
+       deficiency AND for full-color viewers. Three light-mode slots (orange,
+       aqua, magenta) sit below 3:1 contrast on the near-white page by design —
+       Chart.js's legend + point-style markers are ALWAYS on (chartIframe.js) as
+       the required secondary encoding, so identity never rides contrast alone.
+       Consumed by the chat charts AND GraphView node accents/CodeView syntax
+       tokens (index.css .okf-prose .hljs-* below) — those keep their existing
+       chart-N role assignments; only the underlying hues moved.
+       TEN slots. Slot ORDER is the CVD-safety mechanism (assigned in sequence,
+       never cycled), and it was chosen by enumerating all orderings of slots
+       6-10 and taking the one that maximizes the WORST adjacent pair across
+       BOTH modes — the result costs nothing: the worst adjacent pair of the
+       10-slot ramp is still one of slots 1-5's own pairs (9.0 light / 8.2
+       dark), so extending 5 -> 10 did not weaken any pair. Slots 1-5 keep
+       their exact previous values, so existing charts do not repaint.
+       SERIES CAP: these gates are the ADJACENT-pair pairlist (correct for
+       bars/lines/stacks/pie, where only neighbours touch). For scatter/bubble
+       forms, where ANY two marks can sit side by side, only the first THREE
+       slots clear the all-pairs gate — past three, fold to "Other" or facet
+       rather than reaching for slot 4. */
+  --chart-1: oklch(
+    0.556 0.108 242
+  ); /* sky (brand) — hue moved with the Aug-2026 cyan→sky rebrand; same L/C */
+  --chart-2: oklch(0.67 0.175 41); /* orange */
+  --chart-3: oklch(0.67 0.14 162); /* aqua-green */
+  --chart-4: oklch(0.76 0.16 75); /* amber */
+  --chart-5: oklch(0.72 0.14 357); /* magenta */
+  --chart-6: oklch(0.62 0.14 118); /* lime */
+  --chart-7: oklch(0.52 0.17 295); /* violet */
+  --chart-8: oklch(0.55 0.14 145); /* green */
+  --chart-9: oklch(0.55 0.16 262); /* blue */
+  --chart-10: oklch(0.58 0.19 20); /* red */
+  /* GraphView cross-dataset (external/) node cards: a faint brand-sky wash
+       on the white card surface. An explicit per-mode token (see .dark) rather
+       than a runtime color-mix: mixing the brand accents with white IN OKLCH
+       hue-rotates through rose (white's explicit hue is 0), which is exactly
+       the pink-card bug this replaces. Keep in the brand sky family. */
+  --xref-node-bg: oklch(0.965 0.018 240);
+  --radius: 0.625rem;
+  /* Dark sidebar (#2E2E2E) against the light content area. Its sub-tokens are
+       flipped to light-on-dark so nav text, hover/active states, and borders
+       stay legible on the dark surface. */
+  --sidebar: oklch(0.3012 0 0); /* #2E2E2E */
+  --sidebar-foreground: oklch(0.97 0 0);
+  --sidebar-primary: oklch(0.685 0.169 237.323); /* sky, brightened for dark */
+  --sidebar-primary-foreground: oklch(0.977 0.013 236.62);
+  --sidebar-accent: oklch(0.37 0 0); /* hover/active: one step lighter */
+  --sidebar-accent-foreground: oklch(0.97 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+.dark {
+  /* Dark neutrals are pure ACHROMATIC NEUTRAL (chroma 0; replaced the
+       original cool cyan-tinted grays Aug 2026) at the same tuned lightness
+       steps: page 0.18 < card 0.218 < muted 0.275. NOT the light theme's
+       mauve — the temperature split between modes is deliberate. */
+  --background: oklch(0.18 0 0); /* #121212 — page background (lifted from #0B0B0B: pitch black read harsh; still a clear step below the #1A1A1A cards) */
+  --foreground: oklch(0.987 0 0);
+  --card: oklch(0.218 0 0);
+  --card-foreground: oklch(0.987 0 0);
+  --popover: oklch(0.218 0 0);
+  --popover-foreground: oklch(0.987 0 0);
+  --primary: oklch(
+    0.588 0.158 241.966
+  ); /* sky-600 — brand accent, dark-stepped */
+  --primary-foreground: oklch(0.977 0.013 236.62); /* sky-50 */
+  --secondary: oklch(0.274 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.275 0 0);
+  --muted-foreground: oklch(0.723 0 0);
+  --accent: oklch(0.275 0 0);
+  --accent-foreground: oklch(0.987 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.56 0 0);
+  /* Chart palette for DARK mode — same categorical HUES as :root (sky /
+       orange / aqua-green / amber / magenta), independently stepped into the
+       dark lightness band (OKLCH L 0.48-0.67) rather than just brightened —
+       validate_palette.js passes both bands as separate ramps, not one ramp
+       shared across modes. Same slot order as light, so a series keeps its
+       identity across a theme switch. Re-validated: CVD ΔE 8.2, normal-vision
+       floor 19.0 (both clear the ≥8 / ≥15 gates), all 10 slots ≥3:1 on this
+       surface (dark mode needs no contrast relief, unlike light). Same ten
+       hues and same slot order as :root — see the light block for why the
+       order is what it is and for the scatter/bubble series cap. */
+  --chart-1: oklch(0.64 0.13 242); /* sky (brand, dark-stepped) */
+  --chart-2: oklch(0.62 0.17 40); /* orange */
+  --chart-3: oklch(0.62 0.13 163); /* aqua-green */
+  --chart-4: oklch(0.67 0.14 73); /* amber */
+  --chart-5: oklch(0.62 0.17 1); /* magenta */
+  --chart-6: oklch(0.65 0.14 118); /* lime */
+  --chart-7: oklch(0.55 0.17 295); /* violet */
+  --chart-8: oklch(0.58 0.13 145); /* green */
+  --chart-9: oklch(0.58 0.15 262); /* blue */
+  --chart-10: oklch(0.6 0.18 20); /* red */
+  /* GraphView cross-dataset node cards, dark variant: one step lighter than
+       --card (0.218) with a touch more sky chroma, so the wash reads on the
+       dark surface without glowing. Same hue family as the light token. */
+  --xref-node-bg: oklch(0.27 0.028 240);
+  /* Darker sidebar (#161616) in dark mode — reads as a recessed panel against
+       the lighter content bg. Hover accent is a lighter gray so it stays
+       visible on the near-black surface. */
+  --sidebar: oklch(0.2002 0 0); /* #161616 */
+  --sidebar-foreground: oklch(0.97 0 0);
+  --sidebar-primary: oklch(0.685 0.169 237.323);
+  --sidebar-primary-foreground: oklch(0.293 0.066 243.157);
+  --sidebar-accent: oklch(0.3 0 0);
+  --sidebar-accent-foreground: oklch(0.97 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+
+  /* Tailwind v4's Preflight resets buttons/role=button to cursor:default (the
+     raw browser default), unlike v3. Restore the pointer for enabled clickable
+     controls — covers shadcn Button, tabs, sidebar items, tree rows, and the
+     Select trigger. Disabled controls keep the default arrow. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  label[for],
+  summary {
+    cursor: pointer;
+  }
+}
+
+/* Rendered concept-doc markdown. Hand-rolled (no @tailwindcss/typography dep)
+   and scoped so it never leaks into the app chrome. Uses semantic tokens only. */
+@layer components {
+  .okf-prose {
+    @apply text-sm leading-relaxed text-foreground;
+  }
+  .okf-prose > :first-child {
+    @apply mt-0;
+  }
+  .okf-prose h1 {
+    @apply mt-6 mb-3 text-xl font-semibold tracking-tight;
+  }
+  .okf-prose h2 {
+    @apply mt-6 mb-2 border-b pb-1 text-lg font-semibold tracking-tight;
+  }
+  .okf-prose h3 {
+    @apply mt-5 mb-2 text-base font-semibold;
+  }
+  .okf-prose h4 {
+    @apply mt-4 mb-1 text-sm font-semibold;
+  }
+  .okf-prose p {
+    @apply my-3;
+  }
+  .okf-prose ul {
+    @apply my-3 list-disc pl-6;
+  }
+  .okf-prose ol {
+    @apply my-3 list-decimal pl-6;
+  }
+  .okf-prose li {
+    @apply my-1;
+  }
+  .okf-prose li > ul,
+  .okf-prose li > ol {
+    @apply my-1;
+  }
+  .okf-prose a {
+    @apply font-medium text-primary underline-offset-4 hover:underline;
+  }
+  .okf-prose blockquote {
+    @apply my-3 border-l-2 border-border pl-4 text-muted-foreground italic;
+  }
+  .okf-prose hr {
+    @apply my-6;
+  }
+  .okf-prose code {
+    /* A foreground-tint background (not bg-muted): in light mode --muted ≈
+       --background, so bg-muted was invisible against the chat surface. A tint of
+       --foreground reads in BOTH themes (subtle gray on light, subtle light on
+       dark), same technique as the label-grid cells. */
+    @apply rounded px-1.5 py-0.5 font-mono text-[0.8125em];
+    background-color: color-mix(in oklch, var(--foreground) 8%, transparent);
+    border: 1px solid color-mix(in oklch, var(--foreground) 8%, transparent);
+  }
+  /* Concept-id label — inline code SHAPED like a bundle doc id (tables/races,
+     references/metrics/race_wins) rendered as a subtle primary-tinted pill so it
+     reads as an identifier, not raw code. Deliberately NO icon: this is inferred
+     from the string, not a verified file, so it must not assert "this doc exists".
+     Scoped to .okf-prose (chat + doc markdown). */
+  .okf-prose .okf-concept-label {
+    @apply inline-flex items-center rounded-md align-baseline font-mono text-[0.8125em] font-medium whitespace-nowrap;
+    padding: 0.05em 0.4em;
+    color: var(--primary);
+    background-color: color-mix(in oklch, var(--primary) 12%, transparent);
+    border: 1px solid color-mix(in oklch, var(--primary) 22%, transparent);
+  }
+  /* Citation badge — ONE pill per claim, whatever backs it: the agent emits a
+     single <cite src="a,b,https://c"> and Markdown merges adjacent tags, so a
+     claim never trails a row of chips. Layout is icon + short label (+N), and
+     clicking opens the paginated source card (components/chat/Citation.jsx).
+     NEUTRAL surface, not the primary tint the doc-only chip used to have: these
+     now carry real FAVICONS, and a coloured wash muddied them. The icon is what
+     signals the kind (favicon = web, glyph = wiki doc). */
+  .okf-prose .okf-cite {
+    @apply mx-0.5 inline-flex cursor-pointer items-center gap-1 rounded-md align-baseline font-medium whitespace-nowrap;
+    font-size: 0.72em;
+    padding: 0.15em 0.42em;
+    /* NEUTRAL quiet-gray pill (was the primary/sky wash): citations are
+       provenance, not actions — the favicon/glyph carries the identity, so a
+       brand-colored chip overstated them. Borderless — the tint alone is the
+       shape. Foreground-alpha, NOT --muted: --muted matches the light page's
+       lightness, so a muted fill vanishes outside white cards (same recipe as
+       inline code above). Transparent mixes are hue-safe in oklch
+       (premultiplied alpha). */
+    color: var(--muted-foreground);
+    background-color: color-mix(in oklch, var(--foreground) 7%, transparent);
+    line-height: 1.5;
+  }
+  .okf-prose .okf-cite:hover,
+  .okf-prose .okf-cite:focus-visible {
+    color: var(--foreground);
+    background-color: color-mix(in oklch, var(--foreground) 12%, transparent);
+    outline: none;
+  }
+  /* Keyboard focus must stay distinguishable from hover on this focusable
+     role=button pill (WCAG 2.4.7): the borderless restyle above made the two
+     states share one tint with the browser outline suppressed, so a tabbing
+     user got no visible indicator when the pill was already hovered. Ring
+     token, same as the kit's form controls. */
+  .okf-prose .okf-cite:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 1px;
+  }
+  /* The label truncates rather than wrapping: a long headline or concept path must
+     not stretch the pill across the paragraph (the full text is in the card). */
+  .okf-prose .okf-cite-label {
+    @apply inline-block overflow-hidden align-bottom;
+    max-width: 12em;
+    text-overflow: ellipsis;
+  }
+  /* "+2" — the other sources behind this claim, page through them in the card.
+     One step quieter than the (muted-foreground) label — a transparent mix,
+     which is hue-safe in oklch, unlike gray/white/black mixes (the xref
+     pink-card trap). */
+  .okf-prose .okf-cite-more {
+    @apply font-semibold tabular-nums;
+    color: color-mix(in oklch, var(--muted-foreground) 70%, transparent);
+  }
+  .okf-prose .okf-cite-icon {
+    @apply align-middle;
+  }
+  /* NOTE: no `.okf-cite svg { color: … }` rule here — it would sit in @layer
+     components and LOSE to the icon's text-muted-foreground utility (utilities
+     layer comes later; layer order beats specificity). The doc glyph rides
+     that muted default, which matches the neutral pill (Citation.jsx). */
+  /* Markdown's BARE fenced blocks only — CodeView brings its own chrome
+     (header + scroll container), so its pre must not inherit this panel
+     styling (the leak gave it rounded top corners under the header and a
+     second, competing scroller). */
+  .okf-prose pre:not(.okf-codeview-pre) {
+    @apply my-3 overflow-x-auto rounded-md border bg-muted p-3 text-xs;
+  }
+  .okf-prose pre:not(.okf-codeview-pre) code {
+    @apply bg-transparent p-0 text-xs;
+  }
+  /* highlight.js (rehype-highlight) token colors, mapped onto our theme tokens
+     so SQL/code highlighting reads well in BOTH light and dark mode instead of
+     shipping a fixed-palette hljs theme. Keywords use the primary (sky); the
+     rest lean on chart/muted tokens — but this is a WCAG text-contrast job
+     (readable code characters), not the categorical-series job --chart-1..5
+     are now tuned for (see the --chart-1 definition above), so the three roles
+     take the chart slots by contrast against the code block's --muted
+     background, not by hue meaning: chart-1 (4.2:1 light / 5.3:1 dark) is the
+     best all-round slot after primary; chart-2 (2.9 / 4.3) edges chart-3
+     (2.6 / 4.9) in LIGHT mode specifically (the mode where nothing but
+     primary/chart-1 reaches body-text AA of 4.5:1), so numbers/symbols — a
+     common token — get chart-2. Dark mode clears 4.3:1+ on every slot either
+     way. This is a real step down from the old ramp's number/symbol slot
+     (5.40:1 light, since retired), which was hand-tuned for THIS use; the new
+     ramp is tuned for categorical series identity instead and code-token
+     contrast is accepted as secondary here (position + keyword context in a
+     fenced, monospaced block carry most of the readability). */
+  .okf-prose .hljs-keyword,
+  .okf-prose .hljs-selector-tag,
+  .okf-prose .hljs-literal,
+  .okf-prose .hljs-section,
+  .okf-prose .hljs-built_in,
+  .okf-prose .hljs-name {
+    color: var(--primary);
+    font-weight: 600;
+  }
+  .okf-prose .hljs-number,
+  .okf-prose .hljs-symbol,
+  .okf-prose .hljs-bullet,
+  .okf-prose .hljs-link {
+    color: var(--chart-2);
+  }
+  .okf-prose .hljs-string,
+  .okf-prose .hljs-attr,
+  .okf-prose .hljs-template-tag,
+  .okf-prose .hljs-addition {
+    color: var(--chart-3);
+  }
+  .okf-prose .hljs-title,
+  .okf-prose .hljs-type,
+  .okf-prose .hljs-function .hljs-title {
+    color: var(--chart-1);
+  }
+  .okf-prose .hljs-comment,
+  .okf-prose .hljs-quote,
+  .okf-prose .hljs-meta {
+    color: var(--muted-foreground);
+    font-style: italic;
+  }
+  .okf-prose table {
+    @apply my-3 block w-full max-w-full border-collapse overflow-x-auto text-sm;
+  }
+  .okf-prose th {
+    @apply border bg-muted px-3 py-1.5 text-left font-medium;
+  }
+  .okf-prose td {
+    @apply border px-3 py-1.5 align-top;
+  }
+  .okf-prose img {
+    @apply my-3 max-w-full rounded-md border;
+  }
+  /* ...but a citation badge's favicon is UI CHROME, not prose imagery. The rule
+     above would give an 11px icon 12px of vertical margin plus a border ring,
+     which inflates the badge's line box into a chunky block twice the height of
+     the doc badges beside it. Higher specificity, so it wins without !important. */
+  .okf-prose .okf-cite img {
+    @apply m-0 rounded-[3px] border-0 align-middle;
+  }
+
+  /* Inline markdown for a single feed row: keep GFM inline formatting (bold,
+     code, links) but flatten block structure so it stays on one line and can be
+     truncated by the parent's `truncate`. */
+  .okf-inline-md {
+    @apply inline;
+  }
+  .okf-inline-md * {
+    @apply inline;
+  }
+  .okf-inline-md code {
+    @apply rounded bg-muted px-1 py-0.5 font-mono text-[0.85em];
+  }
+  .okf-inline-md a {
+    @apply font-medium text-primary underline-offset-4 hover:underline;
+  }
+  /* Collapse list markers / breaks that would otherwise force wrapping. */
+  .okf-inline-md ul,
+  .okf-inline-md ol,
+  .okf-inline-md li {
+    @apply list-none p-0;
+  }
+  .okf-inline-md br {
+    display: none;
+  }
+
+  /* Thin, transparent-track scrollbar — GLOBAL. Every native overflow pane
+     (the transcript, drawers, tile tables, the page itself) gets the same
+     slim pill automatically; the default opaque track read heavy against
+     cards, and per-pane opt-in (`.okf-thin-scroll`, now redundant — kept in
+     markup harmlessly) kept missing new surfaces (the canvas jobs drawer,
+     TableTile). Chart iframes are separate documents: chartIframe.js embeds
+     the same rules with build-time palette literals. */
+  * {
+    scrollbar-width: thin; /* Firefox */
+    scrollbar-color: var(--border) transparent; /* thumb / track */
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: 9999px;
+    /* Inset the thumb so it reads as a slim pill on the transparent track. */
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: var(--muted-foreground);
+    background-clip: padding-box;
+  }
+}
+
+/* Radix ScrollArea's viewport wraps its children in a div with
+   `min-width:100%; display:table`. A table box shrink-wraps to content width, so
+   a long, unbreakable child (a deep concept file name in the tree; a wide code
+   line or GFM table in the doc) makes the PANE grow past its container instead of
+   the child scrolling/truncating within it. Force that wrapper to `block` so its
+   children resolve against the card width, not their own content — the tree rows
+   then truncate, and the doc's CodeView/`.okf-label-grid` do their OWN horizontal
+   scroll rather than stretching the whole doc column past the viewport. */
+.okf-tree-scroll [data-slot="scroll-area-viewport"] > div,
+.okf-doc-scroll [data-slot="scroll-area-viewport"] > div {
+  display: block !important;
+}
+
+/* React Flow theming — map its defaults (white panels, blue edges) onto our
+   semantic tokens so the graph looks native in both light and dark mode. */
+.okf-graph {
+  /* Edges use a muted-foreground tint (visible in both light and dark, unlike
+     --border which is ~10% white in dark mode) and match the arrow markers. */
+  --xy-edge-stroke-default: color-mix(
+    in oklch,
+    var(--muted-foreground) 55%,
+    transparent
+  );
+  --xy-edge-stroke-selected-default: var(--primary);
+  --xy-attribution-background-color-default: transparent;
+}
+.okf-graph .react-flow__controls {
+  @apply overflow-hidden rounded-lg border bg-card shadow-sm;
+  border-color: var(--border);
+}
+.okf-graph .react-flow__controls-button {
+  @apply border-0 bg-card text-foreground;
+  border-bottom: 1px solid var(--border);
+}
+.okf-graph .react-flow__controls-button:hover {
+  @apply bg-muted;
+}
+.okf-graph .react-flow__controls-button svg {
+  fill: currentColor;
+}
+.okf-graph .react-flow__attribution {
+  @apply text-[10px];
+  color: var(--muted-foreground);
+}
+.okf-graph .react-flow__edge-path {
+  stroke-width: 1.5;
+}
+/* Dim edges/nodes not part of the current focus set. */
+.okf-graph .react-flow__edge.is-dimmed {
+  opacity: 0.12;
+}
+
+/* Agent avatar — a 3×3 grid of TINY uniform dots, the same grain size as the
+   effort-slider dots (~2px on a 6px pitch). While answering, each dot LIGHTS UP
+   through the effort fade colors (staggered → ripples across the grid); when the
+   agent is done the animation stops and each dot HOLDS its current color. No
+   scale/opacity change — just color. Transparent background, pure CSS. */
+.okf-agent-dots {
+  display: grid;
+  grid-template-columns: repeat(3, 7px); /* 7px pitch between sticker centers */
+  grid-template-rows: repeat(3, 7px);
+  place-content: center;
+  place-items: center;
+  background: transparent;
+}
+/* Rubik-face stickers (matches the WikiCubeIcon brand cube): square cells with
+   thin seams instead of round dots. Same grid, same glow animation — only the
+   shape changed, so the twinkle/freeze behaviour is untouched. */
+.okf-agent-dots > span {
+  width: 5.5px;
+  height: 5.5px;
+  border-radius: 1px;
+  background-color: color-mix(in oklch, var(--primary) 25%, transparent);
+  /* The glow animation is ALWAYS applied but PAUSED by default — so when the
+     agent finishes, each dot FREEZES on whatever color it had reached. `.is-
+     active` merely resumes play. */
+  animation: okf-agent-glow 1.3s ease-in-out infinite;
+  animation-play-state: paused;
+}
+/* Light up through the fade (faint → light-primary → dark "Smarter" primary)
+   while answering; the inline stagger ripples the glow across the grid. */
+.okf-agent-dots.is-active > span {
+  animation-play-state: running;
+}
+/* Peak color is per-dot (--okf-dot-peak, set inline) so each dot brightens to its
+   OWN shade of the fade — the grid twinkles instead of all-lighting-the-same. */
+@keyframes okf-agent-glow {
+  0%,
+  100% {
+    background-color: color-mix(in oklch, var(--primary) 22%, transparent);
+  }
+  50% {
+    background-color: color-mix(
+      in oklch,
+      var(--primary) var(--okf-dot-peak, 90%),
+      black 10%
+    );
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .okf-agent-dots > span {
+    animation: none;
+  }
+}
+
+/* Chart "generating" placeholder (ChartFrame) — a ghost bar chart breathing:
+   a centered row of thin primary-tinted bars anchored to a common baseline
+   (no axes — just the bars floating in the footprint); each bar slowly rises
+   and falls (scaleY from the bottom) on its own duration/phase (set inline).
+   Paused (frozen mid-breath) unless .is-active, mirroring the agent avatar's
+   freeze-don't-reset behavior. */
+/* Chart "generating" placeholder — the sketch fabric: a soft rounded card
+   holding a halftone dot cloud animated by a small rAF driver (see
+   ChartGenerating in ChartFrame.jsx): at most three gaussian peaks roam the
+   field — each is born at a random spot, blooms, regresses until its area
+   fades back to the rest cloud, and respawns elsewhere. The driver writes
+   scale/opacity inline per dot at ~30fps; the transition below smooths those
+   steps into a continuous swell. Dots never move. Token-driven colors, so
+   light and dark both work. */
+.okf-chart-sketch {
+  position: absolute;
+  inset: 0;
+  /* No card, no background in either mode — the fabric floats directly on the
+     chat surface, like the revealed chart itself (transparent iframe). The
+     overflow clip just keeps edge squares from spilling past the reserved box. */
+  overflow: hidden;
+  /* PURE primary — a square at full peak is exactly the button sky (the
+     token already carries the right light/dark value). All the shading comes
+     from per-dot opacity: faint sky at rest, full sky at a peak's crest. */
+  color: var(--primary);
+}
+.okf-sketch-dot {
+  position: absolute;
+  display: block;
+  /* Squares, not circles — the app's agent-activity symbol (the fleet view's
+     size-3.5 rounded-[3px] squares). 20% keeps that corner proportion at
+     every dot size as the swell scales them. */
+  border-radius: 20%;
+  background: currentColor;
+  transition:
+    transform 0.18s linear,
+    opacity 0.18s linear;
+}
+
+/* Reasoning-effort slider — dotted track + a larger round thumb (the "Faster ↔
+   Smarter" control in the chat composer's Effort popover). Overrides the shadcn
+   Slider's thin bar: the track becomes a taller pill with a repeating-dot mask so
+   it reads as a dotted field; the filled range keeps the primary tint; the thumb
+   is a white puck. Scoped to `.okf-effort-slider` so no other slider is touched. */
+.okf-effort-slider [data-slot="slider"] {
+  padding: 2px 0;
+}
+/* The TRACK is the UNFILLED base: a plain dotted field, no color. The colored
+   fill only appears where the thumb has passed (the range, below). */
+.okf-effort-slider [data-slot="slider-track"] {
+  height: 18px !important;
+  border-radius: 6px;
+  background-color: color-mix(in oklch, var(--foreground) 8%, transparent);
+  background-image: radial-gradient(
+    circle at center,
+    color-mix(in oklch, var(--foreground) 38%, transparent) 0.9px,
+    transparent 1.2px
+  );
+  background-size: 6px 6px;
+  background-repeat: repeat;
+}
+/* The filled RANGE spans start→thumb ONLY (Radix sizes it). It paints the SAME
+   light→dark fade the full track would show, but the linear-gradient layer is
+   sized to calc(100% / frac) so that gradient maps across the WHOLE track — the
+   range (only `frac` wide) reveals just the 0→thumb slice. Result: the fill
+   fades continuously (never a flat block) and only shows up to the thumb.
+   A brighter dot field tiles over it. */
+.okf-effort-slider [data-slot="slider-range"] {
+  --_frac: var(--okf-effort-frac, 1);
+  border-radius: 6px 0 0 6px;
+  background-color: transparent;
+  background-image:
+    radial-gradient(
+      circle at center,
+      rgb(0 0 0 / 0.28) 0.9px,
+      transparent 1.2px
+    ),
+    linear-gradient(
+      to right,
+      /* Faster end = LIGHTER (primary lifted toward white); Smarter end = DARKER
+         (primary pushed toward black). Full opacity — no transparent mix — so the
+         light→dark swing is obvious in BOTH themes (mixing toward white/black,
+         not toward the near-black dark-mode track, is what makes it read).
+         SRGB mixes: white/black carry an explicit oklch hue of 0, and oklch
+         interpolation hue-rotates the sky primary toward violet (the xref
+         pink-card trap). */
+      color-mix(in srgb, var(--primary) 60%, white) 0%,
+      color-mix(in srgb, var(--primary) 70%, white) 30%,
+      var(--primary) 62%,
+      color-mix(in srgb, var(--primary) 62%, black) 100%
+    );
+  background-size:
+    6px 6px,
+    calc(100% / var(--_frac)) 100%;
+  background-position:
+    0 0,
+    left center;
+  background-repeat: repeat, no-repeat;
+}
+.okf-effort-slider [data-slot="slider-thumb"] {
+  height: 22px;
+  width: 14px;
+  border-radius: 5px;
+  background-color: #fff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.35);
+}
+
+/* Label-grid table — cells rendered as gapped, zebra-tinted "label" blocks with a
+   small radius, separated in BOTH directions. Shared by the chat tool-result
+   tables and chat markdown tables. UNLAYERED on purpose: it must win over the
+   `@layer components` `.okf-prose table/th/td` rules (unlayered > layered),
+   without a specificity war — and it leaves Browse/Harvest doc tables (which
+   don't get this class) with their bordered style. Uses color-mix(oklch) tints
+   so it tracks light/dark automatically (same technique as the graph edges).
+
+   The element carrying `.okf-label-grid` is the SCROLL CONTAINER: a thin,
+   transparent, always-slim scrollbar (cross-browser), with right/bottom padding
+   so the bar sits in its own lane instead of on top of the cells. */
+.okf-label-grid {
+  max-width: 100%;
+  overflow: auto;
+  /* Lanes for the scrollbars (right = vertical, bottom = horizontal) so they
+     never overlap the cell blocks. */
+  padding: 0 5px 5px 0;
+  /* Firefox: thin + transparent track. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+/* WebKit / Blink (Chrome, Safari, Edge): slim, transparent track, pill thumb —
+   the SAME width on hover (never thickens), just a stronger tint. */
+.okf-label-grid::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.okf-label-grid::-webkit-scrollbar-track {
+  background: transparent;
+}
+.okf-label-grid::-webkit-scrollbar-thumb {
+  background-color: var(--border);
+  border-radius: 9999px;
+  border: 2px solid transparent; /* inset → reads as a slim pill */
+  background-clip: padding-box;
+}
+.okf-label-grid::-webkit-scrollbar-thumb:hover {
+  background-color: var(--muted-foreground);
+  background-clip: padding-box;
+}
+.okf-label-grid::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.okf-label-grid table {
+  display: table;
+  width: auto;
+  min-width: 100%;
+  margin: 0;
+  border-collapse: separate; /* cells as separate blocks */
+  border-spacing: 2px; /* the gaps between labels (x + y) */
+  overflow: visible; /* the wrapper scrolls, not the table */
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+/* Neutralize shadcn's row border + hover fill (when rendered via <Table>) —
+   the CELLS carry all the color as label blocks. Harmless for md <tr> too. */
+.okf-label-grid tr {
+  border: 0;
+  background: transparent;
+}
+.okf-label-grid th,
+.okf-label-grid td {
+  border: 0;
+  border-radius: 4px; /* small radius = smooth-edged label */
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.okf-label-grid th {
+  /* Same vertical padding as the body cells (td: 6px 10px) so the header row is
+     exactly as tall as a data row. height:auto overrides shadcn <TableHead>'s h-10
+     (2.5rem) — without it the tool-result headers stay 40px tall regardless of
+     padding (markdown tables use a raw <th> with no h-10). */
+  height: auto;
+  line-height: 1.45;
+  vertical-align: top;
+  background-color: color-mix(in oklch, var(--foreground) 12%, transparent);
+  color: var(--muted-foreground);
+  font-weight: 500;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.okf-label-grid td {
+  background-color: color-mix(in oklch, var(--foreground) 5%, transparent);
+  color: var(--foreground);
+}
+/* Zebra: even rows a shade stronger so each row reads as its own band. */
+.okf-label-grid tbody tr:nth-child(even) td {
+  background-color: color-mix(in oklch, var(--foreground) 9%, transparent);
+}
+
+/* Wrap modifier (opt-in) — for the Browse doc tables: let long cell text WRAP
+   onto multiple lines instead of the default nowrap+scroll (which suits the
+   chat's compact tool-result grids). The table fills the container (fixed layout,
+   width:100%) and wraps within it; long unbreakable tokens break rather than
+   force horizontal overflow, so a wide table no longer pushes past the viewport. */
+.okf-label-grid-wrap table {
+  table-layout: fixed;
+  width: 100%;
+}
+.okf-label-grid-wrap th,
+.okf-label-grid-wrap td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Rolling text swap (components/RollingText.jsx): the old value drops out
+   below while the new one falls in from above — the Claude Code desktop
+   label roll. Durations must match ROLL_MS in the component. */
+@keyframes okf-roll-in {
+  from {
+    transform: translateY(-115%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+@keyframes okf-roll-out {
+  from {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(115%);
+    opacity: 0;
+  }
+}
+.okf-roll-in {
+  animation: okf-roll-in 260ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+.okf-roll-out {
+  animation: okf-roll-out 260ms cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
+}
+
+/* shadcn "text-shimmer" utility — the animated streaming-text effect paired with
+   Marker (chat reasoning/tool headers while a step is running). A muted→bright→
+   muted gradient clipped to the text, swept left-to-right. Theme-aware via the
+   existing --muted-foreground / --foreground tokens (works in light + dark). */
+@utility text-shimmer {
+  color: transparent;
+  background-clip: text;
+  -webkit-background-clip: text;
+  background-color: var(--muted-foreground);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    transparent 35%,
+    var(--foreground) 50%,
+    transparent 65%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 250% 100%;
+  animation: text-shimmer 2.8s ease-in-out infinite;
+}
+@keyframes text-shimmer {
+  0% {
+    background-position: 150% 0;
+  }
+  100% {
+    background-position: -150% 0;
+  }
+}
+
+/* The diff body (source AND rich views) is a self-contained scroll box: at
+   most the viewport height minus the chrome stacked above it (app + pane
+   headers, version pickers, summary line, file-card header), floored for tiny
+   windows. Long diffs scroll in here — never the surrounding pane or page. */
+.okf-diff-scroll {
+  max-height: max(16rem, calc(100vh - 19rem));
+  overflow: auto;
+}
+
+/* @git-diff-view ships GitHub's palette, whose dark surfaces are distinctly
+   BLUE (#0d1117 line background, #131d2e/#0c2d6b hunk rows) and clash with the
+   app's neutral dark theme. Re-skin every neutral surface onto the app tokens
+   (both themes, so light's blue hunk rows go too); the green/red add/del tints
+   are kept — they ARE the app's diff color coding. The extra .okf-diffview
+   ancestor wins the specificity tie against the library stylesheet, which
+   loads after index.css in the bundle. */
+.okf-diffview .diff-tailwindcss-wrapper[data-theme="light"] .diff-style-root,
+.okf-diffview .diff-tailwindcss-wrapper[data-theme="dark"] .diff-style-root {
+  --diff-border--: var(--border);
+  --diff-plain-content--: transparent;
+  --diff-empty-content--: color-mix(
+    in oklch,
+    var(--foreground) 3%,
+    transparent
+  );
+  --diff-expand-content--: color-mix(
+    in oklch,
+    var(--foreground) 3%,
+    transparent
+  );
+  --diff-plain-lineNumber--: color-mix(
+    in oklch,
+    var(--foreground) 3%,
+    transparent
+  );
+  --diff-expand-lineNumber--: color-mix(
+    in oklch,
+    var(--foreground) 3%,
+    transparent
+  );
+  --diff-plain-lineNumber-color--: var(--muted-foreground);
+  --diff-expand-lineNumber-color--: var(--muted-foreground);
+  --diff-hunk-content--: color-mix(in oklch, var(--foreground) 5%, transparent);
+  --diff-hunk-lineNumber--: color-mix(
+    in oklch,
+    var(--foreground) 8%,
+    transparent
+  );
+  --diff-hunk-lineNumber-hover--: var(--primary);
+  --diff-hunk-content-color--: var(--muted-foreground);
+}
+/* The library hard-codes `color: white` for dark-mode text; use the theme's
+   foreground so the diff text matches the rest of the app. */
+.okf-diffview .diff-tailwindcss-wrapper[data-theme="dark"] [data-state="diff"],
+.okf-diffview .diff-tailwindcss-wrapper[data-theme="dark"] [data-state="plain"],
+.okf-diffview .diff-tailwindcss-wrapper[data-theme="dark"] [data-state="hunk"] {
+  color: var(--foreground);
+}
+
+/* Rendered ("rich") markdown diff (VersionHistory RichDiff): htmldiff-js marks
+   changes with <ins>/<del> inside the merged rendered document. Translucent
+   overlays work on both themes; del keeps its strikethrough for scannability.
+   Injected HTML bypasses the react-markdown component overrides, so bare
+   tables get minimal styling of their own here. */
+.okf-richdiff ins {
+  text-decoration: none;
+  border-radius: 2px;
+  padding: 0 1px;
+  background-color: rgba(16, 185, 129, 0.16);
+}
+.okf-richdiff del {
+  border-radius: 2px;
+  padding: 0 1px;
+  background-color: rgba(244, 63, 94, 0.14);
+}
+.okf-richdiff table {
+  margin: 0.75rem 0;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.okf-richdiff th,
+.okf-richdiff td {
+  border: 1px solid var(--border);
+  padding: 0.375rem 0.625rem;
+  text-align: left;
+}
+.okf-richdiff th {
+  background-color: color-mix(in oklch, var(--foreground) 4%, transparent);
+  font-weight: 600;
+}
+
+/* Chat transcript top/bottom fade. shadcn's `scroll-fade-*` utilities (built on
+   the scroll-timeline API) get split into a lazy CSS chunk by Vite and don't
+   reliably land on the chat viewport, so we own an explicit, always-emitted mask
+   here. A static top+bottom fade: content dissolves into the top of the layout
+   and under the docked composer instead of hard-cutting. Sizes match the previous
+   scroll-fade-t-10 / scroll-fade-b-16 (2.5rem top, 4rem bottom). */
+@utility okf-chat-fade {
+  --okf-fade-t: 2.5rem;
+  --okf-fade-b: 4rem;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--okf-fade-t),
+    #000 calc(100% - var(--okf-fade-b)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--okf-fade-t),
+    #000 calc(100% - var(--okf-fade-b)),
+    transparent 100%
+  );
+}

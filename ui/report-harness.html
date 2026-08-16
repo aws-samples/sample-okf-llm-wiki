@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Report chart harness</title>
+    <!-- Loaded only by the chat runtime's headless Chromium (see
+         services/chat/src/chat/report_render.py), never by end users. No theme
+         bootstrap here on purpose: the Python side injects
+         window.__OKF_REPORT_THEME__ per pass and report-harness.js applies it
+         before resolving the palette. -->
+  </head>
+  <body>
+    <script type="module" src="/src/report-harness.js"></script>
+  </body>
+</html>
