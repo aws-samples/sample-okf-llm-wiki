@@ -650,14 +650,27 @@ function Field({ label, children }) {
 // One Chart.js chart inside the app's sandboxed frame (the chat's ChartFrame):
 // interactive tooltips/legends, app palette, crisp at any zoom. `spec` is the
 // same shape the chat agent's render_chart authors.
-function WidgetChart({ spec, height = 240 }) {
+
+// Every widget chart shares ONE height so the summary grid reads as a uniform
+// dashboard — per-widget heights left the chart bottoms misaligned within a
+// row (the card frames stretch to the grid row; the boxes inside didn't).
+const WIDGET_CHART_HEIGHT = 230
+
+// The box ChartFrame reports for that height (+8px frame padding). Non-chart
+// widget bodies (the score dial, the empty states) size to the SAME box so
+// every widget lands at the same height whatever it holds.
+const WIDGET_BODY = "min-h-[238px] flex-1"
+
+function WidgetChart({ spec, height = WIDGET_CHART_HEIGHT }) {
   const code = useMemo(
     () => `renderChart(el, ${JSON.stringify(spec)})`,
     // The spec is built fresh each render; key the memo on its JSON.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [JSON.stringify(spec)]
   )
-  return <ChartFrame code={code} height={height} />
+  // exportMenu={false}: the dashboard is a fixed report surface, not an
+  // authored chat visual — no export kebab floating over the widgets.
+  return <ChartFrame code={code} height={height} exportMenu={false} />
 }
 
 function ScoreWidget({ block }) {
@@ -678,7 +691,12 @@ function ScoreWidget({ block }) {
         title="Score"
         description="No score for this check — nothing was graded."
       >
-        <p className="flex flex-1 items-center justify-center py-2 text-xs text-muted-foreground">
+        <p
+          className={cn(
+            "flex items-center justify-center text-xs text-muted-foreground",
+            WIDGET_BODY
+          )}
+        >
           Not graded — every question was discarded.
         </p>
       </Widget>
@@ -694,7 +712,12 @@ function ScoreWidget({ block }) {
           : "Pass rate across all runs — every run was graded by the judge."
       }
     >
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 py-2">
+      <div
+        className={cn(
+          "flex flex-col items-center justify-center gap-3",
+          WIDGET_BODY
+        )}
+      >
         <ScoreDial raw={raw} adjusted={hasAdjusted ? adjusted : 0} />
         <p className="flex items-center gap-3 text-xs text-muted-foreground tabular-nums">
           <span className="flex items-center gap-1.5">
@@ -817,7 +840,6 @@ function OutcomesWidget({ block, stability, className }) {
       {items.length ? (
         <>
           <WidgetChart
-            height={230}
             spec={{
               type: "treemap",
               series: [
@@ -846,7 +868,12 @@ function OutcomesWidget({ block, stability, className }) {
           ) : null}
         </>
       ) : (
-        <p className="text-xs text-muted-foreground">
+        <p
+          className={cn(
+            "flex items-center justify-center text-xs text-muted-foreground",
+            WIDGET_BODY
+          )}
+        >
           Nothing graded — no outcomes to chart.
         </p>
       )}
@@ -886,7 +913,12 @@ function ToolUsageWidget({ telemetry, scope }) {
           }}
         />
       ) : (
-        <p className="text-xs text-muted-foreground">
+        <p
+          className={cn(
+            "flex items-center justify-center text-center text-xs text-muted-foreground",
+            WIDGET_BODY
+          )}
+        >
           No tool calls recorded — the solvers answered without opening the
           wiki, so this run says nothing about the docs.
         </p>
@@ -934,7 +966,6 @@ function TimeToAnswerWidget({ report, scope, className }) {
     >
       {times.length ? (
         <WidgetChart
-          height={230}
           spec={{
             type: "area",
             labels: times.map((_, i) => String(i + 1)),
@@ -959,7 +990,14 @@ function TimeToAnswerWidget({ report, scope, className }) {
           }}
         />
       ) : (
-        <p className="text-xs text-muted-foreground">No timed solves recorded.</p>
+        <p
+          className={cn(
+            "flex items-center justify-center text-xs text-muted-foreground",
+            WIDGET_BODY
+          )}
+        >
+          No timed solves recorded.
+        </p>
       )}
     </Widget>
   )
@@ -998,7 +1036,6 @@ function VarianceWidget({ block, report, className }) {
       description="How consistently each question was answered across the runs (pass = 1, fail = 0) — a flat line at 0 means every run agreed; hover a bump for the question."
     >
       <WidgetChart
-        height={200}
         spec={{
           type: "area",
           xTicks: false,
