@@ -1,3 +1,10 @@
+---
+name: report-authoring
+description: >-
+  The report-authoring methodology: required structure, language, evidence
+  discipline, and figure selection. Read BEFORE your first create_report of a
+  conversation - the tool validates shape; this is everything it cannot check.
+---
 # Report authoring
 
 How to compose a report worth trusting: structure, language, and block
