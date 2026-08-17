@@ -444,3 +444,41 @@ def test_domains_carry_forward_on_incremental_reuse(tmp_path: Path):
     entry = _domains(tmp_path / ".metadata")["tables"]["races"]
     assert entry["columns"]["status"]["values"] == ["A", "B", "C"]
     assert src2.queries == []  # nothing re-probed
+
+
+# ---------------------------------------------------------------------------
+# Iceberg: the $files capability sizes hint-less tables exactly
+# ---------------------------------------------------------------------------
+
+
+def test_iceberg_capability_small_table_gets_exact_full_scan(tmp_path: Path):
+    src = _Src(agg=_small_table_agg())
+    src.iceberg_data_bytes = lambda table: 500  # under sample_above_bytes=1000
+    meta = {"orders": _meta(("status", "string"), ("driver_ref", "bigint"))}
+    write_profiles(src, tmp_path, tables_meta=meta,
+                   cache=read_cached_profiles(tmp_path), cfg=CFG)
+    sheet = (tmp_path / PROFILE_DIR / "orders.md").read_text()
+    assert "INDICATIVE" not in sheet          # exact, not assume-large
+    assert "TABLESAMPLE" not in src.queries[0]
+    manifest = (tmp_path / PROFILE_DIR / MANIFEST_NAME).read_text()
+    assert "\tok\t\t" in manifest             # empty sample_pct
+
+
+def test_iceberg_capability_big_table_sizes_the_sample(tmp_path: Path):
+    src = _Src(agg=_small_table_agg())
+    src.iceberg_data_bytes = lambda table: 100_000
+    meta = {"orders": _meta(("status", "string"))}
+    write_profiles(src, tmp_path, tables_meta=meta,
+                   cache=read_cached_profiles(tmp_path), cfg=CFG)
+    # Percent from the REAL size (100/100000*100 = 0.1), not the 10% fallback.
+    assert "TABLESAMPLE BERNOULLI (0.1)" in src.queries[0]
+    assert "INDICATIVE" in (tmp_path / PROFILE_DIR / "orders.md").read_text()
+
+
+def test_iceberg_capability_none_keeps_assume_large(tmp_path: Path):
+    src = _Src(agg=_small_table_agg())
+    src.iceberg_data_bytes = lambda table: None  # non-Iceberg / query failed
+    meta = {"mystery": _meta(("status", "string"))}
+    write_profiles(src, tmp_path, tables_meta=meta,
+                   cache=read_cached_profiles(tmp_path), cfg=CFG)
+    assert "TABLESAMPLE BERNOULLI (10)" in src.queries[0]  # the old fallback

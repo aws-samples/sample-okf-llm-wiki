@@ -11,7 +11,10 @@ Cost posture (the reason this module is more than one query):
 * **Scan budget.** A table whose byte-size hint exceeds
   ``OKF_HARVEST_PROFILE_SAMPLE_ABOVE_BYTES`` is profiled from a sample sized to
   ``OKF_HARVEST_PROFILE_TARGET_SAMPLE_BYTES`` (a table with NO size hint is
-  treated as large). Everything derived from a sample is stamped INDICATIVE —
+  treated as large; Iceberg tables — whose Glue Parameters never carry Hive
+  stats — are sized exactly from their ``$files`` metadata sum via the
+  source's ``iceberg_data_bytes`` capability before that default applies).
+  Everything derived from a sample is stamped INDICATIVE —
   the sheet says so in a banner, per column, and in the manifest — because a
   sampled value list is never proof of a closed enum.
 * **Bounded enumeration.** Only columns whose approximate distinct count is at
@@ -268,6 +271,7 @@ class TableProfiler:
         self._table_ref = getattr(source, "sql_table_ref", None)
         self._approx = getattr(source, "sql_approx_distinct", None)
         self._sample = getattr(source, "sql_sample_clause", None)
+        self._iceberg_bytes = getattr(source, "iceberg_data_bytes", None)
 
     @property
     def supported(self) -> bool:
@@ -304,6 +308,15 @@ class TableProfiler:
                 self.source.metadata_profile, "bytesize_param_keys", ()
             ),
         )
+        if size is None and callable(self._iceberg_bytes):
+            # Iceberg tables never carry Hive stats Parameters, but their own
+            # metadata knows the current snapshot's exact size ($files). The
+            # capability answers None for non-Iceberg tables without querying,
+            # so the Hive assume-large default below is untouched.
+            try:
+                size = self._iceberg_bytes(table)
+            except Exception:  # noqa: BLE001 - sizing is best-effort
+                size = None
         # No size hint => assume large: an unbudgeted full scan is the one
         # outcome this module exists to prevent.
         needs_sample = size is None or size > cfg.sample_above_bytes

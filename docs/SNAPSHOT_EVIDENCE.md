@@ -40,7 +40,10 @@ probes authors would otherwise run:
 
 Cost posture:
 
-- Tables over ~1 GiB (or with **no size hint** — treated as large) are
+- Tables over ~1 GiB (or with **no size hint** — treated as large; Iceberg
+  tables, whose Glue Parameters never carry Hive stats, are first sized
+  *exactly* from their `$files` metadata sum via the source's
+  `iceberg_data_bytes` capability) are
   profiled from a `TABLESAMPLE BERNOULLI` row sample sized toward ~256 MiB.
   Sampled sheets are stamped **INDICATIVE** everywhere — a sampled value list
   is never proof of a closed enum. (BERNOULLI is fine here: per-row
@@ -146,9 +149,13 @@ scans.
 Name/role nomination is size-blind (pure catalog strings, zero queries);
 sketch nomination is size-gated as described above. The gate's job in this
 section is different: picking the **probe shape** for each nominated pair.
-Per-side size resolves as: catalog byte hint → **S3 listing** of the table's
-location (`estimate_table_bytes`, LIST calls only, early-exit at the gate;
-needed because DDL-registered tables carry no `totalSize` — only
+Per-side size resolves as: catalog byte hint → **Iceberg `$files` metadata
+sum** (Iceberg tables only — exact for the current snapshot, a manifests-only
+scan through the engine's own permissions, so it also answers for
+LF-governed/cross-account Iceberg tables; an S3 listing would instead
+overcount every retained snapshot until VACUUM) → **S3 listing** of the
+table's location (`estimate_table_bytes`, LIST calls only, early-exit at the
+gate; needed because DDL-registered tables carry no `totalSize` — only
 crawlers/ETL write it) → assume large. Then:
 
 | Pair shape | Action |
@@ -248,7 +255,9 @@ Authoritative table in CONVENTIONS.md; the ones that matter operationally:
   (no direct S3 perms — LF vends creds to Athena, not to us): such tables
   without catalog hints degrade to `skipped-size`. An empty root listing on
   a partitioned table is likewise unmeasurable, not zero (`ADD PARTITION`
-  can point data outside the root). Iceberg's `$files` metadata table is
-  the planned fallback rung.
+  can point data outside the root). **Iceberg tables are exempt**: their
+  `$files` metadata sum answers through the query engine's permissions
+  before any listing is attempted — only non-Iceberg LF/cross-account
+  tables still hit this wall.
 - Redshift gets no sampled probes yet (no reference-level sampling clause)
   and per-column (not batched) sketches.

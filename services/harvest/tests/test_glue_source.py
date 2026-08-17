@@ -266,3 +266,66 @@ def test_estimate_table_bytes_partitioned_empty_root_is_unmeasurable():
 
     src = GlueAthenaSource("db", glue=_PartitionedGlue(), s3=_FakeS3Pages([[]]))
     assert src.estimate_table_bytes("t", stop_at=None) is None
+
+
+# ---------------------------------------------------------------------------
+# Iceberg: the $files metadata sum is the first sizing rung
+# ---------------------------------------------------------------------------
+
+_FILES_SQL = 'SELECT sum(file_size_in_bytes) AS b FROM "db"."t$files"'
+
+
+def _iceberg_source(*, athena=None, s3=None, iceberg=True):
+    class _Glue:
+        def get_table(self, **kwargs):
+            table = {
+                "Name": kwargs["Name"],
+                "StorageDescriptor": {"Location": "s3://bucket/data/t/"},
+            }
+            if iceberg:
+                table["Parameters"] = {
+                    "table_type": "ICEBERG",
+                    "metadata_location": "s3://bucket/data/t/metadata/v3.json",
+                }
+            return {"Table": table}
+
+    return GlueAthenaSource("db", glue=_Glue(), athena=athena, s3=s3)
+
+
+def test_estimate_table_bytes_iceberg_uses_files_metadata():
+    athena = QueryKeyedAthena({_FILES_SQL: (["b"], [[12_345]])})
+    s3 = _FakeS3Pages([[999_999_999]])
+    src = _iceberg_source(athena=athena, s3=s3)
+    # Exact regardless of stop_at (gate call AND complete-listing call), and
+    # the S3 listing — which would overcount retained snapshots — never runs.
+    assert src.estimate_table_bytes("t", stop_at=10_000) == 12_345
+    assert src.estimate_table_bytes("t", stop_at=None) == 12_345
+    assert s3.calls == 0
+    # One query total: the memo serves the second call.
+    assert athena._n == 1
+
+
+def test_estimate_table_bytes_iceberg_files_failure_falls_back_to_listing():
+    class _Boom:
+        def start_query_execution(self, **kwargs):
+            raise RuntimeError("engine unavailable")
+
+    s3 = _FakeS3Pages([[100, 200]])
+    src = _iceberg_source(athena=_Boom(), s3=s3)
+    assert src.estimate_table_bytes("t", stop_at=10_000) == 300
+
+
+def test_iceberg_data_bytes_non_iceberg_is_none_without_query():
+    athena = QueryKeyedAthena({})  # any query would KeyError
+    src = _iceberg_source(athena=athena, iceberg=False)
+    assert src.iceberg_data_bytes("t") is None
+    assert athena._n == 0
+
+
+def test_iceberg_data_bytes_empty_snapshot_is_zero():
+    # sum() over zero data files is NULL -> genuinely 0 bytes (unlike an
+    # empty S3 root, which proves nothing about a partitioned table).
+    athena = QueryKeyedAthena({_FILES_SQL: (["b"], [[None]])})
+    src = _iceberg_source(athena=athena)
+    assert src.iceberg_data_bytes("t") == 0
+    assert src.estimate_table_bytes("t", stop_at=10_000) == 0

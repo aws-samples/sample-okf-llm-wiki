@@ -104,6 +104,10 @@ class GlueAthenaSource:
         self.catalog_id = catalog_id
         self._concepts_cache: list[ConceptRef] | None = None
         self._table_cache: dict[str, dict[str, Any]] = {}
+        # iceberg_data_bytes memo — the profile pass and both relationship
+        # sizing paths (gate + sample percent) ask for the same table; the
+        # $files answer is exact, so one query serves them all.
+        self._iceberg_bytes_cache: dict[str, int | None] = {}
 
     # -- resource URIs (Glue ARNs, matching the golden bundle) -----------
 
@@ -282,12 +286,25 @@ class GlueAthenaSource:
         A partitioned table whose root location lists as EMPTY is also None:
         its partitions live elsewhere (ADD PARTITION with external
         locations), so zero is not evidence of small.
+
+        Iceberg tables short-circuit to :meth:`iceberg_data_bytes` before any
+        listing: their Glue Parameters never carry Hive stats, and an S3
+        listing OVERCOUNTS them (it sums every retained snapshot's data files
+        plus manifests until VACUUM/expire). The ``$files`` sum is exact for
+        the current snapshot regardless of ``stop_at``, so it serves the gate
+        and the sample-percent contract alike; only when that query fails
+        does the table fall through to the listing, whose overcount is at
+        least conservative for the gate.
         """
-        if self.s3 is None:
-            return None
         try:
             tbl = self._get_table_raw(table)
         except Exception:  # noqa: BLE001 - can't tell -> assume large
+            return None
+        if _is_iceberg_table(tbl):
+            size = self.iceberg_data_bytes(table)
+            if size is not None:
+                return size
+        if self.s3 is None:
             return None
         loc = str((tbl.get("StorageDescriptor") or {}).get("Location") or "")
         if not loc.startswith("s3://"):
@@ -316,6 +333,42 @@ class GlueAthenaSource:
         except Exception:  # noqa: BLE001 - can't tell -> assume large
             return None
         return None  # page cap hit before the listing finished: cannot be sure
+
+    def iceberg_data_bytes(self, table: str) -> int | None:
+        """Exact byte size of an Iceberg table's CURRENT snapshot, or None.
+
+        Sums ``file_size_in_bytes`` over the ``"<table>$files"`` metadata
+        table — a manifests-only scan (no data bytes billed) that answers
+        through the query engine's own permissions, so it also works where
+        the S3 location cannot be listed (LF-governed / cross-account
+        tables). None for non-Iceberg tables, sources without Athena, or any
+        query failure — callers fall through to their next sizing rung. A
+        NULL sum means an empty current snapshot, which really is 0 bytes
+        (unlike an empty S3 root, which proves nothing about a partitioned
+        table).
+        """
+        if self.athena is None:
+            return None
+        try:
+            tbl = self._get_table_raw(table)
+        except Exception:  # noqa: BLE001 - can't tell
+            return None
+        if not _is_iceberg_table(tbl):
+            return None
+        if table in self._iceberg_bytes_cache:
+            return self._iceberg_bytes_cache[table]
+        size: int | None
+        try:
+            rows = self.run_query(
+                f"SELECT sum(file_size_in_bytes) AS b "
+                f'FROM "{self.database}"."{table}$files"'  # nosec B608 - catalog-authored identifiers, quoted
+            )
+            val = rows[0].get("b") if rows else None
+            size = int(str(val)) if val is not None else 0
+        except Exception:  # noqa: BLE001 - a failed metadata query is "can't tell"
+            size = None
+        self._iceberg_bytes_cache[table] = size
+        return size
 
     def sql_sampled_ref(self, ref_sql: str, percent: float) -> str:
         """A table reference sampled at ~``percent``% for the relationship
@@ -491,6 +544,17 @@ class GlueAthenaSource:
 
 
 # -- helpers -----------------------------------------------------------------
+
+
+def _is_iceberg_table(tbl: dict[str, Any]) -> bool:
+    """Glue marks Iceberg tables with a ``table_type`` Parameter.
+
+    That's the open-table-format marker (written by Athena and Iceberg's
+    ``GlueCatalog`` alike), distinct from the top-level ``TableType`` field
+    (``EXTERNAL_TABLE``/``VIRTUAL_VIEW``).
+    """
+    params = tbl.get("Parameters") or {}
+    return str(params.get("table_type") or "").upper() == "ICEBERG"
 
 
 def _iso(value: Any) -> str | None:

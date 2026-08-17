@@ -17,7 +17,13 @@ changedPartitions}`` we:
    Glue emits multiple events per logical change). A partition-only change (same
    version, non-empty ``changedPartitions``) still triggers a re-review because
    new partitions can surface data the catalog schema doesn't describe.
-3. Compute a column diff between the two latest table versions.
+3. Compute a column diff between the two latest table versions. An ICEBERG
+   data commit (every Iceberg write bumps the Glue version by swapping
+   ``metadata_location``) with an empty column diff and a version delta of
+   exactly one is absorbed here — version recorded, no re-harvest — because
+   per-commit scoped LLM reviews on a busy Iceberg table would run
+   continuously. See the step-3b comment for the exact conditions and the
+   ``OKF_INCREMENTAL_ICEBERG_COMMITS=review`` override.
 4. InvokeAgentRuntime on the harvest runtime scoped to the changed table (the
    diff rides in the payload; the runtime writes ``.harvest/pending.json``
    itself, through the S3 Files mount), then record the new version and set the
@@ -52,6 +58,26 @@ from incremental.diff import compute_column_diff
 log = logging.getLogger("incremental.handler")
 
 
+def _is_iceberg(tbl: dict[str, Any]) -> bool:
+    """Glue marks Iceberg tables with a ``table_type`` Parameter (the
+    open-table-format marker, distinct from the top-level ``TableType``)."""
+    params = tbl.get("Parameters") or {}
+    return str(params.get("table_type") or "").upper() == "ICEBERG"
+
+
+def _version_delta(stored: str | None, current: str | None) -> int | None:
+    """``current - stored`` as an int, or None when either side isn't numeric.
+
+    Glue VersionIds are monotonically increasing numeric strings. None (table
+    never seen, or an unparsable id) means the gap is unknowable — callers
+    must treat that as "not provably a single commit".
+    """
+    try:
+        return int(str(current)) - int(str(stored))
+    except (TypeError, ValueError):
+        return None
+
+
 def _session_id(data_domain: str, dataset: str) -> str:
     """AgentCore runtimeSessionId — one deterministic session per dataset.
 
@@ -77,8 +103,9 @@ def process_event(
     """Handle one Glue table-change ``detail``. Returns a result dict for logging.
 
     ``result["action"]`` is one of ``skipped_unmapped``, ``skipped_no_table``,
-    ``skipped_unchanged`` or ``invoked``. Raising propagates to the caller so the
-    SQS record is retried; the returned dict never signals failure.
+    ``skipped_unchanged``, ``skipped_iceberg_commit`` or ``invoked``. Raising
+    propagates to the caller so the SQS record is retried; the returned dict
+    never signals failure.
     """
     database = detail.get("databaseName")
     table = detail.get("tableName")
@@ -162,6 +189,53 @@ def process_event(
             store.table_columns(old_tbl),
             store.table_columns(new_tbl) or store.table_columns(current),
         )
+
+    # 3b. Iceberg data commits are absorbed, not re-harvested. Every Iceberg
+    # write commits a new Glue table version (the metadata_location swap), so
+    # treating each bump as a change would run a scoped LLM re-harvest per
+    # write — on a streaming table, continuously. Absorb the bump only when
+    # it is PROVABLY a single data-only commit: the table is Iceberg, the
+    # column diff is empty, no partitions rode the event, and the version
+    # advanced by exactly one (a wider gap can hide a schema change between
+    # versions the two-latest diff never saw — conservative: invoke).
+    # Recording the version is what stops the nightly reconcile from
+    # re-detecting the same commit forever; a later schema change bumps the
+    # version again and invokes as usual. Hive semantics are untouched — a
+    # non-Iceberg version bump with an empty diff still re-reviews (property
+    # or SerDe changes matter there). OKF_INCREMENTAL_ICEBERG_COMMITS=review
+    # restores per-commit re-reviews for Iceberg too.
+    if (
+        not version_unchanged
+        and not changed_partitions
+        and not (diff["added"] or diff["removed"] or diff["retyped"])
+        and _is_iceberg(current)
+        and _version_delta(stored.version_id, current_version) == 1
+        and os.environ.get("OKF_INCREMENTAL_ICEBERG_COMMITS", "skip") != "review"
+    ):
+        store.put_stored_version(
+            ddb,
+            freshness_table,
+            data_domain,
+            dataset,
+            table,
+            version_id=current_version,
+            update_time=current_update,
+        )
+        log.info(
+            "Iceberg data commit for %s.%s (version %s -> %s, no column "
+            "change); absorbed without re-harvest",
+            database,
+            table,
+            stored.version_id,
+            current_version,
+        )
+        return {
+            "action": "skipped_iceberg_commit",
+            "data_domain": data_domain,
+            "dataset": dataset,
+            "table": table,
+            "version_id": current_version,
+        }
 
     # 4. Acquire the per-dataset harvest lease BEFORE staging/invoking. This is
     # the same lease the Control API's trigger_harvest takes, so an incremental

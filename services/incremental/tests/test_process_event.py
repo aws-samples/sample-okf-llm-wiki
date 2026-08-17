@@ -412,3 +412,136 @@ def test_incremental_invoke_failure_releases_lease_and_keeps_version(aws):
         .get_item(Key={"pk": "HARVEST#sales#f1", "sk": "STATUS"})["Item"]
     )
     assert status["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Iceberg data commits — absorbed, not re-harvested (step 3b)
+# ---------------------------------------------------------------------------
+
+ICEBERG = {"table_type": "ICEBERG", "metadata_location": "s3://b/metadata/v2.json"}
+
+
+def _seed_iceberg_dataset(aws, history):
+    seed_mapping(aws["ddb"], data_domain="sales", dataset="f1", glue_database="f1_db")
+    seed_ready_bundle(aws["s3"], data_domain="sales", dataset="f1")
+    return FakeGlue({"f1_db": {"orders": history}})
+
+
+def test_iceberg_data_commit_is_absorbed_without_invoke(aws):
+    """Version +1, empty column diff, Iceberg -> record version, no invoke."""
+    cols = [col("id", "bigint"), col("amount", "double")]
+    v1 = make_table("orders", cols, version_id="1", parameters=ICEBERG)
+    v2 = make_table(
+        "orders", cols, version_id="2",
+        update_time="2026-07-01T00:00:00+00:00", parameters=ICEBERG,
+    )
+    glue = _seed_iceberg_dataset(aws, [v1, v2])
+    agentcore = FakeAgentCore()
+    store.put_stored_version(
+        aws["ddb"], FRESHNESS_TABLE, "sales", "f1", "orders",
+        version_id="1", update_time=v1["UpdateTime"],
+    )
+
+    result = _call(_detail(table="orders"), aws, glue, agentcore)
+
+    assert result["action"] == "skipped_iceberg_commit"
+    assert agentcore.invocations == []
+    # Version recorded, so the nightly reconcile won't re-detect this commit.
+    stored = store.get_stored_version(
+        aws["ddb"], FRESHNESS_TABLE, "sales", "f1", "orders"
+    )
+    assert stored.version_id == "2"
+
+
+def test_iceberg_schema_change_still_invokes(aws):
+    v1 = make_table(
+        "orders", [col("id", "bigint")], version_id="1", parameters=ICEBERG
+    )
+    v2 = make_table(
+        "orders", [col("id", "bigint"), col("status", "string")],
+        version_id="2", parameters=ICEBERG,
+    )
+    glue = _seed_iceberg_dataset(aws, [v1, v2])
+    agentcore = FakeAgentCore()
+    store.put_stored_version(
+        aws["ddb"], FRESHNESS_TABLE, "sales", "f1", "orders",
+        version_id="1", update_time=v1["UpdateTime"],
+    )
+
+    result = _call(_detail(table="orders"), aws, glue, agentcore)
+
+    assert result["action"] == "invoked"
+    assert result["diff"]["added"] and len(agentcore.invocations) == 1
+
+
+def test_iceberg_version_gap_is_conservative_and_invokes(aws):
+    """stored=1, current=3: the two-latest diff can't see v1->v2, so a dropped
+    schema-change event could hide behind an empty diff — must invoke."""
+    cols = [col("id", "bigint")]
+    history = [
+        make_table("orders", cols, version_id=str(v), parameters=ICEBERG)
+        for v in (1, 2, 3)
+    ]
+    glue = _seed_iceberg_dataset(aws, history)
+    agentcore = FakeAgentCore()
+    store.put_stored_version(
+        aws["ddb"], FRESHNESS_TABLE, "sales", "f1", "orders",
+        version_id="1", update_time=history[0]["UpdateTime"],
+    )
+
+    result = _call(_detail(table="orders"), aws, glue, agentcore)
+
+    assert result["action"] == "invoked"
+    assert len(agentcore.invocations) == 1
+
+
+def test_iceberg_never_seen_table_invokes(aws):
+    """No stored version -> the gap is unknowable -> invoke (old behavior)."""
+    v2 = make_table(
+        "orders", [col("id", "bigint")], version_id="2", parameters=ICEBERG
+    )
+    glue = _seed_iceberg_dataset(aws, [v2])
+    agentcore = FakeAgentCore()
+
+    result = _call(_detail(table="orders"), aws, glue, agentcore)
+
+    assert result["action"] == "invoked"
+    assert len(agentcore.invocations) == 1
+
+
+def test_iceberg_commit_review_override_invokes(aws, monkeypatch):
+    monkeypatch.setenv("OKF_INCREMENTAL_ICEBERG_COMMITS", "review")
+    cols = [col("id", "bigint")]
+    v1 = make_table("orders", cols, version_id="1", parameters=ICEBERG)
+    v2 = make_table("orders", cols, version_id="2", parameters=ICEBERG)
+    glue = _seed_iceberg_dataset(aws, [v1, v2])
+    agentcore = FakeAgentCore()
+    store.put_stored_version(
+        aws["ddb"], FRESHNESS_TABLE, "sales", "f1", "orders",
+        version_id="1", update_time=v1["UpdateTime"],
+    )
+
+    result = _call(_detail(table="orders"), aws, glue, agentcore)
+
+    assert result["action"] == "invoked"
+    assert len(agentcore.invocations) == 1
+
+
+def test_non_iceberg_empty_diff_bump_still_invokes(aws):
+    """Hive semantics untouched: a property-only version bump re-reviews."""
+    cols = [col("id", "bigint")]
+    v1 = make_table("races", cols, version_id="1")
+    v2 = make_table("races", cols, version_id="2")
+    seed_mapping(aws["ddb"], data_domain="sales", dataset="f1", glue_database="f1_db")
+    seed_ready_bundle(aws["s3"], data_domain="sales", dataset="f1")
+    glue = FakeGlue({"f1_db": {"races": [v1, v2]}})
+    agentcore = FakeAgentCore()
+    store.put_stored_version(
+        aws["ddb"], FRESHNESS_TABLE, "sales", "f1", "races",
+        version_id="1", update_time=v1["UpdateTime"],
+    )
+
+    result = _call(_detail(), aws, glue, agentcore)
+
+    assert result["action"] == "invoked"
+    assert len(agentcore.invocations) == 1
