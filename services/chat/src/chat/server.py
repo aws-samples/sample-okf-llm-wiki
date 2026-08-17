@@ -868,6 +868,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
 
     from chat.ask_human_middleware import AskHumanMiddleware
     from chat.charts import make_chart_tool
+    from chat.skills import make_read_skill_tool
     from chat.config import build_chat_model
     from chat.guardrails_gate import GuardrailsGateMiddleware, guardrails_gate_enabled
     from chat.graph import (
@@ -1032,6 +1033,12 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # the tool is inert and AskHumanMiddleware owns the interrupt. The <asking_the_user>
         # prompt block covers when to use it, so the base prompt already knows about it.
         agent_tools = [*agent_tools, make_ask_human_tool()]
+        # read_skill is ALWAYS available (no deploy flag, no opt-in): it serves
+        # the methodology skills vendored in the image (chat.skills) — static
+        # text, no server work. Tools that need a methodology point at their
+        # skill by name in their description; the skill text rides a tool
+        # result only when pulled, never the system prompt.
+        agent_tools = [*agent_tools, make_read_skill_tool()]
         # submit_annotation: available on EVERY run with a verified subject —
         # the tool files feedback in the user's name (their sub keys the
         # partition). Scoped runs inject data_domain/dataset like the read

@@ -27,7 +27,6 @@ import functools
 import inspect
 import json
 import logging
-import pathlib
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -38,25 +37,10 @@ from okf_core import reports as rp
 
 log = logging.getLogger(__name__)
 
-# The report-authoring methodology, vendored beside the service (the harvest
-# okf-authoring pattern) and served as a TOOL (the read_me pattern) — pulled
-# on demand rather than riding every turn's system prompt, since most turns
-# never write a report. Loaded once at import; a missing file degrades to a
-# one-line pointer rather than failing the runtime.
-_SKILL_PATH = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "skills"
-    / "report-authoring"
-    / "SKILL.md"
-)
-try:
-    REPORT_SKILL = _SKILL_PATH.read_text(encoding="utf-8")
-except OSError:  # pragma: no cover - image always ships the file
-    REPORT_SKILL = (
-        "Report authoring skill file is missing on this deployment — apply "
-        "your best judgment: conclusion-first structure, business language, "
-        "claim-stating titles, provenance on every figure, real values only."
-    )
+# The report-authoring methodology is vendored beside the service at
+# services/chat/skills/report-authoring/SKILL.md and served by the generic
+# ``read_skill`` tool (chat.skills) — pulled on demand rather than riding
+# every turn's system prompt, since most turns never write a report.
 
 
 def make_report_tools(
@@ -215,9 +199,6 @@ def make_report_tools(
             ),
         }
 
-    def _skill() -> str:
-        return REPORT_SKILL
-
     def _guarded(fn, name: str):
         # Same containment as the consumption tools: an unexpected raise (an
         # S3 throttle, expired creds) must come back as a tool RESULT the
@@ -237,16 +218,10 @@ def make_report_tools(
         if dataset_scope
         else " `data_domain`/`dataset` name the dataset (see list_domains)."
     )
-    skill_doc = inspect.cleandoc(
-        """The report-authoring methodology: required structure, language,
-        evidence discipline, and figure selection. Read it BEFORE your first
-        create_report of a conversation — the tool validates shape; this is
-        everything it cannot check."""
-    )
     create_doc = inspect.cleandoc(
         """Compose and save an immutable HTML report from the evidence you
-        gathered IN THIS CONVERSATION. Read report_skill FIRST (once per
-        conversation) for the required structure and language — narrative + charts + tables + KPIs,
+        gathered IN THIS CONVERSATION. Read read_skill("report-authoring")
+        FIRST (once per conversation) for the required structure and language — narrative + charts + tables + KPIs,
         downloadable as PDF. The user sees it inline as a card. Use it when
         the user asks for a report/write-up; a saved report cannot be edited
         (create a new one), so agree on scope first and only include numbers
@@ -270,8 +245,8 @@ def make_report_tools(
         practice): {"kind":"computation","slug","params"?} or
         {"kind":"adhoc_sql","sql"}. It renders as a numbered note in the
         report's methodology appendix — NEVER in the body, which stays
-        executive-clean business language (see report_skill). Real values
-        only, exactly as the queries returned them."""
+        executive-clean business language (see the report-authoring skill).
+        Real values only, exactly as the queries returned them."""
     )
     present_doc = inspect.cleandoc(
         """Display a report to the user for viewing and download: renders a
@@ -283,11 +258,6 @@ def make_report_tools(
     )
 
     return [
-        StructuredTool.from_function(
-            _skill,
-            name="report_skill",
-            description=skill_doc,
-        ),
         StructuredTool.from_function(
             _guarded(_create, "create_report"),
             name="create_report",

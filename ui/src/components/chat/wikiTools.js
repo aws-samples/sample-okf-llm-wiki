@@ -61,17 +61,17 @@ const ICONS = {
   // the timeline (see buildMessageBlocks) — but keep an icon + label so an edge
   // case (e.g. a raw tool listing) doesn't fall through to raw.
   render_chart: BarChart3Icon,
-  // report_skill = reading the authoring methodology (scroll); create_report =
+  // read_skill = reading a methodology skill (scroll); create_report =
   // folding gathered evidence into the composed artifact (origami).
-  report_skill: ScrollTextIcon,
+  read_skill: ScrollTextIcon,
   create_report: OrigamiIcon,
 }
 
-// Tools whose results are acks/instructions, not evidence: report_skill
-// returns the whole methodology text and create_report's ack is plumbing (the
+// Tools whose results are acks/instructions, not evidence: read_skill
+// returns a whole methodology text and create_report's ack is plumbing (the
 // report card is the surface) — the timeline step shows its name/label only,
 // with no expandable response.
-export const NO_RESULT_TOOLS = new Set(["report_skill", "create_report"])
+export const NO_RESULT_TOOLS = new Set(["read_skill", "create_report"])
 
 export function toolIcon(toolName) {
   return ICONS[toolName] || WrenchIcon
@@ -139,8 +139,12 @@ export function toolLabel(toolName, args, running) {
       const label = t ? `“${t}”` : ""
       return running ? `Charting ${label}`.trim() : `Charted ${label}`.trim()
     }
-    case "report_skill":
-      return running ? "Reading the report skill" : "Report skill"
+    case "read_skill": {
+      const n = s(a.name)
+      return running
+        ? `Reading the ${n || "methodology"} skill`
+        : `${n ? `Skill ${n}` : "Skill"}`
+    }
     case "create_report": {
       // Title only lands on the completed label: the step is announced at
       // tool_pending (args still streaming — see buildMessageBlocks), so the

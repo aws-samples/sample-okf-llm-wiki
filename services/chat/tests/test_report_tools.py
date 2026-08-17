@@ -239,13 +239,15 @@ def test_report_tools_wire_into_the_agent_toolset():
     assert "create_report" in captured["names"]
     assert "present_report" in captured["names"]
     assert "read_page" in captured["names"]
+    # read_skill rides every run (no flag, no opt-in) — the report pair's
+    # descriptions reference it by name, so it must be bound alongside them.
+    assert "read_skill" in captured["names"]
 
 
-def test_report_skill_tool_serves_the_vendored_methodology(s3):
+def test_create_report_points_at_the_authoring_skill(s3):
+    # The methodology itself is served by the generic read_skill tool
+    # (chat.skills, tested in test_skills.py) — the report pair only has to
+    # point the model at it by name.
     tools = _tools(s3, FakeRenderer())
-    skill = tools["report_skill"].invoke({})
-    # The vendored SKILL.md, not the missing-file fallback.
-    assert "# Report authoring" in skill
-    assert "claim" in skill.lower() and "provenance" in skill.lower()
-    # create_report points the model at it.
-    assert "report_skill" in tools["create_report"].description
+    assert "report_skill" not in tools
+    assert 'read_skill("report-authoring")' in tools["create_report"].description

@@ -234,7 +234,7 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error, coun
     toolName === "web_search" || toolName === "ask_human"
   )
 
-  // NO_RESULT tools (report_skill / create_report) never expand: their results
+  // NO_RESULT tools (read_skill / create_report) never expand: their results
   // are acks/instructions, not evidence — the step is its label. Errors still
   // expand (a create_report refusal must stay inspectable).
   const noResult = NO_RESULT_TOOLS.has(toolName)
