@@ -50,7 +50,19 @@ Cost posture:
   statistics survive row sampling; it does *not* reduce Athena's billed
   bytes, only aggregation work.)
 - A wall-clock budget (default 30 min) bounds the whole pass; tables past it
-  are `skipped-budget` in `profile/manifest.tsv`.
+  are `skipped-budget` in `profile/manifest.tsv`. The per-query ceiling
+  (`OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S`) defaults to the same 30 min —
+  a profile that COMPLETES yields a sheet plus a size measurement, while
+  one cancelled early bills a partial scan for nothing — and every query's
+  timeout is clamped to the budget remaining, so a slow table can consume
+  the budget but never overrun it.
+- **The pass-1 scan doubles as a size measurement.** Athena reports each
+  execution's `data_scanned_bytes`; because BERNOULLI reads full bytes,
+  even a *sampled* profile measures the real footprint of the profilable
+  columns. That number — plus per-column `{distinct, null_pct}` — persists
+  as sibling keys on the table's `domains.json` entry (cache-carried under
+  the same fingerprint policy) and feeds the relationship pass: observed
+  bytes are a sizing rung, and the column stats rank sketch columns.
 - **Fingerprint cache**: each sheet is keyed on the table's catalog identity
   (update time + version + column set + size/row hints). Incremental runs
   re-profile only the changed table, cross runs only mismatches; a **full
@@ -102,13 +114,30 @@ relationships/
    rate-p sample with probability ~p, so a sampled sketch would publish
    deflated containment that silently reads as "unrelated"). The scan is
    affordable because columnar engines bill roughly the sketched columns'
-   bytes, not the table's; tables over the size gate are not sketched at
-   all — they fall back to name/role nomination and the sampled probe.
+   bytes, not the table's; tables *measured* over the size gate are never
+   sketched — they fall back to name/role nomination and the sampled probe —
+   while tables whose size is UNKNOWN get bounded **last-resort attempts**:
+   visited after every measured table, each capped by the sketch per-query
+   timeout (`OKF_HARVEST_REL_QUERY_TIMEOUT_S`), abandoned after two
+   consecutive failures (the catalog is telling us the unknowns are big). A
+   timed-out sketch yields NOTHING — never wrong evidence — which is why a
+   bounded attempt is safe where a sampled sketch is not; and a nomination
+   whose probe the size gate still refuses persists as a no-verdict
+   **NOMINATED sheet** (`joins/…`) carrying the containment estimate and
+   routing the author to a live `validate_join` — without it a renamed-key
+   lead on an unsizable table would vanish into a manifest skip row.
    Eligibility is **type-based** (int/text families only — never
-   floats/timestamps), deliberately name-blind; names only *rank* the ≤ 12
-   sketched columns per table (key-suffixed first, then id/key/code-style
-   hints) so the cap trims descriptive columns, not keys. The enum-domain
-   floor is checked against the sketch's own KMV cardinality estimate.
+   floats/timestamps), deliberately name-blind; the ≤ 12 sketched columns
+   per table are *ranked* by names first (key-suffixed, then
+   id/key/code-style hints) and, within each name tier, by the profile
+   pass's per-column stats — high-distinct, low-null first (that's what
+   keys look like), with columns whose OBSERVED distinct count sits at or
+   under the enum-domain floor excluded outright (the comparison stage
+   refuses their nominations anyway, so a slot spent on them buys nothing;
+   safe even from a sampled profile — a genuine key's in-sample distinct
+   tracks the sampled row count, orders of magnitude above the floor). The
+   enum-domain floor is also checked against the sketch's own KMV
+   cardinality estimate.
    Because non-full runs never re-sketch, full runs persist
    the nominations in `relationships/candidates.json`; incremental/cross
    runs revalidate and merge them so sketch-discovered sheets are reused or
@@ -149,14 +178,18 @@ scans.
 Name/role nomination is size-blind (pure catalog strings, zero queries);
 sketch nomination is size-gated as described above. The gate's job in this
 section is different: picking the **probe shape** for each nominated pair.
-Per-side size resolves as: catalog byte hint → **Iceberg `$files` metadata
-sum** (Iceberg tables only — exact for the current snapshot, a manifests-only
-scan through the engine's own permissions, so it also answers for
-LF-governed/cross-account Iceberg tables; an S3 listing would instead
-overcount every retained snapshot until VACUUM) → **S3 listing** of the
-table's location (`estimate_table_bytes`, LIST calls only, early-exit at the
-gate; needed because DDL-registered tables carry no `totalSize` — only
-crawlers/ETL write it) → assume large. Then:
+Per-side size resolves as: catalog byte hint → **profile-observed scan
+bytes** (free — the profile pass-1 query already read the table's profilable
+columns in full and its `data_scanned_bytes` is a COMPLETE-scan measurement,
+never an early-exit lower bound; also the honest number for what a probe
+would bill, unlike a listing that sums columns nobody reads) → **Iceberg
+`$files` metadata sum** (Iceberg tables only — exact for the current
+snapshot, a manifests-only scan through the engine's own permissions, so it
+also answers for LF-governed/cross-account Iceberg tables; an S3 listing
+would instead overcount every retained snapshot until VACUUM) → **S3
+listing** of the table's location (`estimate_table_bytes`, LIST calls only,
+early-exit at the gate; needed because DDL-registered tables carry no
+`totalSize` — only crawlers/ETL write it) → assume large. Then:
 
 | Pair shape | Action |
 |---|---|
@@ -232,7 +265,9 @@ Authoritative table in CONVENTIONS.md; the ones that matter operationally:
 | Env | Default | Meaning |
 |---|---|---|
 | `OKF_HARVEST_PROFILE_BUDGET_S` | 1800 | profile pass wall clock |
+| `OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S` | 1800 | per-profile-query ceiling, clamped to the budget remaining |
 | `OKF_HARVEST_REL_BUDGET_S` | 1800 | relationship pass wall clock |
+| `OKF_HARVEST_REL_QUERY_TIMEOUT_S` | 60 | sketch per-query timeout; bounds each unknown-size last-resort attempt |
 | `OKF_HARVEST_REL_MAX_PAIRS` | 100 | join-pair cap |
 | `OKF_HARVEST_REL_MAX_TABLE_BYTES` | 10 GiB | full-probe size gate per side |
 | `OKF_HARVEST_REL_SAMPLE_TARGET_BYTES` | 256 MiB | sampled-probe target |
@@ -255,9 +290,11 @@ Authoritative table in CONVENTIONS.md; the ones that matter operationally:
   (no direct S3 perms — LF vends creds to Athena, not to us): such tables
   without catalog hints degrade to `skipped-size`. An empty root listing on
   a partitioned table is likewise unmeasurable, not zero (`ADD PARTITION`
-  can point data outside the root). **Iceberg tables are exempt**: their
-  `$files` metadata sum answers through the query engine's permissions
-  before any listing is attempted — only non-Iceberg LF/cross-account
-  tables still hit this wall.
+  can point data outside the root). Two exemptions shrink this wall:
+  **Iceberg tables** size via their `$files` metadata sum, and **any table
+  whose profile completed** sizes via the observed scan bytes — both answer
+  through the query engine's own permissions. The residue is a non-Iceberg
+  LF/cross-account table whose profile also failed or was skipped; even
+  there, sketch nomination still makes a bounded last-resort attempt.
 - Redshift gets no sampled probes yet (no reference-level sampling clause)
   and per-column (not batched) sketches.

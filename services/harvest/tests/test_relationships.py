@@ -1523,3 +1523,134 @@ def test_sk_suffix_is_first_class_key_vocabulary():
     }
     cands, _ = enumerate_join_candidates(meta, CFG)
     assert any(c["column_l"] == "customer_sk" for c in cands)
+
+
+# ---------------------------------------------------------------------------
+# profile-informed sizing + last-resort sketching
+# ---------------------------------------------------------------------------
+
+
+def _unhinted(columns: dict) -> dict:
+    m = _meta(columns)
+    m["parameters"].pop("totalSize", None)
+    return m
+
+
+def test_profile_observed_bytes_unlock_probes_on_unhinted_tables(tmp_path):
+    # No catalog hint and no estimate_table_bytes capability — previously
+    # assume-large, every probe skipped. A completed profile's scanned_bytes
+    # is a real measurement (BERNOULLI bills full bytes) and unlocks both the
+    # grain probe and the full join probe.
+    meta = {
+        "races": _unhinted({"raceid": "int"}),
+        "results": _unhinted({"resultid": "int", "raceid": "int"}),
+    }
+    out = write_relationship_evidence(
+        _FakeSource(unique_sides={"races"}), tmp_path, tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG,
+        profile_stats={
+            "races": {"scanned_bytes": 1 << 20, "columns": {}},
+            "results": {"scanned_bytes": 2 << 20, "columns": {}},
+        },
+    )
+    assert out["joins_probed"] >= 1 and out["grain_probed"] >= 1
+    assert list((tmp_path / "relationships" / "joins").glob("*.md"))
+
+
+def test_profile_observed_bytes_over_gate_still_skip(tmp_path):
+    meta = {
+        "races": _unhinted({"raceid": "int"}),
+        "results": _unhinted({"resultid": "int", "raceid": "int"}),
+    }
+    src = _FakeSource()
+    out = write_relationship_evidence(
+        src, tmp_path, tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG,
+        profile_stats={
+            "races": {"scanned_bytes": (2 << 30) + 1, "columns": {}},
+            "results": {"scanned_bytes": (2 << 30) + 1, "columns": {}},
+        },
+    )
+    # Measured OVER the gate is evidence, not uncertainty: no probes, no
+    # last-resort sketch attempts, zero queries.
+    assert out["joins_probed"] == 0 and out["grain_probed"] == 0
+    assert src.queries == []
+
+
+def test_unknown_size_sketch_attempt_writes_nominated_sheet(tmp_path):
+    # Fully unknown sizes: sketching now ATTEMPTS the tables (timeout-bounded;
+    # a timeout yields nothing, never wrong evidence) instead of refusing, and
+    # a nomination whose probe the size gate still refuses persists as a
+    # no-verdict NOMINATED sheet routing the author to a live probe.
+    meta = {
+        "satscores": _unhinted({"cds": "string", "avgscr": "int"}),
+        "schools": _unhinted({"cdscode": "string", "city": "string"}),
+    }
+    src = _SketchSource(
+        {
+            "satscores": {"cds": list(range(1, 91))},
+            "schools": {"cdscode": list(range(1, 101))},
+        },
+    )
+    out = write_relationship_evidence(
+        src, tmp_path, tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG,
+    )
+    assert src.sketch_queries == 2  # both unknown-size tables attempted
+    assert out["joins_probed"] == 0  # the probe itself is still size-refused
+    sheet = (
+        tmp_path / "relationships" / "joins"
+        / "satscores__schools--cds--cdscode.md"
+    ).read_text()
+    assert "NOMINATED, NOT PROBED" in sheet
+    assert "validate_join" in sheet and "containment" in sheet
+
+
+def test_unknown_size_sketch_breaker_stops_after_strikes(tmp_path):
+    meta = {
+        f"t{i}": _unhinted({f"t{i}_id": "int", "val": "string"})
+        for i in range(5)
+    }
+
+    class _Boom(_FakeSource):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def sql_bottomk_sketch(self, col_sql, k):
+            return f"BOTTOMK({col_sql},{k})"
+
+        def run_query(self, query, **kwargs):
+            if "BOTTOMK(" in query:
+                self.attempts += 1
+                raise RuntimeError("scan too large")
+            return super().run_query(query, **kwargs)
+
+    src = _Boom()
+    write_relationship_evidence(
+        src, tmp_path, tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG,
+    )
+    # Two consecutive failures, remaining three unknowns abandoned.
+    assert src.attempts == 2
+
+
+def test_sketchable_columns_profile_ranking_and_enum_floor():
+    from harvest.relationships import _sketchable_columns
+
+    cols = {
+        "a_code": "string", "b_code": "string", "c_code": "string",
+        "d_code": "string",
+    }
+    stats = {
+        "a_code": {"distinct": 12, "null_pct": 0.0},      # measured enum
+        "b_code": {"distinct": 90_000, "null_pct": 40.0},
+        "c_code": {"distinct": 90_000, "null_pct": 0.0},
+        # d_code unmeasured
+    }
+    ranked = _sketchable_columns(cols, cap=4, col_stats=stats)
+    # A measured enum can never survive the nominator's domain-floor
+    # guardrail — spending a sketch slot on it buys nothing.
+    assert "a_code" not in ranked
+    # Same name tier: low-null key beats high-null key beats unmeasured.
+    assert ranked == ["c_code", "b_code", "d_code"]

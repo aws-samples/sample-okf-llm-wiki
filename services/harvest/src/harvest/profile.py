@@ -100,6 +100,23 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """True when ``fn`` can take ``name`` as a keyword (incl. **kwargs)."""
+    if not callable(fn):
+        return False
+    try:
+        import inspect
+
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # builtins/C callables: can't tell
+        return False
+    if name in params:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 @dataclass(frozen=True)
 class ProfileConfig:
     """Env-derived knobs (documented in CONVENTIONS.md)."""
@@ -112,7 +129,14 @@ class ProfileConfig:
     max_enum_queries: int = 15
     max_columns: int = 100
     budget_s: int = 1800
-    query_timeout_s: int = 60
+    # Per-query ceiling. Deliberately as large as the whole pass: a profile
+    # that COMPLETES yields a sheet plus a fingerprint-cached size
+    # measurement, while one cancelled at 60s bills a partial scan for
+    # nothing (Athena charges bytes scanned up to cancellation). The pass
+    # budget still bounds the wall clock — _run clamps every query's timeout
+    # to the time remaining, so one slow table can consume the budget but
+    # never overrun it.
+    query_timeout_s: int = 1800
 
     @classmethod
     def from_env(cls) -> "ProfileConfig":
@@ -129,7 +153,7 @@ class ProfileConfig:
             max_enum_queries=_env_int("OKF_HARVEST_PROFILE_MAX_ENUM_QUERIES", 15),
             max_columns=_env_int("OKF_HARVEST_PROFILE_MAX_COLUMNS", 100),
             budget_s=_env_int("OKF_HARVEST_PROFILE_BUDGET_S", 1800),
-            query_timeout_s=_env_int("OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S", 60),
+            query_timeout_s=_env_int("OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S", 1800),
         )
 
 
@@ -272,6 +296,9 @@ class TableProfiler:
         self._approx = getattr(source, "sql_approx_distinct", None)
         self._sample = getattr(source, "sql_sample_clause", None)
         self._iceberg_bytes = getattr(source, "iceberg_data_bytes", None)
+        self._takes_stats = _accepts_kwarg(
+            getattr(source, "run_query", None), "stats"
+        )
 
     @property
     def supported(self) -> bool:
@@ -280,8 +307,23 @@ class TableProfiler:
     def out_of_budget(self) -> bool:
         return time.monotonic() > self._deadline
 
-    def _run(self, sql: str) -> list[dict[str, Any]]:
-        return self.source.run_query(sql, timeout_s=float(self.cfg.query_timeout_s))
+    def _run(
+        self, sql: str, stats: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        # Clamp to the remaining pass budget: at a 30-min per-query ceiling an
+        # unclamped query started near the deadline would overrun the whole
+        # pass by its own length (at the old 60s ceiling the overrun was
+        # noise). ``stats`` is the caller-owned sink run_query fills with the
+        # execution's data_scanned_bytes; it is only forwarded to sources
+        # whose run_query accepts it (checked once at init) — the
+        # measurement is optional, and a signature-mismatch retry would
+        # re-bill the query.
+        remaining = self._deadline - time.monotonic()
+        timeout = max(1.0, min(float(self.cfg.query_timeout_s), remaining))
+        kwargs: dict[str, Any] = {"timeout_s": timeout}
+        if stats is not None and self._takes_stats:
+            kwargs["stats"] = stats
+        return self.source.run_query(sql, **kwargs)
 
     def _distinct_sql(self, col_sql: str) -> str:
         if callable(self._approx):
@@ -290,10 +332,16 @@ class TableProfiler:
 
     def profile_table(
         self, table: str, meta: dict[str, Any]
-    ) -> tuple[str, str, dict[str, Any]]:
-        """Return ``(markdown_sheet, sample_pct, domains)`` — sample_pct "" =
-        full scan; ``domains`` maps enum-like columns to their observed value
-        lists (``{values, distinct, exhaustive}``) for ``domains.json``.
+    ) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+        """Return ``(markdown_sheet, sample_pct, domains, table_stats)`` —
+        sample_pct "" = full scan; ``domains`` maps enum-like columns to their
+        observed value lists (``{values, distinct, exhaustive}``) for
+        ``domains.json``; ``table_stats`` is ``{"scanned_bytes", "columns"}``
+        — the pass-1 execution's data_scanned_bytes (a real size measurement
+        of the profilable columns: BERNOULLI reads full bytes, so even a
+        sampled profile measures the true footprint) plus per-column
+        ``{distinct, null_pct}`` the relationship pass uses to rank sketch
+        columns.
 
         Raises on query failure; the caller records the error in the manifest.
         """
@@ -348,11 +396,21 @@ class TableProfiler:
             if (c.get("type") or "").lower().startswith(_ORDERABLE_PREFIXES):
                 selects.append(f"MIN({col_sql}) AS mn_{i}")
                 selects.append(f"MAX({col_sql}) AS mx_{i}")
+        scan_stats: dict[str, Any] = {}
         rows = self._run(
-            f"SELECT {', '.join(selects)} FROM {from_sql}{where_sql}"
+            f"SELECT {', '.join(selects)} FROM {from_sql}{where_sql}",
+            stats=scan_stats,
         )
         agg = rows[0] if rows else {}
         n = _to_int(agg.get("_n"))
+        column_stats: dict[str, Any] = {}
+        for i, c in enumerate(cols):
+            entry: dict[str, Any] = {"distinct": _to_int(agg.get(f"d_{i}"))}
+            if n:
+                entry["null_pct"] = round(
+                    100.0 * (1 - _to_int(agg.get(f"nn_{i}")) / n), 1
+                )
+            column_stats[c.get("name") or ""] = entry
 
         # Pass 2 — top-K values for the most enum-like columns only.
         enum_candidates = sorted(
@@ -412,6 +470,11 @@ class TableProfiler:
                 "exhaustive": exhaustive,
             }
 
+        scanned = scan_stats.get("data_scanned_bytes")
+        table_stats: dict[str, Any] = {
+            "scanned_bytes": int(scanned) if scanned is not None else None,
+            "columns": column_stats,
+        }
         return (
             _render_sheet(
                 table, cols, unprofilable, agg, n, topk,
@@ -419,6 +482,7 @@ class TableProfiler:
             ),
             sample_pct,
             domains,
+            table_stats,
         )
 
 
@@ -530,7 +594,15 @@ def write_profiles(
     ``"cross"`` re-profiles only fingerprint-mismatched or missing tables.
     """
     cfg = cfg or ProfileConfig.from_env()
-    out: dict[str, Any] = {"profiled": 0, "cached": 0, "skipped": 0, "files": []}
+    out: dict[str, Any] = {
+        "profiled": 0, "cached": 0, "skipped": 0, "files": [],
+        # {table: {"scanned_bytes": int|None, "columns": {col: {distinct,
+        # null_pct}}}} — fresh measurements plus cache-carried ones. The
+        # relationship pass consumes this: scanned_bytes is a sizing rung
+        # (a completed profile scan IS a size measurement) and the column
+        # stats rank sketch columns.
+        "profile_stats": {},
+    }
     if not cfg.enabled:
         return out
     profiler = TableProfiler(source, cfg)
@@ -581,6 +653,15 @@ def write_profiles(
             cached_domains = cache.domains.get(table)
             if cached_domains:
                 domains[table] = cached_domains
+                # Carry the prior run's measurement forward with the sheet:
+                # the fingerprint (update time + version + column set + size
+                # hints) vouches that the data it measured is unchanged.
+                stats_entry = {
+                    "scanned_bytes": cached_domains.get("scanned_bytes"),
+                    "columns": cached_domains.get("column_stats") or {},
+                }
+                if stats_entry["scanned_bytes"] is not None or stats_entry["columns"]:
+                    out["profile_stats"][table] = stats_entry
             out["cached"] += 1
             out["files"].append(f"profile/{table}.md")
             continue
@@ -589,7 +670,9 @@ def write_profiles(
             out["skipped"] += 1
             continue
         try:
-            sheet, sample_pct, table_domains = profiler.profile_table(table, meta)
+            sheet, sample_pct, table_domains, table_stats = (
+                profiler.profile_table(table, meta)
+            )
         except Exception as e:  # noqa: BLE001 - per-table best-effort
             log.info("Profile failed for table %s: %s", table, e)
             manifest_lines.append(
@@ -599,8 +682,22 @@ def write_profiles(
             continue
         write_text(profile_root / f"{table}.md", sheet)
         manifest_lines.append(f"{table}\t{fp}\tok\t{sample_pct}\t{now}")
-        if table_domains:
-            domains[table] = {"profiled_at": now, "columns": table_domains}
+        # Every profiled table gets a domains.json entry now — the sibling
+        # scanned_bytes/column_stats keys ride the same file (and its cache
+        # carry) so the measurement survives runs. flatten_domains ignores
+        # entries whose columns are empty, so downstream consumers are
+        # unaffected.
+        entry: dict[str, Any] = {"profiled_at": now, "columns": table_domains}
+        if table_stats.get("scanned_bytes") is not None:
+            entry["scanned_bytes"] = table_stats["scanned_bytes"]
+        if table_stats.get("columns"):
+            entry["column_stats"] = table_stats["columns"]
+        if sample_pct:
+            entry["sample_pct"] = sample_pct
+        if table_domains or len(entry) > 2:
+            domains[table] = entry
+        if table_stats.get("scanned_bytes") is not None or table_stats.get("columns"):
+            out["profile_stats"][table] = table_stats
         out["profiled"] += 1
         out["files"].append(f"profile/{table}.md")
 
