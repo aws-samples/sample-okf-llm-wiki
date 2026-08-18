@@ -1654,3 +1654,100 @@ def test_sketchable_columns_profile_ranking_and_enum_floor():
     assert "a_code" not in ranked
     # Same name tier: low-null key beats high-null key beats unmeasured.
     assert ranked == ["c_code", "b_code", "d_code"]
+
+
+# ---------------------------------------------------------------------------
+# the proven band (small ≤ 10 GiB unconditional; 10–50 GiB needs a rate)
+# ---------------------------------------------------------------------------
+
+# Default gates: small_table_bytes=10 GiB, max_table_bytes=50 GiB.
+CFG_BAND = RelationshipConfig(
+    enabled=True, budget_s=600, max_pairs=60,
+    max_grain_per_table=2, max_tables_per_key=6,
+)
+
+
+def _band_meta():
+    return {
+        "races": _meta({"raceid": "int"}),                       # small hint
+        "results": _meta({"resultid": "int", "raceid": "int"},
+                         totalSize=20 << 30),                    # in the band
+    }
+
+
+def _band_stats(scan_ms):
+    return {"results": {"scanned_bytes": 20 << 30, "scan_ms": scan_ms,
+                        "columns": {}}}
+
+
+def test_proven_band_runs_with_fast_measured_rate(tmp_path):
+    out = write_relationship_evidence(
+        _FakeSource(unique_sides={"races"}), tmp_path,
+        tables_meta=_band_meta(),
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG_BAND,
+        # ~1 GB/s -> a 20 GiB full scan predicts ~21s, inside 0.9*60s.
+        profile_stats=_band_stats(scan_ms=20_000),
+    )
+    assert out["joins_probed"] >= 1 and out["grain_probed"] == 2
+
+
+def test_proven_band_without_rate_does_not_run(tmp_path):
+    src = _FakeSource(unique_sides={"races"})
+    out = write_relationship_evidence(
+        src, tmp_path, tables_meta=_band_meta(),
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG_BAND,
+        # No profile_stats: the in-band table has NO proof -> refused.
+    )
+    manifest = (tmp_path / "relationships" / "manifest.tsv").read_text()
+    assert "skipped-slow" in manifest        # distinct from a hard size skip
+    assert out["grain_probed"] == 1          # the small table still probed
+    assert out["joins_probed"] == 0          # no sql_sampled_ref on the fake
+
+
+def test_proven_band_slow_rate_degrades_to_the_sampled_probe(tmp_path):
+    class _Sampled(_FakeSource):
+        def sql_sampled_ref(self, ref_sql, percent):
+            return f"(SELECT * FROM {ref_sql} SAMPLE {percent:g})"
+
+    out = write_relationship_evidence(
+        _Sampled(unique_sides={"races"}), tmp_path,
+        tables_meta=_band_meta(),
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG_BAND,
+        # ~36 MB/s -> a full scan predicts ~10min: refused, but the measured
+        # size still feeds the sample percent, so the pair degrades to the
+        # SYSTEM-sampled probe instead of vanishing.
+        profile_stats=_band_stats(scan_ms=600_000),
+    )
+    manifest = (tmp_path / "relationships" / "manifest.tsv").read_text()
+    assert "ok-sampled" in manifest
+    assert out["joins_probed"] >= 1
+
+
+def test_sketch_respects_the_proven_band(tmp_path):
+    meta = {
+        "satscores": _meta({"cds": "string", "avgscr": "int"},
+                           totalSize=20 << 30),
+        "schools": _meta({"cdscode": "string", "city": "string"}),
+    }
+    sketch_values = {
+        "satscores": {"cds": list(range(1, 91))},
+        "schools": {"cdscode": list(range(1, 101))},
+    }
+    # Unproven: the in-band table is not sketched (only the small one is).
+    src = _SketchSource(sketch_values)
+    write_relationship_evidence(
+        src, tmp_path / "a", tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG_BAND,
+    )
+    assert src.sketch_queries == 1
+    # Proven fast: both sketched, the renamed key nominates AND full-probes.
+    src2 = _SketchSource(sketch_values, unique_sides={"schools"},
+                         match_rate=0.9)
+    out = write_relationship_evidence(
+        src2, tmp_path / "b", tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG_BAND,
+        profile_stats={"satscores": {"scanned_bytes": 20 << 30,
+                                     "scan_ms": 20_000, "columns": {}}},
+    )
+    assert src2.sketch_queries == 2
+    assert out["joins_probed"] >= 1

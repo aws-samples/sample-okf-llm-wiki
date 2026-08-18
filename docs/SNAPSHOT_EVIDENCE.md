@@ -58,13 +58,16 @@ Cost posture:
   deployment (~300 s buys the 100–500 GB band) when such tables are worth
   profiling. Every query's timeout is clamped to the budget remaining, so no
   setting lets one query overrun the pass.
-- **The pass-1 scan doubles as a size measurement.** Athena reports each
-  execution's `data_scanned_bytes`; because BERNOULLI reads full bytes,
-  even a *sampled* profile measures the real footprint of the profilable
-  columns. That number — plus per-column `{distinct, null_pct}` — persists
-  as sibling keys on the table's `domains.json` entry (cache-carried under
-  the same fingerprint policy) and feeds the relationship pass: observed
-  bytes are a sizing rung, and the column stats rank sketch columns.
+- **The pass-1 scan doubles as a size AND throughput measurement.** Athena
+  reports each execution's `data_scanned_bytes` and `engine_ms`; because
+  BERNOULLI reads full bytes, even a *sampled* profile measures the real
+  footprint of the profilable columns, and bytes/engine-time is a
+  layout-aware scan rate for this exact table. Both — plus per-column
+  `{distinct, null_pct}` — persist as sibling keys on the table's
+  `domains.json` entry (cache-carried under the same fingerprint policy)
+  and feed the relationship pass: observed bytes are a sizing rung, the
+  rate powers the proven-band feasibility check, and the column stats rank
+  sketch columns.
 - **Fingerprint cache**: each sheet is keyed on the table's catalog identity
   (update time + version + column set + size/row hints). Incremental runs
   re-profile only the changed table, cross runs only mismatches; a **full
@@ -193,11 +196,21 @@ listing** of the table's location (`estimate_table_bytes`, LIST calls only,
 early-exit at the gate; needed because DDL-registered tables carry no
 `totalSize` — only crawlers/ETL write it) → assume large. Then:
 
+Per-side, a FULL scan is allowed by a three-tier policy: at or under
+`OKF_HARVEST_REL_SMALL_TABLE_BYTES` (10 GiB) — unconditionally; over
+`OKF_HARVEST_REL_MAX_TABLE_BYTES` (50 GiB) — never; in the **proven band**
+between them — only when a profile-measured scan rate (this table's own
+`scanned_bytes/scan_ms`, else the catalog's conservative p25) predicts
+completion within 90% of the probe's query timeout. No measurement in the
+band = not proven = does not run (grain rows say `skipped-slow`, distinct
+from the hard `skipped-size`). The measured rates and the byte ceiling they
+imply are logged (job logs only) as operator guidance. Then, per pair:
+
 | Pair shape | Action |
 |---|---|
-| both sides ≤ 10 GiB | full two-direction probe (4 aggregate queries) |
-| exactly one side bigger, size known | **sampled probe**: big side `TABLESAMPLE SYSTEM` toward ~256 MiB vs the FULL small side |
-| both big, or size unmeasurable | `skipped-size` |
+| both sides pass the full-scan policy | full two-direction probe (4 aggregate queries) |
+| exactly one side refused, size known | **sampled probe**: that side `TABLESAMPLE SYSTEM` toward ~256 MiB vs the FULL small side (sampling makes it feasible by construction) |
+| both refused, or size unmeasurable | `skipped-size` |
 
 The sampled probe reports **only the sampled→full direction** — a uniform
 sample of the contained side probed against the full containing side is an
@@ -271,7 +284,8 @@ Authoritative table in CONVENTIONS.md; the ones that matter operationally:
 | `OKF_HARVEST_REL_BUDGET_S` | 1800 | relationship pass wall clock |
 | `OKF_HARVEST_REL_QUERY_TIMEOUT_S` | 60 | sketch per-query timeout; bounds each unknown-size last-resort attempt |
 | `OKF_HARVEST_REL_MAX_PAIRS` | 100 | join-pair cap |
-| `OKF_HARVEST_REL_MAX_TABLE_BYTES` | 10 GiB | full-probe size gate per side |
+| `OKF_HARVEST_REL_MAX_TABLE_BYTES` | 50 GiB | hard per-side ceiling for full scans |
+| `OKF_HARVEST_REL_SMALL_TABLE_BYTES` | 10 GiB | below: full scans run unconditionally; between it and the ceiling: only with a proven rate |
 | `OKF_HARVEST_REL_SAMPLE_TARGET_BYTES` | 256 MiB | sampled-probe target |
 | `OKF_HARVEST_REL_SKETCH_MIN_CONTAINMENT` | 0.5 | sketch nomination threshold |
 | `OKF_HARVEST_REL_ENABLED` / `…_SKETCH_ENABLED` | on | kill switches |

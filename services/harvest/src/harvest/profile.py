@@ -471,8 +471,14 @@ class TableProfiler:
             }
 
         scanned = scan_stats.get("data_scanned_bytes")
+        scan_ms = scan_stats.get("engine_ms")
         table_stats: dict[str, Any] = {
             "scanned_bytes": int(scanned) if scanned is not None else None,
+            # Engine time of the same scan: bytes/ms is a LAYOUT-AWARE
+            # throughput measurement for this table, which the relationship
+            # pass uses to predict whether a probe/sketch can complete
+            # within its query timeout (the feasibility band).
+            "scan_ms": int(scan_ms) if scan_ms is not None else None,
             "columns": column_stats,
         }
         return (
@@ -658,6 +664,7 @@ def write_profiles(
                 # hints) vouches that the data it measured is unchanged.
                 stats_entry = {
                     "scanned_bytes": cached_domains.get("scanned_bytes"),
+                    "scan_ms": cached_domains.get("scan_ms"),
                     "columns": cached_domains.get("column_stats") or {},
                 }
                 if stats_entry["scanned_bytes"] is not None or stats_entry["columns"]:
@@ -690,6 +697,8 @@ def write_profiles(
         entry: dict[str, Any] = {"profiled_at": now, "columns": table_domains}
         if table_stats.get("scanned_bytes") is not None:
             entry["scanned_bytes"] = table_stats["scanned_bytes"]
+        if table_stats.get("scan_ms") is not None:
+            entry["scan_ms"] = table_stats["scan_ms"]
         if table_stats.get("columns"):
             entry["column_stats"] = table_stats["columns"]
         if sample_pct:

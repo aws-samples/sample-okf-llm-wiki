@@ -99,6 +99,14 @@ _ENUM_MIN_REPEAT = 4  # each value repeats ≥ this on both sides
 
 _ORPHAN_SAMPLE_N = 5
 
+#: Fraction of the query timeout a predicted scan must fit inside to count
+#: as PROVEN feasible — the headroom absorbs fleet-contention noise. A
+#: misprediction is still bounded by the timeout itself.
+_FEASIBILITY_MARGIN = 0.9
+#: The join/grain probes run at the source's default query timeout (probes.py
+#: passes none); feasibility predictions for them use the same number.
+_PROBE_QUERY_TIMEOUT_S = 60.0
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -116,7 +124,11 @@ class RelationshipConfig:
     max_pairs: int = 100
     max_grain_per_table: int = 2
     max_tables_per_key: int = 6
-    max_table_bytes: int = 10 << 30  # full probes only below this per side
+    # Hard per-side ceiling for full scans (probes and sketches). Raised
+    # from 10 GiB when the feasibility band landed: 10–50 GiB tables now run
+    # only with a PROVEN throughput (see small_table_bytes), so the ceiling
+    # bounds worst-case spend while the proof bounds worst-case time.
+    max_table_bytes: int = 50 << 30
     # When exactly ONE side exceeds the gate (the enterprise fact→dim shape),
     # probe with THAT side sampled toward this byte target (the other side
     # stays full — sampling a CONTAINING side biases match rates); both sides
@@ -133,6 +145,13 @@ class RelationshipConfig:
     # timed-out sketch produces NOTHING (never wrong evidence), so a bounded
     # attempt is safe where a sampled sketch would not be.
     query_timeout_s: int = 60
+    # The FEASIBILITY-FREE zone: tables measured at or under this are probed
+    # and sketched with no questions asked (the pre-2026-08 posture, where
+    # this WAS the whole gate). Between it and max_table_bytes sits the
+    # PROVEN band: a table runs only when a profile-measured scan rate
+    # predicts completion within the margin of the query timeout — no
+    # measurement means it does not run. See _feasible_full.
+    small_table_bytes: int = 10 << 30  # 10 GiB
 
     @classmethod
     def from_env(cls) -> "RelationshipConfig":
@@ -143,7 +162,7 @@ class RelationshipConfig:
             max_grain_per_table=_env_int("OKF_HARVEST_REL_MAX_GRAIN_PER_TABLE", 2),
             max_tables_per_key=_env_int("OKF_HARVEST_REL_MAX_TABLES_PER_KEY", 6),
             max_table_bytes=_env_int(
-                "OKF_HARVEST_REL_MAX_TABLE_BYTES", 10 << 30
+                "OKF_HARVEST_REL_MAX_TABLE_BYTES", 50 << 30
             ),
             sketch_enabled=os.environ.get("OKF_HARVEST_REL_SKETCH_ENABLED", "1")
             != "0",
@@ -153,6 +172,9 @@ class RelationshipConfig:
             ),
             sketch_max_columns=_env_int("OKF_HARVEST_REL_SKETCH_MAX_COLUMNS", 12),
             query_timeout_s=_env_int("OKF_HARVEST_REL_QUERY_TIMEOUT_S", 60),
+            small_table_bytes=_env_int(
+                "OKF_HARVEST_REL_SMALL_TABLE_BYTES", 10 << 30
+            ),
             sample_target_bytes=_env_int(
                 "OKF_HARVEST_REL_SAMPLE_TARGET_BYTES", 256 << 20
             ),
@@ -622,6 +644,7 @@ def _collect_sketches(
     cfg: RelationshipConfig,
     *,
     table_bytes: Any,
+    feasible: Any,
     past_deadline: Any,
     on_progress: Any = None,
     profile_stats: dict[str, Any] | None = None,
@@ -633,10 +656,11 @@ def _collect_sketches(
     query (Redshift, which lacks the aggregate but is columnar anyway).
     Neither → no sketches, and sketch nomination silently contributes nothing.
 
-    Tables are visited in two phases. Phase 1: tables measured under the size
-    gate (``table_bytes`` — catalog hint, profile-observed scan bytes,
-    Iceberg ``$files``, or S3 listing). Phase 2: UNKNOWN-size tables as
-    bounded LAST-RESORT attempts — the per-query timeout caps each attempt's
+    Tables are visited in two phases. Phase 1: measured tables that pass the
+    ``feasible`` policy (``table_bytes`` — catalog hint, profile-observed
+    scan bytes, Iceberg ``$files``, or S3 listing; under the small-table
+    zone unconditionally, in the proven band only with a measured rate).
+    Phase 2: UNKNOWN-size tables as bounded LAST-RESORT attempts — the per-query timeout caps each attempt's
     cost, a timed-out sketch yields NOTHING rather than wrong evidence
     (unlike a sampled sketch, whose deflated containment would read as
     "unrelated"), and after ``_UNKNOWN_SKETCH_STRIKES`` consecutive failures
@@ -715,8 +739,8 @@ def _collect_sketches(
             unknown.append(table)  # deferred to phase 2
             continue
         _tick(f"sketching {table}")
-        if size > cfg.max_table_bytes:
-            continue  # measured big: never attempted
+        if not feasible(table, size):
+            continue  # measured big, or in the proven band without proof
         try:
             _sketch_one(table)
         except Exception as e:  # noqa: BLE001 — a lost sketch loses nominations only
@@ -1430,12 +1454,57 @@ def write_relationship_evidence(
                     measured[t] = None
             return measured[t]
 
-        def _oversized(*tables: str) -> bool:
-            for t in tables:
-                size = _table_bytes(t)
-                if size is None or size > cfg.max_table_bytes:
-                    return True
-            return False
+        # ---- feasibility: the small/proven/never tiers ------------------
+        # Under small_table_bytes a full scan runs with no questions asked
+        # (the pre-existing posture). Over max_table_bytes it never runs.
+        # In between — the PROVEN band — it runs only when a measured scan
+        # rate predicts completion inside the margin of the query timeout.
+        # Rates come from the profile pass (bytes/engine-time of the pass-1
+        # scan — layout-aware, per table); tables without their own rate
+        # fall back to the catalog's conservative p25.
+        small_bytes = min(cfg.small_table_bytes, cfg.max_table_bytes)
+
+        def _scan_rate(t: str) -> float | None:
+            entry = (profile_stats or {}).get(t) or {}
+            b, ms = entry.get("scanned_bytes"), entry.get("scan_ms")
+            if b and ms:
+                return float(b) / (float(ms) / 1000.0)
+            return None
+
+        rates = sorted(r for r in (_scan_rate(t) for t in tables_meta) if r)
+        catalog_rate = rates[len(rates) // 4] if rates else None  # p25
+
+        def _feasible_full(t: str, size: int, timeout_s: float) -> bool:
+            if size <= small_bytes:
+                return True
+            if size > cfg.max_table_bytes:
+                return False
+            rate = _scan_rate(t) or catalog_rate
+            if not rate:
+                return False  # in the band without proof: does not run
+            return (size / rate) <= _FEASIBILITY_MARGIN * timeout_s
+
+        def _band_status(size: int | None) -> str:
+            """Manifest status for a refused full scan: distinguish the
+            proven-band refusal (a live probe may still be worth the
+            author's time) from a hard size refusal."""
+            if size is not None and size <= cfg.max_table_bytes:
+                return "skipped-slow"
+            return "skipped-size"
+
+        if catalog_rate:
+            # Operator guidance, job logs only: what the measured rates imply.
+            log.info(
+                "Feasibility: %d table scan rate(s) measured, p25 ~%.1f MB/s "
+                "— a %.0fs probe covers ~%.1f GB; %.0f–%.0f GiB tables run "
+                "only with a proven rate",
+                len(rates),
+                catalog_rate / 1e6,
+                _PROBE_QUERY_TIMEOUT_S,
+                catalog_rate * _FEASIBILITY_MARGIN * _PROBE_QUERY_TIMEOUT_S / 1e9,
+                small_bytes / (1 << 30),
+                cfg.max_table_bytes / (1 << 30),
+            )
 
         measured_exact: dict[str, int | None] = {}
 
@@ -1507,10 +1576,14 @@ def write_relationship_evidence(
                 _emit("grain", table, fp, "skipped-budget")
                 out["skipped"] += 1
                 continue
-            if _oversized(table):
+            g_size = _table_bytes(table)
+            if g_size is None or not _feasible_full(
+                table, g_size, _PROBE_QUERY_TIMEOUT_S
+            ):
                 # The grain probe is a whole-table GROUP BY — the same scan
-                # gate as joins applies (and no hint = assume large).
-                _emit("grain", table, fp, "skipped-size")
+                # policy as joins applies (no hint = assume large; the
+                # proven band needs a measured rate).
+                _emit("grain", table, fp, _band_status(g_size))
                 out["skipped"] += 1
                 continue
             results = [
@@ -1556,6 +1629,11 @@ def write_relationship_evidence(
                 tables_meta,
                 cfg,
                 table_bytes=_table_bytes,
+                # Sketch feasibility uses the sketch queries' OWN timeout
+                # (cfg.query_timeout_s), not the probes' 60s default.
+                feasible=lambda t, size: _feasible_full(
+                    t, size, float(cfg.query_timeout_s)
+                ),
                 # The sketch scan gets HALF the budget, hard: on a 237-table
                 # catalog the collection alone can eat the whole wall clock
                 # and leave zero seconds for the probes it exists to feed
@@ -1634,12 +1712,15 @@ def write_relationship_evidence(
             over = [
                 t
                 for t, b in sizes.items()
-                if b is None or b > cfg.max_table_bytes
+                if b is None
+                or not _feasible_full(t, b, _PROBE_QUERY_TIMEOUT_S)
             ]
             sampled_side: str | None = None
             if len(over) == 1 and sizes[over[0]] is not None:
-                # The enterprise fact→dim shape: ONE measured-big side. Probe
-                # it SAMPLED against the full small side — the one direction
+                # The enterprise fact→dim shape: ONE side refused a full
+                # scan (measured big, or in the proven band without proof —
+                # sampling makes it feasible by construction). Probe it
+                # SAMPLED against the full small side — the one direction
                 # sampling leaves unbiased. Requires the source to sample by
                 # reference (Athena TABLESAMPLE SYSTEM); without it, skip.
                 if callable(getattr(source, "sql_sampled_ref", None)):
