@@ -44,10 +44,14 @@ class _Src:
     )
     name = "fake"
 
-    def __init__(self, *, agg=None, topk=None, can_sample=True):
+    def __init__(self, *, agg=None, topk=None, can_sample=True,
+                 scanned_bytes=None, scan_ms=None):
         self.agg = agg or {}
         self.topk = topk or {}
         self.queries: list[str] = []
+        self.query_kwargs: list[dict] = []
+        self.scanned_bytes = scanned_bytes  # fills the stats sink when set
+        self.scan_ms = scan_ms
         if not can_sample:
             # Simulate a source without the sampling atom at all.
             self.sql_sample_clause = None  # getattr() sees a non-callable
@@ -63,6 +67,12 @@ class _Src:
 
     def run_query(self, query, **kwargs):
         self.queries.append(query)
+        self.query_kwargs.append(kwargs)
+        sink = kwargs.get("stats")
+        if sink is not None and self.scanned_bytes is not None:
+            sink["data_scanned_bytes"] = self.scanned_bytes
+        if sink is not None and self.scan_ms is not None:
+            sink["engine_ms"] = self.scan_ms
         if "GROUP BY" in query:
             col = query.split('"')[1]
             return self.topk.get(col, [])
@@ -216,7 +226,10 @@ def test_disabled_via_env_writes_nothing(tmp_path: Path):
     cfg = ProfileConfig(enabled=False)
     out = write_profiles(src, tmp_path, tables_meta={"t": _meta(("a", "string"))},
                          cache=read_cached_profiles(tmp_path), cfg=cfg)
-    assert out == {"profiled": 0, "cached": 0, "skipped": 0, "files": []}
+    assert out == {
+        "profiled": 0, "cached": 0, "skipped": 0, "files": [],
+        "profile_stats": {},
+    }
     assert not (tmp_path / PROFILE_DIR).exists()
 
 
@@ -482,3 +495,58 @@ def test_iceberg_capability_none_keeps_assume_large(tmp_path: Path):
     write_profiles(src, tmp_path, tables_meta=meta,
                    cache=read_cached_profiles(tmp_path), cfg=CFG)
     assert "TABLESAMPLE BERNOULLI (10)" in src.queries[0]  # the old fallback
+
+
+# ---------------------------------------------------------------------------
+# Pass-1 measurements: scanned bytes + per-column stats (profile_stats)
+# ---------------------------------------------------------------------------
+
+
+def test_scanned_bytes_and_column_stats_measured_and_persisted(tmp_path: Path):
+    src = _Src(agg=_small_table_agg(), scanned_bytes=4321, scan_ms=250)
+    meta = {"races": _meta(("status", "string"), ("driver_ref", "bigint"),
+                           size=500)}
+    out = write_profiles(src, tmp_path, tables_meta=meta,
+                         cache=read_cached_profiles(tmp_path), cfg=CFG)
+    stats = out["profile_stats"]["races"]
+    assert stats["scanned_bytes"] == 4321
+    assert stats["scan_ms"] == 250  # bytes/ms = the table's layout-aware rate
+    # 90/100 non-null driver_ref -> 10.0% null share; ~80 distinct.
+    assert stats["columns"]["driver_ref"] == {"distinct": 80, "null_pct": 10.0}
+    assert stats["columns"]["status"] == {"distinct": 4, "null_pct": 0.0}
+    # The measurement rides domains.json so it survives runs with the cache.
+    dom = _domains(tmp_path)["tables"]["races"]
+    assert dom["scanned_bytes"] == 4321
+    assert dom["scan_ms"] == 250
+    assert dom["column_stats"]["status"]["distinct"] == 4
+
+
+def test_profile_stats_carried_on_incremental_reuse(tmp_path: Path):
+    meta = {"races": _meta(("status", "string"), size=500)}
+    src = _Src(agg=_small_table_agg(), scanned_bytes=999)
+    write_profiles(src, tmp_path / ".metadata", tables_meta=meta,
+                   cache=read_cached_profiles(tmp_path), cfg=CFG)
+    # Second run, unchanged fingerprint, incremental: sheet reused from cache
+    # and the measurement carried with it.
+    src2 = _Src(agg=_small_table_agg())
+    out = write_profiles(src2, tmp_path / ".metadata", tables_meta=meta,
+                         cache=read_cached_profiles(tmp_path),
+                         profile_mode="incremental", cfg=CFG)
+    assert out["cached"] == 1 and src2.queries == []
+    assert out["profile_stats"]["races"]["scanned_bytes"] == 999
+    assert out["profile_stats"]["races"]["columns"]["status"]["distinct"] == 4
+
+
+def test_query_timeout_clamped_to_remaining_budget(tmp_path: Path):
+    # A 30-min per-query ceiling must never overrun the pass deadline: with
+    # a 3s budget the query gets ~3s, not query_timeout_s.
+    cfg = ProfileConfig(
+        sample_above_bytes=1000, target_sample_bytes=100, enum_max_distinct=5,
+        topk=3, max_enum_queries=2, budget_s=3, query_timeout_s=1800,
+    )
+    src = _Src(agg=_small_table_agg())
+    write_profiles(src, tmp_path,
+                   tables_meta={"races": _meta(("status", "string"), size=500)},
+                   cache=read_cached_profiles(tmp_path), cfg=cfg)
+    assert src.query_kwargs, "no query ran"
+    assert all(k["timeout_s"] <= 3.0 for k in src.query_kwargs)

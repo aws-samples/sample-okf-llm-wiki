@@ -99,6 +99,14 @@ _ENUM_MIN_REPEAT = 4  # each value repeats ≥ this on both sides
 
 _ORPHAN_SAMPLE_N = 5
 
+#: Fraction of the query timeout a predicted scan must fit inside to count
+#: as PROVEN feasible — the headroom absorbs fleet-contention noise. A
+#: misprediction is still bounded by the timeout itself.
+_FEASIBILITY_MARGIN = 0.9
+#: The join/grain probes run at the source's default query timeout (probes.py
+#: passes none); feasibility predictions for them use the same number.
+_PROBE_QUERY_TIMEOUT_S = 60.0
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -116,7 +124,11 @@ class RelationshipConfig:
     max_pairs: int = 100
     max_grain_per_table: int = 2
     max_tables_per_key: int = 6
-    max_table_bytes: int = 10 << 30  # full probes only below this per side
+    # Hard per-side ceiling for full scans (probes and sketches). Raised
+    # from 10 GiB when the feasibility band landed: 10–50 GiB tables now run
+    # only with a PROVEN throughput (see small_table_bytes), so the ceiling
+    # bounds worst-case spend while the proof bounds worst-case time.
+    max_table_bytes: int = 50 << 30
     # When exactly ONE side exceeds the gate (the enterprise fact→dim shape),
     # probe with THAT side sampled toward this byte target (the other side
     # stays full — sampling a CONTAINING side biases match rates); both sides
@@ -128,6 +140,18 @@ class RelationshipConfig:
     sketch_k: int = 256           # sketch size; estimation error ~1/sqrt(k)
     sketch_min_containment: float = 0.5  # nominate at/above this estimate
     sketch_max_columns: int = 12  # sketched columns per table (priority-ranked)
+    # Per-query timeout for the sketch scans (seconds). Doubles as the cost
+    # bound for LAST-RESORT sketch attempts on unknown-size tables: a
+    # timed-out sketch produces NOTHING (never wrong evidence), so a bounded
+    # attempt is safe where a sampled sketch would not be.
+    query_timeout_s: int = 60
+    # The FEASIBILITY-FREE zone: tables measured at or under this are probed
+    # and sketched with no questions asked (the pre-2026-08 posture, where
+    # this WAS the whole gate). Between it and max_table_bytes sits the
+    # PROVEN band: a table runs only when a profile-measured scan rate
+    # predicts completion within the margin of the query timeout — no
+    # measurement means it does not run. See _feasible_full.
+    small_table_bytes: int = 10 << 30  # 10 GiB
 
     @classmethod
     def from_env(cls) -> "RelationshipConfig":
@@ -138,7 +162,7 @@ class RelationshipConfig:
             max_grain_per_table=_env_int("OKF_HARVEST_REL_MAX_GRAIN_PER_TABLE", 2),
             max_tables_per_key=_env_int("OKF_HARVEST_REL_MAX_TABLES_PER_KEY", 6),
             max_table_bytes=_env_int(
-                "OKF_HARVEST_REL_MAX_TABLE_BYTES", 10 << 30
+                "OKF_HARVEST_REL_MAX_TABLE_BYTES", 50 << 30
             ),
             sketch_enabled=os.environ.get("OKF_HARVEST_REL_SKETCH_ENABLED", "1")
             != "0",
@@ -147,6 +171,10 @@ class RelationshipConfig:
                 "OKF_HARVEST_REL_SKETCH_MIN_CONTAINMENT", 0.5
             ),
             sketch_max_columns=_env_int("OKF_HARVEST_REL_SKETCH_MAX_COLUMNS", 12),
+            query_timeout_s=_env_int("OKF_HARVEST_REL_QUERY_TIMEOUT_S", 60),
+            small_table_bytes=_env_int(
+                "OKF_HARVEST_REL_SMALL_TABLE_BYTES", 10 << 30
+            ),
             sample_target_bytes=_env_int(
                 "OKF_HARVEST_REL_SAMPLE_TARGET_BYTES", 256 << 20
             ),
@@ -515,14 +543,31 @@ def _containments(
     )
 
 
-def _sketchable_columns(cols: dict[str, str], cap: int) -> list[str]:
+def _sketchable_columns(
+    cols: dict[str, str],
+    cap: int,
+    col_stats: dict[str, Any] | None = None,
+) -> list[str]:
     """Which columns earn a sketch, priority-ranked then capped.
 
     Only int/text families (join keys live there); key-looking names first so
     the cap trims descriptive columns, not keys. Broader than key-LIKE on
     purpose — the whole point is name-blindness (``cds`` is nobody's idea of
-    a key name), so plain columns still qualify, just at lower priority."""
+    a key name), so plain columns still qualify, just at lower priority.
+
+    ``col_stats`` (the profile pass's per-column ``{distinct, null_pct}``)
+    refines the order WITHIN each name tier: high-distinct, low-null columns
+    first — that's what keys look like — so the cap trims measured
+    descriptive columns before measured keys. Columns whose OBSERVED distinct
+    count is at or under the enum-domain floor are excluded outright: the
+    comparison stage refuses their nominations anyway (a tiny domain is
+    contained in everything), so a sketch slot spent on them buys nothing.
+    The exclusion is safe even from a sampled (INDICATIVE) profile — a
+    genuine key's in-sample distinct tracks the sampled row count, orders of
+    magnitude above the floor, while a true enum stays tiny in any sample.
+    No stats (profile skipped/failed) → the pure name ranking, as before."""
     hints = ("id", "key", "code", "num", "nbr", "cd", "no")
+    stats = col_stats or {}
 
     def score(name: str) -> int:
         low = name.lower()
@@ -530,10 +575,36 @@ def _sketchable_columns(cols: dict[str, str], cap: int) -> list[str]:
             return 0
         return 1 if any(h in low for h in hints) else 2
 
+    def _stat(name: str, key: str) -> float | None:
+        entry = stats.get(name)
+        if isinstance(entry, dict):
+            v = entry.get(key)
+            if isinstance(v, (int, float)):
+                return float(v)
+        return None
+
+    def measured_enum(name: str) -> bool:
+        d = _stat(name, "distinct")
+        return d is not None and 0 < d <= _ENUM_DOMAIN_MAX
+
+    def rank(name: str) -> tuple[int, float, float, str]:
+        distinct = _stat(name, "distinct")
+        null_pct = _stat(name, "null_pct")
+        return (
+            score(name),
+            # Higher distinct first; unmeasured columns (None) rank after
+            # every measured one within their name tier — a measurement,
+            # even a modest one, beats a guess.
+            -(distinct if distinct is not None else 0.5),
+            null_pct if null_pct is not None else 50.0,
+            name,
+        )
+
     eligible = [
-        c for c, t in cols.items() if _type_fam(t) in ("int", "text")
+        c for c, t in cols.items()
+        if _type_fam(t) in ("int", "text") and not measured_enum(c)
     ]
-    return sorted(eligible, key=lambda c: (score(c), c))[:cap]
+    return sorted(eligible, key=rank)[:cap]
 
 
 def _parse_sketch(value: Any) -> list[int]:
@@ -560,14 +631,23 @@ def _parse_sketch(value: Any) -> list[int]:
     return sorted(set(out))
 
 
+#: Consecutive failed last-resort attempts (unknown-size tables) before the
+#: sketch collector stops attempting the rest — at that point the catalog is
+#: telling us the unknowns are big, and each further timeout eats a full
+#: query-timeout of the sketch half-budget for nothing.
+_UNKNOWN_SKETCH_STRIKES = 2
+
+
 def _collect_sketches(
     source: Any,
     tables_meta: dict[str, dict[str, Any]],
     cfg: RelationshipConfig,
     *,
-    skip_table: Any,
+    table_bytes: Any,
+    feasible: Any,
     past_deadline: Any,
     on_progress: Any = None,
+    profile_stats: dict[str, Any] | None = None,
 ) -> tuple[dict[str, dict[str, list[int]]], list[str]]:
     """{table: {column: sketch}} via whichever capability the source has.
 
@@ -575,6 +655,18 @@ def _collect_sketches(
     — every column of a table in ONE columnar scan. Fallback: a per-column
     query (Redshift, which lacks the aggregate but is columnar anyway).
     Neither → no sketches, and sketch nomination silently contributes nothing.
+
+    Tables are visited in two phases. Phase 1: measured tables that pass the
+    ``feasible`` policy (``table_bytes`` — catalog hint, profile-observed
+    scan bytes, Iceberg ``$files``, or S3 listing; under the small-table
+    zone unconditionally, in the proven band only with a measured rate).
+    Phase 2: UNKNOWN-size tables as bounded LAST-RESORT attempts — the per-query timeout caps each attempt's
+    cost, a timed-out sketch yields NOTHING rather than wrong evidence
+    (unlike a sampled sketch, whose deflated containment would read as
+    "unrelated"), and after ``_UNKNOWN_SKETCH_STRIKES`` consecutive failures
+    the rest are abandoned with a note. Phase 2 runs last so doomed attempts
+    can never starve the tables we know are sketchable. Tables measured OVER
+    the gate are never attempted — that is not uncertainty, it is evidence.
     """
     expr_fn = getattr(source, "sql_bottomk_sketch", None)
     colq_fn = getattr(source, "sql_sketch_column_query", None)
@@ -585,52 +677,94 @@ def _collect_sketches(
     from harvest.probes import quote_ident
 
     sketches: dict[str, dict[str, list[int]]] = {}
-    _all = sorted(tables_meta)
-    for _si, table in enumerate(_all, start=1):
-        if on_progress is not None:
-            try:
-                on_progress(_si, len(_all), table)
-            except Exception:  # noqa: BLE001 - a tick must never break the pass
-                pass
+    timeout = float(cfg.query_timeout_s)
+
+    def _sketch_one(table: str) -> None:
         cols = _sketchable_columns(
-            _top_level_columns(tables_meta[table]), cfg.sketch_max_columns
+            _top_level_columns(tables_meta[table]),
+            cfg.sketch_max_columns,
+            col_stats=((profile_stats or {}).get(table) or {}).get("columns"),
         )
         if not cols:
+            return
+        ref = table_ref(table)
+        if callable(expr_fn):
+            selects = [
+                f"{expr_fn(quote_ident(c), cfg.sketch_k)} AS s{i}"
+                for i, c in enumerate(cols)
+            ]
+            rows = source.run_query(
+                f"SELECT {', '.join(selects)} FROM {ref}", timeout_s=timeout
+            )
+            row = rows[0] if rows else {}
+            sketches[table] = {
+                c: _parse_sketch(row.get(f"s{i}"))
+                for i, c in enumerate(cols)
+            }
+        else:
+            per_col: dict[str, list[int]] = {}
+            for c in cols:
+                if past_deadline():
+                    break
+                rows = source.run_query(
+                    colq_fn(ref, quote_ident(c), cfg.sketch_k),
+                    timeout_s=timeout,
+                )
+                per_col[c] = sorted(
+                    {int(r.get("h")) for r in rows if r.get("h") is not None}
+                )
+            sketches[table] = per_col
+
+    _all = sorted(tables_meta)
+    unknown: list[str] = []
+    done = 0
+    total = len(_all)
+
+    def _tick(label: str) -> None:
+        nonlocal done
+        done += 1
+        if on_progress is not None:
+            try:
+                on_progress(done, total, label)
+            except Exception:  # noqa: BLE001 - a tick must never break the pass
+                pass
+
+    # Phase 1: measured-under-the-gate tables.
+    for table in _all:
+        if past_deadline():
+            notes.append(f"sketching stopped at the budget before `{table}`")
+            return sketches, notes
+        size = table_bytes(table)  # after the deadline check — sizing can LIST
+        if size is None:
+            unknown.append(table)  # deferred to phase 2
             continue
+        _tick(f"sketching {table}")
+        if not feasible(table, size):
+            continue  # measured big, or in the proven band without proof
+        try:
+            _sketch_one(table)
+        except Exception as e:  # noqa: BLE001 — a lost sketch loses nominations only
+            notes.append(f"sketching `{table}` failed: {_fmt(e)}")
+
+    # Phase 2: unknown-size last-resort attempts, breaker-bounded.
+    strikes = 0
+    for i, table in enumerate(unknown):
         if past_deadline():
             notes.append(f"sketching stopped at the budget before `{table}`")
             break
-        if skip_table(table):  # after the deadline check — sizing does S3 LISTs
-            continue
-        ref = table_ref(table)
+        if strikes >= _UNKNOWN_SKETCH_STRIKES:
+            notes.append(
+                f"unknown-size sketching abandoned after {strikes} consecutive "
+                f"failures ({len(unknown) - i} table(s) unattempted)"
+            )
+            break
+        _tick(f"sketching {table} (size unknown)")
         try:
-            if callable(expr_fn):
-                selects = [
-                    f"{expr_fn(quote_ident(c), cfg.sketch_k)} AS s{i}"
-                    for i, c in enumerate(cols)
-                ]
-                rows = source.run_query(
-                    f"SELECT {', '.join(selects)} FROM {ref}"
-                )
-                row = rows[0] if rows else {}
-                sketches[table] = {
-                    c: _parse_sketch(row.get(f"s{i}"))
-                    for i, c in enumerate(cols)
-                }
-            else:
-                per_col: dict[str, list[int]] = {}
-                for c in cols:
-                    if past_deadline():
-                        break
-                    rows = source.run_query(
-                        colq_fn(ref, quote_ident(c), cfg.sketch_k)
-                    )
-                    per_col[c] = sorted(
-                        {int(r.get("h")) for r in rows if r.get("h") is not None}
-                    )
-                sketches[table] = per_col
-        except Exception as e:  # noqa: BLE001 — a lost sketch loses nominations only
-            notes.append(f"sketching `{table}` failed: {_fmt(e)}")
+            _sketch_one(table)
+            strikes = 0
+        except Exception as e:  # noqa: BLE001 — bounded attempt; nothing lost
+            strikes += 1
+            notes.append(f"sketching `{table}` (size unknown) failed: {_fmt(e)}")
     return sketches, notes
 
 
@@ -932,6 +1066,42 @@ def _side_lines(name: str, s: dict[str, Any]) -> str:
     )
 
 
+def _render_nominated_sheet(cand: dict[str, Any], reason: str) -> str:
+    """A sketch nomination the pass could NOT probe (size gate).
+
+    Deliberately not a verdict sheet: it exists so the value-containment
+    lead SURVIVES to the author — a renamed-key pair is unrecoverable from
+    names alone, and without this sheet the nomination would vanish into a
+    manifest skip row. Under the sheets-first rule it reads as "no sheet
+    answers this pair": it says so explicitly and routes the author to a
+    live probe."""
+    left, right = cand["left"], cand["right"]
+    col_l, col_r = cand["column_l"], cand["column_r"]
+    on = (
+        f"`{col_l}`"
+        if col_l == col_r
+        else f"`{left}.{col_l}` = `{right}.{col_r}`"
+    )
+    est = cand.get("sketch_containment") or 0.0
+    return "\n".join(
+        [
+            f"# Join candidate: `{left}` ↔ `{right}` — on {on} "
+            "(NOMINATED, NOT PROBED)",
+            "",
+            f"- Nominated by VALUE-SKETCH containment (~{est:.0%} estimated "
+            "of the contained side's values appearing in the other).",
+            f"- **No verdict**: the deterministic probe was skipped ({reason} "
+            "— at least one side is over or beyond the size gate), so match "
+            "rates, cardinality, and orphans are UNKNOWN.",
+            "- Before documenting this join, verify it live with "
+            "`validate_join` and confirm the semantic link (what business "
+            "entity do both sides identify?) — high containment alone can "
+            "also come from shared reference domains.",
+            "",
+        ]
+    ) + _footer("nominated")
+
+
 def _render_join_sheet(
     cand: dict[str, Any],
     stats: dict[str, Any] | None,
@@ -1117,6 +1287,14 @@ def _footer(kind: str = "full") -> str:
             "In the docs, record proportions + mechanism per the authoring "
             "skill, never raw counts.\n"
         )
+    if kind == "nominated":
+        return (
+            "\n> No probe ran — the size gate refused it. The nomination is "
+            "a LEAD, not evidence: verify live with `validate_join` before "
+            "documenting (a sheet that asks for a live probe, like TYPE "
+            "MISMATCH). In the docs, record proportions + mechanism per the "
+            "authoring skill, never raw counts.\n"
+        )
     return (
         "\n> Measured at snapshot time by the same probes as "
         "`validate_join`/`check_grain` (full-scan aggregates, not samples). "
@@ -1169,6 +1347,7 @@ def write_relationship_evidence(
     changed_tables: frozenset[str] | set[str] = frozenset(),
     cfg: RelationshipConfig | None = None,
     progress: Any = None,
+    profile_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Probe the enumerated candidates and write the evidence sheets. Never raises.
 
@@ -1176,6 +1355,11 @@ def write_relationship_evidence(
     fresh; ``"incremental"`` re-probes only subjects touching
     ``changed_tables`` (plus fingerprint mismatches); ``"cross"`` re-probes
     only fingerprint-mismatched/missing subjects.
+
+    ``profile_stats`` (from :func:`harvest.profile.write_profiles`) feeds two
+    optimizations, both optional: per-table ``scanned_bytes`` is a sizing
+    rung (a completed profile scan measured the profilable columns' real
+    bytes), and per-column ``{distinct, null_pct}`` ranks sketch columns.
     """
     cfg = cfg or RelationshipConfig.from_env()
     out: dict[str, Any] = {
@@ -1230,9 +1414,15 @@ def write_relationship_evidence(
         def _changed(*tables: str) -> bool:
             return any(t in changed_tables for t in tables)
 
-        # Catalog hint -> source-measured fallback -> assume large. The
-        # fallback matters in practice: DDL-registered tables carry NO
-        # totalSize Parameter (only crawlers/ETL write it), and pure
+        # Catalog hint -> profile-observed bytes -> source-measured fallback
+        # -> assume large. The profile rung is free (already in memory) and
+        # is a COMPLETE-scan measurement: the profile pass-1 query read the
+        # table's profilable columns in full (BERNOULLI filters rows after
+        # reading, so even a sampled profile bills — and measures — the real
+        # bytes), which is also the honest number for what a probe would
+        # bill, unlike an S3 listing that sums columns nobody reads. The
+        # listing fallback still matters in practice: DDL-registered tables
+        # carry NO totalSize Parameter (only crawlers/ETL write it), and pure
         # assume-large skipped EVERY probe on such catalogs (seen live:
         # "44 skipped" on a 13-table dataset). estimate_table_bytes lists
         # the table's S3 objects — no query, no scan — and early-exits at
@@ -1240,10 +1430,18 @@ def write_relationship_evidence(
         # does the table count as oversized.
         measured: dict[str, int | None] = {}
 
+        def _observed_bytes(t: str) -> int | None:
+            entry = (profile_stats or {}).get(t) or {}
+            sb = entry.get("scanned_bytes")
+            return int(sb) if sb is not None else None
+
         def _table_bytes(t: str) -> int | None:
             hint = _size_hint(tables_meta[t], byte_keys)
             if hint is not None:
                 return hint
+            observed = _observed_bytes(t)
+            if observed is not None:
+                return observed
             if t not in measured:
                 est = getattr(source, "estimate_table_bytes", None)
                 try:
@@ -1256,12 +1454,57 @@ def write_relationship_evidence(
                     measured[t] = None
             return measured[t]
 
-        def _oversized(*tables: str) -> bool:
-            for t in tables:
-                size = _table_bytes(t)
-                if size is None or size > cfg.max_table_bytes:
-                    return True
-            return False
+        # ---- feasibility: the small/proven/never tiers ------------------
+        # Under small_table_bytes a full scan runs with no questions asked
+        # (the pre-existing posture). Over max_table_bytes it never runs.
+        # In between — the PROVEN band — it runs only when a measured scan
+        # rate predicts completion inside the margin of the query timeout.
+        # Rates come from the profile pass (bytes/engine-time of the pass-1
+        # scan — layout-aware, per table); tables without their own rate
+        # fall back to the catalog's conservative p25.
+        small_bytes = min(cfg.small_table_bytes, cfg.max_table_bytes)
+
+        def _scan_rate(t: str) -> float | None:
+            entry = (profile_stats or {}).get(t) or {}
+            b, ms = entry.get("scanned_bytes"), entry.get("scan_ms")
+            if b and ms:
+                return float(b) / (float(ms) / 1000.0)
+            return None
+
+        rates = sorted(r for r in (_scan_rate(t) for t in tables_meta) if r)
+        catalog_rate = rates[len(rates) // 4] if rates else None  # p25
+
+        def _feasible_full(t: str, size: int, timeout_s: float) -> bool:
+            if size <= small_bytes:
+                return True
+            if size > cfg.max_table_bytes:
+                return False
+            rate = _scan_rate(t) or catalog_rate
+            if not rate:
+                return False  # in the band without proof: does not run
+            return (size / rate) <= _FEASIBILITY_MARGIN * timeout_s
+
+        def _band_status(size: int | None) -> str:
+            """Manifest status for a refused full scan: distinguish the
+            proven-band refusal (a live probe may still be worth the
+            author's time) from a hard size refusal."""
+            if size is not None and size <= cfg.max_table_bytes:
+                return "skipped-slow"
+            return "skipped-size"
+
+        if catalog_rate:
+            # Operator guidance, job logs only: what the measured rates imply.
+            log.info(
+                "Feasibility: %d table scan rate(s) measured, p25 ~%.1f MB/s "
+                "— a %.0fs probe covers ~%.1f GB; %.0f–%.0f GiB tables run "
+                "only with a proven rate",
+                len(rates),
+                catalog_rate / 1e6,
+                _PROBE_QUERY_TIMEOUT_S,
+                catalog_rate * _FEASIBILITY_MARGIN * _PROBE_QUERY_TIMEOUT_S / 1e9,
+                small_bytes / (1 << 30),
+                cfg.max_table_bytes / (1 << 30),
+            )
 
         measured_exact: dict[str, int | None] = {}
 
@@ -1271,10 +1514,20 @@ def write_relationship_evidence(
             table 'measures' as ~the gate and the percent would over-sample it
             by orders of magnitude. This one lists to completion (stop_at=None)
             and returns None when even that can't tell (page cap, LF-governed
-            location) — the caller then skips instead of guessing."""
+            location) — the caller then skips instead of guessing.
+
+            The profile-observed rung IS percent-safe: it comes from one
+            complete scan, never an early exit. It measures profilable-column
+            bytes (a lower bound on the table's total), which can only make
+            the percent LARGER than the byte-target implies — more sampled
+            rows, more precision, still bounded by the columnar reality that
+            the probe reads only the key columns anyway."""
             hint = _size_hint(tables_meta[t], byte_keys)
             if hint is not None:
                 return hint
+            observed = _observed_bytes(t)
+            if observed:
+                return observed
             if t not in measured_exact:
                 est = getattr(source, "estimate_table_bytes", None)
                 try:
@@ -1323,10 +1576,14 @@ def write_relationship_evidence(
                 _emit("grain", table, fp, "skipped-budget")
                 out["skipped"] += 1
                 continue
-            if _oversized(table):
+            g_size = _table_bytes(table)
+            if g_size is None or not _feasible_full(
+                table, g_size, _PROBE_QUERY_TIMEOUT_S
+            ):
                 # The grain probe is a whole-table GROUP BY — the same scan
-                # gate as joins applies (and no hint = assume large).
-                _emit("grain", table, fp, "skipped-size")
+                # policy as joins applies (no hint = assume large; the
+                # proven band needs a measured rate).
+                _emit("grain", table, fp, _band_status(g_size))
                 out["skipped"] += 1
                 continue
             results = [
@@ -1371,14 +1628,20 @@ def write_relationship_evidence(
                 source,
                 tables_meta,
                 cfg,
-                skip_table=lambda t: _oversized(t),
+                table_bytes=_table_bytes,
+                # Sketch feasibility uses the sketch queries' OWN timeout
+                # (cfg.query_timeout_s), not the probes' 60s default.
+                feasible=lambda t, size: _feasible_full(
+                    t, size, float(cfg.query_timeout_s)
+                ),
                 # The sketch scan gets HALF the budget, hard: on a 237-table
                 # catalog the collection alone can eat the whole wall clock
                 # and leave zero seconds for the probes it exists to feed
                 # (seen live on MusicBrainz: ~59 of 3,505 pairs probed).
                 past_deadline=lambda: time.monotonic()
                 > deadline - cfg.budget_s / 2,
-                on_progress=lambda i, n, t: _tick(i, n, f"sketching {t}"),
+                on_progress=lambda i, n, t: _tick(i, n, t),
+                profile_stats=profile_stats,
             )
             notes.extend(sk_notes)
             _sketch_nominate(sketches, tables_meta, candidates, cfg, notes=notes)
@@ -1449,12 +1712,15 @@ def write_relationship_evidence(
             over = [
                 t
                 for t, b in sizes.items()
-                if b is None or b > cfg.max_table_bytes
+                if b is None
+                or not _feasible_full(t, b, _PROBE_QUERY_TIMEOUT_S)
             ]
             sampled_side: str | None = None
             if len(over) == 1 and sizes[over[0]] is not None:
-                # The enterprise fact→dim shape: ONE measured-big side. Probe
-                # it SAMPLED against the full small side — the one direction
+                # The enterprise fact→dim shape: ONE side refused a full
+                # scan (measured big, or in the proven band without proof —
+                # sampling makes it feasible by construction). Probe it
+                # SAMPLED against the full small side — the one direction
                 # sampling leaves unbiased. Requires the source to sample by
                 # reference (Athena TABLESAMPLE SYSTEM); without it, skip.
                 if callable(getattr(source, "sql_sampled_ref", None)):
@@ -1462,6 +1728,14 @@ def write_relationship_evidence(
             if over and sampled_side is None:
                 _emit("join", subject, fp, "skipped-size")
                 out["skipped"] += 1
+                if cand.get("via") == "sketch":
+                    # The one nomination source an author cannot reproduce
+                    # (renamed keys are invisible to a columns.tsv grep):
+                    # persist the LEAD as a no-verdict sheet routing to a
+                    # live probe. Not cache-eligible (status stays a skip) —
+                    # it regenerates from candidates.json each run.
+                    write_text(root / rel, _render_nominated_sheet(cand, "size"))
+                    out["files"].append(f"{RELATIONSHIPS_DIR}/{rel}")
                 continue
             l_ref, r_ref = table_ref(left), table_ref(right)
             if sampled_side is not None:
@@ -1469,6 +1743,11 @@ def write_relationship_evidence(
                 if not exact:
                     _emit("join", subject, fp, "skipped-size")
                     out["skipped"] += 1
+                    if cand.get("via") == "sketch":
+                        write_text(
+                            root / rel, _render_nominated_sheet(cand, "size")
+                        )
+                        out["files"].append(f"{RELATIONSHIPS_DIR}/{rel}")
                     continue
                 pct = max(
                     0.01,

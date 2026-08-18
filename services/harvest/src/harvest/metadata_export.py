@@ -348,6 +348,9 @@ def export_metadata(
 
     # Relationship evidence (joins + grain, probed deterministically): runs
     # AFTER profiles and is likewise best-effort — see harvest.relationships.
+    # profile_stats feeds two things there: observed scanned_bytes is a
+    # sizing rung (a completed profile scan IS a size measurement), and the
+    # per-column distinct/null stats rank sketch columns.
     rels = write_relationship_evidence(
         source,
         meta_root,
@@ -356,6 +359,7 @@ def export_metadata(
         profile_mode=profile_mode,
         changed_tables=changed_tables,
         progress=progress,
+        profile_stats=prof.get("profile_stats") or {},
     )
     written.extend(f"{METADATA_DIR}/{rel}" for rel in rels.get("files", []))
 

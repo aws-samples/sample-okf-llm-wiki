@@ -1523,3 +1523,231 @@ def test_sk_suffix_is_first_class_key_vocabulary():
     }
     cands, _ = enumerate_join_candidates(meta, CFG)
     assert any(c["column_l"] == "customer_sk" for c in cands)
+
+
+# ---------------------------------------------------------------------------
+# profile-informed sizing + last-resort sketching
+# ---------------------------------------------------------------------------
+
+
+def _unhinted(columns: dict) -> dict:
+    m = _meta(columns)
+    m["parameters"].pop("totalSize", None)
+    return m
+
+
+def test_profile_observed_bytes_unlock_probes_on_unhinted_tables(tmp_path):
+    # No catalog hint and no estimate_table_bytes capability — previously
+    # assume-large, every probe skipped. A completed profile's scanned_bytes
+    # is a real measurement (BERNOULLI bills full bytes) and unlocks both the
+    # grain probe and the full join probe.
+    meta = {
+        "races": _unhinted({"raceid": "int"}),
+        "results": _unhinted({"resultid": "int", "raceid": "int"}),
+    }
+    out = write_relationship_evidence(
+        _FakeSource(unique_sides={"races"}), tmp_path, tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG,
+        profile_stats={
+            "races": {"scanned_bytes": 1 << 20, "columns": {}},
+            "results": {"scanned_bytes": 2 << 20, "columns": {}},
+        },
+    )
+    assert out["joins_probed"] >= 1 and out["grain_probed"] >= 1
+    assert list((tmp_path / "relationships" / "joins").glob("*.md"))
+
+
+def test_profile_observed_bytes_over_gate_still_skip(tmp_path):
+    meta = {
+        "races": _unhinted({"raceid": "int"}),
+        "results": _unhinted({"resultid": "int", "raceid": "int"}),
+    }
+    src = _FakeSource()
+    out = write_relationship_evidence(
+        src, tmp_path, tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG,
+        profile_stats={
+            "races": {"scanned_bytes": (2 << 30) + 1, "columns": {}},
+            "results": {"scanned_bytes": (2 << 30) + 1, "columns": {}},
+        },
+    )
+    # Measured OVER the gate is evidence, not uncertainty: no probes, no
+    # last-resort sketch attempts, zero queries.
+    assert out["joins_probed"] == 0 and out["grain_probed"] == 0
+    assert src.queries == []
+
+
+def test_unknown_size_sketch_attempt_writes_nominated_sheet(tmp_path):
+    # Fully unknown sizes: sketching now ATTEMPTS the tables (timeout-bounded;
+    # a timeout yields nothing, never wrong evidence) instead of refusing, and
+    # a nomination whose probe the size gate still refuses persists as a
+    # no-verdict NOMINATED sheet routing the author to a live probe.
+    meta = {
+        "satscores": _unhinted({"cds": "string", "avgscr": "int"}),
+        "schools": _unhinted({"cdscode": "string", "city": "string"}),
+    }
+    src = _SketchSource(
+        {
+            "satscores": {"cds": list(range(1, 91))},
+            "schools": {"cdscode": list(range(1, 101))},
+        },
+    )
+    out = write_relationship_evidence(
+        src, tmp_path, tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG,
+    )
+    assert src.sketch_queries == 2  # both unknown-size tables attempted
+    assert out["joins_probed"] == 0  # the probe itself is still size-refused
+    sheet = (
+        tmp_path / "relationships" / "joins"
+        / "satscores__schools--cds--cdscode.md"
+    ).read_text()
+    assert "NOMINATED, NOT PROBED" in sheet
+    assert "validate_join" in sheet and "containment" in sheet
+
+
+def test_unknown_size_sketch_breaker_stops_after_strikes(tmp_path):
+    meta = {
+        f"t{i}": _unhinted({f"t{i}_id": "int", "val": "string"})
+        for i in range(5)
+    }
+
+    class _Boom(_FakeSource):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def sql_bottomk_sketch(self, col_sql, k):
+            return f"BOTTOMK({col_sql},{k})"
+
+        def run_query(self, query, **kwargs):
+            if "BOTTOMK(" in query:
+                self.attempts += 1
+                raise RuntimeError("scan too large")
+            return super().run_query(query, **kwargs)
+
+    src = _Boom()
+    write_relationship_evidence(
+        src, tmp_path, tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG,
+    )
+    # Two consecutive failures, remaining three unknowns abandoned.
+    assert src.attempts == 2
+
+
+def test_sketchable_columns_profile_ranking_and_enum_floor():
+    from harvest.relationships import _sketchable_columns
+
+    cols = {
+        "a_code": "string", "b_code": "string", "c_code": "string",
+        "d_code": "string",
+    }
+    stats = {
+        "a_code": {"distinct": 12, "null_pct": 0.0},      # measured enum
+        "b_code": {"distinct": 90_000, "null_pct": 40.0},
+        "c_code": {"distinct": 90_000, "null_pct": 0.0},
+        # d_code unmeasured
+    }
+    ranked = _sketchable_columns(cols, cap=4, col_stats=stats)
+    # A measured enum can never survive the nominator's domain-floor
+    # guardrail — spending a sketch slot on it buys nothing.
+    assert "a_code" not in ranked
+    # Same name tier: low-null key beats high-null key beats unmeasured.
+    assert ranked == ["c_code", "b_code", "d_code"]
+
+
+# ---------------------------------------------------------------------------
+# the proven band (small ≤ 10 GiB unconditional; 10–50 GiB needs a rate)
+# ---------------------------------------------------------------------------
+
+# Default gates: small_table_bytes=10 GiB, max_table_bytes=50 GiB.
+CFG_BAND = RelationshipConfig(
+    enabled=True, budget_s=600, max_pairs=60,
+    max_grain_per_table=2, max_tables_per_key=6,
+)
+
+
+def _band_meta():
+    return {
+        "races": _meta({"raceid": "int"}),                       # small hint
+        "results": _meta({"resultid": "int", "raceid": "int"},
+                         totalSize=20 << 30),                    # in the band
+    }
+
+
+def _band_stats(scan_ms):
+    return {"results": {"scanned_bytes": 20 << 30, "scan_ms": scan_ms,
+                        "columns": {}}}
+
+
+def test_proven_band_runs_with_fast_measured_rate(tmp_path):
+    out = write_relationship_evidence(
+        _FakeSource(unique_sides={"races"}), tmp_path,
+        tables_meta=_band_meta(),
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG_BAND,
+        # ~1 GB/s -> a 20 GiB full scan predicts ~21s, inside 0.9*60s.
+        profile_stats=_band_stats(scan_ms=20_000),
+    )
+    assert out["joins_probed"] >= 1 and out["grain_probed"] == 2
+
+
+def test_proven_band_without_rate_does_not_run(tmp_path):
+    src = _FakeSource(unique_sides={"races"})
+    out = write_relationship_evidence(
+        src, tmp_path, tables_meta=_band_meta(),
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG_BAND,
+        # No profile_stats: the in-band table has NO proof -> refused.
+    )
+    manifest = (tmp_path / "relationships" / "manifest.tsv").read_text()
+    assert "skipped-slow" in manifest        # distinct from a hard size skip
+    assert out["grain_probed"] == 1          # the small table still probed
+    assert out["joins_probed"] == 0          # no sql_sampled_ref on the fake
+
+
+def test_proven_band_slow_rate_degrades_to_the_sampled_probe(tmp_path):
+    class _Sampled(_FakeSource):
+        def sql_sampled_ref(self, ref_sql, percent):
+            return f"(SELECT * FROM {ref_sql} SAMPLE {percent:g})"
+
+    out = write_relationship_evidence(
+        _Sampled(unique_sides={"races"}), tmp_path,
+        tables_meta=_band_meta(),
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG_BAND,
+        # ~36 MB/s -> a full scan predicts ~10min: refused, but the measured
+        # size still feeds the sample percent, so the pair degrades to the
+        # SYSTEM-sampled probe instead of vanishing.
+        profile_stats=_band_stats(scan_ms=600_000),
+    )
+    manifest = (tmp_path / "relationships" / "manifest.tsv").read_text()
+    assert "ok-sampled" in manifest
+    assert out["joins_probed"] >= 1
+
+
+def test_sketch_respects_the_proven_band(tmp_path):
+    meta = {
+        "satscores": _meta({"cds": "string", "avgscr": "int"},
+                           totalSize=20 << 30),
+        "schools": _meta({"cdscode": "string", "city": "string"}),
+    }
+    sketch_values = {
+        "satscores": {"cds": list(range(1, 91))},
+        "schools": {"cdscode": list(range(1, 101))},
+    }
+    # Unproven: the in-band table is not sketched (only the small one is).
+    src = _SketchSource(sketch_values)
+    write_relationship_evidence(
+        src, tmp_path / "a", tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG_BAND,
+    )
+    assert src.sketch_queries == 1
+    # Proven fast: both sketched, the renamed key nominates AND full-probes.
+    src2 = _SketchSource(sketch_values, unique_sides={"schools"},
+                         match_rate=0.9)
+    out = write_relationship_evidence(
+        src2, tmp_path / "b", tables_meta=meta,
+        cache=read_cached_relationships(tmp_path / "nowhere"), cfg=CFG_BAND,
+        profile_stats={"satscores": {"scanned_bytes": 20 << 30,
+                                     "scan_ms": 20_000, "columns": {}}},
+    )
+    assert src2.sketch_queries == 2
+    assert out["joins_probed"] >= 1
