@@ -21,15 +21,23 @@ def make_table(
     *,
     version_id: str = "1",
     update_time: str = "2026-06-01T00:00:00+00:00",
+    parameters: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """A Glue Table dict with the columns wrapped in a StorageDescriptor."""
-    return {
+    """A Glue Table dict with the columns wrapped in a StorageDescriptor.
+
+    ``parameters`` seeds ``Table.Parameters`` — e.g. ``{"table_type":
+    "ICEBERG"}`` to mark an Iceberg table.
+    """
+    table: dict[str, Any] = {
         "Name": name,
         "VersionId": version_id,
         "UpdateTime": update_time,
         "StorageDescriptor": {"Columns": list(columns)},
         "PartitionKeys": [],
     }
+    if parameters:
+        table["Parameters"] = dict(parameters)
+    return table
 
 
 class _NotFound(Exception):

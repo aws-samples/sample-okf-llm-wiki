@@ -32,7 +32,7 @@ Seven Python services under `services/`, two Terraform stacks under `infra/`, a 
 - `consumption_mcp/` — stateless streamable-HTTP MCP server (FastMCP) on AgentCore. Tools: `read_me` (a how-to-use-the-wiki primer — agents call it first), `list_domains`, `list_directory`, `read_page`, `glob`, `grep`, `get_backlinks`, `semantic_search`, plus the Attested Computations trio `list_computations`/`describe_computation`/`run_computation` (execution behind `enable_attested_computations`, default false; see docs/ATTESTED_COMPUTATIONS.md).
 - `control_api/` — Cognito-authed REST (API GW HTTP API + one Lambda with an internal router). Registers datasets, presigns context uploads, starts/checks harvests, reads bundles, vends/revokes MCP credentials.
 - `reindex/` — S3 object events → Titan embed → S3 Vectors `PutVectors`/`DeleteVectors`. Dedups on the S3 `sequencer`.
-- `incremental/` — Glue change event → confirm real change → scoped re-harvest of the changed table; nightly reconcile catches missed events.
+- `incremental/` — Glue change event → confirm real change → scoped re-harvest of the changed table; nightly reconcile catches missed events. Iceberg data commits (empty column diff, +1 version) are absorbed without a re-harvest — see `OKF_INCREMENTAL_ICEBERG_COMMITS` in CONVENTIONS.md.
 
 **Two invariants worth internalizing before touching harvest/reindex:**
 1. **S3 markdown is the source of truth; the vector index is derived** and can be rebuilt by replaying objects through reindex. Index params (512 dims, cosine, float32) are immutable in S3 Vectors and live in exactly two places: `okf_core/embedding.py` and `infra/durable/storage.tf`.
