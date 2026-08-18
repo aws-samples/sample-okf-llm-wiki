@@ -1,5 +1,7 @@
 # Data Wiki: AI-powered knowledge bundles for your AWS data, served to agents over MCP
 
+[![OKF BundleDex](https://bundledex.net/static-badge.svg)](https://bundledex.net)
+
 **Data Wiki** turns your AWS data sources into portable knowledge bundles and serves them to AI agents over the Model Context Protocol (MCP). It reads a source's catalog, has an LLM author a set of markdown documents describing each dataset — its tables, joins, metrics, and known issues — keeps those documents in sync as the source changes, and exposes them to agents through an MCP server. The result: agents that understand *what your data means*, not just what columns exist.
 
 Two source types are supported today: the **AWS Glue Data Catalog** (queried via Amazon Athena) and **Amazon Redshift** (provisioned clusters or Serverless, via the Redshift Data API). The architecture is source-pluggable — see [`docs/DATA_SOURCES.md`](./docs/DATA_SOURCES.md) for how a source is implemented and how to add another.
