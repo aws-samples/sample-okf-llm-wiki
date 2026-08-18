@@ -129,14 +129,14 @@ class ProfileConfig:
     max_enum_queries: int = 15
     max_columns: int = 100
     budget_s: int = 1800
-    # Per-query ceiling. Deliberately as large as the whole pass: a profile
-    # that COMPLETES yields a sheet plus a fingerprint-cached size
-    # measurement, while one cancelled at 60s bills a partial scan for
-    # nothing (Athena charges bytes scanned up to cancellation). The pass
-    # budget still bounds the wall clock — _run clamps every query's timeout
-    # to the time remaining, so one slow table can consume the budget but
-    # never overrun it.
-    query_timeout_s: int = 1800
+    # Per-query ceiling — the knob that decides how big a table can be
+    # profiled to COMPLETION. 60s reliably covers tables to ~50 GB at
+    # Athena's dependable scan rates; a cancelled query bills its partial
+    # scan and yields neither a sheet nor the size measurement, so raise it
+    # per deployment (~300s buys the 100–500 GB band) when such tables are
+    # worth profiling. Always clamped to the pass budget remaining, so no
+    # value can make one query overrun the pass.
+    query_timeout_s: int = 60
 
     @classmethod
     def from_env(cls) -> "ProfileConfig":
@@ -153,7 +153,7 @@ class ProfileConfig:
             max_enum_queries=_env_int("OKF_HARVEST_PROFILE_MAX_ENUM_QUERIES", 15),
             max_columns=_env_int("OKF_HARVEST_PROFILE_MAX_COLUMNS", 100),
             budget_s=_env_int("OKF_HARVEST_PROFILE_BUDGET_S", 1800),
-            query_timeout_s=_env_int("OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S", 1800),
+            query_timeout_s=_env_int("OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S", 60),
         )
 
 
@@ -310,10 +310,10 @@ class TableProfiler:
     def _run(
         self, sql: str, stats: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
-        # Clamp to the remaining pass budget: at a 30-min per-query ceiling an
+        # Clamp to the remaining pass budget: with a raised per-query ceiling
+        # (deployments profiling big tables set it toward the pass length) an
         # unclamped query started near the deadline would overrun the whole
-        # pass by its own length (at the old 60s ceiling the overrun was
-        # noise). ``stats`` is the caller-owned sink run_query fills with the
+        # pass by its own length. ``stats`` is the caller-owned sink run_query fills with the
         # execution's data_scanned_bytes; it is only forwarded to sources
         # whose run_query accepts it (checked once at init) — the
         # measurement is optional, and a signature-mismatch retry would

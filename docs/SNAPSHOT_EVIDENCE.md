@@ -51,11 +51,13 @@ Cost posture:
   bytes, only aggregation work.)
 - A wall-clock budget (default 30 min) bounds the whole pass; tables past it
   are `skipped-budget` in `profile/manifest.tsv`. The per-query ceiling
-  (`OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S`) defaults to the same 30 min —
-  a profile that COMPLETES yields a sheet plus a size measurement, while
-  one cancelled early bills a partial scan for nothing — and every query's
-  timeout is clamped to the budget remaining, so a slow table can consume
-  the budget but never overrun it.
+  (`OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S`, default 60 s — reliably tables to
+  ~50 GB at Athena's dependable scan rates) is the knob that decides how big
+  a table can be profiled to COMPLETION: a cancelled query bills its partial
+  scan and yields neither a sheet nor the size measurement, so raise it per
+  deployment (~300 s buys the 100–500 GB band) when such tables are worth
+  profiling. Every query's timeout is clamped to the budget remaining, so no
+  setting lets one query overrun the pass.
 - **The pass-1 scan doubles as a size measurement.** Athena reports each
   execution's `data_scanned_bytes`; because BERNOULLI reads full bytes,
   even a *sampled* profile measures the real footprint of the profilable
@@ -265,7 +267,7 @@ Authoritative table in CONVENTIONS.md; the ones that matter operationally:
 | Env | Default | Meaning |
 |---|---|---|
 | `OKF_HARVEST_PROFILE_BUDGET_S` | 1800 | profile pass wall clock |
-| `OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S` | 1800 | per-profile-query ceiling, clamped to the budget remaining |
+| `OKF_HARVEST_PROFILE_QUERY_TIMEOUT_S` | 60 | per-profile-query ceiling, clamped to the budget remaining; raise (~300) for 100+ GB tables |
 | `OKF_HARVEST_REL_BUDGET_S` | 1800 | relationship pass wall clock |
 | `OKF_HARVEST_REL_QUERY_TIMEOUT_S` | 60 | sketch per-query timeout; bounds each unknown-size last-resort attempt |
 | `OKF_HARVEST_REL_MAX_PAIRS` | 100 | join-pair cap |
