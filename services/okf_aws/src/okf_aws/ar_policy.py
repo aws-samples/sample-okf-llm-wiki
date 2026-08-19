@@ -445,11 +445,21 @@ Field rules:
     cast types accept int/integer, float/real, decimal/numeric.
     `targets`, `functions: [name, …]` and/or
     `cast_types: [int|bigint|…]`.
+  - `forbidden_grouping` — a column that must never be a GROUP BY key
+    (brand-scoped spellings, generation-scoped codes, consolidation
+    roles: "never group on X, resolve through Y instead"). `targets:
+    [table.column, …]`. Grouping only — reading/filtering the column
+    stays legal, so bind it even when the column is fine to filter on.
   - `required_predicate` — using (or aggregating) a table requires a WHERE
-    conjunct (soft-deletes, status filters, sentinel exclusion). `table`,
+    conjunct (soft-deletes, status filters, sentinel exclusion, explicit
+    period bounds). `table`,
     `when: aggregate|use` (default aggregate), `when_columns: [col, …]`
-    (default any), `require: {column, op: is_null|is_not_null|eq|neq,
-    value?}`, `or_group_by: col` (grouping as an accepted alternative).
+    (default any), `require: {column, op: is_null|is_not_null|eq|neq|bounded,
+    value?}` (value for eq/neq only; `bounded` = any positive equality/
+    range/IN conjunct on the column, whatever the value — use it for
+    "must pin an explicit window/date bound" policies rather than
+    approximating with is_not_null), `or_group_by: col` (grouping as an
+    accepted alternative).
   - `required_guard` — a numeric CAST of mixed-content text needs a
     regexp_like guard or TRY_CAST. `targets`, optional `cast_types`,
     `guard_functions`.

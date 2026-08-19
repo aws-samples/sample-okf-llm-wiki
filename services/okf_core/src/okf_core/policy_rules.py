@@ -70,7 +70,7 @@ _NAME_RE = re.compile(r"^[a-z0-9_]+$")
 
 _AGG_NAMES = ("sum", "avg", "max", "min", "count")
 _USAGE_CONTEXTS = ("order", "aggregate", "compare", "arithmetic")
-_PREDICATE_OPS = ("is_null", "is_not_null", "eq", "neq")
+_PREDICATE_OPS = ("is_null", "is_not_null", "eq", "neq", "bounded")
 _DEFAULT_CAST_TYPES = (
     "int", "bigint", "smallint", "tinyint", "double", "float", "decimal",
 )
@@ -118,12 +118,23 @@ DIMENSIONS: dict[str, str] = {
         "form (ROUND on point values, CAST-to-int). Fields: targets, "
         "functions [name, …] and/or cast_types [int|bigint|…]."
     ),
+    "forbidden_grouping": (
+        "a column that must never be a GROUP BY key (brand-scoped "
+        "spellings, generation-scoped codes, consolidation roles). Fields: "
+        "targets [table.column, …]. Any GROUP BY key touching the column "
+        "counts (ordinals and expressions included); reading or filtering "
+        "it stays legal, and SELECT DISTINCT is deliberately out of scope."
+    ),
     "required_predicate": (
         "a table whose use (or aggregation) requires a WHERE conjunct "
-        "(soft-deletes, status filters, sentinel exclusion). Fields: table, "
+        "(soft-deletes, status filters, sentinel exclusion, explicit period "
+        "bounds). Fields: table, "
         "when [aggregate|use] (default aggregate), when_columns [col, …] "
         "(default: any column), require {column, op "
-        "[is_null|is_not_null|eq|neq], value?}, or_group_by col?."
+        "[is_null|is_not_null|eq|neq|bounded], value? (eq/neq only)}, "
+        "or_group_by col?. `bounded` = any positive equality/range/IN "
+        "conjunct on the column, whatever the value — the op for 'must pin "
+        "an explicit window' policies."
     ),
     "required_guard": (
         "a numeric CAST of a mixed-content text column that must be guarded "
@@ -319,6 +330,8 @@ def parse_rules(raw: Any, *, where: str = "rules") -> list[dict[str, Any]]:
                 rule["guard_functions"] = [
                     _norm_name(g, "guard_functions", rw) for g in guards
                 ]
+        elif dim == "forbidden_grouping":
+            rule["targets"] = _norm_targets(r.get("targets"), rw)
         elif dim == "forbidden_sequencing_key":
             rule["targets"] = _norm_targets(r.get("targets"), rw)
         elif dim == "required_distinct":
@@ -999,6 +1012,36 @@ def _values_equal(a: str, b: str) -> bool:
     return a == b
 
 
+def _comparison_on(
+    exp: Any, ctx, scope, node: Any, table: str, column: str, *,
+    bounding: bool = False,
+) -> bool:
+    """Whether ``node`` is a comparison conjunct with the column as a DIRECT
+    operand. ``bounding=True`` narrows to shapes that pin/bound the value
+    (equality, range, BETWEEN, IN) — NEQ and LIKE exclude/match but do not
+    bound. Directness matters: a column under COALESCE is null-absorbed and
+    proves nothing."""
+
+    def _is_col(n: Any) -> bool:
+        n = n.unnest() if hasattr(n, "unnest") else n
+        if not isinstance(n, exp.Column):
+            return False
+        triple = ctx._resolve(n, scope)
+        return bool(triple and triple[1] == table and triple[2] == column)
+
+    if isinstance(node, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+        return _is_col(node.this) or _is_col(node.expression)
+    if isinstance(node, exp.NEQ) and not bounding:
+        return _is_col(node.this) or _is_col(node.expression)
+    if isinstance(node, exp.Between):
+        return _is_col(node.this)
+    if isinstance(node, exp.In):
+        return _is_col(node.this)
+    if isinstance(node, exp.Like) and not bounding:
+        return _is_col(node.this)
+    return False
+
+
 def _predicate_matches(exp: Any, ctx, scope, conjunct, table: str, req: dict) -> bool:
     def _resolved_col(node):
         if isinstance(node, exp.Column):
@@ -1016,11 +1059,26 @@ def _predicate_matches(exp: Any, ctx, scope, conjunct, table: str, req: dict) ->
 
     op = req["op"]
     if op in ("is_null", "is_not_null"):
-        return (
+        if (
             isinstance(node, exp.Is)
             and isinstance(node.expression, exp.Null)
             and negated == (op == "is_not_null")
             and _resolved_col(node.this)
+        ):
+            return True
+        # Comparison conjuncts IMPLY not-null: NULL fails every comparison,
+        # and NOT over a NULL comparison is still NULL, so ANY row passing
+        # `col = v` / `col BETWEEN …` / `NOT (col = v)` has a provably
+        # non-null col. Shape-matching alone false-flagged exactly the
+        # bounded queries a "must filter this column" policy exists for.
+        if op == "is_not_null":
+            return _comparison_on(exp, ctx, scope, node, table, req["column"])
+        return False
+    if op == "bounded":
+        # An explicit pin/window on the column, whatever the value —
+        # negation UN-bounds (`NOT (d BETWEEN …)` admits everything else).
+        return not negated and _comparison_on(
+            exp, ctx, scope, node, table, req["column"], bounding=True
         )
     if op in ("eq", "neq"):
         if not isinstance(node, (exp.EQ, exp.NEQ)):
@@ -1037,6 +1095,52 @@ def _predicate_matches(exp: Any, ctx, scope, conjunct, table: str, req: dict) ->
                 if literal is not None and _values_equal(literal, req["value"]):
                     return True
     return False
+
+
+def _eval_forbidden_grouping(ctx: _QueryContext, rule: dict[str, Any]):
+    """GROUP BY keys only — reading/filtering the column stays legal.
+
+    Ordinals (`GROUP BY 1`) resolve through the projection list (qualify
+    rewrites alias references to their expressions already), and an
+    EXPRESSION over the target (`substr(market, 1, 1)`) still groups by it.
+    """
+    exp = ctx.exp
+    wanted = {tuple(t.split(".", 1)) for t in rule["targets"]}
+    unresolved_keys: set[str] = set()
+    for scope in ctx.scopes:
+        group = scope.expression.args.get("group")
+        if group is None:
+            continue
+        aliases = ctx._projection_map(scope)
+        selects = scope.expression.selects
+        for g in group.expressions:
+            g = g.unnest()
+            if isinstance(g, exp.Literal) and str(g.name).isdigit():
+                i = int(g.name) - 1
+                if not 0 <= i < len(selects):
+                    continue
+                g = selects[i]
+                g = g.unalias() if isinstance(g, exp.Alias) else g
+            for col in g.find_all(exp.Column):
+                triple = ctx._resolve(col, scope)
+                if triple is None and not col.table and col.name in aliases:
+                    triple = aliases[col.name]
+                if triple is None:
+                    unresolved_keys.add(col.name.lower())
+                    continue
+                db, table, name = triple
+                if (table, name) in wanted and (not db or db in ctx.own_dbs):
+                    return "violation", f"GROUP BY {table}.{name}"
+    # A grouping key that resolves to a derived source could be a renamed
+    # export of the target — widen by export aliases, exactly like
+    # overlap_unknown, but scoped to the GROUP BY keys.
+    names = {c for _, c in wanted}
+    for alias, exported in ctx.export_aliases.items():
+        if exported & wanted:
+            names.add(alias)
+    if unresolved_keys & names:
+        return "unknown", "a grouping key may flow through a derived source"
+    return "pass", ""
 
 
 def _eval_required_predicate(ctx: _QueryContext, rule: dict[str, Any]):
@@ -1161,6 +1265,7 @@ _EVALUATORS = {
     "forbidden_aggregation": _eval_forbidden_aggregation,
     "forbidden_usage": _eval_forbidden_usage,
     "forbidden_function": _eval_forbidden_function,
+    "forbidden_grouping": _eval_forbidden_grouping,
     "required_predicate": _eval_required_predicate,
     "required_guard": _eval_required_guard,
     "forbidden_sequencing_key": _eval_forbidden_sequencing_key,

@@ -972,3 +972,109 @@ policies:
     entries = policy_doc.parse_policies(doc, drop_invalid_rules=True)
     assert [e["id"] for e in entries] == ["P001", "P002"]
     assert "rules" not in entries[0]
+
+
+# -- catalog growth (FPL-driven): bounded op, not-null implication, forbidden_grouping
+
+
+def test_comparison_conjuncts_imply_is_not_null():
+    # The P005-shaped false flag: a correctly bounded query (`=`, BETWEEN,
+    # even NOT-wrapped) has a provably non-null column — NULL fails every
+    # comparison — so shape-matching IS NOT NULL alone must not flag it.
+    rules = _rule(dimension="required_predicate", table="results", when="use",
+                  require={"column": "time", "op": "is_not_null"})
+    for sql in (
+        "SELECT time FROM results WHERE time = '1:23'",
+        "SELECT time FROM results WHERE time BETWEEN '1' AND '2'",
+        "SELECT time FROM results WHERE NOT (time = '1:23')",
+        "SELECT time FROM results WHERE time IS NOT NULL",
+    ):
+        assert _evaluate(sql, rules)["verdict"] == "pass", sql
+    # COALESCE absorbs NULL — the wrapped comparison proves nothing.
+    assert _evaluate(
+        "SELECT time FROM results WHERE COALESCE(time, 'x') = '1:23'", rules
+    )["verdict"] == "violation"
+    assert _evaluate(
+        "SELECT time FROM results WHERE time IS NULL", rules
+    )["verdict"] == "violation"
+
+
+def test_bounded_requires_a_positive_pin_any_value():
+    rules = _rule(dimension="required_predicate", table="results", when="use",
+                  require={"column": "raceid", "op": "bounded"})
+    for sql in (
+        "SELECT time FROM results WHERE raceid = 900",
+        "SELECT time FROM results WHERE raceid BETWEEN 1 AND 5",
+        "SELECT time FROM results WHERE raceid IN (1, 2, 3)",
+        "SELECT time FROM results WHERE 1 <= raceid AND raceid <= 5",
+    ):
+        assert _evaluate(sql, rules)["verdict"] == "pass", sql
+    for sql in (
+        "SELECT sum(points) FROM results",
+        # NEQ excludes one value — everything else is still unbounded.
+        "SELECT time FROM results WHERE raceid <> 900",
+        # not-null is not a bound either.
+        "SELECT time FROM results WHERE raceid IS NOT NULL",
+        # negation UN-bounds.
+        "SELECT time FROM results WHERE NOT (raceid BETWEEN 1 AND 5)",
+    ):
+        assert _evaluate(sql, rules)["verdict"] == "violation", sql
+    assert _evaluate(
+        "SELECT time FROM results WHERE raceid = 900 OR rank = 1", rules
+    )["verdict"] == "unknown"
+
+
+GROUPING = dict(dimension="forbidden_grouping",
+                targets=["results.positiontext", "results.constructorid"])
+
+
+def test_forbidden_grouping_fires_on_group_by_keys_only():
+    rules = _rule(**GROUPING)
+    for sql in (
+        "SELECT positiontext, count(*) FROM results GROUP BY positiontext",
+        # ordinals resolve through the projection list…
+        "SELECT constructorid, count(*) FROM results GROUP BY 1",
+        # …aliases through qualify/projection map…
+        "SELECT positiontext AS p, count(*) FROM results GROUP BY p",
+        # …and an expression over the target still groups by it.
+        "SELECT substr(positiontext, 1, 1), count(*) FROM results "
+        "GROUP BY substr(positiontext, 1, 1)",
+    ):
+        assert _evaluate(sql, rules)["verdict"] == "violation", sql
+    for sql in (
+        # reading and filtering the column stays legal — grouping only.
+        "SELECT positiontext FROM results WHERE positiontext = 'R'",
+        "SELECT raceid, count(*) FROM results WHERE constructorid = 1 "
+        "GROUP BY raceid",
+        "SELECT count(*) FROM results",
+    ):
+        assert _evaluate(sql, rules)["verdict"] == "pass", sql
+
+
+def test_forbidden_grouping_renamed_export_key_is_unknown():
+    rules = _rule(**GROUPING)
+    sql = (
+        "WITH x AS (SELECT positiontext AS p, raceid FROM results) "
+        "SELECT p, count(*) FROM x GROUP BY p"
+    )
+    assert _evaluate(sql, rules)["verdict"] == "unknown"
+
+
+def test_forbidden_grouping_parse_and_self_test():
+    rules = policy_rules.parse_rules([{
+        "dimension": "forbidden_grouping",
+        "targets": ["results.positiontext"],
+        "examples": {
+            "violation": (
+                "SELECT positiontext, count(*) FROM results "
+                "GROUP BY positiontext"
+            ),
+            "pass": "SELECT raceid, count(*) FROM results GROUP BY raceid",
+        },
+    }])
+    assert policy_rules.self_test(rules, F1) is None
+    with pytest.raises(policy_rules.RulesError, match="targets"):
+        policy_rules.parse_rules([{
+            "dimension": "forbidden_grouping",
+            "examples": {"violation": "SELECT 1", "pass": "SELECT 2"},
+        }])

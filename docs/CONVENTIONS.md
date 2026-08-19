@@ -618,6 +618,7 @@ never a wrong flag.
 author may only BIND these; an unknown dimension is a gate error and a policy
 fitting none stays prose-only): `forbidden_aggregation`, `forbidden_usage`,
 `forbidden_function`, `required_predicate`, `required_guard`,
+`forbidden_grouping`,
 `forbidden_sequencing_key`, `required_distinct`. Two evaluator families —
 expression-local (one ancestor walk after qualification) and scope analysis
 (conjuncts of `WHERE` + `HAVING` + INNER JOIN `ON`; outer-join `ON` never
@@ -628,7 +629,14 @@ case-insensitively), `NOT (col = v)` satisfies a `neq`, negative literals
 resolve, function names match Trino spellings underscore-insensitively
 (`date_diff` ⇒ sqlglot's `datediff`), cast types accept ANSI aliases
 (integer/int, real/float, decimal/numeric — REAL is in the default guard
-set), `||` is transparent to usage contexts (`MIN(time || 'x')` still
+set), comparison conjuncts IMPLY `is_not_null` (NULL fails every
+comparison, so `d = date(…)` satisfies a required not-null — no false flag
+on bounded queries), `required_predicate` has a `bounded` op (any positive
+equality/range/IN conjunct on the column, whatever the value — the
+"must pin an explicit window" shape), `forbidden_grouping` fires on GROUP
+BY keys only (ordinals and expressions over the target included; reading/
+filtering stays legal, DISTINCT deliberately out of scope), `||` is
+transparent to usage contexts (`MIN(time || 'x')` still
 aggregates the text form), cast chains are walked whole (an inner `TRY_CAST`
 never shields an outer forbidden cast, but IS the guard for
 `required_guard`), a guard only counts as a positive conjunct or inside the
