@@ -4287,10 +4287,12 @@ def get_reasoning_status(
         )
         if doc is not None:
             try:
-                policies = pdoc.parse_policies(doc)
+                # Runtime posture (matches the chat gate): a rules block this
+                # build can't parse degrades that one policy to prose rather
+                # than blanking the whole Guardrails page.
+                policies = pdoc.parse_policies(doc, drop_invalid_rules=True)
             except pdoc.PolicyDocError:
                 policies = []  # a bad artifact reads as "no policies yet"
-
     return {
         "data_domain": data_domain,
         "dataset": dataset,

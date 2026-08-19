@@ -147,6 +147,74 @@ def read_policy_doc(s3, *, bucket: str, data_domain: str, dataset: str) -> str |
     return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
 
 
+# -- deterministic rules: schema sidecar ---------------------------------------------
+#
+# `rules_schema.json` is the QUALIFICATION schema for the document's `rules:`
+# blocks — column MEMBERSHIP only ({"databases": {db: {table: [columns]}}}),
+# snapshotted at authoring time from the harvest's own `.metadata/columns.tsv`
+# (the schema the wiki was authored against — deliberately NOT live Glue,
+# which may have drifted ahead of the docs the rules trace to). The chat
+# check loads it next to policies.yaml; drift self-heals through the same
+# staleness gate (a schema change re-authors the wiki -> sources move ->
+# rebuild re-snapshots the sidecar).
+
+
+def rules_schema_key(data_domain: str, dataset: str) -> str:
+    return f"{policy_prefix(data_domain, dataset)}rules_schema.json"
+
+
+def put_rules_schema(
+    s3, *, bucket: str, data_domain: str, dataset: str,
+    databases: dict[str, dict[str, list[str]]],
+) -> str:
+    """Persist the qualification-schema sidecar next to policies.yaml."""
+    key = rules_schema_key(data_domain, dataset)
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps({"version": 1, "databases": databases}).encode("utf-8"),
+        ContentType="application/json",
+    )
+    return key
+
+
+def read_rules_schema(
+    s3, *, bucket: str, data_domain: str, dataset: str
+) -> dict[str, dict[str, list[str]]] | None:
+    """The sidecar's ``databases`` mapping, or None when it does not exist.
+
+    None (not ``{}``) so callers can tell "no sidecar was ever authored"
+    apart from an empty schema — the author gate refuses `rules:` in the
+    former case. Only a genuinely MISSING object reads None; a transient S3
+    failure (throttle, 5xx) RAISES so the caller can log it as what it is —
+    folding it into None made the chat trace misdiagnose an outage as
+    "never authored, re-author to fix", which no re-authoring can fix.
+    """
+    try:
+        obj = s3.get_object(
+            Bucket=bucket, Key=rules_schema_key(data_domain, dataset)
+        )
+        raw = json.loads(obj["Body"].read())
+    except Exception as e:  # noqa: BLE001 - triaged below
+        code = str(getattr(e, "response", {}).get("Error", {}).get("Code", ""))
+        if code in ("NoSuchKey", "404", "NoSuchBucket"):
+            return None
+        raise
+    databases = raw.get("databases") if isinstance(raw, dict) else None
+    if not isinstance(databases, dict):
+        return None
+    out: dict[str, dict[str, list[str]]] = {}
+    for db, tables in databases.items():
+        if not isinstance(tables, dict):
+            return None
+        out[str(db).lower()] = {
+            str(t).lower(): [str(c).lower() for c in (cols or [])]
+            for t, cols in tables.items()
+            if isinstance(cols, list)
+        }
+    return out
+
+
 # -- author state ------------------------------------------------------------------
 #
 # `sources_manifest.json` + `sources/<rel>` copies record what the policy
@@ -358,6 +426,50 @@ Field rules:
   never state figures when …). Write it so a judge can decide violated /
   not violated from the turn alone.
 * `source` — the wiki page the policy traces to.
+* `rules` — OPTIONAL, computational policies only: when (and ONLY when) the
+  policy's anti-pattern is mechanically visible in a query's structure, bind
+  it as one or more deterministic rules. Rules are evaluated on the SQL's
+  syntax tree BEFORE the judges — a violation they prove flags the query to
+  the agent as proof, so bind only what the source document asserts. Each rule
+  picks ONE dimension from this CLOSED catalog (an unknown dimension is
+  rejected; a policy fitting none stays prose-only, which is fine):
+  - `forbidden_aggregation` — an aggregate corrupts the column (cumulative
+    snapshots, running totals). `targets: [table.column, …]`,
+    `aggs: [sum|avg|max|min|count]` (default `[sum, avg]`).
+  - `forbidden_usage` — the column's stored form makes a context wrong (text
+    times ordered/compared/aggregated as durations). `targets`, `contexts`
+    subset of `[order, aggregate, compare, arithmetic]` (default all).
+  - `forbidden_function` — a function must never touch the column (ROUND on
+    precise points, CAST-to-int). Function names use Trino spellings
+    (`date_diff`, `regexp_extract` — matched underscore-insensitively);
+    cast types accept int/integer, float/real, decimal/numeric.
+    `targets`, `functions: [name, …]` and/or
+    `cast_types: [int|bigint|…]`.
+  - `required_predicate` — using (or aggregating) a table requires a WHERE
+    conjunct (soft-deletes, status filters, sentinel exclusion). `table`,
+    `when: aggregate|use` (default aggregate), `when_columns: [col, …]`
+    (default any), `require: {column, op: is_null|is_not_null|eq|neq,
+    value?}`, `or_group_by: col` (grouping as an accepted alternative).
+  - `required_guard` — a numeric CAST of mixed-content text needs a
+    regexp_like guard or TRY_CAST. `targets`, optional `cast_types`,
+    `guard_functions`.
+  - `forbidden_sequencing_key` — the column must never define order: opaque
+    ids mistaken for chronology. Fires on a window ORDER BY and on
+    `ORDER BY … LIMIT 1` ("the latest row"); a plain ordered listing is
+    presentational and never violates. `targets`.
+  - `required_distinct` — a COUNT that fans out at the table's grain.
+    `table`, `group_by: col`, `count_distinct: col`, and normally
+    `when_filtered: {column, op, value?}` — the predicate that makes this
+    reading wrong (e.g. the winner predicate). WITHOUT the trigger the rule
+    fires on every plain count at that grouping, so omit it only when any
+    such count is genuinely wrong. Any `COUNT(DISTINCT …)` is fan-out-safe
+    and never violates.
+  Every rule MUST carry `examples` with one `violation` and one `pass` SQL
+  statement — its self-test. The gate executes both against the dataset's
+  schema: the violation example must trip the rule and the pass example must
+  not (an `unknown` fails too). Table/column names must exist in the schema;
+  write them lowercase and unqualified (`table.column`). If no rules schema
+  is available for the dataset, write NO rules blocks at all.
 
 BE SELECTIVE — a policy earns its place only if violating it would make a
 real answer WRONG (not merely under-documented). Hunt exactly these classes:

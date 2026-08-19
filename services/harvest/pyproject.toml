@@ -9,6 +9,10 @@ description = "OKF harvest agent: LangChain deepagents deep agent on Bedrock Age
 requires-python = ">=3.11"
 dependencies = [
     "okf-core",
+    # Deterministic policy-rules evaluator (okf_core.policy_rules): parse +
+    # qualify agent SQL against the dataset schema. Optional in okf-core;
+    # a REAL dependency here — this runtime evaluates (or self-tests) rules.
+    "sqlglot>=30.0",
     # Shared LLM client factory (Converse + Mantle GPT builders) lives in okf-aws
     # (okf_aws.model_factory); harvest's agent.py delegates model construction to
     # it so the chat agent builds identical clients.

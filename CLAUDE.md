@@ -52,7 +52,11 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e services/okf_core -e services/okf_aws                       # shared libs
 pip install -e services/harvest -e services/reindex -e services/incremental \
             -e services/control_api -e services/consumption_mcp --no-deps
-pip install pytest "moto[s3,dynamodb]" "markdown-it-py>=3.0"  # md-it: annotation orphan renderer-oracle test
+pip install pytest "moto[s3,dynamodb]" "markdown-it-py>=3.0" "sqlglot>=30.0"
+# md-it: annotation orphan renderer-oracle test. sqlglot: the deterministic
+# policy-rules evaluator (okf_core.policy_rules) + its author-gate self-tests —
+# without it those tests SKIP rather than fail (the runtime degrades to the
+# LLM judge fleet), so install it or the tier goes unexercised.
 
 # Run everything (every service's unit tests + the offline E2E harvest test)
 ./scripts/run_tests.sh

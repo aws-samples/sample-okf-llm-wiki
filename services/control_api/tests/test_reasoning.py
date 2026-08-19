@@ -416,3 +416,41 @@ def test_document_absent_reads_as_exists_false(cfg):
         cfg.s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET
     )
     assert out == {"exists": False, "text": ""}
+
+
+# --- deterministic rules: status carries them verbatim --------------------------
+
+
+_RULED_DOC = """\
+policies:
+  - id: P020
+    type: computational
+    condition: aggregating standings points across rounds
+    action: never SUM cumulative snapshot columns
+    source: references/usage_guardrails.md
+    rules:
+      - dimension: forbidden_aggregation
+        targets: [driverstandings.points]
+        examples:
+          violation: SELECT SUM(points) FROM driverstandings
+          pass: SELECT points FROM driverstandings WHERE raceid = 900
+"""
+
+
+def _seed_ruled(cfg):
+    _seed(cfg)
+    _set(cfg, ar_build_status={"S": "ready"}, ar_source_hash={"S": "h"})
+    ap.put_policy_doc(
+        cfg.s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET,
+        doc_text=_RULED_DOC,
+    )
+
+
+def test_status_carries_rules_for_the_page_to_render(cfg):
+    _seed_ruled(cfg)
+    (policy,) = _status(cfg)["policies"]
+    (rule,) = policy["rules"]
+    assert rule["dimension"] == "forbidden_aggregation"
+    assert rule["targets"] == ["driverstandings.points"]
+    # The examples ride along — the accordion's Flags/Allows lines.
+    assert rule["examples"]["violation"].startswith("SELECT SUM")

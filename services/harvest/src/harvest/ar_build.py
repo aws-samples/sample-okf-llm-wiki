@@ -56,6 +56,7 @@ from okf_aws.ar_policy import (
     gather_sources,
     hash_sources,
     persist_author_state,
+    put_rules_schema,
     read_policy_doc,
     read_source_copy,
     read_sources_manifest,
@@ -64,6 +65,8 @@ from okf_aws.ar_policy import (
     stamp_ready,
     try_flip_building,
 )
+from okf_aws.s3_bundle import bundle_prefix
+from okf_core.lint import parse_columns_tsv
 
 log = logging.getLogger(__name__)
 
@@ -227,7 +230,7 @@ def _author_and_stamp(
     # Registration first — before any S3 walk — so authoring can never
     # resurrect state for a dataset whose mapping row is gone (a delete that
     # raced the follow-on build costs exactly one GetItem and writes nothing).
-    registered, status, stored_hash = _read_build_state(
+    registered, status, stored_hash, glue_database = _read_build_state(
         ddb, table, data_domain=data_domain, dataset=dataset
     )
     if not registered:
@@ -293,10 +296,23 @@ def _author_and_stamp(
     # stamp_ready after a successful authoring must still release the lease
     # (as `failed`, which the rebuild authority retries), never wedge the row.
     try:
+        # Snapshot the qualification schema for `rules:` blocks from the
+        # harvest's own `.metadata/columns.tsv` — the schema the wiki (and so
+        # the policies) describe, deliberately NOT live Glue. Persisted next
+        # to policies.yaml whenever available; its absence just means the
+        # author gate refuses rules blocks (policies stay prose-only).
+        rules_schema = _build_rules_schema(
+            s3, bucket, data_domain, dataset, glue_database
+        )
+        if rules_schema is not None:
+            put_rules_schema(
+                s3, bucket=bucket, data_domain=data_domain, dataset=dataset,
+                databases=rules_schema,
+            )
         doc_text = _author_doc(
             author, s3=s3, bucket=bucket,
             data_domain=data_domain, dataset=dataset, sources=sources,
-            force=force,
+            force=force, rules_schema=rules_schema,
         )
         if not doc_text.strip():
             log.error(
@@ -381,9 +397,37 @@ def _stored_doc_parses(
     return True
 
 
+def _build_rules_schema(
+    s3: Any, bucket: str, data_domain: str, dataset: str, glue_database: str
+) -> dict[str, dict[str, list[str]]] | None:
+    """``{db: {table: [columns]}}`` from the snapshot's columns.tsv, or None.
+
+    The database name follows the same contract as every other consumer of
+    the mapping row: ``glue_database`` when stamped, the dataset id as the
+    fallback. Partition-key rows are columns too (queryable in SQL), so they
+    stay in. None (no snapshot, unreadable, empty) means "no schema" — the
+    author gate then refuses ``rules:`` blocks rather than binding blind.
+    """
+    key = f"{bundle_prefix(data_domain, dataset)}.metadata/columns.tsv"
+    try:
+        raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except Exception:  # noqa: BLE001 - absent snapshot is a normal state
+        return None
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+    # The one header-driven parser for this format — the snapshot's column
+    # order varies by fork (the multi-database fork leads with `database`),
+    # so a positional split here would silently build a garbage schema.
+    parsed = parse_columns_tsv(text)
+    if not parsed:
+        return None
+    db = (glue_database or dataset).lower()
+    return {db: {t: sorted(cols) for t, cols in parsed.items()}}
+
+
 def _author_doc(
     author: Any, *, s3: Any, bucket: str, data_domain: str, dataset: str,
     sources: list[tuple[str, bytes]], force: bool = False,
+    rules_schema: dict[str, dict[str, list[str]]] | None = None,
 ) -> str:
     """Run the document author with the previous run's diff base wired in.
 
@@ -414,18 +458,21 @@ def _author_doc(
             s3, bucket=bucket, data_domain=data_domain, dataset=dataset,
             rel_path=rel,
         ),
+        rules_schema=rules_schema,
     )
 
 
 def _read_build_state(
     ddb: Any, table: str, *, data_domain: str, dataset: str
-) -> tuple[bool, str, str]:
-    """``(registered, ar_build_status, ar_source_hash)``.
+) -> tuple[bool, str, str, str]:
+    """``(registered, ar_build_status, ar_source_hash, glue_database)``.
 
-    ``(False, "", "")`` when the mapping row is absent. The registration gate
-    and the iff-changed skip are the whole reason harvest reads this row (its
-    other registry writes are blind UpdateItems), so the runtime role needs
-    GetItem on the registry table as well as UpdateItem.
+    ``(False, "", "", "")`` when the mapping row is absent. The registration
+    gate and the iff-changed skip are the whole reason harvest reads this row
+    (its other registry writes are blind UpdateItems), so the runtime role
+    needs GetItem on the registry table as well as UpdateItem.
+    ``glue_database`` feeds the rules-schema sidecar (dataset id fallback is
+    applied by the consumer — same contract as the chat scope enrichment).
     """
     item = (
         ddb.get_item(TableName=table, Key=registry_key(data_domain, dataset)).get("Item")
@@ -435,6 +482,7 @@ def _read_build_state(
         bool(item),
         ((item.get(ATTR_BUILD_STATUS) or {}).get("S")) or "",
         ((item.get(ATTR_SOURCE_HASH) or {}).get("S")) or "",
+        ((item.get("glue_database") or {}).get("S")) or "",
     )
 
 

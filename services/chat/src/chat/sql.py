@@ -486,6 +486,10 @@ def make_sql_tool(
     if dataset_scope:
         default_db = dataset_scope.get("glue_database") or dataset_scope.get("dataset")
 
+    # The deterministic rules tier evaluates against the engine's own SQL
+    # dialect — attribution must mirror how the backend will resolve names.
+    rules_dialect = "redshift" if isinstance(engine, RedshiftDataSQL) else "trino"
+
     # Per-turn injection budget: at most MAX_INJECTIONS_PER_TURN reminders, and
     # a finding KIND that was already injected this turn never re-injects (the
     # model has been told; repeating it is nagging).
@@ -500,6 +504,25 @@ def make_sql_tool(
         # line N:M ..., Insufficient Lake Formation permission(s) ...) is exactly
         # the feedback the model needs, so it passes through verbatim.
         nonlocal injection_count
+        # The DETERMINISTIC rules tier is submitted first — to the checker
+        # pool, NOT on this thread: its gate loads (DDB + S3) run while the
+        # engine executes, and the result is joined after the results are
+        # back (the advisory note is appended post-results anyway). It is
+        # ADVISORY only — it never refuses. Policies the tier decided
+        # (violation or pass) are excluded from the judge shards; `unknown`
+        # falls through to the fleet as before. Fail-open like everything
+        # else here.
+        rules_future = None
+        if policy_checker is not None:
+            try:
+                submit_rules = getattr(policy_checker, "submit_rules", None)
+                if submit_rules is not None:
+                    rules_future = submit_rules(
+                        sql, default_database=default_db, dialect=rules_dialect
+                    )
+            except Exception:  # noqa: BLE001 - the tier is best-effort
+                log.warning("rule submission failed (non-fatal)", exc_info=True)
+                rules_future = None
         # The soft policy check races the query: submit BEFORE the engine so
         # the judges spend the query's own execution time. Failures fail open.
         # Only ANALYTICAL queries are worth blocking on (should_wait) —
@@ -543,6 +566,20 @@ def make_sql_tool(
                 injection_count += 1
                 injected_kinds.update(f.kind for f in novel)
                 reminders.append(sql_anomalies.compose(novel))
+        rules_outcome = None
+        if rules_future is not None:
+            # Usually already done — the evaluation raced the engine. The
+            # bound only guards a pathological gate stall; timing out just
+            # means no advisory note (the judges still cover the policies).
+            try:
+                rules_outcome = rules_future.result(timeout=20)
+            except Exception:  # noqa: BLE001 - the tier is best-effort
+                log.warning(
+                    "rule evaluation did not complete (non-fatal)",
+                    exc_info=True,
+                )
+        if rules_outcome and rules_outcome.get("note"):
+            reminders.append(rules_outcome["note"])
         if policy_future is not None and policy_wait:
             note = _await_policy_note(policy_future, policy_checker)
             if note:

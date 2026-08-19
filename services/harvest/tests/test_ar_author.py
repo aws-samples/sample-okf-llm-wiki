@@ -536,3 +536,73 @@ def test_submit_rules_tool_advertises_the_full_item_schema():
     rule_schema = schema["$defs"]["ExtractedRule"]["properties"]
     assert rule_schema["type"]["enum"] == ["computational", "behavioural"]
     assert set(rule_schema) == {"type", "condition", "action", "source"}
+
+
+# --- deterministic rules at the gate -----------------------------------------------
+
+
+RULED_DOC = """\
+policies:
+  - id: P020
+    type: computational
+    condition: aggregating standings points across rounds
+    action: never SUM cumulative snapshot columns
+    source: references/usage_guardrails.md
+    rules:
+      - dimension: forbidden_aggregation
+        targets: [driverstandings.points]
+        examples:
+          violation: SELECT SUM(points) FROM driverstandings
+          pass: SELECT points FROM driverstandings WHERE raceid = 900
+"""
+
+RULES_SCHEMA = {"f1": {"driverstandings": ["raceid", "driverid", "points"]}}
+
+
+def _ruled_ctx(rules_schema=None):
+    from harvest.ar_author import AuthorContext
+
+    return AuthorContext(
+        [("references/usage_guardrails.md", b"never sum standings points")],
+        rules_schema=rules_schema,
+    )
+
+
+def test_gate_refuses_rules_without_a_schema():
+    pytest.importorskip("sqlglot")
+    out = _ruled_ctx(rules_schema=None).write_policies(RULED_DOC)
+    assert out.startswith("Error:") and "no rules schema" in out
+
+
+def test_gate_accepts_self_testing_rules_with_a_schema():
+    pytest.importorskip("sqlglot")
+    ctx = _ruled_ctx(rules_schema=RULES_SCHEMA)
+    out = ctx.write_policies(RULED_DOC)
+    assert out.startswith("Accepted:"), out
+    assert "rules:" in ctx.staged or "dimension" in ctx.staged
+
+
+def test_gate_surfaces_a_failing_self_test_as_a_tool_error():
+    pytest.importorskip("sqlglot")
+    bad = RULED_DOC.replace(
+        "violation: SELECT SUM(points) FROM driverstandings",
+        "violation: SELECT points FROM driverstandings",
+    )
+    out = _ruled_ctx(rules_schema=RULES_SCHEMA).write_policies(bad)
+    assert out.startswith("Error:") and "self-test failed" in out
+
+
+def test_schema_note_flips_on_availability():
+    assert "NO" in _ruled_ctx(rules_schema=None)._schema_note()
+    note = _ruled_ctx(rules_schema=RULES_SCHEMA)._schema_note()
+    assert "driverstandings" in note
+
+
+def test_schema_note_marks_truncation_instead_of_hiding_tables():
+    # Shown an ostensibly exhaustive list, the agent declines to bind rules
+    # for real-but-unlisted tables — the cut must be visible.
+    big = {"f1": {f"table_{i:03d}": ["id"] for i in range(60)}}
+    note = _ruled_ctx(rules_schema=big)._schema_note()
+    assert "and 20 more" in note and "every snapshot table is bindable" in note
+    small = _ruled_ctx(rules_schema=RULES_SCHEMA)._schema_note()
+    assert "more" not in small
