@@ -9,6 +9,10 @@ description = "OKF chat agent: LangGraph agent on Bedrock AgentCore Runtime, str
 requires-python = ">=3.11"
 dependencies = [
     "okf-core",
+    # Deterministic policy-rules evaluator (okf_core.policy_rules): parse +
+    # qualify agent SQL against the dataset schema. Optional in okf-core;
+    # a REAL dependency here — this runtime evaluates (or self-tests) rules.
+    "sqlglot>=30.0",
     # Shared LLM client factory (Converse + Mantle GPT builders) — chat builds
     # its models the same way harvest does.
     "okf-aws",

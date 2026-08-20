@@ -269,10 +269,18 @@ A per-dataset **policy document** (`policies.yaml`) — one individually
 trackable, checkable policy per entry — authored from the wiki's reference
 docs by a harvest-runtime agent, and enforced MID-TURN by the chat runtime's
 **map-reduce fleets of LLM judges**, in two tracks selected per run from the
-composer's Policy feature. Advisory only: flags ride back into the model's
-own context as hedged `<system-reminder>`s (the model decides the
+composer's Policy feature. Judge flags are advisory: they ride back into the
+model's own context as hedged `<system-reminder>`s (the model decides the
 correction) and surface in the UI as shield timeline steps; nothing blocks
 or gates.
+
+Underneath the judges sits a **deterministic tier** ("Deterministic policy
+rules" below): computational policies may carry declarative `rules` that are
+evaluated on the query's own syntax tree BEFORE the engine runs. It is
+advisory like everything else — a proven violation rides back as an
+unhedged proof-backed reminder (never a block) — and a policy it decides
+never reaches the judges. Everything it cannot prove falls through to the
+fleet unchanged.
 
 Naming note: the `ar_` prefixes below (module `okf_aws.ar_policy`, the
 registry attributes, `mode="ar_rules"`) are legacy naming from the retired v1
@@ -282,7 +290,8 @@ limitation** — the judges run wherever the chat model runs.
 
 **The document** (pure format: `okf_core.policy_doc`): a YAML mapping with a
 top-level `policies` list; every entry has exactly `{id, type, condition,
-action, source}`. `id` is `P`-prefixed, unique, and STABLE across edits (the
+action, source}` plus, on computational entries only, an optional `rules`
+list (see "Deterministic policy rules"). `id` is `P`-prefixed, unique, and STABLE across edits (the
 UI tracks policies over time; the author agent keeps surviving ids and never
 reuses retired ones). `type` is exactly one of `computational` (the
 violation is visible in a SQL query itself — additivity, grain/collapse,
@@ -368,6 +377,13 @@ any LLM role's file tools.
 policy/<data_domain>/<dataset>/
 ├── policies.yaml          # the authored policy document (the judges' rubric
 │                          #   and the Reasoning page's per-policy list)
+├── rules_schema.json      # {version, databases: {db: {table: [columns]}}} —
+│                          #   the QUALIFICATION schema for `rules:` blocks,
+│                          #   snapshotted at authoring time from the harvest's
+│                          #   .metadata/columns.tsv (the schema the wiki was
+│                          #   authored against, NOT live Glue). Absent = the
+│                          #   author gate refuses rules; the chat tier
+│                          #   evaluates nothing and the judges carry the load
 ├── sources_manifest.json  # {fingerprint, files: {rel: sha256}} — what the
 │                          #   author last SAW…
 └── sources/<rel>          # …and its exact copies: the DIFF BASE. The next
@@ -571,6 +587,144 @@ the results/turn untouched.
 - `GET /reasoning/{domain}/{dataset}/document` — `{exists, text}`: the live
   `policies.yaml` verbatim (kept for raw API access; the UI page renders the
   parsed per-guardrail list from the status call instead).
+
+### Deterministic policy rules
+
+A computational policy entry may carry an optional `rules:` list — the
+mechanically checkable core of its `action`, evaluated on the agent's SQL by
+`okf_core.policy_rules` (sqlglot) at `run_sql` call time. The evaluation is
+SUBMITTED to the checker pool before the engine dispatches (its gate loads
+race the query, never serialize in front of it) and JOINED after the results
+return; the judge path waits on the in-flight evaluation so shard exclusions
+stay deterministic.
+
+**Tri-state contract.** Per rule: `violation` (proven — every implicated
+column resolved to a real `(database, table)` through the schema and the
+forbidden shape is present / the required one absent), `pass` (proven clean),
+or `unknown` (anything unprovable: parse/qualify failure, a column flowing
+through a CTE or derived source whose name overlaps the bindings, `OR` at the
+top of a `WHERE`, a set-operation `ORDER BY`, no sqlglot). Renames don't
+evade: same-scope aliases (`SUM(points) AS total`, `ds.points`) are resolved
+away by qualification and still prove violations, while a derived-scope
+projection that renames a bound column (`points AS pts` in a CTE, `SUM(pts)`
+outside — including expression wrappers like `points + 0 AS pts`) is tracked
+as an export alias and reads `unknown`, never a decisive pass. A policy is
+`violation` if any of its rules
+proves one, else `unknown` if any is undecidable, else `pass`. **The tier only
+ever flags-with-proof or stays silent** — its worst case is coverage loss,
+never a wrong flag.
+
+**The closed dimension catalog** (`okf_core.policy_rules.DIMENSIONS` — the
+author may only BIND these; an unknown dimension is a gate error and a policy
+fitting none stays prose-only): `forbidden_aggregation`, `forbidden_usage`,
+`forbidden_function`, `required_predicate`, `required_guard`,
+`forbidden_grouping`,
+`forbidden_sequencing_key`, `required_distinct`. Two evaluator families —
+expression-local (one ancestor walk after qualification) and scope analysis
+(conjuncts of `WHERE` + `HAVING` + INNER JOIN `ON`; outer-join `ON` never
+satisfies a required predicate, since it does not filter the preserved side).
+Matching is engine-faithful and equivalence-aware: literals compare the way
+Athena compares them (numbers numerically, strings case-SENSITIVELY, booleans
+case-insensitively), `NOT (col = v)` satisfies a `neq`, negative literals
+resolve, function names match Trino spellings underscore-insensitively
+(`date_diff` ⇒ sqlglot's `datediff`), cast types accept ANSI aliases
+(integer/int, real/float, decimal/numeric — REAL is in the default guard
+set), comparison conjuncts IMPLY `is_not_null` (NULL fails every
+comparison, so `d = date(…)` satisfies a required not-null — no false flag
+on bounded queries), `required_predicate` has a `bounded` op (any positive
+equality/range/IN conjunct on the column, whatever the value — the
+"must pin an explicit window" shape), `forbidden_grouping` fires on GROUP
+BY keys only (ordinals and expressions over the target included; reading/
+filtering stays legal, DISTINCT deliberately out of scope), `||` is
+transparent to usage contexts (`MIN(time || 'x')` still
+aggregates the text form), cast chains are walked whole (an inner `TRY_CAST`
+never shields an outer forbidden cast, but IS the guard for
+`required_guard`), a guard only counts as a positive conjunct or inside the
+enclosing CASE/IF (an OR-branch or NOT-wrapped guard reads `unknown`), and
+`COUNT(*)` triggers table-scoped `required_predicate` rules by table
+presence when no `when_columns` narrows the trigger.
+
+**Two semantics that look like bugs but are not.** (a) `forbidden_sequencing_key`
+fires on a window `ORDER BY` and on `ORDER BY … LIMIT 1` ("the latest row") but
+NOT on a plain ordered listing with any other LIMIT — the `run_sql` tool
+description asks the model to LIMIT every query, so an any-LIMIT reading would
+refuse ordinary paging. (b) `required_distinct` normally carries a
+`when_filtered` trigger (the predicate that makes the reading wrong, e.g. the
+winner predicate) and never fires on `COUNT(DISTINCT …)` of ANY column —
+count-distinct is fan-out-safe by construction, and counting a different column
+is a different, legitimate question.
+
+**Every rule carries its own self-test** (`examples: {violation, pass}`) and
+the author gate EXECUTES it at submit time: the violation example must trip
+the rule and the pass example must not (`unknown` fails too), on top of the
+schema-contract check that every bound table/column exists. A rule cannot
+enter the document without proving it fires and does not over-fire — the same
+move as qgen's submit-time gold execution.
+
+**Advisory only — rules never refuse.** A proven violation rides back after
+the results as one `<system-reminder>` per dataset (deterministic wording —
+no false-positive hedge, unlike the judges' — with the policy's own `action`
+as the fix-it). The query always executes; there is no verification
+lifecycle, no overlay, and no blocking path. The trust anchor is entirely
+the author gate's executed self-test (above).
+
+**Cross-dataset queries** get the UNION of both datasets' rules. Bindings are
+database-qualified via the sidecar, and a rule only fires on columns proven to
+belong to ITS dataset's tables, so cross-talk is impossible by construction; a
+table from an unregistered database contributes no schema, which makes bare
+columns near it unresolvable and lands `unknown`.
+
+**Judge-shard exclusion.** Policies the tier decided (violation or pass) for a
+given normalized SQL are removed from that query's judge shards — the fleet
+only ever sees `unknown` and rule-less policies, which also saves judge tokens
+on every flagged-clean query. `run_computation` is deliberately UNTOUCHED: a
+computation is already frozen, human-verified SQL with its own trust lane.
+
+**Which statements it evaluates** (`is_checkable_sql`) is deliberately WIDER
+than the judge track's `is_analytical_sql`: that gate requires an
+aggregate/join/window/group-by because a fleet round costs tokens, while
+several dimensions fire on plain single-table reads (an unguarded numeric
+CAST, `ORDER BY <text time>`, `ORDER BY <opaque id> … LIMIT 1`, a sentinel
+filter). Reusing the judge gate would disarm the tier for exactly those. Only
+non-reading statements (SHOW/DESCRIBE/EXPLAIN — opaque `Command` nodes) and
+`information_schema` probes are skipped, which also keeps this synchronous
+path off the policy gate's I/O.
+
+**Athena/Trino only in practice.** The sidecar's table names come from the
+harvest snapshot, and rule targets are `table.column` (unqualified). A
+Redshift-backed dataset addresses tables as `schema.table`, which no target can
+express and whose 2-part references resolve as `db.table` — so on Redshift the
+tier reads `unknown` everywhere and the judges carry the whole load. Fail-safe,
+but a real coverage gap: schema-qualified bindings are the follow-on.
+
+**Fail-open, everywhere.** No sqlglot, no sidecar, a raising evaluator:
+every path yields `unknown`/no-op and today's judge-only behavior. A `rules`
+block the runtime's own catalog can't parse (okf_core is vendored per
+artifact, so a newer harvest image can author a dimension an older chat
+image doesn't know) degrades THAT policy to prose
+(`parse_policies(drop_invalid_rules=True)`) instead of silencing the whole
+document for both tiers. The tier arms under exactly the conditions the
+computational track already does (deploy gate + the run's
+`policy:computational`/`policy:strict` opt-in) — no new feature flag.
+
+**Tracing (live testing).** Every tier log line is prefixed `[policy-rules]`
+(logger `chat.policy_check`, INFO+), so ONE CloudWatch filter on the chat
+runtime log group yields the whole trace per query: the evaluated SQL +
+dialect/default-db, one line per rule — `<label> P010 rule[0]
+forbidden_aggregation(driverstandings.points) -> VIOLATION: SUM(…)` — the
+per-policy outcome (`VIOLATION -> advisory reminder to the model` /
+`PASS -> excluded from the judge shard` / `UNKNOWN -> deferred to the judge
+fleet`), a
+`done in Nms: X violation / Y pass / Z unknown; …` tally, and the judge-side
+hand-off (`… already decided deterministically — N policies left for the
+judges`). Every SKIP names its reason at WARNING/INFO — no rule-bearing
+policies, missing `rules_schema.json` sidecar (with the fix: Guardrails →
+Sync), a FAILED sidecar load (transient S3 error — named as such, never
+misdiagnosed as "never authored"), sqlglot missing from the image — because
+a silently inert tier is the
+one failure mode an operator can't diagnose from behavior alone. The
+`evaluate_policies` result also carries the per-rule breakdown (`rules:
+[{index, label, dimension, verdict, detail}]`) for any future UI surface.
 
 **The `policy_rebuild` event** (`okf_core.policy_rebuild`): custom source
 `okf.policy`, detail-type `policy_rebuild`, detail

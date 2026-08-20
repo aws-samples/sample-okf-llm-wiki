@@ -537,9 +537,17 @@ def read_columns_tsv(path: Path) -> dict[str, dict[str, str]] | None:
     try:
         if not path.is_file():
             return None
-        lines = path.read_text(encoding="utf-8").splitlines()
+        text = path.read_text(encoding="utf-8")
     except OSError:
         return None
+    return parse_columns_tsv(text)
+
+
+def parse_columns_tsv(text: str) -> dict[str, dict[str, str]] | None:
+    """:func:`read_columns_tsv` for callers holding the snapshot's TEXT
+    (S3 readers like the policy sidecar builder) rather than a mounted path
+    — same header-driven contract, one implementation."""
+    lines = text.splitlines()
     if not lines:
         return None
     header = [h.strip().lower() for h in lines[0].split("\t")]

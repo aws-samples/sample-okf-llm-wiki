@@ -110,10 +110,15 @@ class AuthorContext:
         prior_doc: str = "",
         prior_manifest: dict[str, Any] | None = None,
         fetch_old: Callable[[str], bytes | None] | None = None,
+        rules_schema: dict[str, dict[str, list[str]]] | None = None,
     ):
         self.current: dict[str, bytes] = dict(sources)
         self.prior_doc = prior_doc or ""
         self._fetch_old = fetch_old or (lambda _rel: None)
+        # The rules-schema sidecar ({db: {table: [columns]}}), when the build
+        # snapshotted one — enables `rules:` blocks (contract + self-test in
+        # the gate). None refuses them outright.
+        self.rules_schema = rules_schema
         prior_files = (prior_manifest or {}).get("files") or {}
 
         self.status: dict[str, str] = {}
@@ -217,6 +222,7 @@ class AuthorContext:
             text,
             known_sources=set(self.current),
             max_policies=_max_policies(),
+            rules_schema=self.rules_schema,
         )
 
     def make_tools(self) -> list[Any]:
@@ -260,6 +266,32 @@ class AuthorContext:
             ),
         ]
 
+    def _schema_note(self) -> str:
+        if not self.rules_schema:
+            return (
+                " No rules schema is available for this dataset — write NO "
+                "`rules:` blocks."
+            )
+        tables = sorted(
+            t for tbls in self.rules_schema.values() for t in tbls
+        )
+        # Truncation must be VISIBLE: shown an ostensibly exhaustive list,
+        # the agent declines to bind rules for real-but-unlisted tables —
+        # silent under-authoring on large datasets. The gate validates
+        # against the FULL schema either way.
+        shown = ", ".join(tables[:40])
+        if len(tables) > 40:
+            shown += (
+                f", … and {len(tables) - 40} more — every snapshot table is "
+                "bindable, not just the ones listed"
+            )
+        return (
+            " A rules schema is available (tables: "
+            + shown
+            + ") — bind deterministic `rules:` blocks where the document "
+            "contract allows, each with its violation/pass examples."
+        )
+
     def task_prompt(self, candidates: list[dict] | None = None) -> str:
         if not self.update_mode:
             if candidates:
@@ -273,13 +305,15 @@ class AuthorContext:
                     "job — the fleet extracts maximally by design), verify any "
                     "candidate you doubt with read_source(), and add any "
                     "decidable rule the fleet missed. Then submit the FULL "
-                    "document via write_policies.\n\nCandidate rules:\n"
+                    "document via write_policies."
+                    + self._schema_note()
+                    + "\n\nCandidate rules:\n"
                     + _render_candidates(candidates)
                 )
             return (
                 "Author policies.yaml for this dataset from scratch. Start with "
                 "list_sources(), read every source, then submit via "
-                "write_policies."
+                "write_policies." + self._schema_note()
             )
         changed = [r for r, s in self.status.items() if s in ("new", "changed")]
         return (
@@ -290,6 +324,7 @@ class AuthorContext:
             "read_policies() for the current document, diff_source() for each "
             "change, then submit the minimally-edited full document via "
             "write_policies — surviving policies KEEP their ids."
+            + self._schema_note()
         )
 
 
@@ -301,6 +336,7 @@ def author_policy_doc(
     fetch_old: Callable[[str], bytes | None] | None = None,
     model: Any = None,
     extract: Callable[[list[tuple[str, bytes]]], list[dict]] | None = None,
+    rules_schema: dict[str, dict[str, list[str]]] | None = None,
 ) -> str:
     """Run the authoring agent; returns the accepted document ("" on failure).
 
@@ -342,6 +378,7 @@ def author_policy_doc(
         prior_doc=prior_doc,
         prior_manifest=prior_manifest,
         fetch_old=fetch_old,
+        rules_schema=rules_schema,
     )
     agent = make_react_agent(
         model or _build_author_model(), ctx.make_tools(), _SYSTEM_PROMPT

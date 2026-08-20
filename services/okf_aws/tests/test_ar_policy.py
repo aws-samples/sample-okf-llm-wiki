@@ -345,3 +345,37 @@ def test_flip_building_takes_over_a_stale_building_row(aws):
         ddb, TABLE, data_domain=DOMAIN, dataset=DATASET, pending_hash="h3"
     )
     assert _attr(ddb, ap.ATTR_PENDING_SOURCE_HASH) == "h3"
+
+
+# --- rules-schema sidecar + attestation overlay -------------------------------------
+
+
+def test_rules_schema_roundtrip_and_absence(aws):
+    s3, _ddb = aws
+    assert (
+        ap.read_rules_schema(s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET)
+        is None
+    )
+    databases = {"f1": {"Results": ["RaceId", "points"]}}
+    key = ap.put_rules_schema(
+        s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET, databases=databases
+    )
+    assert key == f"policy/{DOMAIN}/{DATASET}/rules_schema.json"
+    # Read side lowercases everything (the evaluator's namespace).
+    assert ap.read_rules_schema(
+        s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET
+    ) == {"f1": {"results": ["raceid", "points"]}}
+
+
+def test_read_rules_schema_raises_on_transient_failures():
+    # Only a genuinely MISSING object reads None — folding a throttle/5xx
+    # into None made the chat trace misdiagnose an outage as "never
+    # authored, re-author to fix", which no re-authoring can fix.
+    class _Throttling:
+        def get_object(self, **kw):
+            raise RuntimeError("throttled")
+
+    with pytest.raises(RuntimeError, match="throttled"):
+        ap.read_rules_schema(
+            _Throttling(), bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET
+        )

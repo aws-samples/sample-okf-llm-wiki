@@ -352,3 +352,95 @@ def test_pending_hash_is_parked_at_flip_time(aws):
     _trigger(s3, ddb, author=author)
     assert seen["status"] == BUILD_BUILDING
     assert seen["pending"] == _attr(ddb, ATTR_SOURCE_HASH)
+
+
+# --- the rules-schema sidecar ----------------------------------------------------
+
+
+COLUMNS_TSV = (
+    "table\tcolumn\ttype\tcomment\n"
+    "results\traceid\tint\t\n"
+    "results\tpoints\tdouble\t\n"
+    "races\tyear\tint\t(partition key)\n"
+)
+
+
+def test_authoring_snapshots_the_rules_schema_sidecar(aws):
+    s3, ddb = aws
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"okf/{DOMAIN}/{DATASET}/.metadata/columns.tsv",
+        Body=COLUMNS_TSV.encode(),
+    )
+    author = FakeAuthor()
+    assert _trigger(s3, ddb, author=author) == ar_build.OUTCOME_AUTHORED
+    from okf_aws.ar_policy import read_rules_schema
+
+    schema = read_rules_schema(
+        s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET
+    )
+    # No glue_database on the row -> the dataset id is the database name.
+    assert schema == {
+        DATASET: {"results": ["points", "raceid"], "races": ["year"]}
+    }
+    # The author gate received the same schema (rules become validatable).
+    assert author.calls[0]["rules_schema"] == schema
+
+
+def test_no_snapshot_means_no_sidecar_and_a_none_schema(aws):
+    s3, ddb = aws
+    author = FakeAuthor()
+    assert _trigger(s3, ddb, author=author) == ar_build.OUTCOME_AUTHORED
+    from okf_aws.ar_policy import read_rules_schema
+
+    assert (
+        read_rules_schema(s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET)
+        is None
+    )
+    assert author.calls[0]["rules_schema"] is None
+
+
+def test_sidecar_parse_is_header_driven_not_positional(aws):
+    # The multi-database fork's snapshot leads with a `database` column — a
+    # positional split would silently read database as table and table as
+    # column, building a garbage schema the author gate then trusts.
+    s3, ddb = aws
+    five_col = (
+        "database\ttable\tcolumn\ttype\tcomment\n"
+        "f1_db\tresults\traceid\tint\t\n"
+        "f1_db\tresults\tpoints\tdouble\t\n"
+    )
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"okf/{DOMAIN}/{DATASET}/.metadata/columns.tsv",
+        Body=five_col.encode(),
+    )
+    assert _trigger(s3, ddb) == ar_build.OUTCOME_AUTHORED
+    from okf_aws.ar_policy import read_rules_schema
+
+    schema = read_rules_schema(
+        s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET
+    )
+    assert schema == {DATASET: {"results": ["points", "raceid"]}}
+
+
+def test_glue_database_attribute_names_the_sidecar_database(aws):
+    s3, ddb = aws
+    ddb.update_item(
+        TableName=TABLE,
+        Key=registry_key(DOMAIN, DATASET),
+        UpdateExpression="SET glue_database = :g",
+        ExpressionAttributeValues={":g": {"S": "F1_Curated"}},
+    )
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"okf/{DOMAIN}/{DATASET}/.metadata/columns.tsv",
+        Body=COLUMNS_TSV.encode(),
+    )
+    assert _trigger(s3, ddb) == ar_build.OUTCOME_AUTHORED
+    from okf_aws.ar_policy import read_rules_schema
+
+    schema = read_rules_schema(
+        s3, bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET
+    )
+    assert list(schema) == ["f1_curated"]

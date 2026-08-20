@@ -40,6 +40,13 @@ Field semantics:
   the judges are language models, not a parser.
 * ``source`` — the wiki page the policy traces to (``references/….md``); the
   UI links it and the author gate refuses entries pointing at dead pages.
+* ``rules`` — OPTIONAL, computational entries only: declarative SQL checks
+  from the closed dimension catalog (``okf_core.policy_rules``), evaluated
+  deterministically against the agent's query BEFORE the judge fleet. A
+  policy whose rules decide (violation/pass, proven on the AST) never
+  reaches the judges; undecidable rules fall through as today. Parsed and
+  normalized here (shape only — the schema-contract and self-test layers
+  live in :func:`validate_policy_doc`, which only the author gate exercises).
 
 Pure Python (pyyaml only): no AWS, no agent deps — the format's invariants
 live here, next to the other OKF source-of-truth modules.
@@ -72,15 +79,29 @@ class PolicyDocError(ValueError):
     """A ``policies.yaml`` that cannot be used, with a fix-it message."""
 
 
-def parse_policies(text: str | bytes) -> list[dict[str, str]]:
+def parse_policies(
+    text: str | bytes, *, drop_invalid_rules: bool = False
+) -> list[dict[str, Any]]:
     """The document's policy entries, schema-checked. Raises PolicyDocError.
 
-    Returns ``[{id, type, condition, action, source}, …]`` with every field a
-    stripped non-empty string, ids unique and pattern-valid, types from
-    :data:`POLICY_TYPES`. Anything else — unparseable YAML, a missing/blank
-    field, a duplicate or malformed id, an unknown type, a source outside
-    ``references/`` — raises with a message written for the AUTHOR (the
-    validation gate forwards it verbatim to the agent).
+    Returns ``[{id, type, condition, action, source[, rules]}, …]`` with
+    every prose field a stripped non-empty string, ids unique and
+    pattern-valid, types from :data:`POLICY_TYPES`, and ``rules`` (when
+    present on a computational entry) normalized via
+    ``okf_core.policy_rules.parse_rules``. Anything else — unparseable YAML,
+    a missing/blank field, a duplicate or malformed id, an unknown type, a
+    source outside ``references/``, a malformed rule — raises with a message
+    written for the AUTHOR (the validation gate forwards it verbatim to the
+    agent).
+
+    ``drop_invalid_rules=True`` is the RUNTIME reader's posture (chat gate,
+    Reasoning status): a ``rules`` block this build cannot parse — e.g. a
+    dimension a newer harvest image added before this runtime redeployed —
+    degrades THAT policy to prose instead of failing the whole document.
+    okf_core ships vendored in several separately-deployed artifacts, so
+    catalog skew is a normal state; one unparseable rule must never silence
+    both enforcement tiers for every policy of the dataset. The author gate
+    keeps the strict default (bad rules are refused back to the author).
     """
     if isinstance(text, bytes):
         text = text.decode("utf-8", errors="replace")
@@ -92,13 +113,13 @@ def parse_policies(text: str | bytes) -> list[dict[str, str]]:
         raise PolicyDocError(
             "the document must be a YAML mapping with a top-level `policies` list"
         )
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for i, raw in enumerate(doc["policies"]):
         where = f"policies[{i}]"
         if not isinstance(raw, dict):
             raise PolicyDocError(f"{where} is not a mapping")
-        entry: dict[str, str] = {}
+        entry: dict[str, Any] = {}
         for field in _REQUIRED:
             value = raw.get(field)
             if not isinstance(value, str) or not value.strip():
@@ -129,6 +150,24 @@ def parse_policies(text: str | bytes) -> list[dict[str, str]]:
                 f"{where} source {entry['source']!r} must be a "
                 "references/….md wiki page path"
             )
+        if raw.get("rules") is not None:
+            from okf_core import policy_rules
+
+            if entry["type"] != "computational":
+                if not drop_invalid_rules:
+                    raise PolicyDocError(
+                        f"{where} carries `rules` but is {entry['type']!r} — "
+                        "only computational policies may bind deterministic "
+                        "rules"
+                    )
+            else:
+                try:
+                    entry["rules"] = policy_rules.parse_rules(
+                        raw["rules"], where=f"{where}.rules"
+                    )
+                except policy_rules.RulesError as e:
+                    if not drop_invalid_rules:
+                        raise PolicyDocError(str(e)) from e
         entries.append(entry)
     return entries
 
@@ -138,14 +177,21 @@ def validate_policy_doc(
     *,
     known_sources: set[str] | None = None,
     max_policies: int = DEFAULT_MAX_POLICIES,
+    rules_schema: dict[str, dict[str, list[str]]] | None = None,
 ) -> str | None:
     """The author gate: None when acceptable, else what to fix.
 
-    Wraps :func:`parse_policies` and adds the two checks only the caller can
+    Wraps :func:`parse_policies` and adds the checks only the caller can
     parameterize: entries must trace to LIVE sources (``known_sources``, when
     given — a policy citing a removed page must be deleted, not left
-    dangling), and the count backstop (judges shard fine, but enumeration
-    pathology still degrades precision and spends tokens).
+    dangling), the count backstop (judges shard fine, but enumeration
+    pathology still degrades precision and spends tokens), and — for entries
+    carrying ``rules`` — the two deterministic layers: the schema CONTRACT
+    (every bound table/column exists in ``rules_schema``, the sidecar's
+    ``databases`` mapping) and the SELF-TEST (each rule's violation/pass
+    examples must evaluate to exactly those verdicts). Rules without a
+    sidecar are refused outright: an unresolvable binding could never be
+    evaluated, only mislead.
     """
     try:
         entries = parse_policies(text)
@@ -167,12 +213,29 @@ def validate_policy_doc(
                 "these policy sources are not current wiki pages (removed or "
                 "misspelled) — fix or delete their policies: " + ", ".join(dead)
             )
+    ruled = [e for e in entries if e.get("rules")]
+    if ruled:
+        from okf_core import policy_rules
+
+        if not rules_schema:
+            return (
+                "entries carry `rules` but no rules schema is available for "
+                "this dataset — drop the `rules:` blocks (policies stay "
+                "prose-only): " + ", ".join(e["id"] for e in ruled)
+            )
+        for e in ruled:
+            err = policy_rules.check_rules_schema(e["rules"], rules_schema)
+            if err:
+                return f"{e['id']}: {err}"
+            err = policy_rules.self_test(e["rules"], rules_schema)
+            if err:
+                return f"{e['id']}: {err}"
     return None
 
 
 def policies_of_type(
-    policies: list[dict[str, str]], policy_type: str
-) -> list[dict[str, str]]:
+    policies: list[dict[str, Any]], policy_type: str
+) -> list[dict[str, Any]]:
     """The subset one check track judges, order-preserving.
 
     ``policy_type`` must be a member of :data:`POLICY_TYPES` — a typo'd track
@@ -184,8 +247,8 @@ def policies_of_type(
 
 
 def shard_policies(
-    policies: list[dict[str, str]], size: int = DEFAULT_SHARD_SIZE
-) -> list[list[dict[str, str]]]:
+    policies: list[dict[str, Any]], size: int = DEFAULT_SHARD_SIZE
+) -> list[list[dict[str, Any]]]:
     """Split entries into judge-sized shards, keeping same-``source`` groups whole.
 
     Policies distilled from ONE wiki page share vocabulary and context (the
@@ -202,11 +265,11 @@ def shard_policies(
     """
     if size < 1:
         raise ValueError("shard size must be >= 1")
-    groups: dict[str, list[dict[str, str]]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
     for policy in policies:
         groups.setdefault(str(policy.get("source") or ""), []).append(policy)
-    shards: list[list[dict[str, str]]] = []
-    current: list[dict[str, str]] = []
+    shards: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
     for group in groups.values():
         # An oversized group is pre-chunked to the cap; each chunk then
         # places like a normal block (its siblings land in adjacent shards).
@@ -221,7 +284,7 @@ def shard_policies(
     return shards
 
 
-def render_policies_for_judge(policies: list[dict[str, str]]) -> str:
+def render_policies_for_judge(policies: list[dict[str, Any]]) -> str:
     """One shard as prompt text — id, condition, action, source, verbatim."""
     blocks = []
     for p in policies:

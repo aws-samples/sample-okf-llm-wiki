@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useState } from "react"
 import {
+  ChevronRightIcon,
   FileTextIcon,
   RefreshCwIcon,
   ShieldCheckIcon,
@@ -82,10 +83,99 @@ const TYPE_BADGE = {
     "border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-400",
 }
 
+// "forbidden_aggregation" -> "Forbidden Aggregation" (UI copy is Title Case;
+// the raw key stays snake_case everywhere machine-facing).
+function ruleTitle(dimension) {
+  return String(dimension || "")
+    .split("_")
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(" ")
+}
+
+// Every load-bearing binding, mirroring okf_core.policy_rules.rule_label —
+// the accordion is this feature's human-review surface, so a reviewer must
+// see WHAT the rule checks (which filter, which grouping, which functions),
+// not just which table it touches.
+function ruleBindings(rule) {
+  const parts = [...(rule.targets || [])]
+  const table = rule.table
+  if (table) {
+    if (rule.group_by) {
+      parts.push(
+        `${table} group by ${rule.group_by} → count distinct ${rule.count_distinct}`
+      )
+    }
+    if (rule.require) {
+      const value = rule.require.value != null ? ` ${rule.require.value}` : ""
+      parts.push(
+        `${table} requires ${rule.require.column} ${rule.require.op}${value}`
+      )
+    }
+    if (rule.or_group_by) parts.push(`or group by ${table}.${rule.or_group_by}`)
+    if (rule.when_filtered) {
+      const value =
+        rule.when_filtered.value != null ? ` ${rule.when_filtered.value}` : ""
+      parts.push(
+        `when ${rule.when_filtered.column} ${rule.when_filtered.op}${value}`
+      )
+    }
+    if (!parts.length) parts.push(table)
+  }
+  if (rule.dimension === "forbidden_aggregation" && rule.aggs?.length)
+    parts.push(`aggs: ${rule.aggs.join(", ")}`)
+  if (rule.dimension === "forbidden_usage" && rule.contexts?.length < 4)
+    parts.push(`in: ${rule.contexts.join(", ")}`)
+  if (rule.functions?.length) parts.push(`functions: ${rule.functions.join(", ")}`)
+  if (rule.dimension === "forbidden_function" && rule.cast_types?.length)
+    parts.push(`cast to: ${rule.cast_types.join(", ")}`)
+  if (rule.dimension === "required_guard" && rule.guard_functions?.length)
+    parts.push(`guard: ${rule.guard_functions.join("/")}`)
+  return parts.join(" · ")
+}
+
+// One rule, rendered from its dimension + bindings. Deliberately terse: the
+// dimension names the shape, the bindings name the columns and the exact
+// check, and the examples show what it flags and what it lets through.
+function RuleRow({ rule }) {
+  const bindings = ruleBindings(rule)
+  return (
+    <li className="space-y-1 rounded border border-border/50 bg-background/60 px-2 py-1.5">
+      <div className="flex flex-wrap items-baseline gap-x-2">
+        <span className="text-[11px] font-medium text-foreground">
+          {ruleTitle(rule.dimension)}
+        </span>
+        {bindings ? (
+          <span className="font-mono text-[11px] text-muted-foreground">
+            {bindings}
+          </span>
+        ) : null}
+      </div>
+      {rule.examples?.violation ? (
+        <p className="font-mono text-[10px] leading-relaxed text-muted-foreground">
+          <span className="text-rose-600 dark:text-rose-400">Flags:</span>{" "}
+          {rule.examples.violation}
+        </p>
+      ) : null}
+      {rule.examples?.pass ? (
+        <p className="font-mono text-[10px] leading-relaxed text-muted-foreground">
+          <span className="text-emerald-600 dark:text-emerald-400">
+            Allows:
+          </span>{" "}
+          {rule.examples.pass}
+        </p>
+      ) : null}
+    </li>
+  )
+}
+
 // One authored guardrail as its own sub-card: id + track badge + source on
 // the top line, then the two authored fields verbatim (sky labels, full
-// foreground text — the guardrail text is the payload, not an aside).
+// foreground text — the guardrail text is the payload, not an aside). A
+// guardrail carrying deterministic rules shows them behind a collapsed
+// accordion — the count is the summary; the rows are review material.
 function GuardrailItem({ policy }) {
+  const rules = policy.rules || []
+  const [rulesOpen, setRulesOpen] = useState(false)
   return (
     <li className="space-y-1 rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-sm">
       <div className="flex flex-wrap items-center gap-2">
@@ -120,6 +210,30 @@ function GuardrailItem({ policy }) {
         </span>{" "}
         {policy.action}
       </p>
+      {rules.length ? (
+        <div className="space-y-1.5 pt-1">
+          <button
+            type="button"
+            className="flex items-center gap-1 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+            onClick={() => setRulesOpen((open) => !open)}
+            aria-expanded={rulesOpen}
+          >
+            <ChevronRightIcon
+              className={`h-3 w-3 transition-transform ${
+                rulesOpen ? "rotate-90" : ""
+              }`}
+            />
+            {rules.length === 1 ? "1 Rule" : `${rules.length} Rules`}
+          </button>
+          {rulesOpen ? (
+            <ul className="space-y-1">
+              {rules.map((rule, i) => (
+                <RuleRow key={i} rule={rule} />
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
     </li>
   )
 }

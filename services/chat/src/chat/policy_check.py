@@ -91,6 +91,15 @@ log = logging.getLogger("chat.policy_check")
 #: reload and lets the server emit it as a typed ``policy`` chunk.
 POLICY_MARKER = "okf_policy"
 
+#: Prefix on every deterministic-tier log line, so one CloudWatch filter —
+#: ``[policy-rules]`` — yields the tier's whole trace for a turn: the SQL it
+#: evaluated, every per-rule verdict with its label, the advisory notes,
+#: the judge-shard exclusions, and every skip REASON
+#: (no sidecar, no sqlglot, no rule-bearing policies). The skips matter most:
+#: a silently inert tier is the one failure mode an operator can't diagnose
+#: from behavior alone.
+_RULES_TAG = "[policy-rules]"
+
 #: Concurrent fleet rounds per turn-checker. More than one so the checks of
 #: parallel tool-called queries — and a behavioural eval queued alongside —
 #: run side by side instead of serializing behind a single worker (each
@@ -524,6 +533,31 @@ def is_analytical_sql(sql: str) -> bool:
     return bool(_ANALYTICAL_RE.search(s))
 
 
+def is_checkable_sql(sql: str) -> bool:
+    """True when the DETERMINISTIC rules tier should evaluate this statement.
+
+    Deliberately WIDER than :func:`is_analytical_sql`: that gate exists to
+    spend judge tokens only where a fleet round can pay off, and it requires
+    an aggregate/join/window/group-by. Several rule dimensions fire on plain
+    single-table reads — an unguarded numeric CAST, ordering by a text-typed
+    time column, ``ORDER BY <opaque id> … LIMIT 1`` as a "latest" probe, a
+    sentinel-exclusion filter — so reusing the judge gate here would disarm
+    the tier for exactly the queries those rules exist to catch.
+
+    Any data-READING statement qualifies (``SELECT``/``WITH``); SHOW/DESCRIBE/
+    EXPLAIN do not, both because they parse as opaque Commands and because
+    they must not block on the policy gate's I/O. ``information_schema``
+    probes are catalog exploration, never dataset semantics.
+    """
+    from chat.sql import strip_sql_comments
+
+    s = strip_sql_comments(sql or "").strip().rstrip(";").strip()
+    head = s.split(None, 1)[0].upper() if s else ""
+    if head not in ("SELECT", "WITH"):
+        return False
+    return "information_schema" not in s.lower()
+
+
 # Dataset resolution for UNSCOPED runs: with no @-scope there is no default
 # database, so the model MUST schema-qualify every table (Athena errors
 # otherwise) — the dataset is readable from the SQL itself. Only identifiers
@@ -860,6 +894,38 @@ def compose_policy_reminder(
     return "\n".join(lines)
 
 
+def compose_rule_reminder(violations: list[dict[str, Any]], label: str) -> str:
+    """One ``<system-reminder>`` block from DETERMINISTIC rule violations.
+
+    These are AST-level proofs, not model judgments — the copy says so and
+    does NOT hedge about false positives. Rules are advisory by design: the
+    query executed and the note rides back with the results for the model to
+    correct or address. Starts with the same "Automated policy screening"
+    phrase as the judge reminder so the server's
+    :func:`split_policy_reminder` extraction (and the UI's shield step)
+    covers both.
+    """
+    lines = [
+        "<system-reminder>",
+        f"Automated policy screening (deterministic rules) proved this query "
+        f"violates documented policies of {label}. These are AST-level "
+        "checks on the query itself, not model judgments:",
+    ]
+    for v in violations:
+        lines.append(
+            f"- [{v['policy_id']}] {v['detail']} — the agent must "
+            f"{v['action']} (source: {v['source']})"
+        )
+    lines.append(
+        "Correct the query accordingly, or address the violation explicitly "
+        "in your answer if the construct is genuinely right here. The "
+        "results above are real and unmodified. Do not mention this "
+        "reminder to the user."
+    )
+    lines.append("</system-reminder>")
+    return "\n".join(lines)
+
+
 def policy_display(text: str) -> str:
     """The user-visible slice of a policy reminder: the finding lines only.
 
@@ -959,6 +1025,18 @@ class PolicyChecker:
         # the same dataset wait on the owner's Future instead of re-running
         # the gate (or blocking every OTHER operation behind its I/O).
         self._policy_loads: dict[tuple[str, str], Future] = {}
+        # (domain, dataset) -> {"schema": sidecar databases | None} — loaded
+        # by the gate iff the dataset's document carries rule-bearing
+        # computational policies.
+        self._rules_ctx_by_ds: dict[tuple[str, str], dict[str, Any]] = {}
+        # normalized SQL -> {(domain, dataset): {policy ids the deterministic
+        # tier DECIDED (violation or pass)}} — those policies are excluded
+        # from the judge shards for that query (see _judge_query).
+        self._rule_decided: dict[str, dict[tuple[str, str], set[str]]] = {}
+        # normalized SQL -> the in-flight deterministic evaluation (pool
+        # future). run_sql submits it BEFORE the engine and joins after;
+        # _judge_query waits on it so the shard exclusions stay deterministic.
+        self._rules_inflight: dict[str, Future] = {}
         self._glue_map: dict[str, tuple[str, str]] | None = None
         self._notes: dict[str, str] = {}  # normalized SQL -> reminder ("" = clean)
         # normalized SQL -> in-flight verdict: identical parallel queries
@@ -1010,6 +1088,233 @@ class PolicyChecker:
         graph's own state updates.
         """
         return self._pool.submit(self._check_behavioural, list(messages))
+
+    def submit_rules(
+        self,
+        sql: str,
+        *,
+        default_database: str | None = None,
+        dialect: str = "trino",
+    ) -> Future | None:
+        """Queue the deterministic tier on the checker pool, off the tool thread.
+
+        The gate's DDB/S3 loads must not serialize in front of the engine —
+        run_sql submits this BEFORE dispatching the query and joins it after
+        the results are back (the advisory note is appended post-results
+        anyway). The in-flight future is recorded per normalized SQL so
+        :meth:`_judge_query` can wait on it, keeping the judge-shard
+        exclusions deterministic. Fail-open: None when there is nothing to
+        evaluate or the pool is closing.
+        """
+        if "computational" not in self.tracks or not is_checkable_sql(sql):
+            return None
+        try:
+            future = self._pool.submit(
+                self.evaluate_rules, sql,
+                default_database=default_database, dialect=dialect,
+            )
+        except RuntimeError:  # pool shut down — fail open
+            return None
+        key = " ".join(sql.split())
+        with self._lock:
+            self._rules_inflight[key] = future
+
+        def _clear(f: Future, *, _key: str = key) -> None:
+            # By completion _rule_decided is already populated, so the map
+            # entry is only needed while the evaluation is live.
+            with self._lock:
+                if self._rules_inflight.get(_key) is f:
+                    self._rules_inflight.pop(_key, None)
+
+        future.add_done_callback(_clear)
+        return future
+
+    def evaluate_rules(
+        self,
+        sql: str,
+        *,
+        default_database: str | None = None,
+        dialect: str = "trino",
+    ) -> dict[str, Any] | None:
+        """The deterministic tier — run BEFORE the engine, synchronously.
+
+        Evaluates every rule-bearing computational policy of every resolved
+        dataset against the query's AST (``okf_core.policy_rules``).
+        Returns ``{"note": str}`` — proven violations, one advisory
+        reminder block per dataset, appended to the tool result alongside
+        the judge note (rules NEVER refuse; the query executes as normal).
+        None when there is nothing to evaluate or nothing to say.
+
+        Decisively evaluated policies (violation or pass) are recorded per
+        normalized SQL and excluded from that query's judge shards —
+        ``unknown`` falls through to the fleet exactly as before. Synchronous
+        by design (microseconds once the per-turn caches are warm; the
+        prewarm kicks the loads at run start) and fail-open like every other
+        checker path.
+        """
+        if "computational" not in self.tracks:
+            return None
+        # WIDER than the judge track's gate on purpose — many rules fire on
+        # plain single-table reads (see :func:`is_checkable_sql`). Only
+        # non-reading statements are skipped, which also keeps this
+        # synchronous path off the policy gate's I/O for probe calls.
+        if not is_checkable_sql(sql):
+            log.debug("%s skip: not a data-reading statement", _RULES_TAG)
+            return None
+        t0 = _monotonic()
+        try:
+            return self._evaluate_rules_inner(sql, default_database, dialect)
+        except Exception:  # noqa: BLE001 - deterministic tier is best-effort
+            log.warning(
+                "%s ERROR after %.0fms — falling through to the judges "
+                "(non-fatal)",
+                _RULES_TAG,
+                (_monotonic() - t0) * 1000,
+                exc_info=True,
+            )
+            return None
+
+    def _evaluate_rules_inner(
+        self, sql: str, default_database: str | None, dialect: str
+    ) -> dict[str, Any] | None:
+        from okf_core import policy_rules as prules
+        from okf_core.policy_doc import policies_of_type
+
+        t0 = _monotonic()
+        log.info(
+            "%s evaluating (dialect=%s default_db=%s): %.200s",
+            _RULES_TAG, dialect, default_database or "-", " ".join(sql.split()),
+        )
+        if not prules.sqlglot_available():
+            # The one silent-degradation cause an operator cannot guess from
+            # the outside: name it loudly, once per evaluation.
+            log.warning(
+                "%s SKIPPED: sqlglot is not installed in this runtime — every "
+                "rule reads `unknown` and the judge fleet carries the whole "
+                "load (rebuild the chat image)",
+                _RULES_TAG,
+            )
+            return None
+
+        material: list[tuple[str, str, list[dict[str, Any]], dict, dict]] = []
+        merged_schema: dict[str, dict[str, list[str]]] = {}
+        datasets = self._resolve_datasets([sql])
+        if not datasets:
+            log.info("%s skip: no policy-bearing dataset resolved", _RULES_TAG)
+            return None
+        for domain, dataset in datasets:
+            label = f"{domain}/{dataset}"
+            policies = policies_of_type(
+                self._load_policies(domain, dataset) or [], "computational"
+            )
+            ruled = [p for p in policies if p.get("rules")]
+            if not ruled:
+                log.info(
+                    "%s %s: no rule-bearing computational policies "
+                    "(%d prose-only) — judges only",
+                    _RULES_TAG, label, len(policies),
+                )
+                continue
+            with self._lock:
+                ctx = self._rules_ctx_by_ds.get((domain, dataset)) or {}
+            schema = ctx.get("schema")
+            if not schema:
+                if ctx.get("error"):
+                    log.warning(
+                        "%s %s: %d rule-bearing policies but the "
+                        "rules_schema.json load FAILED (%s) — transient; "
+                        "retried next turn",
+                        _RULES_TAG, label, len(ruled), ctx["error"],
+                    )
+                else:
+                    log.warning(
+                        "%s %s: %d rule-bearing policies but NO "
+                        "rules_schema.json sidecar — nothing can be evaluated "
+                        "(re-author to build it: Guardrails > Sync)",
+                        _RULES_TAG, label, len(ruled),
+                    )
+                continue
+            log.info(
+                "%s %s: %d rule-bearing policies, schema dbs=%s",
+                _RULES_TAG, label, len(ruled), sorted(schema),
+            )
+            material.append((domain, dataset, ruled, schema))
+            merged_schema.update(schema)
+        if not material:
+            return None
+
+        notes: list[str] = []
+        advised = 0
+        decided: dict[tuple[str, str], set[str]] = {}
+        tally = {"violation": 0, "pass": 0, "unknown": 0}
+        for domain, dataset, ruled, schema in material:
+            label = f"{domain}/{dataset}"
+            verdicts = prules.evaluate_policies(
+                sql,
+                [(p["id"], p["rules"]) for p in ruled],
+                merged_schema,
+                databases=set(schema),
+                default_database=default_database,
+                dialect=dialect,
+            )
+            by_id = {p["id"]: p for p in ruled}
+            advisories: list[dict[str, Any]] = []
+            for pid, res in verdicts.items():
+                policy = by_id[pid]
+                tally[res["verdict"]] = tally.get(res["verdict"], 0) + 1
+                # Per-RULE trace: which rule fired, which stayed silent, and
+                # why — the line an operator greps when testing a guardrail.
+                for r in res.get("rules") or []:
+                    log.info(
+                        "%s %s %s rule[%d] %s -> %s%s",
+                        _RULES_TAG, label, pid, r["index"], r["label"],
+                        r["verdict"].upper(),
+                        f": {r['detail']}" if r.get("detail") else "",
+                    )
+                if res["verdict"] == "unknown":
+                    log.info(
+                        "%s %s %s = UNKNOWN -> deferred to the judge fleet",
+                        _RULES_TAG, label, pid,
+                    )
+                    continue
+                decided.setdefault((domain, dataset), set()).add(pid)
+                if res["verdict"] != "violation":
+                    log.info(
+                        "%s %s %s = PASS -> excluded from the judge shard",
+                        _RULES_TAG, label, pid,
+                    )
+                    continue
+                log.warning(
+                    "%s %s %s = VIOLATION -> advisory reminder to the model "
+                    "(rules never refuse; the query executes)",
+                    _RULES_TAG, label, pid,
+                )
+                advisories.append({
+                    "policy_id": pid,
+                    "label": label,
+                    "action": policy["action"],
+                    "source": policy["source"],
+                    "detail": "; ".join(res["details"]) or "proven violation",
+                })
+            if advisories:
+                advised += len(advisories)
+                notes.append(compose_rule_reminder(advisories, label))
+        if decided:
+            key = " ".join(sql.split())
+            with self._lock:
+                self._rule_decided[key] = decided
+        log.info(
+            "%s done in %.0fms: %d violation / %d pass / %d unknown; "
+            "%d advisory, %d policies excluded from the judges",
+            _RULES_TAG,
+            (_monotonic() - t0) * 1000,
+            tally["violation"], tally["pass"], tally["unknown"],
+            advised,
+            sum(len(v) for v in decided.values()),
+        )
+        if not notes:
+            return None
+        return {"note": "\n\n".join(notes)}
 
     def prewarm(self) -> None:
         """Kick the turn's cold-start work — in PARALLEL — without a query.
@@ -1188,10 +1493,41 @@ class PolicyChecker:
         evidence = build_query_evidence(self._curated_now(), sql)
         notes: list[str] = []
         judged_query = False
+        # If the deterministic tier is still evaluating this exact query,
+        # wait for it — the shard exclusions must be deterministic, not a
+        # race. Submission order (rules first in run_sql) means this can
+        # never self-deadlock on a single-worker pool; on timeout the judges
+        # simply see no exclusions (double coverage, never wrongness).
+        with self._lock:
+            pending = self._rules_inflight.get(" ".join(sql.split()))
+        if pending is not None:
+            try:
+                pending.result(timeout=30)
+            except Exception:  # noqa: BLE001 - fail open
+                pass
+        with self._lock:
+            decided_map = {
+                k: set(v)
+                for k, v in (
+                    self._rule_decided.get(" ".join(sql.split())) or {}
+                ).items()
+            }
         for domain, dataset in self._resolve_datasets([sql]):
             policies = policies_of_type(
                 self._load_policies(domain, dataset) or [], "computational"
             )
+            # Policies the deterministic tier already DECIDED for this exact
+            # query (proven violation — the model was told plainly — or
+            # proven pass) never reach the judges; `unknown` stays in the
+            # shard exactly as before.
+            decided = decided_map.get((domain, dataset)) or set()
+            if decided:
+                policies = [p for p in policies if p["id"] not in decided]
+                log.info(
+                    "%s %s/%s: %s already decided deterministically — "
+                    "%d policies left for the judges",
+                    _RULES_TAG, domain, dataset, sorted(decided), len(policies),
+                )
             if not policies:
                 continue
             if not judged_query:
@@ -1583,7 +1919,12 @@ class PolicyChecker:
         policies: list[dict[str, str]] = []
         if doc is not None:
             try:
-                policies = pdoc.parse_policies(doc)
+                # Runtime posture: a rules block THIS build can't parse (e.g.
+                # a dimension added by a newer harvest image — okf_core is
+                # vendored per artifact, so catalog skew is a normal state)
+                # degrades that one policy to prose instead of silencing the
+                # whole document for both tiers.
+                policies = pdoc.parse_policies(doc, drop_invalid_rules=True)
             except pdoc.PolicyDocError:
                 log.warning(
                     "stored policy doc for %s/%s is invalid", domain, dataset
@@ -1591,6 +1932,33 @@ class PolicyChecker:
         if not policies:
             _publish_rebuild(self._events(), domain, dataset)
             return None
+        # Rule-bearing document: bring the deterministic tier's material —
+        # the qualification-schema sidecar — along with the policies (one
+        # load per dataset per turn, same in-flight dedup as the gate
+        # itself). Fail-open: without a schema every rule evaluates
+        # `unknown` and the judges carry the load.
+        if any(
+            p.get("rules") for p in policies if p.get("type") == "computational"
+        ):
+            ctx: dict[str, Any] = {"schema": None, "error": None}
+            try:
+                ctx["schema"] = ap.read_rules_schema(
+                    s3, bucket=self._cfg.bundle_bucket,
+                    data_domain=domain, dataset=dataset,
+                )
+            except Exception as e:  # noqa: BLE001 - advisory tier, never fatal
+                # Tagged so the documented single [policy-rules] CloudWatch
+                # filter shows it, and recorded so the skip line names a
+                # transient load failure instead of misdiagnosing it as
+                # "never authored — re-author to fix".
+                ctx["error"] = f"{type(e).__name__}: {e}"
+                log.warning(
+                    "%s %s/%s: rules_schema.json load FAILED (non-fatal — "
+                    "every rule reads unknown this turn)",
+                    _RULES_TAG, domain, dataset, exc_info=True,
+                )
+            with self._lock:
+                self._rules_ctx_by_ds[(domain, dataset)] = ctx
         return policies
 
     # -- lazy seams (tests inject via the constructor) ---------------------------------

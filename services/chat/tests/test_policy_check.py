@@ -16,6 +16,7 @@ fake; DynamoDB + S3 run on moto.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from moto import mock_aws
 
 from chat import policy_check as pc
+from okf_core import policy_rules as pc_rules
 from chat import server
 from chat.threads import read_policy_state, write_policy_state
 from okf_aws import ar_policy as ap
@@ -1554,4 +1556,314 @@ def test_slow_rewrite_never_blocks_unrelated_checker_state(env):
         assert time.monotonic() - t0 < 2.0
     finally:
         release.set()
+    checker.close()
+
+
+# --- the deterministic rules tier -------------------------------------------------
+
+
+# sqlglot gates only the DETERMINISTIC-tier tests below — never the judge
+# suite above it (a module-level importorskip would skip that too).
+_needs_sqlglot = pytest.mark.skipif(
+    not pc_rules.sqlglot_available(), reason="sqlglot is not installed"
+)
+
+_RULED_DOC = """\
+policies:
+  - id: P010
+    type: computational
+    condition: aggregating standings points across rounds
+    action: never SUM cumulative snapshot columns; read one round's row
+    source: references/usage_guardrails.md
+    rules:
+      - dimension: forbidden_aggregation
+        targets: [driverstandings.points]
+        examples:
+          violation: SELECT SUM(points) FROM driverstandings
+          pass: SELECT points FROM driverstandings WHERE raceid = 900
+  - id: P011
+    type: computational
+    condition: figures are stated from a query with duplicates
+    action: apply the documented dedup before stating figures
+    source: references/usage_guardrails.md
+"""
+
+_RULES_SCHEMA = {
+    DATASET: {"driverstandings": ["raceid", "driverid", "points"]}
+}
+
+_VIOLATING_SQL = "SELECT SUM(points) FROM driverstandings"
+
+
+def _seed_ruled(env):
+    _seed_usable_policy(env, doc=_RULED_DOC)
+    ap.put_rules_schema(
+        env["s3"], bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET,
+        databases=_RULES_SCHEMA,
+    )
+
+
+@_needs_sqlglot
+def test_evaluate_rules_violation_advises_never_refuses(env):
+    _seed_ruled(env)
+    checker = _checker(env, judge=_RaisingModel())
+    out = checker.evaluate_rules(_VIOLATING_SQL, default_database=DATASET)
+    assert out is not None
+    assert "refusals" not in out  # the tier has no refuse path at all
+    assert "deterministic rules" in out["note"]
+    assert "P010" in out["note"] and "<system-reminder>" in out["note"]
+    # The advisory note rides the same UI shield channel as judge flags.
+    _stripped, display = pc.split_policy_reminder("results\n\n" + out["note"])
+    assert "P010" in display
+    checker.close()
+
+
+@_needs_sqlglot
+def test_decided_policies_never_reach_the_judges(env, monkeypatch):
+    _seed_ruled(env)
+    seen: list[list[str]] = []
+
+    def _recording_judge(model, policies, evidence, **kw):
+        seen.append([p["id"] for p in policies])
+        return [], 0, len(policies)
+
+    monkeypatch.setattr(pc, "judge_policies", _recording_judge)
+    checker = _checker(env, judge=_RaisingModel())
+    checker.evaluate_rules(_VIOLATING_SQL, default_database=DATASET)
+    note = checker.submit(_VIOLATING_SQL).result(timeout=10)
+    assert note == ""
+    # P010 was decided deterministically; only the prose policy is judged.
+    assert seen == [["P011"]]
+    checker.close()
+
+
+@_needs_sqlglot
+def test_unknown_verdicts_fall_through_to_the_judges(env, monkeypatch):
+    _seed_ruled(env)
+    seen: list[list[str]] = []
+
+    def _recording_judge(model, policies, evidence, **kw):
+        seen.append([p["id"] for p in policies])
+        return [], 0, len(policies)
+
+    monkeypatch.setattr(pc, "judge_policies", _recording_judge)
+    checker = _checker(env, judge=_RaisingModel())
+    cte = (
+        "WITH s AS (SELECT driverid, points FROM driverstandings) "
+        "SELECT driverid, SUM(points) FROM s GROUP BY 1"
+    )
+    out = checker.evaluate_rules(cte, default_database=DATASET)
+    assert out is None  # nothing decided, nothing to say
+    checker.submit(cte).result(timeout=10)
+    assert seen == [["P010", "P011"]]
+    checker.close()
+
+
+@_needs_sqlglot
+def test_missing_sidecar_leaves_everything_to_the_judges(env, monkeypatch):
+    _seed_usable_policy(env, doc=_RULED_DOC)  # doc has rules, NO sidecar
+    seen: list[list[str]] = []
+
+    def _recording_judge(model, policies, evidence, **kw):
+        seen.append([p["id"] for p in policies])
+        return [], 0, len(policies)
+
+    monkeypatch.setattr(pc, "judge_policies", _recording_judge)
+    checker = _checker(env, judge=_RaisingModel())
+    assert checker.evaluate_rules(_VIOLATING_SQL, default_database=DATASET) is None
+    checker.submit(_VIOLATING_SQL).result(timeout=10)
+    assert seen == [["P010", "P011"]]
+    checker.close()
+
+
+@_needs_sqlglot
+def test_run_sql_executes_a_violating_query_and_appends_the_note(env):
+    # Rules are advisory ONLY: a proven violation must never block the
+    # engine — the results come back with the reminder appended.
+    from chat.sql import AthenaSQL, make_sql_tool
+
+    _seed_ruled(env)
+    checker = _checker(env, judge=_RaisingModel())
+
+    class _FakeEngine(AthenaSQL):
+        def __init__(self):
+            super().__init__(athena=None)
+            self.ran = False
+
+        def run(self, sql, *, default_database=None):
+            self.ran = True
+            return {"columns": ["c"], "rows": [{"c": "1"}], "row_count": 1,
+                    "truncated": False}
+
+    engine = _FakeEngine()
+    tool = make_sql_tool(
+        engine,
+        dataset_scope={"data_domain": DOMAIN, "dataset": DATASET,
+                       "glue_database": DATASET},
+        policy_checker=checker,
+    )
+    out = tool.func(_VIOLATING_SQL)
+    assert engine.ran
+    assert isinstance(out, str) and '"row_count": 1' in out
+    assert "deterministic rules" in out and "P010" in out
+    checker.close()
+
+
+@_needs_sqlglot
+def test_non_reading_statements_skip_the_deterministic_tier(env):
+    # SHOW/DESCRIBE parse as opaque Commands and must not block this
+    # synchronous path on the policy gate's I/O.
+    _seed_ruled(env)
+    checker = _checker(env, judge=_RaisingModel())
+    assert checker.evaluate_rules("SHOW TABLES", default_database=DATASET) is None
+    assert checker.evaluate_rules(
+        "DESCRIBE driverstandings", default_database=DATASET
+    ) is None
+    checker.close()
+
+
+@_needs_sqlglot
+def test_tier_gate_is_wider_than_the_judge_gate():
+    # The judge gate needs an aggregate/join/window to pay for a fleet round;
+    # the deterministic tier must still see plain single-table reads, which is
+    # where required_guard / forbidden_usage / sequencing rules live.
+    plain = "SELECT CAST(positiontext AS INTEGER) FROM results"
+    assert not pc.is_analytical_sql(plain)
+    assert pc.is_checkable_sql(plain)
+    latest = "SELECT * FROM results ORDER BY raceid DESC LIMIT 1"
+    assert not pc.is_analytical_sql(latest)
+    assert pc.is_checkable_sql(latest)
+    # Non-reading + catalog probes stay out.
+    assert not pc.is_checkable_sql("SHOW TABLES")
+    assert not pc.is_checkable_sql("DESCRIBE results")
+    assert not pc.is_checkable_sql(
+        "SELECT table_name FROM information_schema.tables"
+    )
+    # A comment must not disguise a readable statement (same rule as the
+    # judge gate).
+    assert pc.is_checkable_sql("-- pull one row\nSELECT time FROM results")
+
+
+@_needs_sqlglot
+def test_plain_read_violation_is_caught_by_the_tier(env):
+    # The regression the wider gate exists for: an unguarded cast has no
+    # aggregate, so the judge gate would have skipped it entirely.
+    _seed_usable_policy(env, doc=_GUARD_DOC)
+    ap.put_rules_schema(
+        env["s3"], bucket=BUCKET, data_domain=DOMAIN, dataset=DATASET,
+        databases={DATASET: {"results": ["positiontext", "raceid"]}},
+    )
+    checker = _checker(env, judge=_RaisingModel())
+    sql = "SELECT CAST(positiontext AS INTEGER) FROM results"
+    assert not pc.is_analytical_sql(sql)
+    out = checker.evaluate_rules(sql, default_database=DATASET)
+    assert out is not None and "P088" in out["note"]
+    checker.close()
+
+
+_GUARD_DOC = """\
+policies:
+  - id: P088
+    type: computational
+    condition: casting positiontext to a number
+    action: guard the cast with regexp_like or use TRY_CAST
+    source: references/usage_guardrails.md
+    rules:
+      - dimension: required_guard
+        targets: [results.positiontext]
+        examples:
+          violation: SELECT CAST(positiontext AS INTEGER) FROM results
+          pass: SELECT TRY_CAST(positiontext AS INTEGER) FROM results
+"""
+
+
+@_needs_sqlglot
+def test_unarmed_computational_track_never_evaluates_rules(env):
+    _seed_ruled(env)
+    checker = _checker(env, judge=_RaisingModel(), tracks=("behavioural",))
+    assert checker.evaluate_rules(_VIOLATING_SQL, default_database=DATASET) is None
+    checker.close()
+
+
+@_needs_sqlglot
+def test_rules_trace_is_greppable_and_names_the_fired_rule(env, caplog):
+    # The operator contract: one CloudWatch filter — "[policy-rules]" — yields
+    # the whole tier trace: the evaluated SQL, each rule's verdict with its
+    # label, and the summary tally.
+    _seed_ruled(env)
+    checker = _checker(env, judge=_RaisingModel())
+    with caplog.at_level(logging.INFO, logger="chat.policy_check"):
+        checker.evaluate_rules(_VIOLATING_SQL, default_database=DATASET)
+    trace = [r.getMessage() for r in caplog.records if "[policy-rules]" in r.getMessage()]
+    assert any("evaluating" in line and "SUM(points)" in line for line in trace)
+    assert any(
+        "P010 rule[0] forbidden_aggregation(driverstandings.points) -> VIOLATION"
+        in line
+        for line in trace
+    )
+    assert any("advisory reminder" in line and "VIOLATION" in line
+               for line in trace)
+    assert any("done in" in line and "1 advisory" in line for line in trace)
+    checker.close()
+
+
+@_needs_sqlglot
+def test_rules_trace_names_every_skip_reason(env, caplog):
+    # A silently inert tier is the one failure mode an operator can't
+    # diagnose from behavior — every skip must say WHY.
+    _seed_usable_policy(env, doc=_RULED_DOC)  # rules but NO sidecar
+    checker = _checker(env, judge=_RaisingModel())
+    with caplog.at_level(logging.INFO, logger="chat.policy_check"):
+        checker.evaluate_rules(_VIOLATING_SQL, default_database=DATASET)
+    assert any(
+        "NO rules_schema.json" in r.getMessage() for r in caplog.records
+    )
+    checker.close()
+
+
+@_needs_sqlglot
+def test_sidecar_load_failure_is_traced_not_misdiagnosed(env, caplog, monkeypatch):
+    # A transient S3 failure must ride the [policy-rules] filter and say
+    # "load FAILED", never "never authored — re-author to fix".
+    _seed_ruled(env)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("throttled")
+
+    monkeypatch.setattr("okf_aws.ar_policy.read_rules_schema", _boom)
+    checker = _checker(env, judge=_RaisingModel())
+    with caplog.at_level(logging.INFO, logger="chat.policy_check"):
+        assert checker.evaluate_rules(
+            _VIOLATING_SQL, default_database=DATASET
+        ) is None
+    trace = [
+        r.getMessage() for r in caplog.records
+        if "[policy-rules]" in r.getMessage()
+    ]
+    assert any("load FAILED" in line for line in trace)
+    assert not any("re-author" in line for line in trace)
+    checker.close()
+
+
+@_needs_sqlglot
+def test_submitted_rules_still_exclude_decided_policies(env, monkeypatch):
+    # run_sql now submits the tier to the pool instead of evaluating on the
+    # tool thread — the judge path must WAIT on the in-flight evaluation so
+    # the shard exclusions stay deterministic.
+    _seed_ruled(env)
+    seen: list[list[str]] = []
+
+    def _recording_judge(model, policies, evidence, **kw):
+        seen.append([p["id"] for p in policies])
+        return [], 0, len(policies)
+
+    monkeypatch.setattr(pc, "judge_policies", _recording_judge)
+    checker = _checker(env, judge=_RaisingModel())
+    future = checker.submit_rules(_VIOLATING_SQL, default_database=DATASET)
+    assert future is not None
+    note = checker.submit(_VIOLATING_SQL).result(timeout=10)
+    assert note == ""
+    assert seen == [["P011"]]
+    outcome = future.result(timeout=10)
+    assert outcome is not None and "P010" in outcome["note"]
     checker.close()
