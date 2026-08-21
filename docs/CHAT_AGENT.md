@@ -780,13 +780,15 @@ registry does support `Mcp.Connector` and is `FULLY_MUTABLE`, so the target is a
 `aws_cloudcontrolapi_resource` — same provider, still declarative, still no console
 steps. Swap it for the native resource when the provider grows the block.
 
-**Region is not the deployment's.** The connector is offered in `us-east-1` only,
-so the gateway, its service role, and the target all use the existing
-`aws.us_east_1` provider alias whatever `var.region` is, and the runtime signs for
-us-east-1 (`OKF_WEB_SEARCH_REGION`). A query never leaves AWS — the gateway serves
-it internally, not via a third-party engine — but it *does* leave the deployment's
-region. That, per-query billing, and the attribution duty below are why the flag
-exists.
+**Region may not be the deployment's.** The connector is offered in `us-east-1`,
+`eu-west-1`, and `ap-northeast-1` only, so the gateway, its service role, and the
+target all use the `aws.web_search` provider alias (`var.web_search_region`,
+default `us-east-1`) rather than `var.region`, and the runtime signs for that
+region (`OKF_WEB_SEARCH_REGION`). Pick the connector region matching (or nearest)
+the deployment so queries stay in-region where possible. A query never leaves AWS
+— the gateway serves it internally, not via a third-party engine — but it *can*
+leave the deployment's region. That, per-query billing, and the attribution duty
+below are why the flag exists.
 
 **Two roles, not one.** The *gateway service role* holds
 `bedrock-agentcore:InvokeWebSearch` on the service-owned ARN
@@ -794,19 +796,35 @@ exists.
 literally `aws`) plus `InvokeGateway`. The *chat role* gains exactly one action:
 `bedrock-agentcore:InvokeGateway` on this gateway's ARN.
 
-**No date filter — deliberately.** `WebSearch` accepts only `query` (≤200 chars)
-and `maxResults` (1–25, agent-selectable, default 10 via
-`var.web_search_max_results`) — there is no recency parameter — while each result
-carries an optional `publishedDate`. An earlier revision added
-`published_after`/`published_before` wrapper args that filtered client-side; they
-were **removed**: filtering a relevance-ranked top-N after the fact can only
-subtract results, never surface period-relevant pages the ranking missed, so it
-added argument surface without adding recall. Instead the agent anchors time in
-the query itself ("EU steel tariffs Q2 2026") and reads each result's publication
-date — which is why the tool **description carries today's date** (the system
-prompt is deliberately static, a cacheable prefix, so the description is the one
-place a per-run date belongs). An optional server-side domain denylist
-(`var.web_search_excluded_domains`) is invisible to the model.
+**Server-side filters (connector 1.2.0) — deploy-gated.** `WebSearch` accepts
+`query` (≤200 chars), `maxResults` (1–25, agent-selectable, default 10 via
+`var.web_search_max_results`) and, once the target is pinned to connector
+`1.2.0`, an optional `filters` object: `domainFilter.include/exclude` (≤100 bare
+domains each, subdomains match) and `publishedDateFilter.from/to` (inclusive,
+matching each page's *publication* date). The wrapper surfaces these as
+`published_after`/`published_before`/`include_domains`/`exclude_domains`. The
+history matters: an earlier revision shipped the date args as **client-side**
+post-filters and they were removed — filtering a relevance-ranked top-N after
+the fact can only subtract results, never surface period-relevant pages the
+ranking missed. The connector's filters constrain the search itself, so that
+objection no longer applies and the args are back. The agent still anchors time
+in the query too ("EU steel tariffs Q2 2026") and reads each result's
+publication date — the date filter matches when a page was *published*, not the
+period it is *about* — which is why the tool **description carries today's
+date** (the system prompt is deliberately static, a cacheable prefix, so the
+description is the one place a per-run date belongs).
+
+The filter args exist only when `OKF_WEB_SEARCH_FILTERS_ENABLED` is set, and
+only Terraform sets it: a **pre-1.2.0 target does not reject an unknown
+`filters` argument — it silently ignores it** (verified live), so an ungated
+runtime would hand the model constraints that quietly don't apply. The pin
+itself is a `terraform_data` + `update-gateway-target` bridge (the CFN registry
+can't express `source.version` yet — see API_REFERENCE §2b), and the runtime
+env is derived *through* that pin resource so a runtime never advertises the
+args before the pin lands. Operator-side domain filtering
+(`var.web_search_excluded_domains`, and `var.web_search_included_domains` on
+1.2.0+) stays server-side and invisible to the model; per-call lists compose
+with it and can only narrow, never relax.
 
 **Prompt.** `graph.WEB_SEARCH_BLOCK` documents *when* to reach for it
 (interpretation, cause-and-effect, freshness, verification), when not to (anything
@@ -823,7 +841,8 @@ picked from pre-built variants: the deployment-constant web-search block comes
 turns that do and don't opt into SQL.
 
 New env: `OKF_WEB_SEARCH_ENABLED`, `OKF_WEB_SEARCH_GATEWAY_URL`,
-`OKF_WEB_SEARCH_REGION`, `OKF_WEB_SEARCH_TOOL_NAME`, `OKF_WEB_SEARCH_MAX_RESULTS`.
+`OKF_WEB_SEARCH_REGION`, `OKF_WEB_SEARCH_TOOL_NAME`, `OKF_WEB_SEARCH_MAX_RESULTS`,
+`OKF_WEB_SEARCH_FILTERS_ENABLED`.
 No new UI env — there's no affordance to gate, only rendering (below).
 
 ### 14e.1 UI: source cards, favicons, and GROUPED citations

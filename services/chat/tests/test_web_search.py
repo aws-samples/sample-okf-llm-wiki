@@ -2,9 +2,10 @@
 
 Fully offline — the transport (the one thing that would talk to AWS) is injected,
 so these tests exercise the JSON-RPC we send, the two response encodings the
-gateway may answer with, result normalization (incl. the deliberately absent date
-filter: time is steered by query text only), and the "a tool error is feedback,
-not a crash" convention.
+gateway may answer with, result normalization, the connector-1.2.0 request-level
+filters (their wire shape, validation, and the deploy gate: a pre-1.2.0 target
+silently IGNORES `filters`, so an ungated deployment must never offer or send
+them), and the "a tool error is feedback, not a crash" convention.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import json
 import pytest
 
 from chat.web_search import (
+    DOMAIN_FILTER_MAX,
     QUERY_MAX_CHARS,
     HttpResponse,
     WebSearchError,
@@ -99,9 +101,17 @@ def test_normalize_gateway_url_appends_mcp_path_once():
 def test_parse_published_date_reads_dates_and_timestamps():
     assert parse_published_date("2024-10-07") == datetime.date(2024, 10, 7)
     assert parse_published_date("2024-10-07T11:22:33Z") == datetime.date(2024, 10, 7)
-    # Unreadable -> UNDATED (never silently "today"), incl. an impossible date.
+    # The connector's prose timestamp variant, verbatim as observed live.
+    assert parse_published_date("05:00PM, Sunday, October 06 2024, PDT") == datetime.date(
+        2024, 10, 6
+    )
+    assert parse_published_date("March 3, 2026") == datetime.date(2026, 3, 3)
+    # Unreadable -> UNDATED (never silently "today"), incl. impossible dates in
+    # either format.
     assert parse_published_date("last Tuesday") is None
     assert parse_published_date("2024-13-45") is None
+    assert parse_published_date("Smarch 5, 2024") is None
+    assert parse_published_date("February 30 2024") is None
     assert parse_published_date(None) is None
 
 
@@ -142,7 +152,8 @@ def test_search_initializes_then_calls_the_tool_with_the_session_id():
         "published_date": "2026-07-02",
         "text": "Industry-wide sales declined...",
     }
-    # Flat payload — no filter bookkeeping (there is no date filter).
+    # An unfiltered search stays flat — no `filters` key on the wire (a pre-1.2.0
+    # gateway must see the exact old shape) and none echoed in the payload.
     assert set(out) == {"query", "as_of", "result_count", "results"}
 
 
@@ -281,28 +292,147 @@ def test_bad_arguments_raise_value_error_before_any_request():
     assert t.requests == []
 
 
+# --- request-level filters (connector 1.2.0) -----------------------------------
+
+
+def test_filters_are_sent_in_the_connector_wire_shape_and_echoed():
+    t = FakeTransport()
+    out = _engine(t, filters_enabled=True).search(
+        "steel tariffs",
+        published_after="2026-04-01",
+        published_before="2026-06-30",
+        include_domains=["europa.eu", "reuters.com"],
+        exclude_domains=["example.com"],
+    )
+    args = t.calls("tools/call")[0]["params"]["arguments"]
+    assert args["filters"] == {
+        "domainFilter": {
+            "include": ["europa.eu", "reuters.com"],
+            "exclude": ["example.com"],
+        },
+        "publishedDateFilter": {"from": "2026-04-01", "to": "2026-06-30"},
+    }
+    # The payload echoes what constrained the search, in ARG shape (so an empty
+    # result reads as "maybe over-constrained", not "the web has nothing").
+    assert out["filters"] == {
+        "include_domains": ["europa.eu", "reuters.com"],
+        "exclude_domains": ["example.com"],
+        "published_after": "2026-04-01",
+        "published_before": "2026-06-30",
+    }
+
+
+def test_partial_filters_send_only_what_was_given():
+    t = FakeTransport()
+    _engine(t, filters_enabled=True).search("q", published_after="2026-01-01")
+    args = t.calls("tools/call")[0]["params"]["arguments"]
+    assert args["filters"] == {"publishedDateFilter": {"from": "2026-01-01"}}
+
+    t2 = FakeTransport()
+    _engine(t2, filters_enabled=True).search("q", include_domains=["sec.gov"])
+    args2 = t2.calls("tools/call")[0]["params"]["arguments"]
+    assert args2["filters"] == {"domainFilter": {"include": ["sec.gov"]}}
+
+
+def test_a_lone_domain_string_is_accepted_as_a_one_item_list():
+    t = FakeTransport()
+    _engine(t, filters_enabled=True).search("q", include_domains="sec.gov")
+    args = t.calls("tools/call")[0]["params"]["arguments"]
+    assert args["filters"] == {"domainFilter": {"include": ["sec.gov"]}}
+
+
+def test_bad_filters_raise_value_error_before_any_request():
+    t = FakeTransport()
+    engine = _engine(t, filters_enabled=True)
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        engine.search("q", published_after="last quarter")
+    with pytest.raises(ValueError, match="not a real date"):
+        engine.search("q", published_before="2026-13-45")
+    with pytest.raises(ValueError, match="must not be later"):
+        engine.search("q", published_after="2026-06-01", published_before="2026-01-01")
+    with pytest.raises(ValueError, match="bare domains"):
+        engine.search("q", include_domains=["https://example.com/page"])
+    with pytest.raises(ValueError, match=f"at most {DOMAIN_FILTER_MAX}"):
+        engine.search("q", exclude_domains=[f"d{i}.com" for i in range(DOMAIN_FILTER_MAX + 1)])
+    assert t.requests == []
+
+
+def test_filters_are_refused_when_the_deployment_is_not_gated_on():
+    # A pre-1.2.0 target silently IGNORES `filters` (verified live), so sending
+    # them ungated would give the model constraints that quietly don't apply —
+    # refuse with actionable feedback instead, before any request.
+    t = FakeTransport()
+    with pytest.raises(ValueError, match="predates connector 1.2.0"):
+        _engine(t).search("q", published_after="2026-01-01")
+    assert t.requests == []
+
+
 # --- the LangChain tool wrapper ----------------------------------------------
 
 
-def test_tool_shape_and_description():
+def test_tool_shape_and_description_without_filters():
+    # The ungated variant (target predates connector 1.2.0): the old two-arg
+    # surface, and the description documents the ABSENT date filter as a
+    # property, not an omission.
     tool = make_web_search_tool(_engine(FakeTransport()), today=datetime.date(2026, 7, 27))
     assert tool.name == "web_search"
-    # The only time lever is the query text, so the model needs today's date to
-    # write "Q2 2026" for "last quarter"; the system prompt is static, which
-    # makes the description the place for it.
+    # The model needs today's date to write "Q2 2026" for "last quarter"; the
+    # system prompt is static, which makes the description the place for it.
     assert "2026-07-27" in tool.description
     assert set(tool.args) == {"query", "max_results"}
-    # No date filter is a documented property, not an omission — and the default
-    # result count is stated so the model can reason about asking for more/less.
     assert "no date filter" in tool.description
     assert "default 10" in tool.description
-    # The date guidance lives HERE (not in graph.WEB_SEARCH_BLOCK, which is static
-    # and can't carry today's date): time is steered by the query text, with the
-    # worked example, and each result's date must be checked before use.
     assert "RELEVANCE, not date" in tool.description
     assert "put the period in the query itself" in tool.description
     assert "EU steel tariffs Q2 2026" in tool.description
     assert "publication date before" in tool.description
+    # Never advertise args the gateway would silently ignore.
+    assert "published_after" not in tool.description
+    assert "include_domains" not in tool.description
+
+
+def test_tool_shape_and_description_with_filters():
+    tool = make_web_search_tool(
+        _engine(FakeTransport(), filters_enabled=True), today=datetime.date(2026, 7, 27)
+    )
+    assert set(tool.args) == {
+        "query",
+        "max_results",
+        "published_after",
+        "published_before",
+        "include_domains",
+        "exclude_domains",
+    }
+    assert "2026-07-27" in tool.description
+    # The query-text time anchor survives (the date filter matches when a page
+    # was PUBLISHED, not the period it is about), now beside the bounds.
+    assert "EU steel tariffs Q2 2026" in tool.description
+    assert "`published_after`/`published_before`" in tool.description
+    assert "YYYY-MM-DD" in tool.description
+    assert "include_domains" in tool.description
+    assert f"up to {DOMAIN_FILTER_MAX} per list" in tool.description
+    assert "no date filter" not in tool.description
+
+
+def test_tool_passes_filter_args_through_to_the_engine():
+    t = FakeTransport()
+    tool = make_web_search_tool(_engine(t, filters_enabled=True))
+    tool.invoke(
+        {
+            "query": "q",
+            "published_after": "2026-01-01",
+            "include_domains": ["sec.gov"],
+        }
+    )
+    args = t.calls("tools/call")[0]["params"]["arguments"]
+    assert args["filters"] == {
+        "domainFilter": {"include": ["sec.gov"]},
+        "publishedDateFilter": {"from": "2026-01-01"},
+    }
+
+    # And a filter mistake is feedback, not a crash.
+    out = tool.invoke({"query": "q", "published_after": "yesterday"})
+    assert out.startswith("Error: ") and "YYYY-MM-DD" in out
 
 
 def test_tool_returns_errors_as_results_never_raises():
@@ -331,6 +461,7 @@ class _Cfg:
         self.web_search_region = "us-east-1"
         self.web_search_tool_name = ""
         self.web_search_max_results = 8
+        self.web_search_filters_enabled = kw.get("filters", False)
 
 
 def test_engine_is_none_unless_flag_and_url_are_both_present(monkeypatch):
@@ -341,3 +472,11 @@ def test_engine_is_none_unless_flag_and_url_are_both_present(monkeypatch):
     assert build_web_search_engine(_Cfg(enabled=False)) is None
     assert build_web_search_engine(_Cfg(url="  ")) is None
     assert build_web_search_engine(_Cfg()) is not None
+
+
+def test_engine_reads_the_filters_gate_from_config(monkeypatch):
+    import chat.web_search as ws
+
+    monkeypatch.setattr(ws, "_sigv4_transport", lambda *a, **k: FakeTransport())
+    assert build_web_search_engine(_Cfg()).filters_enabled is False
+    assert build_web_search_engine(_Cfg(filters=True)).filters_enabled is True

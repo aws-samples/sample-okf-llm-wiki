@@ -30,3 +30,12 @@ provider "aws" {
   alias  = "us_east_1"
   region = "us-east-1"
 }
+
+# The web-search gateway lives where the connector is offered (us-east-1,
+# eu-west-1, or ap-northeast-1 — var.web_search_region), which may differ from
+# var.region. Its own alias, not aws.us_east_1: that one is pinned for
+# CloudFront/ACM and must not move with the connector choice.
+provider "aws" {
+  alias  = "web_search"
+  region = var.web_search_region
+}

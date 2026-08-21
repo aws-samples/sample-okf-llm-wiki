@@ -189,14 +189,20 @@ class ChatConfig:
     # Public web search via the AgentCore Gateway web-search connector (see
     # chat/web_search.py). Deploy-gated by OKF_WEB_SEARCH_ENABLED **and** a
     # gateway URL — no per-run opt-in (it reads no source data). The gateway
-    # lives in web_search_region (the connector is us-east-1 only), which may
-    # differ from the runtime's own region. web_search_tool_name is the
-    # gateway-side name (`<target>___WebSearch`); empty = discover via tools/list.
+    # lives in web_search_region (the connector exists in us-east-1, eu-west-1,
+    # and ap-northeast-1 — var.web_search_region), which may differ from the
+    # runtime's own region. web_search_tool_name is the gateway-side name
+    # (`<target>___WebSearch`); empty = discover via tools/list.
+    # web_search_filters_enabled offers the model the per-call date/domain
+    # filter args — true only when the target is pinned to connector >= 1.2.0
+    # (an older target silently IGNORES filters; Terraform sets the env in the
+    # same apply that pins).
     web_search_enabled: bool = False
     web_search_gateway_url: str = ""
     web_search_region: str = "us-east-1"
     web_search_tool_name: str = ""
     web_search_max_results: int = 10
+    web_search_filters_enabled: bool = False
 
     # Mid-turn policy checks (chat/policy_check.py) — the deploy-time MASTER
     # gate above the per-run opt-in (the composer's Policy feature, carried as
@@ -262,6 +268,8 @@ class ChatConfig:
             web_search_region=env.get("OKF_WEB_SEARCH_REGION") or "us-east-1",
             web_search_tool_name=env.get("OKF_WEB_SEARCH_TOOL_NAME", ""),
             web_search_max_results=_int_env("OKF_WEB_SEARCH_MAX_RESULTS", 10, env),
+            web_search_filters_enabled=env.get("OKF_WEB_SEARCH_FILTERS_ENABLED", "").lower()
+            in ("true", "1", "yes"),
             policy_check_enabled=env.get("OKF_CHAT_POLICY_CHECK_ENABLED", "").lower()
             in ("true", "1", "yes"),
             policy_check_model=env.get(
