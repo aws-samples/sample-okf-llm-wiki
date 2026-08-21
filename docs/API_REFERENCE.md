@@ -154,6 +154,23 @@ reachable *only* this way — there is no direct search API — so the chat agen
 gets it by talking MCP to a gateway whose single target is the built-in
 `web-search` connector.
 
+> **Not to be confused with Bedrock's own "Web Search" tool** (Aug 2026): a
+> *server-side* built-in tool over the same Amazon index, offered **only on the
+> `bedrock-mantle` Responses API** (GPT-5.x — not Converse/Anthropic, not
+> `bedrock-runtime`), with Search + **Fetch** (cached page content) ops,
+> `url_citation` annotations, its own IAM namespace
+> (`bedrock-websearch:InvokeSearch`/`InvokeFetch`), and an
+> `external_web_access` parameter — default `true` to match OpenAI, but live-web
+> retrieval is additionally gated by `bedrock-websearch:ExternalWebAccess`,
+> which `AmazonBedrockFullAccess` deliberately omits because external fetch is a
+> **data-exfiltration channel** for an agent holding internal data (encode data
+> in a URL, fetch it). The chat agent deliberately does NOT use it: the gateway
+> connector serves every chat model (Anthropic included), is search-only, and
+> stays in-AWS; the chat role holds no `bedrock-websearch:*` actions, and our
+> Mantle requests never send the built-in tool (our LangChain `web_search` is a
+> `type: "function"` tool — the shared name does not trigger the `type:
+> "web_search"` built-in).
+
 - **Gateway (Terraform, native):** `aws_bedrockagentcore_gateway` with
   `name role_arn protocol_type = "MCP"` and `authorizer_type = "AWS_IAM"`
   (valid: `CUSTOM_JWT`, `AWS_IAM`; `authorizer_configuration { custom_jwt_authorizer {
