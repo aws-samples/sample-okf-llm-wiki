@@ -9,7 +9,7 @@
 #                                  #   leftovers TF can't remove; shows fix steps)
 #   ./scripts/deploy.sh destroy --force  # auto-remediate the blockers, then destroy
 #
-# Requires: awscli (authenticated), terraform, docker (buildx for ARM64), node/npm, jq.
+# Requires: awscli (authenticated), terraform, docker (buildx for ARM64), node/npm, jq, python3.
 # Config (region, TF state bucket, Cognito admin user) is gathered once and saved
 # to scripts/.deployment.config; image URIs + CloudFront URL flow between stages
 # automatically. By default a small VPC is provisioned for the harvest runtime's
@@ -80,7 +80,9 @@ gather_config() {
 
 require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 check_prereqs() {
-  for t in aws terraform docker node npm jq; do require "$t"; done
+  # python3: compute-stage output parsing + the web-search connector pin
+  # (infra/compute/files/web_search_pin.py, run by terraform local-exec).
+  for t in aws terraform docker node npm jq python3; do require "$t"; done
   # Fail early and clearly if AWS creds aren't configured (otherwise the first
   # aws call dies mid-run with a cryptic error under `set -e`).
   aws sts get-caller-identity >/dev/null 2>&1 \

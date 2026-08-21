@@ -38,9 +38,18 @@
 #   the pre-1.2.0 schema and *silently ignores* a `filters` argument (verified
 #   live, all three regions). But the CFN registry's ConnectorSource carries ONLY
 #   ConnectorId (additionalProperties: false — verified live Aug 2026), so
-#   neither Cloud Control nor awscc can pin. Until it can, the terraform_data
-#   step below pins via one `update-gateway-target` CLI call after the target
-#   exists (the AWS CLI is already a documented deploy prerequisite). It is also
+#   neither Cloud Control nor awscc can pin. And the SHIPPED CLI/SDK service
+#   models are equally behind: as of aws-cli 2.35.8 / botocore 1.43.44 their
+#   ConnectorSource also has only connectorId, so `aws bedrock-agentcore-control
+#   update-gateway-target` rejects `source.version` CLIENT-SIDE (ParamValidation)
+#   while the service itself accepts it (verified live: raw UpdateGatewayTarget
+#   with version returns 202 and the schema gains `filters`). Until the models
+#   ship, the terraform_data step below sends the UpdateGatewayTarget request
+#   raw — a stdlib-python SigV4 signer fed by `aws configure export-credentials`
+#   (python3 is already a deploy.sh dependency; curl --aws-sigv4 is NOT portable,
+#   macOS's SecureTransport curl silently downgrades it to Basic auth). Swap the
+#   whole step back to the plain CLI call — and eventually into the declarative
+#   resource — as the models catch up. It is also
 #   the SINGLE WRITER for the connector's parameterValues (both domain lists):
 #   the Cloud Control desired_state keeps ParameterValues empty and constant, so
 #   a domain-list change never routes an update through the CFN handler — whose
@@ -213,6 +222,7 @@ resource "terraform_data" "web_search_target_pin" {
     aws_cloudcontrolapi_resource.web_search_target[0].id,
     local.web_search_pinned_configuration,
     var.web_search_region,
+    filesha256("${path.module}/files/web_search_pin.py"),
   ]
 
   provisioner "local-exec" {
@@ -225,6 +235,7 @@ resource "terraform_data" "web_search_target_pin" {
       TARGET_NAME          = local.web_search_target_name
       TARGET_DESCRIPTION   = local.web_search_target_desc
       TARGET_CONFIGURATION = local.web_search_pinned_configuration
+      CONNECTOR_VERSION    = local.web_search_connector_version
     }
     command = <<-EOT
       set -euo pipefail
@@ -235,18 +246,18 @@ resource "terraform_data" "web_search_target_pin" {
         echo "web-search target '$TARGET_NAME' not found on gateway $GATEWAY_ID" >&2
         exit 1
       fi
-      # The target can briefly report UPDATING right after create; retry.
+      export TARGET_ID
+      # The target can briefly report UPDATING right after create; retry. The
+      # UpdateGatewayTarget request is sent RAW (stdlib SigV4, files/
+      # web_search_pin.py) because shipped CLI/SDK models predate
+      # `source.version` — see the header comment.
       for attempt in 1 2 3 4 5; do
-        if aws bedrock-agentcore-control update-gateway-target \
-          --gateway-identifier "$GATEWAY_ID" --target-id "$TARGET_ID" \
-          --name "$TARGET_NAME" --description "$TARGET_DESCRIPTION" \
-          --target-configuration "$TARGET_CONFIGURATION" \
-          --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
-          --region "$GW_REGION" > /dev/null; then
+        if aws configure export-credentials \
+          | python3 "${path.module}/files/web_search_pin.py"; then
           echo "web-search target pinned to connector ${local.web_search_connector_version}"
           exit 0
         fi
-        echo "update-gateway-target attempt $attempt failed - retrying" >&2
+        echo "UpdateGatewayTarget attempt $attempt failed - retrying" >&2
         sleep 5
       done
       exit 1

@@ -202,11 +202,20 @@ gets it by talking MCP to a gateway whose single target is the built-in
   (verified live, Aug 2026). But `AWS::BedrockAgentCore::GatewayTarget`'s
   `ConnectorSource` carries **only `ConnectorId`** (`additionalProperties: false`
   in the live registry schema, all three connector regions), so neither Cloud
-  Control nor `awscc` can express the pin. Our bridge: a `terraform_data` step
-  runs one `aws bedrock-agentcore-control update-gateway-target` after the target
-  exists, and is the single writer for `parameterValues` (both domain lists) —
-  see `infra/compute/web_search.tf`. Fold it back in when `ConnectorSource` grows
-  `Version`.
+  Control nor `awscc` can express the pin. The shipped CLI/SDK models lag too:
+  as of aws-cli 2.35.8 / botocore 1.43.44 their `ConnectorSource` also has only
+  `connectorId`, so `update-gateway-target` with `source.version` fails
+  CLIENT-SIDE (`ParamValidation`) while the service accepts it (raw call →
+  `202`, schema gains `filters` — verified live). Our bridge: a `terraform_data`
+  step sends `UpdateGatewayTarget` raw — `PUT
+  /gateways/{id}/targets/{targetId}/` on `bedrock-agentcore-control.<region>`,
+  SigV4 service name `bedrock-agentcore`, signed by the stdlib-python script
+  `infra/compute/files/web_search_pin.py` fed by `aws configure
+  export-credentials` (curl's `--aws-sigv4` is not portable: macOS's
+  SecureTransport curl silently downgrades it to Basic auth). The step is the
+  single writer for `parameterValues` (both domain lists) — see
+  `infra/compute/web_search.tf`. Fold it back into the CLI, then the
+  declarative resource, as the models and the CFN registry catch up.
 - **Operator domain filtering** (`parameterValues.domainFilter`): `exclude` (any
   connector version) and `include` (1.2.0+), ≤100 bare domains each, subdomains
   match, enforced server-side and invisible to the model. Request-level lists
