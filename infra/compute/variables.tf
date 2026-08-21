@@ -294,9 +294,11 @@ variable "enable_web_search" {
     bedrock-agentcore:InvokeGateway on it.
 
     Three things to weigh before leaving this on:
-      * REGION — the connector exists only in us-east-1, so the gateway is created
-        there whatever var.region is. Queries are served inside AWS (never handed to
-        a third-party search engine) but they DO leave the deployment's region.
+      * REGION — the connector exists only in us-east-1, eu-west-1, and
+        ap-northeast-1 (var.web_search_region picks one; default us-east-1), so the
+        gateway may be created outside var.region. Queries are served inside AWS
+        (never handed to a third-party search engine) but they can leave the
+        deployment's region.
       * COST — searches are billed per query, on top of the tokens the results add
         to a turn's context.
       * ATTRIBUTION — AWS's acceptable use requires that source citations and links
@@ -309,15 +311,59 @@ variable "enable_web_search" {
   EOT
 }
 
+variable "web_search_region" {
+  type        = string
+  default     = "us-east-1"
+  description = <<-EOT
+    Region the web-search gateway (and its connector target) is created in. The
+    connector is offered in us-east-1, eu-west-1, and ap-northeast-1 — pick the one
+    matching (or nearest) var.region so search queries stay in-region. Changing it
+    on an existing deployment RECREATES the gateway + target in the new region (the
+    provider alias moves; expect one apply where the old region's resources are
+    replaced).
+  EOT
+
+  validation {
+    condition     = contains(["us-east-1", "eu-west-1", "ap-northeast-1"], var.web_search_region)
+    error_message = "The web-search connector is offered in us-east-1, eu-west-1, and ap-northeast-1 only."
+  }
+}
+
 variable "web_search_excluded_domains" {
   type        = list(string)
   default     = []
   description = <<-EOT
-    Optional domain denylist for web_search (e.g. ["example.com"]). Enforced
-    SERVER-SIDE by the connector and invisible to the model — the agent isn't told
-    about the restriction, it simply never receives results from these hosts. Only
-    used when var.enable_web_search = true.
+    Optional domain denylist for web_search (e.g. ["example.com"]; bare domains,
+    subdomains match, up to 100). Enforced SERVER-SIDE by the connector and
+    invisible to the model — the agent isn't told about the restriction, it simply
+    never receives results from these hosts. Composes with the model's own per-call
+    exclude_domains (either list drops a host). Only used when
+    var.enable_web_search = true.
   EOT
+
+  validation {
+    condition     = length(var.web_search_excluded_domains) <= 100
+    error_message = "The connector accepts at most 100 excluded domains."
+  }
+}
+
+variable "web_search_included_domains" {
+  type        = list(string)
+  default     = []
+  description = <<-EOT
+    Optional domain ALLOWLIST for web_search (bare domains, subdomains match, up to
+    100): when non-empty, every search on this deployment returns results from
+    these hosts only. Enforced SERVER-SIDE (connector >= 1.2.0, so it rides the
+    version pin — see web_search.tf) and invisible to the model; the model's
+    per-call include_domains can only narrow it further (results must appear on
+    EVERY include list set), never widen it. Empty = no restriction. Only used when
+    var.enable_web_search = true.
+  EOT
+
+  validation {
+    condition     = length(var.web_search_included_domains) <= 100
+    error_message = "The connector accepts at most 100 included domains."
+  }
 }
 
 variable "web_search_max_results" {

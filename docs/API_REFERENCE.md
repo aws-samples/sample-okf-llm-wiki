@@ -170,20 +170,36 @@ gets it by talking MCP to a gateway whose single target is the built-in
     Name = "<target>", GatewayIdentifier = "<gateway_id>"
     TargetConfiguration = { Mcp = { Connector = {
       Source         = { ConnectorId = "web-search" }
-      Configurations = [{ Name = "WebSearch", ParameterValues = {
-        domainFilter = { exclude = ["blocked.example"] } } }]   # optional denylist
+      Configurations = [{ Name = "WebSearch", ParameterValues = {} }]
     } } }
     CredentialProviderConfigurations = [{ CredentialProviderType = "GATEWAY_IAM_ROLE" }]
   })
   ```
   Connector targets need **no** `iamCredentialProvider` (the connector's service is
   known to the gateway); MCP-server and OpenAPI targets do.
+- **Connector versioning — the CFN registry can't pin.** The control-plane API
+  accepts `source: {connectorId, version}`, and `version: "1.2.0"` is what turns on
+  the request-level `filters` (below) plus the target-level domain *include* list —
+  a gateway **snapshots the tool schema at target creation**, and an unpinned
+  target keeps the pre-1.2.0 schema and **silently ignores** a `filters` argument
+  (verified live, Aug 2026). But `AWS::BedrockAgentCore::GatewayTarget`'s
+  `ConnectorSource` carries **only `ConnectorId`** (`additionalProperties: false`
+  in the live registry schema, all three connector regions), so neither Cloud
+  Control nor `awscc` can express the pin. Our bridge: a `terraform_data` step
+  runs one `aws bedrock-agentcore-control update-gateway-target` after the target
+  exists, and is the single writer for `parameterValues` (both domain lists) —
+  see `infra/compute/web_search.tf`. Fold it back in when `ConnectorSource` grows
+  `Version`.
+- **Operator domain filtering** (`parameterValues.domainFilter`): `exclude` (any
+  connector version) and `include` (1.2.0+), ≤100 bare domains each, subdomains
+  match, enforced server-side and invisible to the model. Request-level lists
+  compose with them — target-level constraints can never be relaxed per call.
 - **IAM, two roles.** The *gateway service role* (trust
   `bedrock-agentcore.amazonaws.com`) needs `bedrock-agentcore:InvokeGateway` on
   `…:gateway/*` **and** `bedrock-agentcore:InvokeWebSearch` on the service-owned
-  ARN `arn:aws:bedrock-agentcore:us-east-1:aws:tool/web-search.v1` (account field
-  is literally `aws`). The *caller* (our chat runtime) needs only
-  `bedrock-agentcore:InvokeGateway` on the gateway ARN.
+  ARN `arn:aws:bedrock-agentcore:<region>:aws:tool/web-search.v1` (account field
+  is literally `aws`; region is the gateway's). The *caller* (our chat runtime)
+  needs only `bedrock-agentcore:InvokeGateway` on the gateway ARN.
 - **Invoke (MCP over HTTPS, SigV4 service `bedrock-agentcore`):** POST JSON-RPC to
   `gateway_url`. `initialize` (`protocolVersion` `"2025-06-18"`) returns an
   `Mcp-Session-Id` header to echo on subsequent calls; then
@@ -192,15 +208,23 @@ gets it by talking MCP to a gateway whose single target is the built-in
 - **Tool naming:** `${target_name}___${tool_name}` (three underscores), e.g.
   `okf-web-search___WebSearch`.
 - **`WebSearch` I/O:** input is `{query (≤200 chars, required), maxResults (1–25,
-  default 10)}` — **no date/recency parameter**. The result is an MCP tool result
-  whose text block is JSON: `{id, results:[{text, url, title, publishedDate}]}`
-  (`url`/`title`/`publishedDate` all optional). Our wrapper deliberately adds no
-  client-side date filter either — the agent puts the period in the query and
-  reads `publishedDate` (`services/chat/src/chat/web_search.py`).
-- **Region + acceptable use:** connector available in `us-east-1` only. Queries are
-  served inside AWS (not handed to a third-party engine), but AWS's terms require
-  retaining the source citations/links in anything shown to end users, and forbid
-  bulk extraction or building a competing index.
+  default 10), filters?}`. `filters` (connector **1.2.0+ only** — absent from the
+  schema, and silently ignored on the wire, on older targets) is
+  `{domainFilter: {include?, exclude?}, publishedDateFilter: {from?, to?}}` —
+  ≤100 bare domains per list (root domain matches subdomains), inclusive ISO-8601
+  UTC date bounds matching each page's *publication* date. The result is an MCP
+  tool result whose text block is JSON:
+  `{id, results:[{text, url, title, publishedDate}]}` (`url`/`title`/
+  `publishedDate` all optional; `publishedDate` format is unpinned — ISO dates
+  but also prose like `"05:00PM, Sunday, October 06 2024, PDT"` observed live).
+  Our wrapper surfaces the filters as `published_after`/`published_before`/
+  `include_domains`/`exclude_domains`, gated on `OKF_WEB_SEARCH_FILTERS_ENABLED`
+  (`services/chat/src/chat/web_search.py`).
+- **Region + acceptable use:** connector available in `us-east-1`, `eu-west-1`,
+  and `ap-northeast-1`. Queries are served inside AWS (not handed to a third-party
+  engine), but AWS's terms require retaining the source citations/links in
+  anything shown to end users, and forbid bulk extraction or building a competing
+  index.
 
 ## 3. S3 Vectors — `boto3.client("s3vectors")`
 

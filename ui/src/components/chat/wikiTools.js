@@ -165,8 +165,9 @@ export function toolLabel(toolName, args, running) {
         : `Computed ${n}`.trim()
     }
     case "web_search": {
-      // Any period lives in the query text itself (the tool has no date args —
-      // it steers time by query), so the query IS the whole label.
+      // The query is the label: the period lives in the query text itself even
+      // when the model also passed the date/domain filter args (those render in
+      // the step's detail, not the one-line label).
       const q = s(a.query)
       const quoted = q ? `“${q}”` : ""
       const verb = running ? "Searching the web" : "Web search"

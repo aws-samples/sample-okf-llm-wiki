@@ -21,20 +21,30 @@ protocol surface we need is two POSTs, and LangChain tools here are SYNCHRONOUS
 running graph loop). botocore — already a dependency via boto3 — supplies both
 the signer and the HTTP session, so this adds no new package.
 
-**Region.** The connector is only offered in ``us-east-1``, so the gateway lives
-there regardless of the deployment's region (see infra/compute/web_search.tf).
-The query still never leaves AWS — the gateway serves it internally — but it
-does leave the deployment's region, which is the trade-off for the capability.
+**Region.** The connector is offered in ``us-east-1``, ``eu-west-1``, and
+``ap-northeast-1``; ``var.web_search_region`` places the gateway in one of them
+(default us-east-1), which may still differ from the deployment's own region
+(see infra/compute/web_search.tf). The query never leaves AWS — the gateway
+serves it internally — but it can leave the deployment's region, which is the
+trade-off for the capability.
 
-**No date filter — deliberately.** ``WebSearch`` accepts only ``query`` +
-``maxResults`` (no recency parameter), and we do NOT bolt a client-side one on
-top: filtering a relevance-ranked top-N after the fact can only *subtract*
-results, never surface period-relevant ones the ranking missed, so it added
-argument surface without adding recall. Instead the agent anchors time in the
-QUERY itself ("EU steel tariffs Q2 2026" — the tool description carries today's
-date so it can), and every result carries its ``publishedDate`` for the agent to
-judge. An earlier revision shipped ``published_after``/``published_before``
-wrapper args; they were removed for exactly this reason.
+**Server-side filters — deploy-gated.** Connector version 1.2.0 added an
+optional ``filters`` object to ``WebSearch``: ``domainFilter.include/exclude``
+(bare domains, subdomains match, ≤100 per list) and ``publishedDateFilter``
+``from``/``to`` (inclusive dates). We surface them as the ``published_after``/
+``published_before``/``include_domains``/``exclude_domains`` tool args. An
+earlier revision shipped the date args as CLIENT-side post-filters and they
+were removed: filtering a relevance-ranked top-N after the fact can only
+subtract results, never surface period-relevant pages the ranking missed. The
+connector's filters constrain the search itself, so that objection no longer
+applies — but the agent still anchors the period in the QUERY TEXT too ("EU
+steel tariffs Q2 2026" — the tool description carries today's date so it can),
+because the date filter matches when a page was PUBLISHED, not the period it is
+about. The args exist only when ``OKF_WEB_SEARCH_FILTERS_ENABLED`` is set —
+Terraform sets it in the same apply that pins the gateway target to connector
+>= 1.2.0 — because a pre-1.2.0 target does not REJECT an unknown ``filters``
+argument, it silently IGNORES it (verified live): advertising the args against
+an unpinned target would hand the model constraints that quietly don't apply.
 
 Deploy-gated by ``OKF_WEB_SEARCH_ENABLED`` + a gateway URL: with either missing
 the tool is simply not offered (the role carries no InvokeGateway grant anyway).
@@ -57,6 +67,7 @@ log = logging.getLogger("chat.web_search")
 # instead of a gateway 400 the model can't interpret.
 QUERY_MAX_CHARS = 200
 RESULTS_MAX = 25
+DOMAIN_FILTER_MAX = 100  # per list (include/exclude), connector 1.2.0
 
 # The MCP protocol revision the gateway examples use.
 _MCP_PROTOCOL_VERSION = "2025-06-18"
@@ -174,21 +185,69 @@ def normalize_gateway_url(url: str) -> str:
     return trimmed if trimmed.endswith("/mcp") else f"{trimmed}/mcp"
 
 
+_MONTHS = {
+    name: number
+    for number, name in enumerate(
+        "january february march april may june july august "
+        "september october november december".split(),
+        start=1,
+    )
+}
+
+
 def parse_published_date(value: Any) -> datetime.date | None:
     """Best-effort ``publishedDate`` -> date (the connector's format is unpinned).
 
-    Results carry dates like ``2024-10-07`` but also full timestamps; anything we
-    can't read counts as UNDATED rather than silently mapping to today.
+    Results carry dates like ``2024-10-07`` and full timestamps, but also prose
+    ("05:00PM, Sunday, October 06 2024, PDT" — observed live); anything we can't
+    read counts as UNDATED rather than silently mapping to today.
     """
     if not isinstance(value, str):
         return None
-    match = re.match(r"\s*(\d{4})-(\d{2})-(\d{2})", value)
-    if not match:
-        return None
+    iso = re.match(r"\s*(\d{4})-(\d{2})-(\d{2})", value)
+    if iso:
+        parts = (int(iso[1]), int(iso[2]), int(iso[3]))
+    else:
+        prose = re.search(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", value)
+        if not prose or prose[1].lower() not in _MONTHS:
+            return None
+        parts = (int(prose[3]), _MONTHS[prose[1].lower()], int(prose[2]))
     try:
-        return datetime.date(int(match[1]), int(match[2]), int(match[3]))
+        return datetime.date(*parts)
     except ValueError:
         return None
+
+
+def _validate_filter_date(value: str, arg: str) -> str:
+    """A model-supplied date bound -> validated ``YYYY-MM-DD`` (or ValueError)."""
+    cleaned = (value or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned):
+        raise ValueError(f"{arg} must be a YYYY-MM-DD date (got {cleaned!r})")
+    try:
+        datetime.date.fromisoformat(cleaned)
+    except ValueError as e:
+        raise ValueError(f"{arg} is not a real date: {cleaned}") from e
+    return cleaned
+
+
+def _validate_domains(values: Any, arg: str) -> list[str]:
+    """Model-supplied domain list -> cleaned bare domains (or ValueError)."""
+    if values is None:
+        return []
+    if isinstance(values, str):  # a lone domain instead of a one-item list
+        values = [values]
+    cleaned = [str(v).strip() for v in values if str(v).strip()]
+    if len(cleaned) > DOMAIN_FILTER_MAX:
+        raise ValueError(
+            f"{arg} accepts at most {DOMAIN_FILTER_MAX} domains (got {len(cleaned)})"
+        )
+    for domain in cleaned:
+        if "://" in domain or "/" in domain or " " in domain:
+            raise ValueError(
+                f'{arg} entries must be bare domains like "example.com" '
+                f"(got {domain!r})"
+            )
+    return cleaned
 
 
 class WebSearchGateway:
@@ -207,6 +266,7 @@ class WebSearchGateway:
         region: str = "us-east-1",
         tool_name: str = "",
         default_max_results: int = 10,
+        filters_enabled: bool = False,
         timeout_s: float = 20.0,
         transport: Transport | None = None,
         today: Callable[[], datetime.date] | None = None,
@@ -216,6 +276,10 @@ class WebSearchGateway:
             raise ValueError("gateway_url is required")
         self.region = region
         self.default_max_results = max(1, min(RESULTS_MAX, default_max_results))
+        # True only when the deployment's gateway target is pinned to connector
+        # >= 1.2.0 (a pre-1.2.0 target silently IGNORES `filters` — see module
+        # docstring). Gates both the tool's argument surface and search().
+        self.filters_enabled = filters_enabled
         self._tool_name = (tool_name or "").strip()
         self._transport = transport or _sigv4_transport(self.url, region, timeout_s)
         self._today = today or (lambda: datetime.datetime.now(datetime.timezone.utc).date())
@@ -317,7 +381,16 @@ class WebSearchGateway:
 
     # --- the search itself ---------------------------------------------------
 
-    def search(self, query: str, *, max_results: int | None = None) -> dict[str, Any]:
+    def search(
+        self,
+        query: str,
+        *,
+        max_results: int | None = None,
+        published_after: str = "",
+        published_before: str = "",
+        include_domains: list[str] | None = None,
+        exclude_domains: list[str] | None = None,
+    ) -> dict[str, Any]:
         """Run one web search; return normalized results.
 
         Raises ``ValueError`` for bad arguments (the tool turns those into
@@ -336,12 +409,41 @@ class WebSearchGateway:
             raise ValueError("max_results must be at least 1")
         wanted = min(RESULTS_MAX, wanted)
 
+        # Request-level filters (connector 1.2.0 wire shape). Validated FIRST so
+        # bad values come back as tool feedback before any network round trip.
+        filters: dict[str, Any] = {}
+        include = _validate_domains(include_domains, "include_domains")
+        exclude = _validate_domains(exclude_domains, "exclude_domains")
+        domain_filter = {
+            key: val for key, val in (("include", include), ("exclude", exclude)) if val
+        }
+        if domain_filter:
+            filters["domainFilter"] = domain_filter
+        date_filter = {}
+        if (published_after or "").strip():
+            date_filter["from"] = _validate_filter_date(published_after, "published_after")
+        if (published_before or "").strip():
+            date_filter["to"] = _validate_filter_date(published_before, "published_before")
+        if "from" in date_filter and "to" in date_filter and date_filter["from"] > date_filter["to"]:
+            raise ValueError("published_after must not be later than published_before")
+        if date_filter:
+            filters["publishedDateFilter"] = date_filter
+        if filters and not self.filters_enabled:
+            # Never send filters a pre-1.2.0 target would silently ignore —
+            # a constraint the model believes in but that wasn't applied is
+            # worse than an error it can react to.
+            raise ValueError(
+                "date/domain filters are not available on this deployment "
+                "(its web-search target predates connector 1.2.0) — retry "
+                "without them and steer with the query text instead"
+            )
+
+        arguments: dict[str, Any] = {"query": cleaned, "maxResults": wanted}
+        if filters:
+            arguments["filters"] = filters
         result = self._rpc(
             "tools/call",
-            {
-                "name": self._resolve_tool_name(),
-                "arguments": {"query": cleaned, "maxResults": wanted},
-            },
+            {"name": self._resolve_tool_name(), "arguments": arguments},
         )
         if result.get("isError"):
             raise WebSearchError(f"web search failed: {_result_text(result)[:300]}")
@@ -361,12 +463,27 @@ class WebSearchGateway:
             }
             for item in _extract_results(result)
         ]
-        return {
+        payload: dict[str, Any] = {
             "query": cleaned,
             "as_of": self._today().isoformat(),
             "result_count": len(results),
             "results": results,
         }
+        if filters:
+            # Echo what actually constrained the search (arg-shaped, not wire-
+            # shaped) so an empty result reads as "maybe my window/domains were
+            # too tight", not "the web has nothing".
+            applied: dict[str, Any] = {}
+            if include:
+                applied["include_domains"] = include
+            if exclude:
+                applied["exclude_domains"] = exclude
+            if "from" in date_filter:
+                applied["published_after"] = date_filter["from"]
+            if "to" in date_filter:
+                applied["published_before"] = date_filter["to"]
+            payload["filters"] = applied
+        return payload
 
 
 def _result_text(result: dict) -> str:
@@ -404,11 +521,14 @@ def _extract_results(result: dict) -> list[dict]:
 
 
 # The tool description the model sees. It carries TODAY'S DATE because the
-# connector ranks by relevance with no date parameter — the only time lever is
-# the query text itself, and the model can't write "Q2 2026" for "last quarter"
-# without knowing "now". The system prompt is deliberately static (a cacheable
-# prefix), so this is the one place a per-run date belongs.
-_WEB_SEARCH_DESC = (
+# connector ranks by relevance — the query text (and, when available, the date
+# bounds) is the time lever, and the model can't write "Q2 2026" for "last
+# quarter" without knowing "now". The system prompt is deliberately static (a
+# cacheable prefix), so this is the one place a per-run date belongs. The args
+# paragraph has two variants, picked by engine.filters_enabled — a deployment
+# whose target predates connector 1.2.0 must not be told about args that its
+# gateway would silently ignore.
+_WEB_SEARCH_DESC_HEAD = (
     "Search the public web and return ranked results (title, url, publication "
     "date, and a relevant text snippet). Today is {today}.\n"
     "Use this for context that lives OUTSIDE the wiki and outside the data: to "
@@ -419,11 +539,29 @@ _WEB_SEARCH_DESC = (
     "what a table, column, join, or metric MEANS — that is what the wiki is for, "
     "and web guesses about this organization's schema are wrong by default.\n"
     "Args: `query` is a short keyword phrase, {max_chars} characters or fewer (not "
-    "a sentence). `max_results` is 1-{results_max} (default {default}). Results "
-    "are ranked by RELEVANCE, not date, and there is no date filter — when the "
-    'question concerns a specific period, put the period in the query itself ("EU '
-    'steel tariffs Q2 2026") and check each result\'s publication date before '
-    "treating it as evidence for that period.\n"
+    "a sentence). `max_results` is 1-{results_max} (default {default}). "
+)
+_WEB_SEARCH_DESC_NO_FILTERS = (
+    "Results are ranked by RELEVANCE, not date, and there is no date filter — "
+    "when the question concerns a specific period, put the period in the query "
+    'itself ("EU steel tariffs Q2 2026") and check each result\'s publication '
+    "date before treating it as evidence for that period.\n"
+)
+_WEB_SEARCH_DESC_FILTERS = (
+    "Results are ranked by RELEVANCE — when the question concerns a specific "
+    'period, put the period in the query itself ("EU steel tariffs Q2 2026") '
+    "and bound it with `published_after`/`published_before` (YYYY-MM-DD, both "
+    "inclusive): they constrain the search server-side to pages PUBLISHED in "
+    "that window, which is not always the period a page is ABOUT, so still "
+    "check each result's date and content. `include_domains` restricts results "
+    "to the listed sites and `exclude_domains` drops them (bare domains like "
+    '"reuters.com"; subdomains match; up to {domains_max} per list) — reach for '
+    "`include_domains` when only particular sources can settle the claim (a "
+    "regulator, a standards body, the company's own site). Zero results usually "
+    "means over-constrained filters: retry with fewer before concluding the web "
+    "has nothing.\n"
+)
+_WEB_SEARCH_DESC_TAIL = (
     "Every result you rely on must be attributed with its URL inside a citation "
     'tag — <c src="https://…"></c> — the same tag wiki docs use; put every '
     "source for one claim in ONE tag, comma-separated. Treat snippets as claims by "
@@ -433,28 +571,61 @@ _WEB_SEARCH_DESC = (
 
 
 def make_web_search_tool(engine: WebSearchGateway, *, today: datetime.date | None = None) -> Any:
-    """Wrap a :class:`WebSearchGateway` as the LangChain ``web_search`` tool."""
+    """Wrap a :class:`WebSearchGateway` as the LangChain ``web_search`` tool.
+
+    The argument surface follows ``engine.filters_enabled``: the filter args
+    exist only when the deployment's target speaks connector >= 1.2.0.
+    """
     from langchain_core.tools import StructuredTool
 
     stamp = (today or datetime.datetime.now(datetime.timezone.utc).date()).isoformat()
-    description = _WEB_SEARCH_DESC.format(
+    args_variant = (
+        _WEB_SEARCH_DESC_FILTERS if engine.filters_enabled else _WEB_SEARCH_DESC_NO_FILTERS
+    )
+    description = (_WEB_SEARCH_DESC_HEAD + args_variant + _WEB_SEARCH_DESC_TAIL).format(
         today=stamp,
         max_chars=QUERY_MAX_CHARS,
         results_max=RESULTS_MAX,
         default=engine.default_max_results,
+        domains_max=DOMAIN_FILTER_MAX,
     )
 
-    def web_search(query: str, max_results: int = 0) -> Any:
+    def run(query: str, max_results: int, **filter_args: Any) -> Any:
         # Same convention as chat.tools/chat.sql: a failure comes back as the
-        # tool's RESULT so the model can react (rephrase the query, or tell the
-        # user the web lookup failed) instead of aborting the run.
+        # tool's RESULT so the model can react (rephrase the query, drop a
+        # filter, or tell the user the web lookup failed) instead of aborting
+        # the run.
         try:
-            return engine.search(query, max_results=max_results or None)
+            return engine.search(query, max_results=max_results or None, **filter_args)
         except ValueError as e:  # bad arguments — concise + actionable
             return f"Error: {e}"
         except Exception as e:  # noqa: BLE001 - a tool error is feedback, not a crash
             log.warning("web_search failed", exc_info=True)
             return f"Error: web_search failed: {type(e).__name__}: {e}"
+
+    if engine.filters_enabled:
+
+        def web_search(
+            query: str,
+            max_results: int = 0,
+            published_after: str = "",
+            published_before: str = "",
+            include_domains: list[str] | None = None,
+            exclude_domains: list[str] | None = None,
+        ) -> Any:
+            return run(
+                query,
+                max_results,
+                published_after=published_after,
+                published_before=published_before,
+                include_domains=include_domains,
+                exclude_domains=exclude_domains,
+            )
+
+    else:
+
+        def web_search(query: str, max_results: int = 0) -> Any:  # type: ignore[misc]
+            return run(query, max_results)
 
     return StructuredTool.from_function(
         func=web_search, name="web_search", description=description
@@ -480,6 +651,7 @@ def build_web_search_engine(chat_config: Any) -> WebSearchGateway | None:
             region=getattr(chat_config, "web_search_region", "us-east-1"),
             tool_name=getattr(chat_config, "web_search_tool_name", "") or "",
             default_max_results=getattr(chat_config, "web_search_max_results", 10),
+            filters_enabled=getattr(chat_config, "web_search_filters_enabled", False),
         )
     except Exception:  # noqa: BLE001 - a misconfigured gateway must not break chat
         log.warning("could not build the web search client — web_search off", exc_info=True)

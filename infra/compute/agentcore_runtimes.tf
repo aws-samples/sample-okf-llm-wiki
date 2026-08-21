@@ -291,19 +291,26 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     OKF_REDSHIFT_ENABLED = var.enable_redshift ? "true" : ""
 
     # Public web search via the AgentCore Gateway web-search connector
-    # (var.enable_web_search, see web_search.tf). The gateway is in us-east-1 —
-    # the connector's only region — so the runtime signs its SigV4 for THAT
-    # region, not var.region. Both the flag and the URL must be present for the
-    # runtime to offer the tool; with the flag off the role has no InvokeGateway
-    # grant anyway. The tool name carries the target prefix AgentCore adds
-    # (`<target>___WebSearch`); the runtime falls back to tools/list if it's empty.
+    # (var.enable_web_search, see web_search.tf). The gateway lives in
+    # var.web_search_region (the connector's regions are a fixed set), which may
+    # differ from var.region — the runtime signs its SigV4 for THAT region. Both
+    # the flag and the URL must be present for the runtime to offer the tool;
+    # with the flag off the role has no InvokeGateway grant anyway. The tool
+    # name carries the target prefix AgentCore adds (`<target>___WebSearch`);
+    # the runtime falls back to tools/list if it's empty. FILTERS_ENABLED
+    # offers the model the per-call date/domain filter args — asserted THROUGH
+    # the pin resource (not var.enable_web_search) so the runtime update is
+    # ordered after a successful pin to connector >= 1.2.0: an unpinned target
+    # silently ignores filters, so the args must never be advertised before the
+    # pin lands (see web_search.tf).
     OKF_WEB_SEARCH_ENABLED = tostring(local.web_search_enabled)
     OKF_WEB_SEARCH_GATEWAY_URL = try(
       aws_bedrockagentcore_gateway.web_search[0].gateway_url, ""
     )
-    OKF_WEB_SEARCH_REGION      = local.web_search_enabled ? "us-east-1" : ""
-    OKF_WEB_SEARCH_TOOL_NAME   = local.web_search_enabled ? local.web_search_tool_name : ""
-    OKF_WEB_SEARCH_MAX_RESULTS = tostring(var.web_search_max_results)
+    OKF_WEB_SEARCH_REGION          = local.web_search_enabled ? var.web_search_region : ""
+    OKF_WEB_SEARCH_TOOL_NAME       = local.web_search_enabled ? local.web_search_tool_name : ""
+    OKF_WEB_SEARCH_MAX_RESULTS     = tostring(var.web_search_max_results)
+    OKF_WEB_SEARCH_FILTERS_ENABLED = length(terraform_data.web_search_target_pin) > 0 ? "true" : ""
 
     # Policy checks (var.enable_policy_checks): the deploy-time MASTER gate
     # above the per-run opt-in (the composer's Policy feature — features:

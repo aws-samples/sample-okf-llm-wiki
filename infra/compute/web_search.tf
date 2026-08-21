@@ -8,15 +8,18 @@
 #      connector: bedrock-agentcore:InvokeWebSearch on the service-owned tool ARN);
 #   2. an MCP gateway with AWS_IAM inbound auth, so the CHAT RUNTIME authenticates
 #      with SigV4 from its own execution role — no JWT, no client secret to vend;
-#   3. the web-search connector target.
+#   3. the web-search connector target;
+#   4. a version-pin step that upgrades the target to connector 1.2.0 (request-
+#      level date/domain filters + the target-level include list).
 #
-# TWO non-obvious constraints are baked in here:
+# THREE non-obvious constraints are baked in here:
 #
-# * REGION — the connector is offered ONLY in us-east-1, so all three resources
-#   use the existing aws.us_east_1 alias regardless of var.region. A query still
-#   never leaves AWS (the gateway serves it internally), but it does leave the
-#   deployment's region; that's the trade-off for the capability, and it's why the
-#   flag exists. The chat runtime signs for us-east-1 (OKF_WEB_SEARCH_REGION).
+# * REGION — the connector is offered in us-east-1, eu-west-1, and ap-northeast-1
+#   only, so all resources here use the aws.web_search provider alias
+#   (var.web_search_region, default us-east-1) rather than var.region. A query
+#   still never leaves AWS (the gateway serves it internally), but it can leave
+#   the deployment's region; that's the trade-off for the capability, and it's why
+#   the flag exists. The chat runtime signs for that region (OKF_WEB_SEARCH_REGION).
 #
 # * The target is an aws_cloudcontrolapi_resource, NOT
 #   aws_bedrockagentcore_gateway_target. As of hashicorp/aws 6.56 that resource's
@@ -27,6 +30,22 @@
 #   us the same declarative create/update/destroy through the SAME aws provider
 #   (no second provider, still no console steps). Swap this for the native
 #   resource once the provider grows a `connector` block.
+#
+# * The CONNECTOR VERSION PIN cannot be expressed declaratively AT ALL yet. The
+#   request-level filters exist only when the target's source pins connector
+#   version >= 1.2.0 (`source.version` in the control-plane API) — a gateway
+#   snapshots the tool schema at target creation, and an unpinned target keeps
+#   the pre-1.2.0 schema and *silently ignores* a `filters` argument (verified
+#   live, all three regions). But the CFN registry's ConnectorSource carries ONLY
+#   ConnectorId (additionalProperties: false — verified live Aug 2026), so
+#   neither Cloud Control nor awscc can pin. Until it can, the terraform_data
+#   step below pins via one `update-gateway-target` CLI call after the target
+#   exists (the AWS CLI is already a documented deploy prerequisite). It is also
+#   the SINGLE WRITER for the connector's parameterValues (both domain lists):
+#   the Cloud Control desired_state keeps ParameterValues empty and constant, so
+#   a domain-list change never routes an update through the CFN handler — whose
+#   schema-conformant model would strip the pin. Fold the pin (and the lists)
+#   back into the declarative resource when ConnectorSource grows Version.
 
 locals {
   web_search_enabled = var.enable_web_search
@@ -36,6 +55,40 @@ locals {
   # explicitly saves a round trip on the first search of each process.
   web_search_target_name = "${var.name_prefix}-web-search"
   web_search_tool_name   = "${var.name_prefix}-web-search___WebSearch"
+  web_search_target_desc = "Amazon-operated web index + knowledge graph, MCP tool WebSearch"
+
+  # First connector version with request-level filters and the include list.
+  web_search_connector_version = "1.2.0"
+
+  # Operator-side domain filtering, enforced server-side and invisible to the
+  # model (the model's own per-call lists can only narrow further). Applied by
+  # the pin step, not the Cloud Control resource — see the header comment.
+  web_search_domain_filter = merge(
+    length(var.web_search_included_domains) > 0 ? { include = var.web_search_included_domains } : {},
+    length(var.web_search_excluded_domains) > 0 ? { exclude = var.web_search_excluded_domains } : {},
+  )
+
+  # The control-plane (camelCase) target configuration the pin step asserts.
+  web_search_pinned_configuration = jsonencode({
+    mcp = {
+      connector = {
+        source = {
+          connectorId = "web-search"
+          version     = local.web_search_connector_version
+        }
+        configurations = [
+          {
+            name = "WebSearch"
+            parameterValues = (
+              length(local.web_search_domain_filter) > 0
+              ? { domainFilter = local.web_search_domain_filter }
+              : {}
+            )
+          }
+        ]
+      }
+    }
+  })
 }
 
 # --- the gateway's own service role -------------------------------------------
@@ -60,7 +113,7 @@ data "aws_iam_policy_document" "web_search_gateway" {
   statement {
     sid       = "InvokeGateway"
     actions   = ["bedrock-agentcore:InvokeGateway"]
-    resources = ["arn:aws:bedrock-agentcore:us-east-1:${local.account_id}:gateway/*"]
+    resources = ["arn:aws:bedrock-agentcore:${var.web_search_region}:${local.account_id}:gateway/*"]
   }
 
   # ...and this is what authorizes the search itself. The resource is a
@@ -68,7 +121,7 @@ data "aws_iam_policy_document" "web_search_gateway" {
   statement {
     sid       = "InvokeWebSearch"
     actions   = ["bedrock-agentcore:InvokeWebSearch"]
-    resources = ["arn:aws:bedrock-agentcore:us-east-1:aws:tool/web-search.v1"]
+    resources = ["arn:aws:bedrock-agentcore:${var.web_search_region}:aws:tool/web-search.v1"]
   }
 }
 
@@ -96,7 +149,7 @@ resource "aws_iam_role_policy" "web_search_gateway" {
 # client for a purely server-to-server hop — IAM is both simpler and tighter.
 resource "aws_bedrockagentcore_gateway" "web_search" {
   count    = local.web_search_enabled ? 1 : 0
-  provider = aws.us_east_1
+  provider = aws.web_search
 
   name            = "${var.name_prefix}-web-search"
   description     = "Web search connector for the OKF chat agent"
@@ -115,14 +168,14 @@ resource "aws_bedrockagentcore_gateway" "web_search" {
 
 resource "aws_cloudcontrolapi_resource" "web_search_target" {
   count    = local.web_search_enabled ? 1 : 0
-  provider = aws.us_east_1
+  provider = aws.web_search
 
   type_name = "AWS::BedrockAgentCore::GatewayTarget"
 
   desired_state = jsonencode({
     Name              = local.web_search_target_name
     GatewayIdentifier = aws_bedrockagentcore_gateway.web_search[0].gateway_id
-    Description       = "Amazon-operated web index + knowledge graph, MCP tool WebSearch"
+    Description       = local.web_search_target_desc
     TargetConfiguration = {
       Mcp = {
         Connector = {
@@ -130,14 +183,11 @@ resource "aws_cloudcontrolapi_resource" "web_search_target" {
           Configurations = [
             {
               Name = "WebSearch"
-              # Fixed provisioning values for the tool. An operator-supplied
-              # domain denylist is enforced SERVER-SIDE and is invisible to the
-              # model — it just never sees results from those hosts.
-              ParameterValues = (
-                length(var.web_search_excluded_domains) > 0
-                ? { domainFilter = { exclude = var.web_search_excluded_domains } }
-                : {}
-              )
+              # Deliberately empty and CONSTANT: the pin step below owns the
+              # version and the domain lists (see the header comment). Keeping
+              # them out of desired_state means a domain-list change never
+              # produces a Cloud Control patch that would strip the pin.
+              ParameterValues = {}
             }
           ]
         }
@@ -149,4 +199,57 @@ resource "aws_cloudcontrolapi_resource" "web_search_target" {
       { CredentialProviderType = "GATEWAY_IAM_ROLE" }
     ]
   })
+}
+
+# --- the connector version pin (+ domain lists) --------------------------------
+
+# Re-runs whenever the target is recreated or the pinned configuration changes
+# (version bump, either domain list). Uses the deployer's own credentials, like
+# every other step of `terraform apply`.
+resource "terraform_data" "web_search_target_pin" {
+  count = local.web_search_enabled ? 1 : 0
+
+  triggers_replace = [
+    aws_cloudcontrolapi_resource.web_search_target[0].id,
+    local.web_search_pinned_configuration,
+    var.web_search_region,
+  ]
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    # Values travel as env vars, not interpolated shell text, so a quote in a
+    # domain name can't break out of the command.
+    environment = {
+      GATEWAY_ID           = aws_bedrockagentcore_gateway.web_search[0].gateway_id
+      GW_REGION            = var.web_search_region
+      TARGET_NAME          = local.web_search_target_name
+      TARGET_DESCRIPTION   = local.web_search_target_desc
+      TARGET_CONFIGURATION = local.web_search_pinned_configuration
+    }
+    command = <<-EOT
+      set -euo pipefail
+      TARGET_ID=$(aws bedrock-agentcore-control list-gateway-targets \
+        --gateway-identifier "$GATEWAY_ID" --region "$GW_REGION" \
+        --query "items[?name=='$TARGET_NAME'].targetId" --output text)
+      if [ -z "$TARGET_ID" ] || [ "$TARGET_ID" = "None" ]; then
+        echo "web-search target '$TARGET_NAME' not found on gateway $GATEWAY_ID" >&2
+        exit 1
+      fi
+      # The target can briefly report UPDATING right after create; retry.
+      for attempt in 1 2 3 4 5; do
+        if aws bedrock-agentcore-control update-gateway-target \
+          --gateway-identifier "$GATEWAY_ID" --target-id "$TARGET_ID" \
+          --name "$TARGET_NAME" --description "$TARGET_DESCRIPTION" \
+          --target-configuration "$TARGET_CONFIGURATION" \
+          --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
+          --region "$GW_REGION" > /dev/null; then
+          echo "web-search target pinned to connector ${local.web_search_connector_version}"
+          exit 0
+        fi
+        echo "update-gateway-target attempt $attempt failed - retrying" >&2
+        sleep 5
+      done
+      exit 1
+    EOT
+  }
 }

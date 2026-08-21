@@ -128,9 +128,10 @@ Keep responses reasonably concise — answer first, brief support after.
 # both SQL and non-SQL turns. Split of duties: WHEN to reach for the tool (and the
 # keep-internal-and-external-distinct + attribution policy) lives here; every
 # ARGUMENT-level detail lives in the tool description — query length, max_results,
-# and the relevance-not-date/put-the-period-in-the-query guidance with its "EU
-# steel tariffs Q2 2026" example, which sits beside today's date there (the only
-# place a per-run date can live, since this block is static).
+# the date/domain filter args (offered only when the deployment's target speaks
+# connector 1.2.0 — see chat/web_search.py), and the put-the-period-in-the-query
+# guidance with its "EU steel tariffs Q2 2026" example, which sits beside today's
+# date there (the only place a per-run date can live, since this block is static).
 WEB_SEARCH_BLOCK = """
 
 <web_search_tool>
