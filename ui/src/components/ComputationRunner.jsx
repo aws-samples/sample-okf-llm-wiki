@@ -108,7 +108,17 @@ function ParamChips({ p }) {
         {p.type}
       </Badge>
       {p.required ? (
-        <Badge variant="secondary" className={cn(_chip, "font-sans")}>
+        // A destructive TINT, not variant="secondary": the secondary fill is
+        // nearly invisible on the white card, so "required" read as just
+        // another type chip. The red tint matches the run form's required-*
+        // marker — same fact, same color.
+        <Badge
+          variant="outline"
+          className={cn(
+            _chip,
+            "border-destructive/30 bg-destructive/5 font-sans text-destructive"
+          )}
+        >
           required
         </Badge>
       ) : (
