@@ -1118,7 +1118,7 @@ function QuestionCard({ q, openTrace, onOpenTrace }) {
   const anyDetail = checkKeys.length > 0
 
   return (
-    <div className="min-w-0 rounded-xl border bg-card p-3 shadow-xs">
+    <div className="min-w-0 rounded-xl border border-edge bg-card p-3">
       <button
         type="button"
         onClick={() => anyDetail && setExpanded((v) => !v)}

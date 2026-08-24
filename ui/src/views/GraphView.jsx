@@ -251,7 +251,7 @@ const ConceptNode = memo(function ConceptNode({ data, selected }) {
   return (
     <div
       className={cn(
-        "group flex w-56 items-center gap-2.5 rounded-xl border bg-card px-3 py-2.5 text-left shadow-sm ring-1 ring-foreground/5 transition-shadow",
+        "group flex w-56 items-center gap-2.5 rounded-xl border border-edge bg-card px-3 py-2.5 text-left shadow-sm transition-shadow",
         "hover:shadow-md",
         selected && "ring-2 ring-primary"
       )}
