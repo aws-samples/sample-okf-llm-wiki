@@ -11,8 +11,15 @@ function Card({
     <div
       data-slot="card"
       data-size={size}
+      // Ring rides --edge (stone-300 light / white-10% dark), the SURFACE
+      // BOUNDARY tier: the near-white page (#FCFCFB) sits a whisker below
+      // the white card fill, so the ring — not the fill — carries the card
+      // boundary, at the same strength as every edge-bearing surface
+      // (overlays, panels, composer, list cards). Separators INSIDE the card
+      // (border-b etc.) stay on the softer --border tier. Was
+      // ring-foreground/5 when the page was a clearly darker gray.
       className={cn(
-        "group/card flex flex-col gap-(--card-spacing) overflow-hidden rounded-xl bg-card py-(--card-spacing) text-sm text-card-foreground shadow-sm ring-1 ring-foreground/5 [--card-spacing:--spacing(5)] has-[>img:first-child]:pt-0 data-[size=sm]:[--card-spacing:--spacing(4)] dark:ring-foreground/10 *:[img:first-child]:rounded-t-xl *:[img:last-child]:rounded-b-xl",
+        "group/card flex flex-col gap-(--card-spacing) overflow-hidden rounded-xl bg-card py-(--card-spacing) text-sm text-card-foreground ring-1 ring-edge [--card-spacing:--spacing(5)] has-[>img:first-child]:pt-0 data-[size=sm]:[--card-spacing:--spacing(4)] *:[img:first-child]:rounded-t-xl *:[img:last-child]:rounded-b-xl",
         className
       )}
       {...props} />

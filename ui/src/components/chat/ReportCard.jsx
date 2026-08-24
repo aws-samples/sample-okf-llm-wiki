@@ -17,7 +17,7 @@ function MockPage({ front = false, className }) {
   return (
     <div
       className={cn(
-        "absolute overflow-hidden rounded-md border bg-background shadow-sm",
+        "absolute overflow-hidden rounded-md border border-edge bg-background",
         "h-20 w-[4.2rem] p-2",
         className
       )}
@@ -59,7 +59,7 @@ export function ReportCard({
       disabled={!ready}
       onClick={() => onOpenReport?.({ reportId, title })}
       className={cn(
-        "relative my-3 flex min-h-20 w-full items-center gap-4 overflow-hidden rounded-xl border bg-card px-4 py-3 text-left transition-colors",
+        "relative my-3 flex min-h-20 w-full items-center gap-4 overflow-hidden rounded-xl border border-edge bg-card px-4 py-3 text-left transition-colors",
         ready && "cursor-pointer hover:bg-muted/60",
         !ready && !error && !stalled && "animate-pulse",
         error && "border-destructive/40 bg-destructive/10"

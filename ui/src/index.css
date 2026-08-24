@@ -29,6 +29,7 @@
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);
+  --color-edge: var(--edge);
   --color-destructive: var(--destructive);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
@@ -55,11 +56,13 @@
 
 :root {
   /* LIGHT-mode neutrals are shadcn STONE (warm gray, hue ~50-106). The
-       page is a light warm off-white — midway between the original soft
-       gray (#F3F3F1) and near-white, so the white cards still read a
-       half-step lighter than the page. Hue stays in the stone family.
-       Light-mode ONLY — dark mode is pure achromatic neutral (see .dark). */
-  --background: oklch(0.9759 0.0013 106.4); /* #F7F7F6 — light warm off-white page */
+       page is a warm near-white — a whisker below the pure-white cards, so
+       surfaces separate by EDGE, not fill: boundaries ride the stone-300
+       --edge token (ring-edge on cards/overlays, border-edge on panels and
+       the chat composer) while --border stays stone-200 for separators —
+       revisit those if this token moves back toward gray. Light-mode
+       ONLY — dark mode is pure achromatic neutral (see .dark). */
+  --background: oklch(0.9908 0.0013 106.4); /* #FCFCFB — warm near-white page */
   --foreground: oklch(0.147 0.004 49.25);
   --card: oklch(1 0 0);
   --card-foreground: oklch(0.147 0.004 49.25);
@@ -76,7 +79,17 @@
   --accent: oklch(0.963 0.002 106.4);
   --accent-foreground: oklch(0.216 0.006 56.043);
   --destructive: oklch(0.577 0.245 27.325);
+  /* TWO-TIER lines. --border (stone-200, the shadcn default) is for
+       SEPARATORS — header dividers, table lines, border-b rows. --edge
+       (stone-300, one step darker) is for SURFACE BOUNDARIES on the
+       near-white page: cards + overlays (ring-edge), the chat composer,
+       the right-side panels (PanelShell), the analysis/report list cards,
+       and the inline chat cards (border-edge). Keep the tiers separate:
+       separators at edge strength read heavy inside white surfaces, and
+       edges at separator strength vanish against the page. --input stays
+       stone-200: it tints field FILLS (bg-input/50), not edges. */
   --border: oklch(0.923 0.003 48.717);
+  --edge: oklch(0.869 0.005 56.366);
   --input: oklch(0.923 0.003 48.717);
   --ring: oklch(0.709 0.01 56.259);
   /* Chart palette for LIGHT mode — anchored on the app's BRAND SKY (--primary,
@@ -162,7 +175,10 @@
   --accent: oklch(0.275 0 0);
   --accent-foreground: oklch(0.987 0 0);
   --destructive: oklch(0.704 0.191 22.216);
+  /* Dark separates surfaces by FILL lightness, not line strength — both
+       line tiers share the same subtle white-alpha. */
   --border: oklch(1 0 0 / 10%);
+  --edge: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.56 0 0);
   /* Chart palette for DARK mode — same categorical HUES as :root (sky /
@@ -272,10 +288,11 @@
     @apply my-6;
   }
   .okf-prose code {
-    /* A foreground-tint background (not bg-muted): in light mode --muted ≈
-       --background, so bg-muted was invisible against the chat surface. A tint of
-       --foreground reads in BOTH themes (subtle gray on light, subtle light on
-       dark), same technique as the label-grid cells. */
+    /* A foreground-tint background (not bg-muted): a muted fill vanished
+       against the old soft-gray chat surface, and its visibility shifts every
+       time the page neutrals are retuned. A tint of --foreground reads in BOTH
+       themes (subtle gray on light, subtle light on dark), same technique as
+       the label-grid cells. */
     @apply rounded px-1.5 py-0.5 font-mono text-[0.8125em];
     background-color: color-mix(in oklch, var(--foreground) 8%, transparent);
     border: 1px solid color-mix(in oklch, var(--foreground) 8%, transparent);
@@ -305,14 +322,24 @@
     padding: 0.15em 0.42em;
     /* NEUTRAL quiet-gray pill (was the primary/sky wash): citations are
        provenance, not actions — the favicon/glyph carries the identity, so a
-       brand-colored chip overstated them. Borderless — the tint alone is the
-       shape. Foreground-alpha, NOT --muted: --muted nearly matches the light
-       page's lightness, so a muted fill all but vanishes outside white cards
-       (same recipe as inline code above). Transparent mixes are hue-safe in
-       oklch (premultiplied alpha). */
-    color: var(--muted-foreground);
+       brand-colored chip overstated them. Tint + a foreground-alpha border
+       (≈ --border strength on the near-white page; the pill was borderless
+       when the page was a clearly darker gray). Foreground-alpha, NOT
+       --muted/--border directly: translucent foreground mixes read on any
+       surface in BOTH themes (same recipe as inline code above), and
+       transparent mixes are hue-safe in oklch (premultiplied alpha).
+       Text is the ACHROMATIC twin of --muted-foreground (same lightness,
+       chroma 0): at the pill's small bold size the stone warm gray read
+       BROWN. Light-mode only — dark muted-foreground is already achromatic
+       (see the .dark override below). The icon follows via text-current
+       (Citation.jsx). */
+    color: oklch(0.553 0 0);
     background-color: color-mix(in oklch, var(--foreground) 7%, transparent);
+    border: 1px solid color-mix(in oklch, var(--foreground) 15%, transparent);
     line-height: 1.5;
+  }
+  .dark .okf-prose .okf-cite {
+    color: var(--muted-foreground);
   }
   .okf-prose .okf-cite:hover,
   .okf-prose .okf-cite:focus-visible {
@@ -321,10 +348,10 @@
     outline: none;
   }
   /* Keyboard focus must stay distinguishable from hover on this focusable
-     role=button pill (WCAG 2.4.7): the borderless restyle above made the two
-     states share one tint with the browser outline suppressed, so a tabbing
-     user got no visible indicator when the pill was already hovered. Ring
-     token, same as the kit's form controls. */
+     role=button pill (WCAG 2.4.7): hover and focus share one tint with the
+     browser outline suppressed, so a tabbing user got no visible indicator
+     when the pill was already hovered. Ring token, same as the kit's form
+     controls. */
   .okf-prose .okf-cite:focus-visible {
     outline: 2px solid var(--ring);
     outline-offset: 1px;
@@ -337,20 +364,19 @@
     text-overflow: ellipsis;
   }
   /* "+2" — the other sources behind this claim, page through them in the card.
-     One step quieter than the (muted-foreground) label — a transparent mix,
-     which is hue-safe in oklch, unlike gray/white/black mixes (the xref
-     pink-card trap). */
+     SAME color as the label (inherits; it was one alpha step quieter, but at
+     this size the step read as a different COLOR, not a quieter one). */
   .okf-prose .okf-cite-more {
     @apply font-semibold tabular-nums;
-    color: color-mix(in oklch, var(--muted-foreground) 70%, transparent);
   }
   .okf-prose .okf-cite-icon {
     @apply align-middle;
   }
   /* NOTE: no `.okf-cite svg { color: … }` rule here — it would sit in @layer
      components and LOSE to the icon's text-muted-foreground utility (utilities
-     layer comes later; layer order beats specificity). The doc glyph rides
-     that muted default, which matches the neutral pill (Citation.jsx). */
+     layer comes later; layer order beats specificity). Citation.jsx passes
+     text-current instead (tailwind-merge lets it win), so the glyph follows
+     the pill's neutralized text color in both states. */
   /* Markdown's BARE fenced blocks only — CodeView brings its own chrome
      (header + scroll container), so its pre must not inherit this panel
      styling (the leak gave it rounded top corners under the header and a

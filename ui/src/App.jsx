@@ -580,9 +580,10 @@ function CollapsedTriggerOverlay({
 }) {
   const { state, isMobile } = useSidebar()
   if (!isMobile && state !== "collapsed") return null
-  // The ghost variant's hover (bg-muted) is ~invisible on the top bar since
-  // --muted ≈ --background in this theme; use a foreground tint so the hover
-  // reads. dark:hover overrides the variant's dark:hover:bg-muted/50 too.
+  // The ghost variant's hover (bg-muted) is unreliable on the top bar — its
+  // visibility depends on where the (often-retuned) page neutrals sit; use a
+  // foreground tint so the hover always reads. dark:hover overrides the
+  // variant's dark:hover:bg-muted/50 too.
   return (
     <div className="absolute top-4 left-4 z-20">
       <CollapsedNavTrigger

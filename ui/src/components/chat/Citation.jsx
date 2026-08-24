@@ -176,16 +176,18 @@ export function CitationGroup({
       <PopoverTrigger asChild>
         <span className="okf-cite" tabIndex={0} role="button">
           {isWebSource(first) ? (
-            <SourceIcon url={first} size={11} className="okf-cite-icon" />
+            <SourceIcon url={first} size={11} className="okf-cite-icon text-current" />
           ) : (
-            // The kind glyph stays on DocIcon's muted default — the badge is a
-            // NEUTRAL pill now (favicons keep their own colors; the site's mark
-            // IS the signal there). conceptIdOf strips a qualified id's
-            // domain/dataset prefix so the glyph keys on the kind.
+            // text-current overrides DocIcon's muted default (tailwind-merge)
+            // so the glyph matches the pill's neutralized text color — the
+            // stone muted-foreground read brown next to it. Favicons keep
+            // their own colors (the site's mark IS the signal there).
+            // conceptIdOf strips a qualified id's domain/dataset prefix so
+            // the glyph keys on the kind.
             <DocIcon
               conceptId={conceptIdOf(first)}
               size={11}
-              className="okf-cite-icon"
+              className="okf-cite-icon text-current"
             />
           )}
           <span className="okf-cite-label">{shortLabel(first)}</span>

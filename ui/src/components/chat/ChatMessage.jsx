@@ -183,8 +183,9 @@ function ChatMessageImpl({
     <div className="flex flex-col gap-5">
       {/* User message — right-aligned bubble. NEUTRAL surface (was bg-primary):
           the brand sky is reserved for actions/accents; the bubble is content.
-          Foreground-alpha, not bg-muted — --muted matches the light page bg,
-          so a muted bubble would vanish on the transcript. */}
+          Foreground-alpha, not bg-muted — the tint reads on any surface in
+          both themes, while a muted bubble's visibility shifts whenever the
+          page neutrals are retuned (it vanished on the old soft-gray page). */}
       <div className="flex justify-end">
         <div className="max-w-[85%] whitespace-pre-wrap rounded-xl bg-foreground/8 px-3 py-2 text-sm text-foreground">
           {turn.userMessage}

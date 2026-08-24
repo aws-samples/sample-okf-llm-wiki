@@ -23,11 +23,12 @@ const tabsListVariants = cva(
   {
     variants: {
       variant: {
-        // A foreground TINT, not bg-muted: in light mode --muted (0.963)
-        // sits barely below --background (0.976), so a muted track is nearly
-        // invisible on the page and the active pill has nothing to sit in. A
-        // tint of --foreground reads in BOTH themes — the same technique the
-        // prose code pills and label-grid cells use (see index.css).
+        // A foreground TINT, not bg-muted: a tint of --foreground reads on
+        // any surface in BOTH themes, while bg-muted's visibility depends on
+        // where the (often-retuned) page neutrals sit — the track fully
+        // vanished on the old soft-gray page, leaving the active pill nothing
+        // to sit in. Same technique as the prose code pills and label-grid
+        // cells (see index.css).
         default: "bg-foreground/[0.07] dark:bg-muted",
         line: "gap-1 bg-transparent",
       },
