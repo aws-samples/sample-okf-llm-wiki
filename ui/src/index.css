@@ -55,11 +55,11 @@
 
 :root {
   /* LIGHT-mode neutrals are shadcn STONE (warm gray, hue ~50-106). The
-       soft-gray-page structure is kept: --background stays at the same
-       lightness as always (page reads a step darker than the white cards),
-       hue in the stone family. Light-mode ONLY — dark mode is pure
-       achromatic neutral (see .dark). */
-  --background: oklch(0.9626 0.0021 106.4); /* #F3F3F1 — soft warm-gray page */
+       page is a light warm off-white — midway between the original soft
+       gray (#F3F3F1) and near-white, so the white cards still read a
+       half-step lighter than the page. Hue stays in the stone family.
+       Light-mode ONLY — dark mode is pure achromatic neutral (see .dark). */
+  --background: oklch(0.9759 0.0013 106.4); /* #F7F7F6 — light warm off-white page */
   --foreground: oklch(0.147 0.004 49.25);
   --card: oklch(1 0 0);
   --card-foreground: oklch(0.147 0.004 49.25);
@@ -306,10 +306,10 @@
     /* NEUTRAL quiet-gray pill (was the primary/sky wash): citations are
        provenance, not actions — the favicon/glyph carries the identity, so a
        brand-colored chip overstated them. Borderless — the tint alone is the
-       shape. Foreground-alpha, NOT --muted: --muted matches the light page's
-       lightness, so a muted fill vanishes outside white cards (same recipe as
-       inline code above). Transparent mixes are hue-safe in oklch
-       (premultiplied alpha). */
+       shape. Foreground-alpha, NOT --muted: --muted nearly matches the light
+       page's lightness, so a muted fill all but vanishes outside white cards
+       (same recipe as inline code above). Transparent mixes are hue-safe in
+       oklch (premultiplied alpha). */
     color: var(--muted-foreground);
     background-color: color-mix(in oklch, var(--foreground) 7%, transparent);
     line-height: 1.5;
