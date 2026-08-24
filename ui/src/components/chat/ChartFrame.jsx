@@ -241,6 +241,11 @@ function ChartFrameInner({
   const [height, setHeight] = useState(boxHeight + 8)
   const [status, setStatus] = useState("loading") // loading | ok | error
   const [errorMsg, setErrorMsg] = useState(null)
+  // Whether THIS srcdoc has fired the iframe's load event. The frame is
+  // loading="lazy", so an offscreen chart (a dashboard tile below the fold, a
+  // chart up in the transcript) may not even START loading for a while — the
+  // give-up clock must not run before then.
+  const [frameLoaded, setFrameLoaded] = useState(false)
 
   // "Theater" = this chart mounted mid-generation (a live streaming turn). Only
   // then does the generating grid show and hold for its minimum beat; a
@@ -305,6 +310,7 @@ function ChartFrameInner({
   useEffect(() => {
     setStatus("loading")
     setErrorMsg(null)
+    setFrameLoaded(false)
   }, [srcDoc])
 
   // Receive height/status/error from THIS frame only (match on contentWindow —
@@ -356,13 +362,18 @@ function ChartFrameInner({
   // A frame that never reports back (blocked/blank) shouldn't spin forever — after
   // a grace period with no "ok"/"error", treat it as failed so the user sees the
   // contained error rather than an empty box.
-  // The grace clock only runs while the tab is VISIBLE: hidden tabs pause the
-  // frame's rAF and throttle its timers (Chrome: up to a minute), so a chart
-  // mounted while the user is away would otherwise be declared dead before it
-  // ever had a frame to report in — the "chart could not be generated (but
-  // renders after refresh)" symptom.
+  // TWO gates before the clock may run, both the same symptom ("couldn't
+  // render — but fine after refresh"):
+  //   - the tab must be VISIBLE: hidden tabs pause the frame's rAF and
+  //     throttle its timers (Chrome: up to a minute);
+  //   - the iframe must have LOADED (frameLoaded): the frame is lazy, so an
+  //     offscreen chart may not start loading for seconds/minutes — the old
+  //     mount-anchored clock declared those dead while they were simply
+  //     waiting to scroll into view. Once load fires, the frame draws and
+  //     posts ok within milliseconds, so the grace only has to cover a
+  //     genuinely broken document.
   useEffect(() => {
-    if (status !== "loading" || !srcDoc) return undefined
+    if (status !== "loading" || !srcDoc || !frameLoaded) return undefined
     let t = null
     const fail = () => setStatus((s) => (s === "loading" ? "error" : s))
     const arm = () => {
@@ -381,7 +392,7 @@ function ChartFrameInner({
       disarm()
       document.removeEventListener("visibilitychange", onVisibility)
     }
-  }, [status, srcDoc])
+  }, [status, srcDoc, frameLoaded])
 
   // Hand the export capability to a host that renders its own kebab (canvas
   // tiles keep it in the card header, next to the title): once the frame has
@@ -428,6 +439,7 @@ function ChartFrameInner({
         sandbox="allow-scripts"
         srcDoc={srcDoc}
         loading="lazy"
+        onLoad={() => setFrameLoaded(true)}
         // Kept mounted at full size (it must load + draw to report ok) but
         // transparent until reveal; the placeholder floats above it meanwhile.
         // Reveal is a PURE opacity cross-fade — no transform: a translate/scale
