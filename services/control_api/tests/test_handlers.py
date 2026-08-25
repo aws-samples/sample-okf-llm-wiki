@@ -2276,6 +2276,44 @@ def test_read_bundle_file_rejects_key_outside_bundle(cfg):
     assert ei.value.status == 400
 
 
+def test_export_bundle_zips_only_published_content(cfg):
+    import io
+    import zipfile
+
+    _seed_bundle(cfg.s3)
+    # A zero-byte dir marker like ensure_dir_markers writes — must be skipped.
+    cfg.s3.put_object(Bucket=BUCKET, Key="okf/sales/orders/tables/", Body=b"")
+    res = handlers.export_bundle(
+        cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
+    )
+    assert res["filename"] == "sales--orders-okf-bundle.zip"
+    assert res["files"] == 4
+    assert "exports/sales/orders/okf-bundle.zip" in res["url"]
+    staged = cfg.s3.get_object(
+        Bucket=BUCKET, Key="exports/sales/orders/okf-bundle.zip"
+    )["Body"].read()
+    assert res["bytes"] == len(staged)
+    with zipfile.ZipFile(io.BytesIO(staged)) as zf:
+        names = sorted(zf.namelist())
+        assert names == [
+            "orders/datasets/orders.md",
+            "orders/index.md",
+            "orders/tables/customers.md",
+            "orders/tables/orders.md",
+        ]
+        # Authoring state (.context/.harvest/.metadata) stays out.
+        assert not any("/." in n for n in names)
+        assert zf.read("orders/tables/orders.md").startswith(b"---")
+
+
+def test_export_bundle_empty_bundle_404(cfg):
+    with pytest.raises(ApiError) as ei:
+        handlers.export_bundle(
+            cfg.s3, bucket=BUCKET, data_domain="nothing", dataset="here"
+        )
+    assert ei.value.status == 404
+
+
 def test_read_bundle_file_rejects_other_dataset(cfg):
     with pytest.raises(ApiError) as ei:
         handlers.read_bundle_file(

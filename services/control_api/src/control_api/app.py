@@ -1180,6 +1180,15 @@ def _r_bundle_graph(cfg, params, body, query, caller):
     )
 
 
+def _r_export_bundle(cfg, params, body, query, caller):
+    return 200, handlers.export_bundle(
+        cfg.s3,
+        bucket=cfg.bucket,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
 def _r_bundle_versions(cfg, params, body, query, caller):
     return 200, handlers.list_bundle_versions(
         cfg.s3,
@@ -1422,6 +1431,7 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("POST", "/bundle/{domain}/{dataset}/computations/{slug}/unverify", _r_unverify_computation),
     # Bundle version history (reconstructed from S3 object versions), diff, and
     # repromote; POST repromotes, GET polls its vector-index convergence.
+    ("POST", "/bundle/{domain}/{dataset}/export", _r_export_bundle),
     ("GET", "/bundle/{domain}/{dataset}/versions", _r_bundle_versions),
     ("GET", "/bundle/{domain}/{dataset}/diff", _r_bundle_diff),
     ("POST", "/bundle/{domain}/{dataset}/repromote", _r_repromote_bundle),

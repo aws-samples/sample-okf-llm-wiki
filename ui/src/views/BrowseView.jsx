@@ -6,13 +6,16 @@ import {
   BadgeCheckIcon,
   ChevronRightIcon,
   CodeIcon,
+  DownloadIcon,
   FileTextIcon,
   FolderIcon,
   FolderOpenIcon,
   HistoryIcon,
+  Loader2Icon,
   MessageSquareTextIcon,
   XIcon,
 } from "lucide-react"
+import { toast } from "sonner"
 
 import { CodeView } from "@/components/chat/CodeView"
 import {
@@ -137,6 +140,22 @@ function FilesPane({
   const [error, setError] = useState(null)
   const [content, setContent] = useState("")
   const [loadingDoc, setLoadingDoc] = useState(false)
+  const [exporting, setExporting] = useState(false)
+
+  // Export the published bundle as a zip: the endpoint stages the archive
+  // off-mount and returns a presigned URL with an attachment disposition, so
+  // assigning location saves the file rather than navigating.
+  const exportBundle = async () => {
+    setExporting(true)
+    try {
+      const res = await api.exportBundle(domain, dataset)
+      window.location.assign(res.url)
+    } catch (e) {
+      toast.error(e?.message || "Could not export the bundle")
+    } finally {
+      setExporting(false)
+    }
+  }
   const [docError, setDocError] = useState(null)
 
   // Selected concept: local state so a click updates the tree/viewer instantly,
@@ -361,6 +380,17 @@ function FilesPane({
             </Button>
           ) : (
             <>
+              {/* Download the published bundle as a zip (authored docs only —
+                  no .metadata/.harvest/.context). Ghost like History: one
+                  primary action per row (Annotations). */}
+              <Button variant="ghost" onClick={exportBundle} disabled={exporting}>
+                {exporting ? (
+                  <Loader2Icon className="animate-spin" />
+                ) : (
+                  <DownloadIcon />
+                )}
+                Export
+              </Button>
               {/* Compare/restore published bundle versions. Ghost, not
                   filled: Annotations is the row's one primary action — two
                   filled buttons side by side compete for attention. */}

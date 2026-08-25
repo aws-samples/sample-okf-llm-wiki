@@ -190,6 +190,11 @@ export function makeApi(token) {
       ),
     bundleGraph: (domain, dataset) =>
       request(token, "GET", `/bundle/${domain}/${dataset}/graph`),
+    // Stage the published bundle as a zip and return a presigned download
+    // ({url, filename, files, bytes}). POST: each call (re)writes the staged
+    // archive.
+    exportBundle: (domain, dataset) =>
+      request(token, "POST", `/bundle/${domain}/${dataset}/export`),
 
     // Attested Computations: list with merged verification badges, one doc's
     // contract (the Run modal's form data), execute with typed parameter

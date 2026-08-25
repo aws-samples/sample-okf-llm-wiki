@@ -12,9 +12,11 @@ rather than re-encoded here.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3742,6 +3744,65 @@ def list_bundle_files(
             continue
         out.append({"concept_id": loc.concept_id, "key": key})
     return out
+
+
+_EXPORT_PRESIGN_EXPIRY_SECONDS = 300
+
+
+def export_bundle(
+    s3, *, bucket: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """Zip the published bundle tree and return a presigned download URL.
+
+    "Published" is the same rule the file endpoints serve: keys under the
+    dataset prefix with no dot-prefixed path segment — the authored concept
+    docs plus ``index.md``/``log.md``. Authoring state stays out of the
+    archive (``.metadata/`` snapshot, ``.harvest/`` run artifacts,
+    ``.context/`` uploads), as do the zero-byte dir markers the S3 mount
+    derives permissions from. Deployment state that must not travel with
+    content never lives under the prefix at all — attested-computation
+    VERIFICATION chief among it (off-mount by design), so an exported bundle
+    cannot carry trust with it.
+
+    The archive is rooted at ``<dataset>/`` and staged at a FIXED off-mount
+    key, overwritten per export (the versioned bucket keeps history — the
+    report-artifact pattern); the presigned GET carries an attachment
+    disposition so the browser saves the file instead of navigating to it.
+    """
+    prefix = bundle_prefix(data_domain, dataset)
+    buf = io.BytesIO()
+    count = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for key in _iter_bundle_keys(s3, bucket=bucket, prefix=prefix):
+            rel = key[len(prefix) :]
+            if not rel or rel.endswith("/"):
+                continue  # zero-byte dir markers
+            if any(not p or p.startswith(".") for p in rel.split("/")):
+                continue  # dot-dirs/dot-files: authoring state
+            body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            zf.writestr(f"{dataset}/{rel}", body)
+            count += 1
+    if not count:
+        raise ApiError(404, f"no published bundle for {data_domain}/{dataset}")
+    data = buf.getvalue()
+    stage_key = f"exports/{data_domain}/{dataset}/okf-bundle.zip"
+    s3.put_object(
+        Bucket=bucket, Key=stage_key, Body=data, ContentType="application/zip"
+    )
+    filename = f"{data_domain}--{dataset}-okf-bundle.zip"
+    try:
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": bucket,
+                "Key": stage_key,
+                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+            },
+            ExpiresIn=_EXPORT_PRESIGN_EXPIRY_SECONDS,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise ApiError(502, f"could not presign the export: {e}") from e
+    return {"url": url, "filename": filename, "files": count, "bytes": len(data)}
 
 
 def _validate_bundle_key(key: str, *, data_domain: str, dataset: str) -> str:
