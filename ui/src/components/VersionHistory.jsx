@@ -74,7 +74,9 @@ import "@git-diff-view/react/styles/diff-view.css"
 
 // htmldiff-js ships CJS with a default export; interop differs between the
 // node test runner and Vite's ESM shim, so resolve both shapes.
-const HtmlDiff = HtmlDiffModule?.execute ? HtmlDiffModule : HtmlDiffModule.default
+const HtmlDiff = HtmlDiffModule?.execute
+  ? HtmlDiffModule
+  : HtmlDiffModule.default
 
 const LIVE = "live"
 // Select can't carry "": stands for "let the server pick the base" — the
@@ -179,12 +181,14 @@ export function useVersionHistory({
     setRestore({ phase: "idle" })
     loadVersions()
     // Surface a repromote that died mid-write in an earlier session (404 = no
-    // repromote ever ran — the normal case — so it is swallowed).
+    // repromote ever ran — the normal case — so it is swallowed). can_retry
+    // gates the banner: the server also reports a stalled IMPORT lease here,
+    // whose retry is re-applying the import, not re-POSTing a repromote.
     let alive = true
     api
       .repromoteStatus(domain, dataset)
       .then((s) => {
-        if (alive && s?.state === "stalled_lease") {
+        if (alive && s?.state === "stalled_lease" && s?.can_retry) {
           setRestore({ phase: "stalled_lease", target: s.target_version_id })
         }
       })
@@ -549,7 +553,12 @@ function RichDiff({ vh, file }) {
       absent
         ? Promise.resolve("")
         : vh.api
-            .readBundleFile(vh.domain, vh.dataset, file.key, versionId || undefined)
+            .readBundleFile(
+              vh.domain,
+              vh.dataset,
+              file.key,
+              versionId || undefined
+            )
             .then((r) => r?.text ?? "")
     Promise.all([
       side(file.old_version_id, file.status === "added"),
@@ -651,23 +660,23 @@ function SelectedFileDiff({ vh, file, mode, theme }) {
         </div>
       ) : hunks.length ? (
         <div ref={scrollRef} style={scrollStyle} className="okf-diff-scroll">
-        <DiffBoundary raw={file.diff}>
-          <DiffView
-            key={`${file.key}:${theme}`}
-            data={{
-              oldFile: { fileName: `a/${file.key}`, fileLang: "markdown" },
-              newFile: { fileName: `b/${file.key}`, fileLang: "markdown" },
-              hunks,
-            }}
-            diffViewMode={
-              mode === "split" ? DiffModeEnum.Split : DiffModeEnum.Unified
-            }
-            diffViewTheme={theme}
-            diffViewWrap
-            diffViewHighlight
-            diffViewFontSize={12}
-          />
-        </DiffBoundary>
+          <DiffBoundary raw={file.diff}>
+            <DiffView
+              key={`${file.key}:${theme}`}
+              data={{
+                oldFile: { fileName: `a/${file.key}`, fileLang: "markdown" },
+                newFile: { fileName: `b/${file.key}`, fileLang: "markdown" },
+                hunks,
+              }}
+              diffViewMode={
+                mode === "split" ? DiffModeEnum.Split : DiffModeEnum.Unified
+              }
+              diffViewTheme={theme}
+              diffViewWrap
+              diffViewHighlight
+              diffViewFontSize={12}
+            />
+          </DiffBoundary>
         </div>
       ) : (
         <p className="p-3 text-xs text-muted-foreground">
@@ -744,7 +753,9 @@ export function VersionDiffPane({ vh }) {
               <SelectValue placeholder="Base version…" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={AUTO}>Auto (version before the target)</SelectItem>
+              <SelectItem value={AUTO}>
+                Auto (version before the target)
+              </SelectItem>
               {vh.versions.map((v) => (
                 <SelectItem key={v.version_id} value={v.version_id}>
                   {versionLabel(v)}
@@ -791,7 +802,9 @@ export function VersionDiffPane({ vh }) {
             size="sm"
             variant="outline"
             className="h-7 text-xs"
-            disabled={restore.phase === "posting" || restore.phase === "polling"}
+            disabled={
+              restore.phase === "posting" || restore.phase === "polling"
+            }
             onClick={() => vh.setConfirmOpen(true)}
           >
             <RotateCcwIcon className="size-3.5" />
@@ -821,8 +834,8 @@ export function VersionDiffPane({ vh }) {
           <AlertTitle>Can't check indexing progress</AlertTitle>
           <AlertDescription className="flex items-center gap-3">
             <span>
-              The restore itself completed; the progress check keeps failing
-              ({restore.error}). The index usually converges on its own.
+              The restore itself completed; the progress check keeps failing (
+              {restore.error}). The index usually converges on its own.
             </span>
             <Button size="sm" variant="outline" onClick={vh.resumePolling}>
               Check again
@@ -908,8 +921,8 @@ export function VersionDiffPane({ vh }) {
               </span>{" "}
               become current again. The restore is saved as a new version, so
               nothing is lost, and the search index updates to match. Keep in
-              mind that a future harvest, whether run manually or triggered by
-              a catalog change, will overwrite the restored docs.
+              mind that a future harvest, whether run manually or triggered by a
+              catalog change, will overwrite the restored docs.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

@@ -84,6 +84,26 @@ resource "aws_s3_bucket_lifecycle_configuration" "bundles" {
       expired_object_delete_marker = true
     }
   }
+  # Bundle import/export staging (fixed keys, overwritten per use, deleted
+  # after a successful apply): every overwrite parks the prior archive as a
+  # noncurrent version, and without expiry those 10s-of-MB zips accumulate
+  # forever — neither okf/ rule above covers these prefixes.
+  dynamic "rule" {
+    for_each = toset(["imports/", "exports/"])
+    content {
+      id     = "expire-noncurrent-staging-${trimsuffix(rule.value, "/")}"
+      status = "Enabled"
+      filter {
+        prefix = rule.value
+      }
+      noncurrent_version_expiration {
+        noncurrent_days = 7
+      }
+      expiration {
+        expired_object_delete_marker = true
+      }
+    }
+  }
 }
 
 # --- Bundle-write restriction (threat #26) -----------------------------------

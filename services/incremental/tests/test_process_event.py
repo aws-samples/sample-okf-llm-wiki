@@ -354,6 +354,34 @@ def test_incremental_defers_when_harvest_already_in_flight(aws):
     assert staged is False
 
 
+def test_incremental_takes_over_a_dead_import_lease(aws):
+    """A queued mode=import row past SYNC_LEASE_STALE_SECONDS is a crashed
+    30s-capped Lambda, not an 8h harvest — the incremental path must steal it
+    immediately instead of returning skipped_locked all day."""
+    seed_mapping(aws["ddb"], data_domain="sales", dataset="f1", glue_database="f1_db")
+    seed_ready_bundle(aws["s3"], data_domain="sales", dataset="f1")
+    tbl = make_table("races", [col("id", "bigint")], version_id="7")
+    glue = FakeGlue({"f1_db": {"races": [tbl]}})
+    agentcore = FakeAgentCore()
+
+    from datetime import datetime, timezone, timedelta
+
+    dead = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    aws["ddb"].Table(REGISTRY_TABLE).put_item(
+        Item={
+            "pk": "HARVEST#sales#f1",
+            "sk": "STATUS",
+            "status": "queued",
+            "mode": "import",
+            "started_at": dead,  # 5min > 120s, way under the 8h escape
+        }
+    )
+
+    result = _call(_detail(), aws, glue, agentcore)
+    assert result["action"] == "invoked"
+    assert len(agentcore.invocations) == 1
+
+
 def test_incremental_takes_over_a_stale_lease(aws):
     """A lease older than the 8h AgentCore session cap is dead -> taken over."""
     seed_mapping(aws["ddb"], data_domain="sales", dataset="f1", glue_database="f1_db")

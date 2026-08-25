@@ -147,6 +147,7 @@ const MODE_LABEL = {
   annotated: "Apply annotations",
   cross: "Cross-dataset discovery",
   repromote: "Version repromote",
+  import: "Bundle import",
 }
 
 // Map harvest status -> Badge variant. queued/running are in-flight, complete

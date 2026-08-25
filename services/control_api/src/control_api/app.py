@@ -1189,6 +1189,51 @@ def _r_export_bundle(cfg, params, body, query, caller):
     )
 
 
+def _r_import_presign(cfg, params, body, query, caller):
+    return 200, handlers.presign_import_upload(
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+    )
+
+
+def _r_import_validate(cfg, params, body, query, caller):
+    return 200, handlers.validate_bundle_import(
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        athena=cfg.athena,
+        athena_workgroup=cfg.athena_workgroup,
+        athena_output=cfg.athena_output,
+        athena_catalog=cfg.athena_catalog,
+    )
+
+
+def _r_import_apply(cfg, params, body, query, caller):
+    # Identity from the validated JWT ONLY (the marker's imported_by), same
+    # posture as repromote/verify.
+    return 200, handlers.apply_bundle_import(
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        requested_by=caller.ident,
+        acknowledged=bool((body or {}).get("acknowledged")),
+        archive_sha256=str((body or {}).get("archive_sha256") or ""),
+        glue=cfg.glue,
+        freshness_table=cfg.freshness_table,
+        events=cfg.events,
+    )
+
+
 def _r_bundle_versions(cfg, params, body, query, caller):
     return 200, handlers.list_bundle_versions(
         cfg.s3,
@@ -1432,6 +1477,11 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     # Bundle version history (reconstructed from S3 object versions), diff, and
     # repromote; POST repromotes, GET polls its vector-index convergence.
     ("POST", "/bundle/{domain}/{dataset}/export", _r_export_bundle),
+    # Import (export's inverse): presign the zip upload, dry-run validate the
+    # staged archive, then apply it as the live bundle under the harvest lease.
+    ("POST", "/bundle/{domain}/{dataset}/import", _r_import_presign),
+    ("POST", "/bundle/{domain}/{dataset}/import/validate", _r_import_validate),
+    ("POST", "/bundle/{domain}/{dataset}/import/apply", _r_import_apply),
     ("GET", "/bundle/{domain}/{dataset}/versions", _r_bundle_versions),
     ("GET", "/bundle/{domain}/{dataset}/diff", _r_bundle_diff),
     ("POST", "/bundle/{domain}/{dataset}/repromote", _r_repromote_bundle),

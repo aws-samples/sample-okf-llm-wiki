@@ -195,6 +195,24 @@ export function makeApi(token) {
     // archive.
     exportBundle: (domain, dataset) =>
       request(token, "POST", `/bundle/${domain}/${dataset}/export`),
+    // Import (export's inverse), three steps: presign the zip upload (POST the
+    // file to S3 via uploadToPresigned), dry-run validate the staged archive
+    // ({blockers, findings, sql, archive_sha256, ...} — blockers refuse,
+    // findings are the user's call), then apply. acknowledged=true accepts the
+    // findings; archiveSha256 pins the exact bytes the report described.
+    importBundlePresign: (domain, dataset) =>
+      request(token, "POST", `/bundle/${domain}/${dataset}/import`),
+    importBundleValidate: (domain, dataset) =>
+      request(token, "POST", `/bundle/${domain}/${dataset}/import/validate`),
+    importBundleApply: (
+      domain,
+      dataset,
+      { acknowledged, archiveSha256 } = {}
+    ) =>
+      request(token, "POST", `/bundle/${domain}/${dataset}/import/apply`, {
+        acknowledged: Boolean(acknowledged),
+        archive_sha256: archiveSha256 || "",
+      }),
 
     // Attested Computations: list with merged verification badges, one doc's
     // contract (the Run modal's form data), execute with typed parameter
@@ -565,7 +583,12 @@ export async function uploadToPresigned({ url, fields }, file) {
   const res = await fetch(url, { method: "POST", body: form })
   if (!res.ok) {
     const body = await res.text().catch(() => "")
-    if (res.status === 403 && /EntityTooLarge/i.test(body)) {
+    // S3 rejects a content-length-range violation with 400 (EntityTooLarge);
+    // 403 kept for signature/policy variants that carry the same code.
+    if (
+      (res.status === 400 || res.status === 403) &&
+      /EntityTooLarge/i.test(body)
+    ) {
       throw new Error("file exceeds the upload size limit")
     }
     throw new Error(`upload failed: ${res.status}`)

@@ -17,7 +17,11 @@ from typing import Any, Iterator
 from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 
-from okf_core.session import HARVEST_LEASE_STALE_SECONDS
+from okf_core.session import (
+    HARVEST_LEASE_STALE_SECONDS,
+    SYNC_LEASE_MODES,
+    SYNC_LEASE_STALE_SECONDS,
+)
 from okf_core.sources import normalize_source
 
 
@@ -238,16 +242,23 @@ def acquire_harvest_lease(
 
     The resource-API twin of the Control API's ``acquire_harvest_lease`` (same
     HARVEST#.../STATUS row, same conditional). The lease lands only if there is
-    no row, the last harvest is terminal (not queued/running), or the in-flight
+    no row, the last harvest is terminal (not queued/running), the in-flight
     lease is STALE (``started_at`` older than ``HARVEST_LEASE_STALE_SECONDS`` — a
-    dead job past AgentCore's 8h session cap). Returning False means a harvest is
-    already in flight for this dataset, so the incremental orchestrator must NOT
-    invoke a colliding second run on the shared bundle directory.
+    dead job past AgentCore's 8h session cap), or the row belongs to a DEAD
+    repromote/import (``SYNC_LEASE_MODES``: 30s-capped Lambda writers, so
+    ``queued`` past ``SYNC_LEASE_STALE_SECONDS`` is provably dead — without
+    this escape a crashed import wedged the incremental path for 8h).
+    Returning False means a harvest is already in flight for this dataset, so
+    the incremental orchestrator must NOT invoke a colliding second run on the
+    shared bundle directory.
     """
     tbl = ddb.Table(registry_table_name)
     now = _now_iso()
     stale_cutoff = (
         datetime.now(timezone.utc) - timedelta(seconds=HARVEST_LEASE_STALE_SECONDS)
+    ).isoformat()
+    sync_cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=SYNC_LEASE_STALE_SECONDS)
     ).isoformat()
     item: dict[str, Any] = {
         "pk": harvest_status_pk(data_domain, dataset),
@@ -266,13 +277,18 @@ def acquire_harvest_lease(
             ConditionExpression=(
                 "attribute_not_exists(pk) "
                 "OR NOT (#s = :queued OR #s = :running) "
-                "OR started_at < :stale"
+                "OR started_at < :stale "
+                "OR ((#m = :rmode OR #m = :imode) AND #s = :queued "
+                "AND started_at < :sstale)"
             ),
-            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeNames={"#s": "status", "#m": "mode"},
             ExpressionAttributeValues={
                 ":queued": "queued",
                 ":running": "running",
                 ":stale": stale_cutoff,
+                ":rmode": SYNC_LEASE_MODES[0],
+                ":imode": SYNC_LEASE_MODES[1],
+                ":sstale": sync_cutoff,
             },
         )
         return True

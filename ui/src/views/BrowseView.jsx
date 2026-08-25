@@ -1,4 +1,11 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import {
@@ -14,11 +21,13 @@ import {
   HistoryIcon,
   Loader2Icon,
   MessageSquareTextIcon,
+  UploadIcon,
   XIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 
 import { CodeView } from "@/components/chat/CodeView"
+import { ImportBundleDialog } from "@/components/ImportBundleDialog"
 import {
   ComputationBanner,
   RunComputationDialog,
@@ -30,6 +39,7 @@ import {
   VersionDiffPane,
   VersionFilePane,
 } from "@/components/VersionHistory"
+import { uploadToPresigned } from "@/lib/api"
 import {
   buildTree,
   parseDocument,
@@ -54,10 +64,7 @@ import {
   BreadcrumbPage,
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb"
-import {
-  Card,
-  CardTitle,
-} from "@/components/ui/card"
+import { Card, CardTitle } from "@/components/ui/card"
 import {
   Collapsible,
   CollapsibleContent,
@@ -163,6 +170,7 @@ function FilesPane({
       setExporting(false)
     }
   }
+
   const [docError, setDocError] = useState(null)
 
   // Selected concept: local state so a click updates the tree/viewer instantly,
@@ -251,6 +259,47 @@ function FilesPane({
     load()
   }, [load])
 
+  // Import (export's inverse): pick a zip -> presigned POST to the staging
+  // key -> dry-run validate -> the report dialog carries the human decision
+  // (blockers refuse; lint findings are acknowledged by clicking Import).
+  // archive_sha256 pins the exact bytes the report described, so a re-upload
+  // racing the confirm gets a clean 409 instead of importing unreviewed.
+  const importInputRef = useRef(null)
+  const [importPhase, setImportPhase] = useState(null) // uploading|validating|applying
+  const [importReport, setImportReport] = useState(null) // {report, fileName}
+  const startImport = async (file) => {
+    try {
+      setImportPhase("uploading")
+      const presigned = await api.importBundlePresign(domain, dataset)
+      await uploadToPresigned(presigned, file)
+      setImportPhase("validating")
+      const report = await api.importBundleValidate(domain, dataset)
+      setImportReport({ report, fileName: file.name })
+    } catch (e) {
+      toast.error(e?.message || "Could not validate the bundle")
+    } finally {
+      setImportPhase(null)
+    }
+  }
+  const confirmImport = async () => {
+    setImportPhase("applying")
+    try {
+      const res = await api.importBundleApply(domain, dataset, {
+        acknowledged: true,
+        archiveSha256: importReport?.report?.archive_sha256,
+      })
+      setImportReport(null)
+      toast.success(
+        `Imported ${res.files} files — search indexing continues in the background`
+      )
+      load()
+    } catch (e) {
+      toast.error(e?.message || "Import failed")
+    } finally {
+      setImportPhase(null)
+    }
+  }
+
   // Concept id -> S3 key, so an in-doc link (which resolves to a concept id)
   // can be opened without re-listing.
   const keyByConcept = useMemo(() => {
@@ -308,8 +357,8 @@ function FilesPane({
 
   const interrupted = Boolean(
     bundleState &&
-      bundleState.ready === false &&
-      ["cancelled", "failed"].includes(bundleState.status?.status)
+    bundleState.ready === false &&
+    ["cancelled", "failed"].includes(bundleState.status?.status)
   )
 
   // Version-history state, shared by BOTH panes while versionMode is open:
@@ -395,7 +444,7 @@ function FilesPane({
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button variant="ghost" size="icon" aria-label="More actions">
-                    {exporting ? (
+                    {exporting || importPhase ? (
                       <Loader2Icon className="animate-spin" />
                     ) : (
                       <EllipsisVerticalIcon />
@@ -411,9 +460,21 @@ function FilesPane({
                 >
                   {/* Download the published bundle as a zip (authored docs
                       only — no .metadata/.harvest/.context). */}
-                  <DropdownMenuItem onSelect={exportBundle} disabled={exporting}>
+                  <DropdownMenuItem
+                    onSelect={exportBundle}
+                    disabled={exporting}
+                  >
                     <DownloadIcon />
                     Export bundle
+                  </DropdownMenuItem>
+                  {/* Upload an exported zip as this dataset's live bundle
+                      (validated first; the report dialog confirms). */}
+                  <DropdownMenuItem
+                    onSelect={() => importInputRef.current?.click()}
+                    disabled={Boolean(importPhase)}
+                  >
+                    <UploadIcon />
+                    Import bundle
                   </DropdownMenuItem>
                   {/* Compare/restore published bundle versions. */}
                   <DropdownMenuItem onSelect={() => setVersionMode({})}>
@@ -422,6 +483,17 @@ function FilesPane({
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept=".zip,application/zip,application/x-zip-compressed"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0]
+                  e.target.value = "" // let the same file be picked again
+                  if (f) startImport(f)
+                }}
+              />
               {/* Open the annotations panel. The badge shows how many of the
                   caller's notes are still open (unresolved) for this dataset.
                   Frosted primary-foreground tint, NOT variant="secondary":
@@ -443,7 +515,7 @@ function FilesPane({
           )}
         </div>
       </div>
-      <Card className="grid min-h-0 flex-1 grid-cols-1 gap-0 overflow-hidden py-0 md:grid-rows-1 md:grid-cols-[minmax(240px,320px)_1fr]">
+      <Card className="grid min-h-0 flex-1 grid-cols-1 gap-0 overflow-hidden py-0 md:grid-cols-[minmax(240px,320px)_1fr] md:grid-rows-1">
         <div className="flex min-h-0 flex-col border-b bg-muted/40 max-md:h-[40vh] md:border-r md:border-b-0">
           {/* Equal-height header rows (h-12) in BOTH panes + the same fade
               hairline below, so the two separators sit on one level. */}
@@ -457,46 +529,46 @@ function FilesPane({
           </div>
           <div className="h-px shrink-0 bg-gradient-to-r from-transparent via-border/60 to-transparent" />
           <div className="flex min-h-0 flex-1 flex-col">
-          {versionMode ? (
-            <VersionFilePane vh={vh} />
-          ) : error ? (
-            <div className="p-4">
-              <Alert variant="destructive">
-                <AlertTitle>Failed to list bundle</AlertTitle>
-                <AlertDescription>{error}</AlertDescription>
-              </Alert>
-            </div>
-          ) : loading ? (
-            <div className="flex flex-col gap-2 p-4">
-              <Skeleton className="h-7 w-full" />
-              <Skeleton className="h-7 w-3/4" />
-              <Skeleton className="h-7 w-5/6" />
-            </div>
-          ) : files.length === 0 ? (
-            <div className="p-4">
-              <Alert>
-                <FileTextIcon />
-                <AlertTitle>No bundle files</AlertTitle>
-                <AlertDescription>
-                  Run a harvest for this dataset to generate concept docs.
-                </AlertDescription>
-              </Alert>
-            </div>
-          ) : (
-            // okf-tree-scroll forces Radix's viewport wrapper (display:table,
-            // which shrink-wraps to content width and lets long names grow the
-            // pane) to block, so the tree fills the card width and long file
-            // names truncate instead of overflowing. See index.css.
-            <ScrollArea className="okf-tree-scroll h-full">
-              <div className="p-2">
-                <FileTree
-                  nodes={tree}
-                  selectedId={selectedId}
-                  onSelect={openConcept}
-                />
+            {versionMode ? (
+              <VersionFilePane vh={vh} />
+            ) : error ? (
+              <div className="p-4">
+                <Alert variant="destructive">
+                  <AlertTitle>Failed to list bundle</AlertTitle>
+                  <AlertDescription>{error}</AlertDescription>
+                </Alert>
               </div>
-            </ScrollArea>
-          )}
+            ) : loading ? (
+              <div className="flex flex-col gap-2 p-4">
+                <Skeleton className="h-7 w-full" />
+                <Skeleton className="h-7 w-3/4" />
+                <Skeleton className="h-7 w-5/6" />
+              </div>
+            ) : files.length === 0 ? (
+              <div className="p-4">
+                <Alert>
+                  <FileTextIcon />
+                  <AlertTitle>No bundle files</AlertTitle>
+                  <AlertDescription>
+                    Run a harvest for this dataset to generate concept docs.
+                  </AlertDescription>
+                </Alert>
+              </div>
+            ) : (
+              // okf-tree-scroll forces Radix's viewport wrapper (display:table,
+              // which shrink-wraps to content width and lets long names grow the
+              // pane) to block, so the tree fills the card width and long file
+              // names truncate instead of overflowing. See index.css.
+              <ScrollArea className="okf-tree-scroll h-full">
+                <div className="p-2">
+                  <FileTree
+                    nodes={tree}
+                    selectedId={selectedId}
+                    onSelect={openConcept}
+                  />
+                </div>
+              </ScrollArea>
+            )}
           </div>
         </div>
 
@@ -506,60 +578,61 @@ function FilesPane({
             the track shrink so the inner ScrollArea + label-grid/CodeView scroll. */}
         <div className="flex min-h-0 min-w-0 flex-col max-md:h-[60vh]">
           <div className="flex h-12 shrink-0 flex-row items-center justify-between gap-2 px-4">
-          {versionMode ? (
-            <CardTitle className="flex items-center gap-2 text-sm">
-              <HistoryIcon className="size-4 text-muted-foreground" />
-              Version history
-            </CardTitle>
-          ) : selectedId ? (
-            <ConceptBreadcrumb conceptId={selectedId} />
-          ) : (
-            <CardTitle className="text-sm text-muted-foreground">
-              No file selected
-            </CardTitle>
-          )}
-          {/* Per-doc actions, pinned right of the breadcrumb. Raw toggles the
+            {versionMode ? (
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <HistoryIcon className="size-4 text-muted-foreground" />
+                Version history
+              </CardTitle>
+            ) : selectedId ? (
+              <ConceptBreadcrumb conceptId={selectedId} />
+            ) : (
+              <CardTitle className="text-sm text-muted-foreground">
+                No file selected
+              </CardTitle>
+            )}
+            {/* Per-doc actions, pinned right of the breadcrumb. Raw toggles the
               rendered doc for its source markdown (frontmatter + body); the
               PageAnnotator files feedback about THIS page (concept), distinct
               from a text selection or the whole dataset. */}
-          {!versionMode && selectedId && (
-            <div className="flex shrink-0 items-center gap-2">
-              {/* The human attestation entry point for an Attested
+            {!versionMode && selectedId && (
+              <div className="flex shrink-0 items-center gap-2">
+                {/* The human attestation entry point for an Attested
                   Computation doc (Run lives in the doc's inline banner —
                   running is a reader action, verifying is a curator action,
                   so they get different surfaces). */}
-              {isComputationDoc && computation?.computation === computationSlug && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 gap-1.5 text-xs"
-                  onClick={() => setVerifyOpen(true)}
-                >
-                  <BadgeCheckIcon className="size-3.5" />
-                  Verify
-                </Button>
-              )}
-              {/* Radix's Switch renders a real <button>, which is labelable —
+                {isComputationDoc &&
+                  computation?.computation === computationSlug && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 gap-1.5 text-xs"
+                      onClick={() => setVerifyOpen(true)}
+                    >
+                      <BadgeCheckIcon className="size-3.5" />
+                      Verify
+                    </Button>
+                  )}
+                {/* Radix's Switch renders a real <button>, which is labelable —
                   so wrapping it in a <label> makes the icon + text clickable. */}
-              <label className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-muted-foreground">
-                <CodeIcon className="size-3.5" />
-                Raw
-                <Switch
-                  size="sm"
-                  checked={rawView}
-                  onCheckedChange={setRawView}
-                  aria-label="Show raw markdown"
+                <label className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                  <CodeIcon className="size-3.5" />
+                  Raw
+                  <Switch
+                    size="sm"
+                    checked={rawView}
+                    onCheckedChange={setRawView}
+                    aria-label="Show raw markdown"
+                  />
+                </label>
+                <PageAnnotator
+                  api={api}
+                  domain={domain}
+                  dataset={dataset}
+                  conceptId={selectedId}
+                  onCreated={annotations.reload}
                 />
-              </label>
-              <PageAnnotator
-                api={api}
-                domain={domain}
-                dataset={dataset}
-                conceptId={selectedId}
-                onCreated={annotations.reload}
-              />
-            </div>
-          )}
+              </div>
+            )}
           </div>
           <div className="h-px shrink-0 bg-gradient-to-r from-transparent via-border/60 to-transparent" />
           <div className="min-h-0 flex-1">
@@ -669,6 +742,16 @@ function FilesPane({
           </div>
         </SheetContent>
       </Sheet>
+      <ImportBundleDialog
+        open={Boolean(importReport)}
+        onOpenChange={(o) => {
+          if (!o && importPhase !== "applying") setImportReport(null)
+        }}
+        report={importReport?.report}
+        fileName={importReport?.fileName}
+        applying={importPhase === "applying"}
+        onConfirm={confirmImport}
+      />
     </div>
   )
 }
@@ -931,7 +1014,11 @@ export function ConceptDoc({
               title={`${cross.dataDomain}/${cross.dataset} · ${cross.conceptId}`}
               onClick={(e) => {
                 e.preventDefault()
-                onNavigateCross(cross.dataDomain, cross.dataset, cross.conceptId)
+                onNavigateCross(
+                  cross.dataDomain,
+                  cross.dataset,
+                  cross.conceptId
+                )
               }}
               {...props}
             >

@@ -100,14 +100,18 @@ the dataset listing by `is_domain_dataset()`. Vector key:
   at start anyway — the guard for a predecessor that crashed before its own
   cleanup.
 
-**Derived artifacts live OFF the mount prefix.** Two sibling top-level prefixes
+**Derived artifacts live OFF the mount prefix.** Sibling top-level prefixes
 sit next to `okf/` in the same bucket and are deliberately NOT under it, so
 nothing an LLM role's file tools can reach ever sees them:
 `benchmark/<domain>/<dataset>/` (the gold-carrying questions CSV + report
-artifacts — see "Benchmark Studio invocation" below) and
+artifacts — see "Benchmark Studio invocation" below),
 `policy/<domain>/<dataset>/` (the policy-check artifacts — see "Policy
-checks (LLM-judge engine)"). Both are derived: the bundle stays the source of
-truth, and deleting a dataset purges both prefixes along with it.
+checks (LLM-judge engine)"), and the export/import staging
+`exports/<domain>/<dataset>/` + `imports/<domain>/<dataset>/` (fixed-key zip
++ validation record — see "Bundle export & import"). All are derived or
+transient: the bundle stays the source of truth, and deleting a dataset
+purges every one of these prefixes along with it (versions included; a
+lifecycle rule also ages out the staging prefixes' noncurrent versions).
 
 ### Cross-dataset references (`external/`)
 
@@ -262,6 +266,83 @@ lifecycle expiry emits `Object Deleted` events with deletion-type
 `"Permanently Deleted"` for keys whose live doc is untouched; the reindex
 worker MUST keep filtering those (only `"Delete Marker Created"` reaches
 `DeleteVectors`) or daily expiry would delete live docs' vectors.
+
+## Bundle export & import
+
+A bundle is a portable artifact: **export** zips the PUBLISHED tree (the same
+rule the file endpoints serve — non-dot `.md` only, so `.context`/`.metadata`/
+`.harvest` and the zero-byte dir markers stay out, and computation
+VERIFICATION — off-mount by design — cannot travel), rooted at `<dataset>/`
+with a top-level `manifest.json` sibling (`{format, data_domain, dataset,
+exported_at, files}` — the only machine-checkable provenance: docs carry no
+dataset identity, which is exactly what makes them portable). `POST
+/bundle/{d}/{ds}/export` stages the archive at the FIXED off-mount key
+`exports/<d>/<ds>/okf-bundle.zip` (overwritten per export; the versioned
+bucket keeps history) and returns a presigned GET with an attachment
+disposition.
+
+**Import** is repromote with the snapshot swapped for an uploaded zip, three
+endpoints under `POST /bundle/{d}/{ds}/import[...]`:
+
+1. **presign** (`/import`) — a presigned POST pinned to the off-mount staging
+   key `imports/<d>/<ds>/upload.zip`, size-capped by the POST policy itself.
+   404 unless the dataset is REGISTERED (the registry row is the lease
+   anchor); a never-harvested registered dataset is a fine target — that is
+   the point (move a bundle between deployments without re-running the
+   authoring).
+2. **validate** (`/import/validate`) — dry-runs the staged archive and names
+   every problem at once (the content checks run even when structural
+   blockers already exist — no second refusal round), in two deliberate
+   tiers: **blockers** (zip traversal/absolute paths, dot-prefixed and
+   agent-scratch segments per `is_reserved_rel_segments`, non-markdown,
+   non-UTF-8, unreadable/corrupt/encrypted members, duplicate entry names,
+   file-vs-directory path collisions, wrong root folder or manifest
+   `dataset`, size/count caps) which apply refuses outright, and
+   **findings** — the SAME offline `okf_core.lint` steps a harvest gate runs
+   (coverage self-skips: no `.metadata` travels) plus live `EXPLAIN` of the
+   archive's runnable ```sql against THIS deployment's catalog (budget-
+   capped, skips and engine TIMEOUTS counted honestly as unchecked — a slow
+   engine is never reported as a defect in the doc's SQL; `external/`
+   fences are skipped like the harvest gate skips them — a counterpart's
+   tables are outside this dataset's database) — which are the human's
+   call. Caps bind on ACTUAL decompressed bytes via bounded streaming reads
+   (64MB archive / 4MB per doc / 128MB total / `MAX_RESTORE_FILES` docs) —
+   the zip's declared sizes are never trusted. The report carries
+   `archive_sha256`, and validate persists a small record
+   (`imports/<d>/<ds>/validate.json`: digest + finding counts) that apply
+   requires.
+3. **apply** (`/import/apply {acknowledged, archive_sha256}`) — refuses
+   blockers (400), refuses an archive with NO validation record matching the
+   staged digest (409 — validate first; the record is what lets the
+   acknowledged gate cover the live-EXPLAIN findings apply cannot re-derive,
+   and a client-supplied `archive_sha256` additionally pins what the human
+   reviewed), refuses unacknowledged findings (409), then: harvest lease
+   with `mode="import"` → `in_progress` marker → write docs + delete live
+   published `.md` the archive lacks (dot-dirs survive, and non-markdown
+   strays are LEFT ALONE — version snapshots are `.md`-only, so deleting one
+   would be irreversible) in parallel (serial writes × hundreds of docs
+   would blow the 30s Lambda) → fill MISSING `index.md` files
+   deterministically (authored indexes travel and are preserved — the index
+   regen never deletes) → `graph.json` → `ensure_dir_markers` over the
+   written keys + the marker key (a marker-less directory mounts READ-ONLY —
+   without this the next harvest dies EACCES) → freshness seeding → fresh
+   `complete` marker → `IMPORT` row → release → policy-rebuild signal →
+   staged zip + record deleted (consumed). Reindex needs nothing: the object
+   events re-converge the vector index.
+
+The synthesized marker carries `tables` (derived from the archive's top-level
+`tables/` docs) and `table_versions` seeded from the LIVE Glue catalog for
+exactly the tables the archive documents — apply also writes those tables'
+`TABLE#…/VERSION` freshness rows (the item shape
+`incremental.store.put_stored_version` owns), which is what stops the nightly
+reconcile from seeing every imported table as drifted and re-authoring the
+bundle the import just delivered. Catalog tables the archive does NOT
+document stay unseeded, so the reconcile authors them; seeding is
+best-effort (a Glue failure degrades to the re-author-everything behavior,
+never a failed import). Also on the marker: `imported_by` (JWT identity),
+`imported_files`, `imported_sha256`, and `imported_export` (the manifest's
+`exported_at`, only when present). Imported computation docs land UNVERIFIED
+until a human re-verifies.
 
 ## Policy checks (LLM-judge engine)
 
@@ -943,17 +1024,26 @@ dataset). The initiating bundle's fresh `complete` marker carries
 
 A **repromote** (bundle version restore, below) takes this SAME lease with
 `mode = "repromote"` and rides the existing `queued → complete | failed`
-lifecycle — no new status value. Its acquire adds one extra takeover clause:
+lifecycle — no new status value. A **bundle import** ("Bundle export & import"
+below) does the same with `mode = "import"`. EVERY acquirer — the Control
+API's harvest and repromote/import acquires AND the incremental
+orchestrator's twin — carries one extra takeover clause for these two modes:
 
 ```
-OR (mode = "repromote" AND status = queued AND started_at < <now − 120s>)
+OR (mode IN ("repromote", "import") AND status = queued AND started_at < <now − 120s>)
 ```
 
-A repromote runs synchronously inside the 30s-capped Control API Lambda, so a
-repromote row still `queued` after 120s (`REPROMOTE_LEASE_STALE_SECONDS`) is
-provably dead and a retry may take it over immediately — harvest rows are
-unaffected. The row also carries `repromote_target` (the marker VersionId being
-restored) so the status GET's `stalled_lease` answer can offer one-click retry.
+Both run synchronously inside the 30s-capped Control API Lambda, so such a row
+still `queued` after 120s is provably dead, and anything (a retry, a harvest
+start, an incremental event) may take it over immediately instead of waiting
+out the 8h harvest staleness — harvest rows are unaffected. The mode list and
+threshold have ONE owner, `okf_core.session.SYNC_LEASE_MODES` /
+`SYNC_LEASE_STALE_SECONDS`, shared by all acquirers and the read-side
+`harvest_lease_held` mirror. The repromote row also carries
+`repromote_target` (the marker VersionId being restored) so the status GET's
+`stalled_lease` answer can offer one-click retry; a stalled IMPORT row is
+reported on the same GET with `can_retry: false` (its retry is re-applying
+the import, not re-POSTing a repromote).
 
 **Repromote convergence manifest.** `pk = "HARVEST#<data_domain>#<dataset>"`,
 `sk = "REPROMOTE"`, attrs `{started_at, completed_at, target_version_id,
@@ -966,6 +1056,15 @@ freshness row's `updated_at` (which reindex advances only AFTER the vector work
 succeeds) is `>= started_at − 2s`; the UI declares a repromote done only when
 every key converged — matching the definition that *current is what the vector
 index serves*.
+
+**Import provenance row.** Same shape on `sk = "IMPORT"` for a bundle import
+(`{started_at, completed_at, archive_sha256, new_version_id, requested_by,
+copied, deleted, total}`), written once per apply. No convergence poll reads
+it yet — it captures the touched-key set at write time (the same
+deleted-keys-are-unlistable reason) so one can. Dataset deletion removes the
+`REPROMOTE` and `IMPORT` rows along with `STATUS` (the ghost-row rule: a
+re-registered same-named dataset must not inherit a previous owner's
+convergence manifests).
 
 **Harvest live step feed.** Separate from the coarse status row, the harvest
 runtime narrates its progress at message granularity. As the agent runs, a

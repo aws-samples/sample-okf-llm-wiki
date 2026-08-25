@@ -54,3 +54,13 @@ def runtime_session_id(
     session_id = f"{prefix}-{digest}"
     # Prefix + '-' + 32 hex is always >= 33; only guard the max.
     return session_id[:_MAX_LEN]
+
+# Bundle-rewriting modes that run synchronously inside the 30s-capped Control
+# API Lambda (repromote, import) — never an 8h AgentCore session. A STATUS row
+# in one of these modes still ``queued`` after this window is provably dead and
+# every lease acquirer (Control API harvest/repromote/import AND the
+# incremental orchestrator's twin) may take it over immediately instead of
+# waiting out the 8h harvest staleness. ONE owner for the mode list and the
+# threshold so the acquirers and the read-side mirror can't drift.
+SYNC_LEASE_MODES = ("repromote", "import")
+SYNC_LEASE_STALE_SECONDS = 120
