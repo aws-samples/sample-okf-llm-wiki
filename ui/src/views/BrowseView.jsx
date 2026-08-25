@@ -7,6 +7,7 @@ import {
   ChevronRightIcon,
   CodeIcon,
   DownloadIcon,
+  EllipsisVerticalIcon,
   FileTextIcon,
   FolderIcon,
   FolderOpenIcon,
@@ -40,6 +41,12 @@ import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -380,24 +387,35 @@ function FilesPane({
             </Button>
           ) : (
             <>
-              {/* Download the published bundle as a zip (authored docs only —
-                  no .metadata/.harvest/.context). Ghost like History: one
-                  primary action per row (Annotations). */}
-              <Button variant="ghost" onClick={exportBundle} disabled={exporting}>
-                {exporting ? (
-                  <Loader2Icon className="animate-spin" />
-                ) : (
-                  <DownloadIcon />
-                )}
-                Export
-              </Button>
-              {/* Compare/restore published bundle versions. Ghost, not
-                  filled: Annotations is the row's one primary action — two
-                  filled buttons side by side compete for attention. */}
-              <Button variant="ghost" onClick={() => setVersionMode({})}>
-                <HistoryIcon />
-                History
-              </Button>
+              {/* The secondary actions fold into ONE overflow menu:
+                  Annotations is the row's single primary action, and a row of
+                  buttons reads as clutter. Export feedback lives on the
+                  TRIGGER (spinner) — the menu closes on select, so the item
+                  itself can't show progress. */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" size="icon" aria-label="More actions">
+                    {exporting ? (
+                      <Loader2Icon className="animate-spin" />
+                    ) : (
+                      <EllipsisVerticalIcon />
+                    )}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {/* Download the published bundle as a zip (authored docs
+                      only — no .metadata/.harvest/.context). */}
+                  <DropdownMenuItem onSelect={exportBundle} disabled={exporting}>
+                    <DownloadIcon />
+                    Export bundle
+                  </DropdownMenuItem>
+                  {/* Compare/restore published bundle versions. */}
+                  <DropdownMenuItem onSelect={() => setVersionMode({})}>
+                    <HistoryIcon />
+                    History
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
               {/* Open the annotations panel. The badge shows how many of the
                   caller's notes are still open (unresolved) for this dataset.
                   Frosted primary-foreground tint, NOT variant="secondary":
