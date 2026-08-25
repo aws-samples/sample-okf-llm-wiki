@@ -12,9 +12,12 @@ rather than re-encoded here.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
+import tempfile
+import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -44,8 +47,17 @@ from okf_core import memory_records as mem
 from okf_core import policy_rebuild
 from okf_core.domain import DOMAIN_DATASET
 from okf_core.graph_json import build_graph_json
-from okf_core.paths import is_external_concept_id, parse_concept_id
-from okf_core.session import HARVEST_LEASE_STALE_SECONDS, runtime_session_id
+from okf_core.paths import (
+    is_external_concept_id,
+    is_reserved_rel_segments,
+    parse_concept_id,
+)
+from okf_core.session import (
+    HARVEST_LEASE_STALE_SECONDS,
+    SYNC_LEASE_MODES,
+    SYNC_LEASE_STALE_SECONDS,
+    runtime_session_id,
+)
 from okf_core.sources import (
     REDSHIFT_CLUSTER_KEY,
     REDSHIFT_DATABASE_KEY,
@@ -953,9 +965,18 @@ def delete_domain_mapping(
             ar_policy.policy_prefix(data_domain, dataset),
         ):
             purged_objects += _purge_s3_prefix(s3, bucket=bundle_bucket, prefix=prefix)
-        purged_objects += _purge_s3_prefix_versions(
-            s3, bucket=bundle_bucket, prefix=_benchmark_prefix(data_domain, dataset)
-        )
+        # benchmark/ carries GOLD; imports/ carries a whole uploaded bundle
+        # and exports/ a whole published one — all three purge EVERY version
+        # (plain deletes on the versioned bucket would leave the content
+        # readable as noncurrent versions for a re-registered same name).
+        for prefix in (
+            _benchmark_prefix(data_domain, dataset),
+            f"imports/{data_domain}/{dataset}/",
+            f"exports/{data_domain}/{dataset}/",
+        ):
+            purged_objects += _purge_s3_prefix_versions(
+                s3, bucket=bundle_bucket, prefix=prefix
+            )
 
     # 2. Freshness rows: TABLE#<d>#<ds>#* / VERSION and VEC#<d>/<ds>/* / SEQ.
     if freshness_table:
@@ -963,13 +984,16 @@ def delete_domain_mapping(
             ddb, freshness_table, data_domain, dataset
         )
 
-    # 3. Benchmark REPORT# rows, the harvest status row, then the mapping
-    #    (mapping last).
+    # 3. Benchmark REPORT#/QBANK# rows, the harvest status row plus the
+    #    repromote/import provenance rows (same ghost-row hazard as reports:
+    #    a re-registered same-named dataset must not inherit the previous
+    #    owner's convergence manifests), then the mapping (mapping last).
     purged_reports = _delete_report_rows(ddb, registry_table, data_domain, dataset)
-    ddb.delete_item(
-        TableName=registry_table,
-        Key={"pk": {"S": f"HARVEST#{data_domain}#{dataset}"}, "sk": {"S": "STATUS"}},
-    )
+    for sk in ("STATUS", "REPROMOTE", "IMPORT"):
+        ddb.delete_item(
+            TableName=registry_table,
+            Key={"pk": {"S": f"HARVEST#{data_domain}#{dataset}"}, "sk": {"S": sk}},
+        )
     ddb.delete_item(
         TableName=registry_table,
         Key={"pk": {"S": f"DOMAIN#{data_domain}"}, "sk": {"S": f"DATASET#{dataset}"}},
@@ -2866,11 +2890,11 @@ def harvest_lease_held(
         started = _s(item.get("started_at"))
         if not started or started < stale_cutoff:
             return False
-        # The repromote twin (constants defined near acquire_repromote_lease).
-        if _s(item.get("mode")) == REPROMOTE_MODE and status == "queued":
+        # The repromote/import twin (okf_core.session.SYNC_LEASE_MODES).
+        if _s(item.get("mode")) in SYNC_LEASE_MODES and status == "queued":
             repromote_cutoff = (
                 datetime.now(timezone.utc)
-                - timedelta(seconds=REPROMOTE_LEASE_STALE_SECONDS)
+                - timedelta(seconds=SYNC_LEASE_STALE_SECONDS)
             ).isoformat()
             if started < repromote_cutoff:
                 return False
@@ -2960,20 +2984,34 @@ def acquire_harvest_lease(
         # A cross-dataset discovery run records its counterpart so the status
         # surface can show WHO the run is against (mirrors `repromote_target`).
         item["cross_target"] = {"S": cross_target}
+    sync_cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=SYNC_LEASE_STALE_SECONDS)
+    ).isoformat()
     try:
         ddb.put_item(
             TableName=registry_table,
             Item=item,
+            # The last clause mirrors acquire_repromote_lease's takeover: a
+            # repromote/import row (30s-capped Lambda writers) still queued
+            # after SYNC_LEASE_STALE_SECONDS is provably dead — without it a
+            # crashed import wedged harvest starts for the full 8h while
+            # harvest_lease_held (the read-side mirror) reported the lease
+            # free.
             ConditionExpression=(
                 "attribute_not_exists(pk) "
                 "OR NOT (#s = :queued OR #s = :running) "
-                "OR started_at < :stale"
+                "OR started_at < :stale "
+                "OR ((#m = :rmode OR #m = :imode) AND #s = :queued "
+                "AND started_at < :sstale)"
             ),
-            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeNames={"#s": "status", "#m": "mode"},
             ExpressionAttributeValues={
                 ":queued": {"S": "queued"},
                 ":running": {"S": "running"},
                 ":stale": {"S": stale_cutoff},
+                ":rmode": {"S": SYNC_LEASE_MODES[0]},
+                ":imode": {"S": SYNC_LEASE_MODES[1]},
+                ":sstale": {"S": sync_cutoff},
             },
         )
         return True
@@ -3748,6 +3786,10 @@ def list_bundle_files(
 
 _EXPORT_PRESIGN_EXPIRY_SECONDS = 300
 
+# Provenance file at the archive ROOT (a sibling of the ``<dataset>/`` folder,
+# never imported as content). Shared by export (writer) and import (checker).
+_IMPORT_MANIFEST_NAME = "manifest.json"
+
 
 def export_bundle(
     s3, *, bucket: str, data_domain: str, dataset: str
@@ -3779,9 +3821,37 @@ def export_bundle(
                 continue  # zero-byte dir markers
             if any(not p or p.startswith(".") for p in rel.split("/")):
                 continue  # dot-dirs/dot-files: authoring state
+            if not rel.endswith(".md"):
+                # Published content is markdown by contract; a stray non-md
+                # object (the write guard passes them through) must not ride
+                # into an archive its own import validator would then refuse.
+                continue
             body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             zf.writestr(f"{dataset}/{rel}", body)
             count += 1
+        if count:
+            # Provenance for the IMPORT side, a top-level sibling of the
+            # <dataset>/ folder (never imported as content): the docs
+            # themselves carry no dataset identity — frontmatter is
+            # type/title/description/timestamp and concept ids are
+            # bundle-relative, which is what makes a bundle portable — so
+            # this is the only machine-checkable "what was this exported
+            # from" the validator can match against its target.
+            zf.writestr(
+                _IMPORT_MANIFEST_NAME,
+                json.dumps(
+                    {
+                        "format": "okf-bundle-export",
+                        "data_domain": data_domain,
+                        "dataset": dataset,
+                        "exported_at": _now_iso(),
+                        "files": count,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+            )
     if not count:
         raise ApiError(404, f"no published bundle for {data_domain}/{dataset}")
     data = buf.getvalue()
@@ -3803,6 +3873,996 @@ def export_bundle(
     except Exception as e:  # noqa: BLE001
         raise ApiError(502, f"could not presign the export: {e}") from e
     return {"url": url, "filename": filename, "files": count, "bytes": len(data)}
+
+
+# --------------------------------------------------------------------------- #
+# Bundle import — the export's inverse. Import is "repromote where the
+# snapshot comes from an uploaded zip": it reuses the same lease, marker,
+# dir-marker, and vector-convergence machinery, so a registered dataset can
+# receive a bundle exported elsewhere without ever running a harvest.
+# --------------------------------------------------------------------------- #
+
+IMPORT_MODE = "import"
+
+# Zip-side caps, sized to the Lambda's memory (not just "generous"): the
+# loader holds the raw zip + the decoded files dict in RAM, and apply adds a
+# /tmp materialization on top, so caps × copies must fit the function. The
+# upload cap is enforced by S3 itself (presigned-POST content-length-range);
+# the uncompressed caps are enforced on ACTUAL decompressed bytes via bounded
+# streaming reads — the central directory's declared sizes are never trusted
+# (a lying header would otherwise both bypass the caps and allocate first).
+# The file-count cap reuses the repromote guard: both paths rewrite the live
+# prefix one object per file inside a 30s-capped Lambda.
+IMPORT_UPLOAD_MAX_BYTES = 64 * 1024 * 1024
+_IMPORT_MAX_FILE_BYTES = 4 * 1024 * 1024
+_IMPORT_MAX_TOTAL_BYTES = 128 * 1024 * 1024
+_IMPORT_MANIFEST_MAX_BYTES = 256 * 1024
+
+# The validate pass EXPLAINs the archive's runnable ```sql against THIS
+# deployment's catalog — the strongest "does this bundle fit here?" signal —
+# but it runs synchronously in the API Lambda, so the budget is a fraction of
+# the harvest gate's (250 stmts / 300s). Anything past the caps is counted
+# honestly in the report, never silently dropped; engine TIMEOUTS count as
+# skipped, never as findings — a slow engine is not a defect in the doc's SQL.
+_IMPORT_EXPLAIN_MAX_STATEMENTS = 40
+_IMPORT_EXPLAIN_TIME_BUDGET_S = 12.0
+_IMPORT_EXPLAIN_STMT_TIMEOUT_S = 8.0
+_IMPORT_EXPLAIN_MIN_REMAINING_S = 2.0
+
+# Concurrency for apply's S3 rewrite. Serial round-trips × hundreds of docs
+# blew the 30s window once already (see _GRAPH_FETCH_WORKERS' history) — the
+# import cap allows MAX_RESTORE_FILES docs, so the writes must be parallel.
+_IMPORT_WRITE_WORKERS = 16
+
+
+def _import_stage_key(data_domain: str, dataset: str) -> str:
+    """The staged upload's FIXED off-mount key (like ``exports/``: outside the
+    ``okf/`` mount prefix so the harvest agents never see it, overwritten per
+    upload — the versioned bucket keeps history, aged out by lifecycle)."""
+    return f"imports/{data_domain}/{dataset}/upload.zip"
+
+
+def _import_record_key(data_domain: str, dataset: str) -> str:
+    """The validation record staged next to the zip: ``{archive_sha256,
+    blockers, findings, validated_at}``. Apply requires a record matching the
+    staged archive's digest — that is what makes "acknowledged" meaningful
+    (the human acknowledged THIS archive's report, and validate actually ran,
+    EXPLAIN included; apply cannot re-derive the engine findings itself)."""
+    return f"imports/{data_domain}/{dataset}/validate.json"
+
+
+def _require_dataset_registered(
+    ddb, *, registry_table: str, data_domain: str, dataset: str
+) -> None:
+    """404 unless the dataset mapping exists — import needs the registry row
+    (lease anchor, MCP scoping, freshness) that registration creates."""
+    resp = ddb.get_item(
+        TableName=registry_table,
+        Key={"pk": {"S": f"DOMAIN#{data_domain}"}, "sk": {"S": f"DATASET#{dataset}"}},
+    )
+    if not resp.get("Item"):
+        raise ApiError(404, f"no such dataset: {data_domain}/{dataset}")
+
+
+def presign_import_upload(
+    s3, ddb, *, bucket: str, registry_table: str, data_domain: str, dataset: str
+) -> dict[str, Any]:
+    """Presigned POST for staging a bundle zip (mirror of the context-upload
+    presign: exact key pinned server-side, size cap enforced by S3 itself via
+    the POST policy's ``content-length-range``). No Content-Type condition —
+    browsers disagree on zip MIME types (``application/zip`` vs Windows'
+    ``x-zip-compressed``) and the validator inspects the bytes anyway."""
+    _require_dataset_registered(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
+    key = _import_stage_key(data_domain, dataset)
+    presigned = s3.generate_presigned_post(
+        Bucket=bucket,
+        Key=key,
+        Fields={},
+        Conditions=[["content-length-range", 0, IMPORT_UPLOAD_MAX_BYTES]],
+        ExpiresIn=PRESIGN_EXPIRY_SECONDS,
+    )
+    return {
+        "url": presigned["url"],
+        "fields": presigned["fields"],
+        "key": key,
+        "max_bytes": IMPORT_UPLOAD_MAX_BYTES,
+        "expires_in": PRESIGN_EXPIRY_SECONDS,
+    }
+
+
+def _load_import_archive(
+    s3, *, bucket: str, data_domain: str, dataset: str
+) -> tuple[dict[str, bytes], dict[str, Any] | None, list[dict[str, str]], str]:
+    """Download + structurally validate the staged zip.
+
+    Returns ``(files, manifest, blockers, sha256)`` — ``files`` maps
+    bundle-relative doc path -> bytes with the ``<dataset>/`` root stripped.
+    Content problems accumulate as blockers instead of raising, so ONE
+    validate names every problem (the guard's posture) — including per-entry
+    read failures (corrupt/encrypted/unsupported members) and the size/UTF-8
+    checks, which run even when other blockers already exist. Blockers are
+    the REFUSE tier: anything that could write outside the bundle tree
+    (traversal, absolute paths), smuggle authoring state (dot-prefixed or
+    agent-scratch segments), collide on materialization (duplicate names,
+    file-vs-directory overlaps), land non-content (non-``.md``), or came from
+    a different dataset (root folder / manifest mismatch — the docs
+    themselves carry no dataset identity, which is exactly what makes them
+    portable). Every member is read via a BOUNDED stream (``zf.open().read``
+    with a cap), so the central directory's declared sizes are never trusted:
+    a lying header can neither bypass the caps nor allocate past them (a bare
+    ``zf.read()`` would hand the decompressor a 1 GiB output budget).
+    """
+    key = _import_stage_key(data_domain, dataset)
+    try:
+        raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except Exception as e:  # noqa: BLE001 - only a clean 404 means "not uploaded"
+        code = str(
+            (getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+        )
+        if code in ("NoSuchKey", "404", "NotFound"):
+            raise ApiError(
+                404,
+                "no uploaded archive to import — request an upload URL and "
+                "POST the zip first",
+            ) from e
+        raise
+    digest = hashlib.sha256(raw).hexdigest()
+    blockers: list[dict[str, str]] = []
+    files: dict[str, bytes] = {}
+    manifest: dict[str, Any] | None = None
+
+    def _blocker(code_: str, path: str, message: str) -> None:
+        blockers.append({"code": code_, "path": path, "message": message})
+
+    def _bounded_read(info: zipfile.ZipInfo, cap: int) -> bytes:
+        # read(n) bounds the DECOMPRESSOR's output at n, unlike read() whose
+        # chunk budget is 1 GiB; cap+1 so an over-cap member is detectable.
+        with zf.open(info) as fh:
+            return fh.read(cap + 1)
+
+    buf = io.BytesIO(raw)
+    del raw  # BytesIO copied the bytes — don't hold the archive twice
+    try:
+        zf = zipfile.ZipFile(buf)
+    except zipfile.BadZipFile:
+        return (
+            {},
+            None,
+            [
+                {
+                    "code": "bad-zip",
+                    "path": "",
+                    "message": "the uploaded file is not a readable zip archive",
+                }
+            ],
+            digest,
+        )
+    with zf:
+        entries: list[tuple[zipfile.ZipInfo, list[str]]] = []
+        seen_names: set[str] = set()
+        for info in zf.infolist():
+            name = info.filename
+            if name.endswith("/"):
+                continue  # directory entries carry no content
+            if name in seen_names:
+                # Refuse rather than dedupe last-write-wins: which copy the
+                # human reviewed would be ambiguous, and silent drops don't
+                # surface anywhere.
+                _blocker(
+                    "duplicate-entry",
+                    name,
+                    "the archive contains this entry more than once",
+                )
+                continue
+            seen_names.add(name)
+            if name == _IMPORT_MANIFEST_NAME:
+                parsed = None
+                try:
+                    data = _bounded_read(info, _IMPORT_MANIFEST_MAX_BYTES)
+                    if len(data) <= _IMPORT_MANIFEST_MAX_BYTES:
+                        parsed = json.loads(data.decode("utf-8"))
+                except Exception:  # noqa: BLE001 - a broken manifest blocks
+                    parsed = None
+                manifest = parsed if isinstance(parsed, dict) else None
+                if manifest is None:
+                    _blocker(
+                        "bad-manifest",
+                        name,
+                        "manifest.json is not a readable JSON object within "
+                        f"its {_IMPORT_MANIFEST_MAX_BYTES}-byte cap",
+                    )
+                continue
+            parts = name.split("/")
+            if (
+                "\\" in name
+                or name.startswith("/")
+                or any((not p) or p in (".", "..") for p in parts)
+            ):
+                _blocker(
+                    "unsafe-path",
+                    name,
+                    "archive entry path is absolute, empty, or traverses "
+                    "directories — refusing the entry",
+                )
+                continue
+            # is_reserved_rel_segments is the ONE non-concept rule shared by
+            # index_gen/lint/the link graph: dot-dirs plus the deepagents
+            # scratch dirs — a leaked scratch doc must not be published to a
+            # tree every other surface refuses to see.
+            if is_reserved_rel_segments(parts):
+                _blocker(
+                    "reserved-path",
+                    name,
+                    "dot-prefixed and agent-scratch paths are authoring/"
+                    "deployment state (.metadata/.harvest/.context, internal "
+                    "scratch dirs) and are never imported — remove them from "
+                    "the archive",
+                )
+                continue
+            if len(parts) < 2:
+                _blocker(
+                    "stray-file",
+                    name,
+                    "top-level entries other than manifest.json are not "
+                    "bundle content — docs live under the <dataset>/ root "
+                    "folder",
+                )
+                continue
+            if not name.endswith(".md"):
+                _blocker(
+                    "not-markdown",
+                    name,
+                    "published bundle content is markdown only",
+                )
+                continue
+            entries.append((info, parts))
+
+        roots = {parts[0] for _, parts in entries}
+        if roots and roots != {dataset}:
+            others = ", ".join(sorted(r for r in roots if r != dataset))
+            _blocker(
+                "dataset-mismatch",
+                "",
+                f"the archive is rooted at {others!r} but the import target "
+                f"is {dataset!r} — a bundle imports into the dataset it was "
+                f"exported from",
+            )
+        if isinstance(manifest, dict):
+            m_ds = manifest.get("dataset")
+            if m_ds and m_ds != dataset:
+                _blocker(
+                    "dataset-mismatch",
+                    _IMPORT_MANIFEST_NAME,
+                    f"the manifest says this bundle was exported from dataset "
+                    f"{m_ds!r}, not {dataset!r}",
+                )
+        if len(entries) > s3_versions.MAX_RESTORE_FILES:
+            _blocker(
+                "too-many-files",
+                "",
+                f"the archive holds {len(entries)} documents; refusing to "
+                f"import more than {s3_versions.MAX_RESTORE_FILES}",
+            )
+        # A path that is both a file and a directory prefix passes every
+        # per-entry check but crashes materialization (FileExistsError /
+        # IsADirectoryError) — turn it into a blocker here.
+        file_paths = {"/".join(parts) for _, parts in entries}
+        dir_paths: set[str] = set()
+        for _, parts in entries:
+            for i in range(1, len(parts)):
+                dir_paths.add("/".join(parts[:i]))
+        for clash in sorted(file_paths & dir_paths):
+            _blocker(
+                "path-collision",
+                clash,
+                "this path is both a file and a directory in the archive",
+            )
+
+        # Content checks run for every structurally-sound entry EVEN when
+        # other blockers exist, so the user never faces a second refusal
+        # round after fixing the first; bounded reads keep the cost capped.
+        total = 0
+        for info, parts in entries:
+            try:
+                data = _bounded_read(info, _IMPORT_MAX_FILE_BYTES)
+            except Exception as e:  # noqa: BLE001 - corrupt/encrypted/unsupported
+                _blocker(
+                    "unreadable-entry",
+                    info.filename,
+                    f"the entry cannot be decompressed "
+                    f"({type(e).__name__}: {e})",
+                )
+                continue
+            if len(data) > _IMPORT_MAX_FILE_BYTES:
+                _blocker(
+                    "file-too-large",
+                    info.filename,
+                    f"decompresses past the {_IMPORT_MAX_FILE_BYTES}-byte "
+                    f"per-document cap",
+                )
+                continue
+            total += len(data)
+            if total > _IMPORT_MAX_TOTAL_BYTES:
+                _blocker(
+                    "archive-too-large",
+                    "",
+                    "the archive's decompressed size exceeds the "
+                    f"{_IMPORT_MAX_TOTAL_BYTES}-byte cap",
+                )
+                break
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError:
+                _blocker(
+                    "not-utf8",
+                    info.filename,
+                    "document is not valid UTF-8 text",
+                )
+                continue
+            files["/".join(parts[1:])] = data
+    if not files and not blockers:
+        _blocker("empty-archive", "", "the archive contains no bundle documents")
+    if blockers:
+        files = {}
+    return files, manifest, blockers, digest
+
+
+def _import_tables(files: dict[str, bytes]) -> list[str]:
+    """Table names implied by the archive's top-level ``tables/`` docs — what
+    the synthesized commit marker's ``tables`` claims (same convention as the
+    lint coverage step). Reserved basenames are generated/free-form files,
+    never table docs."""
+    return sorted(
+        rel[len("tables/") : -len(".md")]
+        for rel in files
+        if rel.startswith("tables/")
+        and rel.count("/") == 1
+        and rel.split("/")[1] not in ("index.md", "log.md")
+    )
+
+
+def _materialize_import(files: dict[str, bytes], tmpdir: str, dataset: str) -> Path:
+    """Write the validated archive files under ``<tmpdir>/<dataset>/`` so the
+    filesystem-shaped okf_core passes (lint, index_gen, graph) can run."""
+    root = Path(tmpdir) / dataset
+    for rel, data in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+    return root
+
+
+def _seed_import_freshness(
+    glue,
+    ddb,
+    *,
+    freshness_table: str,
+    database: str,
+    data_domain: str,
+    dataset: str,
+    documented_tables: set[str],
+) -> dict[str, str]:
+    """Stamp "these docs describe the catalog as it stands" for the reconcile.
+
+    Writes the ``TABLE#<d>#<ds>#<t>`` / ``VERSION`` freshness rows (the exact
+    item shape ``incremental.store.put_stored_version`` writes — that is what
+    the nightly reconcile compares against Glue) for every LIVE catalog table
+    the archive documents, and returns ``{table: version_id}`` for the
+    marker's ``table_versions``. Only doc-matched tables are seeded: a
+    catalog table the archive does NOT document stays unseeded so the
+    reconcile authors it, and a doc for a table the catalog lacks seeds
+    nothing (the next harvest's lint flags it) — convergence in both
+    directions instead of the everything-looks-drifted full re-author an
+    unseeded import used to trigger.
+    """
+    versions: dict[str, str] = {}
+    now = _now_iso()
+    token: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {"DatabaseName": database}
+        if token:
+            kwargs["NextToken"] = token
+        resp = glue.get_tables(**kwargs)
+        for t in resp.get("TableList", []):
+            name = t.get("Name")
+            if not name or name not in documented_tables:
+                continue
+            version_id = str(t.get("VersionId") or "")
+            update_time = t.get("UpdateTime")
+            update_iso = (
+                update_time.isoformat()
+                if hasattr(update_time, "isoformat")
+                else (str(update_time) if update_time else "")
+            )
+            item: dict[str, Any] = {
+                "pk": {"S": f"TABLE#{data_domain}#{dataset}#{name}"},
+                "sk": {"S": "VERSION"},
+                "last_seen_at": {"S": now},
+            }
+            if version_id:
+                item["version_id"] = {"S": version_id}
+                versions[name] = version_id
+            if update_iso:
+                item["update_time"] = {"S": update_iso}
+            ddb.put_item(TableName=freshness_table, Item=item)
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return versions
+
+
+def validate_bundle_import(
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    athena=None,
+    athena_workgroup: str = "",
+    athena_output: str = "",
+    athena_catalog: str = "AwsDataCatalog",
+) -> dict[str, Any]:
+    """Dry-run the staged archive and report everything at once.
+
+    Two tiers, deliberately distinct:
+
+    * ``blockers`` — structural/safety problems (see ``_load_import_archive``)
+      that ``apply_bundle_import`` refuses outright.
+    * ``findings`` — the SAME offline lint the harvest gate runs (frontmatter,
+      links, required docs, joins, computations; coverage self-skips with no
+      ``.metadata`` snapshot) plus live ``EXPLAIN`` failures against this
+      deployment's catalog. These are the human's call: a harvest must fix
+      its lint errors to zero, but an import is a decision about content that
+      already exists somewhere — the UI shows the findings and apply proceeds
+      only with ``acknowledged=true``.
+
+    ``archive_sha256`` pins what was reviewed: apply refuses if the staged
+    object changed after this report was produced (the verify-click posture).
+    """
+    _require_dataset_registered(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
+    files, manifest, blockers, digest = _load_import_archive(
+        s3, bucket=bucket, data_domain=data_domain, dataset=dataset
+    )
+    findings: list[dict[str, str]] = []
+    steps: list[dict[str, str]] = []
+    sql: dict[str, Any] = {"checked": 0, "failed": 0, "skipped": 0, "note": ""}
+    if isinstance(manifest, dict):
+        m_dom = manifest.get("data_domain")
+        if m_dom and m_dom != data_domain:
+            # Domain mismatch is only a warning: content embeds no domain
+            # (unlike the dataset name, which names the Glue database the
+            # docs describe).
+            findings.append(
+                {
+                    "severity": "warning",
+                    "code": "domain-mismatch",
+                    "path": _IMPORT_MANIFEST_NAME,
+                    "message": f"the bundle was exported from domain {m_dom!r}; "
+                    f"you are importing into {data_domain!r}",
+                }
+            )
+    fences: list[Any] | None = []
+    if not blockers:
+        from okf_core.lint import collect_sql_fences, lint_bundle
+
+        with tempfile.TemporaryDirectory() as td:
+            root = _materialize_import(files, td, dataset)
+            report = lint_bundle(root, collect_fences=True)
+            steps = [
+                {"name": st.name, "status": st.status, "note": st.note}
+                for st in report.steps
+            ]
+            findings += [f.to_dict() for f in report.findings]
+            # sql_fences is None when the collector FAILED (lint is
+            # best-effort there) — that is not "no SQL": fall back to the
+            # standalone collector, and if that fails too, say so as a
+            # finding rather than presenting a clean SQL section.
+            fences = report.sql_fences
+            if fences is None:
+                try:
+                    fences = collect_sql_fences(root)
+                except Exception:  # noqa: BLE001 - surfaced as a finding below
+                    fences = None
+
+        if fences is None:
+            sql["note"] = "the ```sql fence collector failed — SQL was NOT checked"
+            findings.append(
+                {
+                    "severity": "warning",
+                    "code": "sql-check-unavailable",
+                    "path": "",
+                    "message": "the archive's ```sql fences could not be "
+                    "collected, so none were validated against this "
+                    "deployment's catalog",
+                }
+            )
+            statements: list[tuple[str, str]] = []
+        else:
+            statements = []
+            seen: set[str] = set()
+            for fence in fences:
+                if fence.templated or fence.fragment:
+                    continue
+                # external/ docs quote SQL against a COUNTERPART dataset's
+                # database — outside this dataset's engine session, so
+                # EXPLAIN here would fail spuriously (and, sorting first,
+                # burn the whole budget). Same deliberate skip as the
+                # harvest gate's EXPLAIN step.
+                if fence.path.startswith("external/"):
+                    continue
+                for stmt in fence.statements:
+                    k = " ".join(stmt.split())
+                    if k not in seen:
+                        seen.add(k)
+                        statements.append((fence.path, stmt))
+        if fences is not None and not statements:
+            sql["note"] = "no runnable ```sql statements in the archive"
+        elif statements:
+            database = None
+            if athena is not None:
+                source = get_dataset_source(
+                    ddb,
+                    registry_table=registry_table,
+                    data_domain=data_domain,
+                    dataset=dataset,
+                )
+                database = source_glue_database(source)
+            if athena is None or not database:
+                sql["skipped"] = len(statements)
+                sql["note"] = (
+                    "no Athena engine wired on this deployment"
+                    if athena is None
+                    else "the dataset mapping resolves to no Glue database"
+                )
+            else:
+                from okf_aws.athena_query import run_explain
+
+                deadline = time.monotonic() + _IMPORT_EXPLAIN_TIME_BUDGET_S
+                timed_out = 0
+                for path, stmt in statements:
+                    remaining = deadline - time.monotonic()
+                    if (
+                        sql["checked"] >= _IMPORT_EXPLAIN_MAX_STATEMENTS
+                        or remaining < _IMPORT_EXPLAIN_MIN_REMAINING_S
+                    ):
+                        sql["skipped"] += 1
+                        continue
+                    sql["checked"] += 1
+                    try:
+                        run_explain(
+                            athena,
+                            sql=stmt,
+                            database=str(database),
+                            workgroup=athena_workgroup or None,
+                            output_location=athena_output or None,
+                            catalog=athena_catalog,
+                            timeout_s=min(_IMPORT_EXPLAIN_STMT_TIMEOUT_S, remaining),
+                        )
+                    except Exception as e:  # noqa: BLE001 - classified below
+                        # A budget/engine TIMEOUT is not a defect in the
+                        # doc's SQL — count it as unchecked (the harvest
+                        # gate's posture), never as a finding the human
+                        # would wrongly acknowledge.
+                        if "timed out" in str(e):
+                            sql["checked"] -= 1
+                            sql["skipped"] += 1
+                            timed_out += 1
+                            continue
+                        sql["failed"] += 1
+                        snippet = " ".join(stmt.split())[:80]
+                        findings.append(
+                            {
+                                "severity": "warning",
+                                "code": "sql-explain-failed",
+                                "path": path,
+                                "message": f"EXPLAIN failed against this "
+                                f"deployment's catalog for `{snippet}`: {e}",
+                            }
+                        )
+                if sql["skipped"]:
+                    sql["note"] = (
+                        f"{sql['skipped']} statement(s) not checked "
+                        f"({timed_out} engine timeout(s); budget "
+                        f"{_IMPORT_EXPLAIN_MAX_STATEMENTS} stmts / "
+                        f"{int(_IMPORT_EXPLAIN_TIME_BUDGET_S)}s)"
+                    )
+    docs = sum(
+        1 for rel in files if rel.rsplit("/", 1)[-1] not in ("index.md", "log.md")
+    )
+    # Persist the validation record next to the zip: apply requires a record
+    # whose digest matches the staged archive, which is what makes its
+    # "acknowledged" gate cover EVERY finding tier (the EXPLAIN findings
+    # cannot be re-derived at apply time) and proves validate actually ran.
+    s3.put_object(
+        Bucket=bucket,
+        Key=_import_record_key(data_domain, dataset),
+        Body=(
+            json.dumps(
+                {
+                    "archive_sha256": digest,
+                    "blockers": len(blockers),
+                    "findings": len(findings),
+                    "validated_at": _now_iso(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8"),
+        ContentType="application/json",
+    )
+    return {
+        "ok": not blockers,
+        "clean": not blockers and not findings,
+        "blockers": blockers,
+        "findings": findings,
+        "steps": steps,
+        "sql": sql,
+        "manifest": manifest if isinstance(manifest, dict) else None,
+        "archive_sha256": digest,
+        "files": len(files),
+        "docs": docs,
+        "tables": _import_tables(files),
+    }
+
+
+def apply_bundle_import(
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    data_domain: str,
+    dataset: str,
+    requested_by: str,
+    acknowledged: bool = False,
+    archive_sha256: str = "",
+    glue=None,
+    freshness_table: str = "",
+    events=None,
+) -> dict[str, Any]:
+    """Make the staged archive the live bundle. Synchronous; seconds.
+
+    Repromote's flow with the snapshot swapped for the validated zip: check ->
+    lease (``mode=import``; a concurrent harvest gets its usual 409,
+    incremental events degrade to ``skipped_locked``) -> ``in_progress``
+    marker -> write the docs + delete live PUBLISHED docs the archive lacks
+    (dot-dirs are deployment state and survive: ``.context`` uploads,
+    ``.harvest`` history) -> fill MISSING ``index.md`` files deterministically
+    (authored indexes travel in the zip and are preserved) -> precompute
+    ``graph.json`` -> dir markers (the S3 Files mount presents a marker-less
+    directory READ-ONLY; without them the NEXT harvest of this dataset dies
+    EACCES — the repromote lesson) -> fresh ``complete`` marker -> IMPORT
+    convergence row -> release -> policy-rebuild signal (the AR policy is
+    derived from the bundle). Reindex needs nothing: the object events from
+    these writes re-converge the vector index on their own.
+
+    The marker is SYNTHESIZED: ``tables`` from the imported ``tables/`` docs,
+    and ``table_versions`` (plus the freshness rows the reconcile actually
+    reads) seeded from the LIVE Glue catalog for exactly the tables the
+    archive documents — "these docs describe the catalog as it stands", the
+    feature's stated use. Catalog tables the archive does NOT document stay
+    unseeded, so the reconcile authors them; without any seeding it would
+    see every table as drifted and re-author the whole imported bundle over
+    the following nights. Verification does NOT travel (off-mount by
+    design): imported computations land unverified until a human re-verifies.
+
+    Requires a validation record matching the staged archive's digest (POST
+    ``/import/validate`` first): the record is what makes ``acknowledged``
+    meaningful — it counts EVERY finding tier including the live-EXPLAIN
+    ones apply cannot re-derive, and it proves the reviewed bytes are the
+    staged bytes.
+    """
+    _require_dataset_registered(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
+    files, manifest, blockers, digest = _load_import_archive(
+        s3, bucket=bucket, data_domain=data_domain, dataset=dataset
+    )
+    if blockers:
+        first = "; ".join(b["message"] for b in blockers[:3])
+        raise ApiError(
+            400, f"the archive fails validation ({len(blockers)} blocker(s)): {first}"
+        )
+    if archive_sha256 and archive_sha256 != digest:
+        raise ApiError(
+            409,
+            "the staged archive changed since it was validated — re-run "
+            "validation and review the new report",
+        )
+    record: dict[str, Any] | None = None
+    try:
+        record = json.loads(
+            s3.get_object(
+                Bucket=bucket, Key=_import_record_key(data_domain, dataset)
+            )["Body"].read()
+        )
+    except Exception:  # noqa: BLE001 - absent/unreadable record refuses below
+        record = None
+    if not isinstance(record, dict) or record.get("archive_sha256") != digest:
+        raise ApiError(
+            409,
+            "the staged archive has no matching validation on record — run "
+            "validate and review its report first",
+        )
+    if record.get("findings") and not acknowledged:
+        raise ApiError(
+            409,
+            f"the validate report has {record['findings']} finding(s) — "
+            f"review and acknowledge them before importing",
+        )
+
+    from okf_core.graph_json import collect_bundle_files
+    from okf_core.index_gen import regenerate_indexes
+
+    with tempfile.TemporaryDirectory() as td:
+        root = _materialize_import(files, td, dataset)
+
+        started_at = acquire_repromote_lease(
+            ddb,
+            registry_table=registry_table,
+            data_domain=data_domain,
+            dataset=dataset,
+            detail=f"import of {len(files)} files",
+            mode=IMPORT_MODE,
+        )
+        if started_at is None:
+            raise ApiError(
+                409,
+                f"a harvest for {data_domain}/{dataset} is already queued or running",
+            )
+
+        prefix = bundle_prefix(data_domain, dataset)
+        marker_key = state_marker_key(data_domain, dataset)
+        try:
+            s3.put_object(
+                Bucket=bucket,
+                Key=marker_key,
+                Body=(
+                    json.dumps(
+                        {
+                            "status": "in_progress",
+                            "data_domain": data_domain,
+                            "dataset": dataset,
+                            "started_at": started_at,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+            # Fill only the GAPS: exported indexes carry the harvest's authored
+            # directory descriptions — regenerating them all with the
+            # deterministic fallback would degrade the wiki it just imported.
+            # remove_file is a NO-OP for the same reason: index_gen's default
+            # unlinks the index of a directory whose sibling docs it can't
+            # parse, which would silently drop an authored index.md that
+            # travelled in the sha-pinned archive.
+            def _write_if_missing(path: Path, text: str) -> None:
+                if not path.exists():
+                    path.write_text(text, encoding="utf-8")
+
+            regenerate_indexes(
+                root, write_file=_write_if_missing, remove_file=lambda p: None
+            )
+
+            # The delete set is computed BEFORE the writes: live published
+            # docs the archive lacks. The .md filter matters — repromote's
+            # snapshots carry only .md, so a live non-markdown object this
+            # loop deleted would be gone IRREVERSIBLY (no version restore can
+            # bring it back); like repromote, we leave such strays in place.
+            live = []
+            for key in _iter_bundle_keys(s3, bucket=bucket, prefix=prefix):
+                rel = key[len(prefix) :]
+                if not rel or rel.endswith("/") or not rel.endswith(".md"):
+                    continue
+                if any(not p or p.startswith(".") for p in rel.split("/")):
+                    continue
+                live.append(key)
+
+            # Parallel writes: serial round-trips × hundreds of docs blew the
+            # 30s window once already (_GRAPH_FETCH_WORKERS' history), and the
+            # blocker cap admits MAX_RESTORE_FILES docs. Any failure raises
+            # out of result() into the failed-release path below.
+            to_upload = sorted(root.rglob("*.md"))
+
+            def _put(p: Path) -> str:
+                rel = p.relative_to(root).as_posix()
+                key = f"{prefix}{rel}"
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Body=p.read_bytes(),
+                    ContentType="text/markdown; charset=utf-8",
+                )
+                return key
+
+            with ThreadPoolExecutor(max_workers=_IMPORT_WRITE_WORKERS) as pool:
+                uploaded = list(pool.map(_put, to_upload))
+            to_delete = sorted(set(live) - set(uploaded))
+
+            def _del(key: str) -> str:
+                s3.delete_object(Bucket=bucket, Key=key)
+                return key
+
+            with ThreadPoolExecutor(max_workers=_IMPORT_WRITE_WORKERS) as pool:
+                deleted = list(pool.map(_del, to_delete))
+
+            completed_at = _now_iso()
+            # Precompute the /graph artifact with the SAME stamp the marker
+            # will carry (finalize_bundle's contract: matching stamps = fresh).
+            # Best-effort — derived data must not fail a finished import.
+            try:
+                graph = build_graph_json(collect_bundle_files(root))
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=graph_artifact_key(data_domain, dataset),
+                    Body=(
+                        json.dumps(
+                            {"completed_at": completed_at, **graph}, sort_keys=True
+                        )
+                        + "\n"
+                    ).encode("utf-8"),
+                )
+            except Exception:  # noqa: BLE001 - the endpoint computes live instead
+                log.warning(
+                    "import: could not precompute the graph artifact for %s/%s",
+                    data_domain,
+                    dataset,
+                    exc_info=True,
+                )
+            # Marker key included: on a never-harvested dataset nothing else
+            # would ever seed the .harvest/ dir marker, and the next real
+            # harvest must be able to write there through the mount.
+            s3_versions.ensure_dir_markers(
+                s3,
+                bucket=bucket,
+                data_domain=data_domain,
+                dataset=dataset,
+                keys=[*uploaded, marker_key],
+            )
+            tables = _import_tables(files)
+            # Seed the reconcile's freshness rows + the marker's
+            # table_versions from the live catalog (doc-matched tables only —
+            # see _seed_import_freshness). Best-effort: without it the import
+            # still works, the reconcile just trues everything up by
+            # re-authoring (the pre-seeding behavior), so a Glue hiccup must
+            # not fail a finished write.
+            table_versions: dict[str, str] = {}
+            if glue is not None and freshness_table:
+                try:
+                    source = get_dataset_source(
+                        ddb,
+                        registry_table=registry_table,
+                        data_domain=data_domain,
+                        dataset=dataset,
+                    )
+                    database = source_glue_database(source)
+                    if database:
+                        table_versions = _seed_import_freshness(
+                            glue,
+                            ddb,
+                            freshness_table=freshness_table,
+                            database=str(database),
+                            data_domain=data_domain,
+                            dataset=dataset,
+                            documented_tables=set(tables),
+                        )
+                except Exception:  # noqa: BLE001 - reconcile re-authors instead
+                    log.warning(
+                        "import: could not seed freshness rows for %s/%s — the "
+                        "nightly reconcile will re-author the imported tables",
+                        data_domain,
+                        dataset,
+                        exc_info=True,
+                    )
+            exported_at = (
+                manifest.get("exported_at", "") if isinstance(manifest, dict) else ""
+            )
+            put = s3.put_object(
+                Bucket=bucket,
+                Key=marker_key,
+                Body=(
+                    json.dumps(
+                        {
+                            "status": "complete",
+                            "data_domain": data_domain,
+                            "dataset": dataset,
+                            "tables": tables,
+                            "completed_at": completed_at,
+                            "table_versions": table_versions,
+                            "imported_by": requested_by or "",
+                            "imported_files": len(uploaded),
+                            "imported_sha256": digest,
+                            **(
+                                {"imported_export": exported_at}
+                                if exported_at
+                                else {}
+                            ),
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+            new_version_id = put.get("VersionId", "")
+            copied_vkeys = [
+                loc.vector_key
+                for k in uploaded
+                if (loc := parse_bundle_key(k)) is not None
+            ]
+            deleted_vkeys = [
+                loc.vector_key
+                for k in deleted
+                if (loc := parse_bundle_key(k)) is not None
+            ]
+            ddb.put_item(
+                TableName=registry_table,
+                Item={
+                    "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
+                    "sk": {"S": "IMPORT"},
+                    "started_at": {"S": started_at},
+                    "completed_at": {"S": completed_at},
+                    "archive_sha256": {"S": digest},
+                    "new_version_id": {"S": new_version_id},
+                    "requested_by": {"S": requested_by or ""},
+                    "copied": {"L": [{"S": k} for k in copied_vkeys]},
+                    "deleted": {"L": [{"S": k} for k in deleted_vkeys]},
+                    "total": {"N": str(len(copied_vkeys) + len(deleted_vkeys))},
+                },
+            )
+            _set_status_row(
+                ddb,
+                registry_table=registry_table,
+                data_domain=data_domain,
+                dataset=dataset,
+                status="complete",
+                detail=f"imported {len(uploaded)} files",
+            )
+            _signal_policy_rebuild(
+                ddb,
+                events,
+                registry_table=registry_table,
+                data_domain=data_domain,
+                dataset=dataset,
+            )
+            # Staging cleanup: a consumed archive must not sit importable
+            # forever (delete markers; noncurrent versions age out via the
+            # imports/ lifecycle rule). Best-effort — the import committed.
+            try:
+                s3.delete_object(
+                    Bucket=bucket, Key=_import_stage_key(data_domain, dataset)
+                )
+                s3.delete_object(
+                    Bucket=bucket, Key=_import_record_key(data_domain, dataset)
+                )
+            except Exception:  # noqa: BLE001 - lifecycle ages it out anyway
+                log.warning("import: staged-archive cleanup failed", exc_info=True)
+            return {
+                "status": "complete",
+                "files": len(uploaded),
+                "deleted": len(deleted),
+                "tables": tables,
+                "new_version_id": new_version_id,
+            }
+        except Exception as e:  # noqa: BLE001 - release the lease, surface a 502
+            _set_status_row(
+                ddb,
+                registry_table=registry_table,
+                data_domain=data_domain,
+                dataset=dataset,
+                status="failed",
+                detail=f"import failed: {type(e).__name__}",
+            )
+            raise ApiError(502, f"import failed: {e}") from e
 
 
 def _validate_bundle_key(key: str, *, data_domain: str, dataset: str) -> str:
@@ -3942,12 +5002,14 @@ def bundle_graph(s3, *, bucket: str, data_domain: str, dataset: str) -> dict[str
 
 REPROMOTE_MODE = "repromote"
 
-# A repromote runs synchronously inside this 30s-capped Lambda, so — unlike a
-# real harvest, which legitimately runs for hours (HARVEST_LEASE_STALE_SECONDS
-# = 8h) — a repromote row still `queued` after this window is provably dead.
-# The lease takeover clause + the status GET's stalled_lease/can_retry both key
-# off it, giving the UI one-click retry instead of an 8h wedge.
-REPROMOTE_LEASE_STALE_SECONDS = 120
+# A repromote (or import — the two SYNC_LEASE_MODES) runs synchronously inside
+# this 30s-capped Lambda, so — unlike a real harvest, which legitimately runs
+# for hours (HARVEST_LEASE_STALE_SECONDS = 8h) — such a row still `queued`
+# after this window is provably dead. The lease takeover clauses (every
+# acquirer) + the status GET's stalled_lease both key off it. The value and
+# the mode list live in okf_core.session so the incremental orchestrator's
+# twin acquirer can't drift from these.
+REPROMOTE_LEASE_STALE_SECONDS = SYNC_LEASE_STALE_SECONDS
 
 # EventBridge->SQS->reindex normally converges in seconds; past this we stop
 # claiming "converging" and surface `stalled` (an event may have been dropped —
@@ -4000,18 +5062,21 @@ def acquire_repromote_lease(
     dataset: str,
     detail: str,
     target_version_id: str = "",
+    mode: str = REPROMOTE_MODE,
 ) -> str | None:
-    """Take the harvest lease for a repromote. Returns ``started_at`` or None.
+    """Take the harvest lease for a repromote (or import). Returns ``started_at``
+    or None.
 
     Same conditional PutItem as :func:`acquire_harvest_lease` — repromote rides
     the existing ``queued -> complete|failed`` lifecycle (no new status value) —
-    plus ONE extra takeover clause: a prior ``mode=repromote`` row still
-    ``queued`` after :data:`REPROMOTE_LEASE_STALE_SECONDS` is a dead run (the
-    writer is a 30s-capped Lambda), so a retry may steal it immediately instead
-    of waiting out the 8h harvest staleness. Harvest rows are unaffected.
-    The guardrails build lock gates here too (inside the choke point, like
-    :func:`acquire_harvest_lease`) — the restore rewrites the wiki a live
-    author is reading.
+    plus ONE extra takeover clause: a prior ``mode=repromote``/``mode=import``
+    row still ``queued`` after :data:`REPROMOTE_LEASE_STALE_SECONDS` is a dead
+    run (both writers are 30s-capped Lambdas), so a retry may steal it
+    immediately instead of waiting out the 8h harvest staleness. Harvest rows
+    are unaffected. The guardrails build lock gates here too (inside the choke
+    point, like :func:`acquire_harvest_lease`) — the restore rewrites the wiki
+    a live author is reading. ``mode`` distinguishes the two callers on the
+    row itself (``apply_bundle_import`` passes :data:`IMPORT_MODE`).
     """
     refuse_if_guardrails_building(
         ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
@@ -4030,10 +5095,10 @@ def acquire_repromote_lease(
                 "pk": {"S": f"HARVEST#{data_domain}#{dataset}"},
                 "sk": {"S": "STATUS"},
                 "status": {"S": "queued"},
-                "mode": {"S": REPROMOTE_MODE},
+                "mode": {"S": mode},
                 "started_at": {"S": now},
                 "updated_at": {"S": now},
-                "runtime_session_id": {"S": f"repromote-{uuid.uuid4().hex}"},
+                "runtime_session_id": {"S": f"{mode}-{uuid.uuid4().hex}"},
                 "detail": {"S": detail[:1024]},
                 # Persisted so a DEAD repromote's one-click retry knows which
                 # version to re-POST (the status GET echoes it on stalled_lease).
@@ -4043,7 +5108,8 @@ def acquire_repromote_lease(
                 "attribute_not_exists(pk) "
                 "OR NOT (#s = :queued OR #s = :running) "
                 "OR started_at < :stale "
-                "OR (#m = :rmode AND #s = :queued AND started_at < :rstale)"
+                "OR ((#m = :rmode OR #m = :imode) AND #s = :queued "
+                "AND started_at < :rstale)"
             ),
             ExpressionAttributeNames={"#s": "status", "#m": "mode"},
             ExpressionAttributeValues={
@@ -4051,6 +5117,7 @@ def acquire_repromote_lease(
                 ":running": {"S": "running"},
                 ":stale": {"S": stale_cutoff},
                 ":rmode": {"S": REPROMOTE_MODE},
+                ":imode": {"S": IMPORT_MODE},
                 ":rstale": {"S": repromote_cutoff},
             },
         )
@@ -4727,18 +5794,23 @@ def get_repromote_status(
     ).get("Item")
     if (
         status_item
-        and _s(status_item.get("mode")) == REPROMOTE_MODE
+        and _s(status_item.get("mode")) in SYNC_LEASE_MODES
         and _s(status_item.get("status")) == "queued"
     ):
+        mode = _s(status_item.get("mode")) or ""
         started_raw = _s(status_item.get("started_at")) or ""
         started = _parse_iso(started_raw)
-        if started and (now - started).total_seconds() > REPROMOTE_LEASE_STALE_SECONDS:
+        if started and (now - started).total_seconds() > SYNC_LEASE_STALE_SECONDS:
+            # can_retry drives the UI's one-click re-POST of /repromote, which
+            # is only meaningful for a repromote row (an import retries by
+            # re-applying, and any acquirer can now steal the dead lease).
             return {
                 "state": "stalled_lease",
-                "can_retry": True,
+                "can_retry": mode == REPROMOTE_MODE,
+                "mode": mode,
                 "started_at": started_raw,
                 "target_version_id": _s(status_item.get("repromote_target")) or "",
-                "detail": "a repromote died mid-write; retry to take over its lease",
+                "detail": f"a {mode} died mid-write; its lease is stealable",
             }
         return {"state": "running", "can_retry": False, "started_at": started_raw}
 

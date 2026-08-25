@@ -20,11 +20,22 @@ class _GlueEntityNotFound(Exception):
 
 
 class FakeGlue:
-    """Glue client returning canned databases, optionally across two pages."""
+    """Glue client returning canned databases, optionally across two pages.
 
-    def __init__(self, databases: list[dict[str, Any]], page_size: int | None = None):
+    ``tables`` (optional) maps database name -> canned ``get_tables`` Table
+    dicts (Name/VersionId/UpdateTime) for the import freshness-seeding path;
+    databases without an entry return an empty list as before.
+    """
+
+    def __init__(
+        self,
+        databases: list[dict[str, Any]],
+        page_size: int | None = None,
+        tables: dict[str, list[dict[str, Any]]] | None = None,
+    ):
         self._databases = databases
         self._page_size = page_size
+        self._tables = tables or {}
 
     def get_databases(self, **kwargs) -> dict:
         if self._page_size is None:
@@ -48,7 +59,7 @@ class FakeGlue:
         name = kwargs.get("DatabaseName")
         if not any(db.get("Name") == name for db in self._databases):
             raise _GlueEntityNotFound(name)
-        return {"TableList": []}
+        return {"TableList": list(self._tables.get(name, []))}
 
 
 class FakeRedshift:
@@ -348,3 +359,40 @@ class FakeEvents:
     # convenience for assertions (mirrors FakeAgentCore.last_payload)
     def last_detail(self) -> dict[str, Any]:
         return json.loads(self.calls[-1]["Entries"][0]["Detail"])
+
+
+class FakeAthena:
+    """Athena fake for the import validator's EXPLAIN pass.
+
+    Every started query succeeds immediately unless its QueryString contains
+    one of ``fail_on``'s substrings — then it terminates FAILED with a canned
+    reason. Records the exact strings started so tests can assert the EXPLAIN
+    wrapping and statement selection.
+    """
+
+    def __init__(self, fail_on: list[str] | None = None):
+        self.fail_on = fail_on or []
+        self.started: list[str] = []
+        # The QueryExecutionContext of each start — lets tests assert WHICH
+        # database/catalog a statement was bound against.
+        self.contexts: list[dict[str, Any]] = []
+        self._states: dict[str, str] = {}
+
+    def start_query_execution(self, **kwargs) -> dict:
+        sql = kwargs.get("QueryString", "")
+        self.started.append(sql)
+        self.contexts.append(kwargs.get("QueryExecutionContext", {}))
+        qid = f"q{len(self.started)}"
+        failed = any(s in sql for s in self.fail_on)
+        self._states[qid] = "FAILED" if failed else "SUCCEEDED"
+        return {"QueryExecutionId": qid}
+
+    def get_query_execution(self, QueryExecutionId: str) -> dict:
+        state = self._states[QueryExecutionId]
+        status: dict[str, Any] = {"State": state}
+        if state == "FAILED":
+            status["StateChangeReason"] = "TABLE_NOT_FOUND: line 1: no such table"
+        return {"QueryExecution": {"Status": status}}
+
+    def stop_query_execution(self, QueryExecutionId: str) -> dict:
+        return {}

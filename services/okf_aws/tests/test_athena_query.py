@@ -86,3 +86,39 @@ def test_run_select_refuses_non_select():
         sleep=lambda s: None,
     )
     assert out["row_count"] == 2
+
+
+def test_run_explain_wraps_and_succeeds_quietly():
+    fake = FakeAthena()
+    from okf_aws.athena_query import run_explain
+
+    assert (
+        run_explain(fake, sql="SELECT 1 FROM t", database="db", sleep=lambda s: None)
+        is None
+    )
+    assert fake.started[0]["QueryString"] == "EXPLAIN SELECT 1 FROM t"
+
+
+def test_run_explain_raises_on_failure_and_refuses_non_select():
+    from okf_aws.athena_query import run_explain
+
+    fake = FakeAthena(states=("FAILED",), reason="TABLE_NOT_FOUND")
+    with pytest.raises(RuntimeError, match="TABLE_NOT_FOUND"):
+        run_explain(fake, sql="SELECT 1 FROM t", database="db", sleep=lambda s: None)
+    # The first-token guard applies to the BARE statement, before wrapping —
+    # "EXPLAIN DROP ..." must never reach the engine.
+    with pytest.raises(RuntimeError, match="non-SELECT"):
+        run_explain(FakeAthena(), sql="DROP TABLE t", database="db")
+
+
+def test_run_explain_sees_through_leading_comments():
+    """Authored fences arrive VERBATIM from the lint collector — a `--` or
+    /* */ header must not read as a non-SELECT first token (the harvest gate
+    EXPLAINs such fences fine; import must not spuriously fail them)."""
+    from okf_aws.athena_query import run_explain
+
+    fake = FakeAthena()
+    sql = "-- races per season\n/* audited */\nSELECT 1 FROM t"
+    assert run_explain(fake, sql=sql, database="db", sleep=lambda s: None) is None
+    # The statement runs UNSTRIPPED — only the guard looks through comments.
+    assert fake.started[0]["QueryString"] == f"EXPLAIN {sql}"

@@ -111,3 +111,72 @@ def run_select(
             "engine_execution_ms": stats.get("EngineExecutionTimeInMillis"),
         },
     }
+
+
+# Leading whitespace, `-- line` and `/* block */` comments — everything that
+# may legally precede an authored statement's first keyword.
+_LEADING_SQL_COMMENTS_RE = re.compile(r"^(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)+", re.DOTALL)
+
+
+def _strip_leading_sql_comments(sql: str) -> str:
+    return _LEADING_SQL_COMMENTS_RE.sub("", sql, count=1)
+
+
+def run_explain(
+    athena,
+    *,
+    sql: str,
+    database: str,
+    workgroup: str | None = None,
+    output_location: str | None = None,
+    catalog: str = "AwsDataCatalog",
+    poll_interval: float = 0.5,
+    timeout_s: float = 30.0,
+    sleep=time.sleep,
+) -> None:
+    """``EXPLAIN`` one SELECT/WITH statement; raise RuntimeError on failure.
+
+    The bundle-import validator's SQL check (Control API): EXPLAIN scans no
+    data but exercises the full parse/bind against THIS deployment's catalog,
+    which is exactly the "does this bundle's SQL fit here?" question. The
+    statement handed in is the bare SELECT — the EXPLAIN wrapping happens
+    here so the same first-token defense as :func:`run_select` applies to
+    what actually runs. No results are fetched; success is the verdict.
+
+    Unlike :func:`run_select` (whose SQL is compiler-generated), the input
+    here is an authored ```sql fence, which the lint collector keeps VERBATIM
+    — leading ``--``/``/* */`` comments included. Those pass the harvest
+    gate's bare EXPLAIN, so the guard must look through them or every
+    comment-headed fence becomes a spurious import finding.
+    """
+    m = re.match(r"[A-Za-z]+", _strip_leading_sql_comments(sql))
+    token = m.group(0).upper() if m else ""
+    if token not in ("SELECT", "WITH"):
+        raise RuntimeError(f"refusing non-SELECT statement (first token {token!r})")
+
+    kwargs: dict[str, Any] = {
+        "QueryString": f"EXPLAIN {sql}",
+        "QueryExecutionContext": {"Database": database, "Catalog": catalog},
+    }
+    if workgroup:
+        kwargs["WorkGroup"] = workgroup
+    if output_location:
+        kwargs["ResultConfiguration"] = {"OutputLocation": output_location}
+    qid = athena.start_query_execution(**kwargs)["QueryExecutionId"]
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        info = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]
+        state = info.get("Status", {}).get("State")
+        if state in _TERMINAL:
+            break
+        if time.monotonic() >= deadline:
+            try:
+                athena.stop_query_execution(QueryExecutionId=qid)
+            except Exception:  # noqa: BLE001 - best-effort cancel on our way out
+                pass
+            raise RuntimeError(f"EXPLAIN timed out after {timeout_s:.0f}s (id {qid})")
+        sleep(poll_interval)
+    if state != "SUCCEEDED":
+        reason = info.get("Status", {}).get("StateChangeReason", "no reason given")
+        raise RuntimeError(f"EXPLAIN {state}: {reason}")

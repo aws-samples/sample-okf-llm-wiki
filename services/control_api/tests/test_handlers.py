@@ -2283,6 +2283,12 @@ def test_export_bundle_zips_only_published_content(cfg):
     _seed_bundle(cfg.s3)
     # A zero-byte dir marker like ensure_dir_markers writes — must be skipped.
     cfg.s3.put_object(Bucket=BUCKET, Key="okf/sales/orders/tables/", Body=b"")
+    # A stray non-markdown object (the write guard passes those through) must
+    # be skipped too: import refuses non-md, so zipping it would make the
+    # export non-round-trippable.
+    cfg.s3.put_object(
+        Bucket=BUCKET, Key="okf/sales/orders/tables/diagram.png", Body=b"\x89PNG"
+    )
     res = handlers.export_bundle(
         cfg.s3, bucket=BUCKET, data_domain="sales", dataset="orders"
     )
@@ -2296,6 +2302,7 @@ def test_export_bundle_zips_only_published_content(cfg):
     with zipfile.ZipFile(io.BytesIO(staged)) as zf:
         names = sorted(zf.namelist())
         assert names == [
+            "manifest.json",
             "orders/datasets/orders.md",
             "orders/index.md",
             "orders/tables/customers.md",
@@ -2304,6 +2311,13 @@ def test_export_bundle_zips_only_published_content(cfg):
         # Authoring state (.context/.harvest/.metadata) stays out.
         assert not any("/." in n for n in names)
         assert zf.read("orders/tables/orders.md").startswith(b"---")
+        # Import-side provenance: the only machine-checkable record of what
+        # the archive was exported from (docs carry no dataset identity).
+        manifest = json.loads(zf.read("manifest.json"))
+        assert manifest["data_domain"] == "sales"
+        assert manifest["dataset"] == "orders"
+        assert manifest["files"] == 4
+        assert manifest["exported_at"]
 
 
 def test_export_bundle_empty_bundle_404(cfg):
@@ -2312,6 +2326,649 @@ def test_export_bundle_empty_bundle_404(cfg):
             cfg.s3, bucket=BUCKET, data_domain="nothing", dataset="here"
         )
     assert ei.value.status == 404
+
+
+# --------------------------------------------------------------------------- #
+# Bundle import
+# --------------------------------------------------------------------------- #
+
+_IMPORT_STAMP = "2026-08-25T00:00:00Z"
+
+
+def _okf_doc(type_, title, body=""):
+    return (
+        f"---\ntype: {type_}\ntitle: {title}\ndescription: {title} doc\n"
+        f"timestamp: {_IMPORT_STAMP}\n---\n{body or title}\n"
+    )
+
+
+def _clean_import_entries(ds="orders"):
+    """A lint-clean minimal bundle: required docs + two tables + root index."""
+    return {
+        f"{ds}/index.md": "# Orders\n",
+        f"{ds}/datasets/{ds}.md": _okf_doc(
+            "Glue Database",
+            "Orders DB",
+            # the lint wants the guardrails reachable from the overview
+            "Read [the guardrails](../references/usage_guardrails.md) first.",
+        ),
+        f"{ds}/references/usage_guardrails.md": _okf_doc(
+            "Reference", "Usage Guardrails"
+        ),
+        f"{ds}/tables/orders.md": _okf_doc("Glue Table", "orders"),
+        f"{ds}/tables/customers.md": _okf_doc("Glue Table", "customers"),
+    }
+
+
+def _import_zip(entries, manifest=None):
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        if manifest is not None:
+            zf.writestr("manifest.json", json.dumps(manifest))
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def _stage_import(cfg, entries, manifest=None, dd="sales", ds="orders"):
+    handlers.upsert_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain=dd, dataset=ds,
+        glue_database="orders",
+    )
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key=f"imports/{dd}/{ds}/upload.zip",
+        Body=_import_zip(entries, manifest),
+    )
+
+
+def _validate_import(cfg, dd="sales", ds="orders", **kw):
+    return handlers.validate_bundle_import(
+        cfg.s3, cfg.ddb, bucket=BUCKET, registry_table=REGISTRY,
+        data_domain=dd, dataset=ds, **kw,
+    )
+
+
+def _apply_import(cfg, dd="sales", ds="orders", validate_first=True, **kw):
+    # Apply refuses an archive with no matching validation record, so the
+    # helper runs validate by default (validate_first=False exercises that
+    # refusal itself).
+    if validate_first:
+        _validate_import(cfg, dd=dd, ds=ds)
+    kw.setdefault("requested_by", "admin@example.com")
+    return handlers.apply_bundle_import(
+        cfg.s3, cfg.ddb, bucket=BUCKET, registry_table=REGISTRY,
+        data_domain=dd, dataset=ds, **kw,
+    )
+
+
+def test_presign_import_upload_pins_key_and_requires_dataset(cfg):
+    with pytest.raises(ApiError) as ei:
+        handlers.presign_import_upload(
+            cfg.s3, cfg.ddb, bucket=BUCKET, registry_table=REGISTRY,
+            data_domain="sales", dataset="orders",
+        )
+    assert ei.value.status == 404
+    handlers.upsert_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders",
+        glue_database="orders",
+    )
+    res = handlers.presign_import_upload(
+        cfg.s3, cfg.ddb, bucket=BUCKET, registry_table=REGISTRY,
+        data_domain="sales", dataset="orders",
+    )
+    assert res["key"] == "imports/sales/orders/upload.zip"
+    assert res["fields"]["key"] == res["key"]
+    assert res["max_bytes"] == handlers.IMPORT_UPLOAD_MAX_BYTES
+
+
+def test_validate_import_clean_archive(cfg):
+    _stage_import(
+        cfg,
+        _clean_import_entries(),
+        manifest={"data_domain": "sales", "dataset": "orders", "files": 5},
+    )
+    res = _validate_import(cfg)
+    assert res["ok"] is True and res["clean"] is True
+    assert res["blockers"] == [] and res["findings"] == []
+    assert res["files"] == 5
+    assert res["docs"] == 4  # index.md is not a concept doc
+    assert res["tables"] == ["customers", "orders"]
+    assert res["archive_sha256"]
+    # coverage self-skips (no .metadata snapshot travels in an export)
+    assert {"coverage": "skipped"} == {
+        s["name"]: s["status"] for s in res["steps"] if s["name"] == "coverage"
+    }
+    # no ```sql in the fixtures — the engine phase reports that honestly
+    assert res["sql"]["checked"] == 0 and "no runnable" in res["sql"]["note"]
+
+
+def test_validate_import_names_every_structural_blocker(cfg):
+    _stage_import(
+        cfg,
+        {
+            "../evil.md": "x",
+            "orders/.harvest/state.json": "{}",
+            "other/tables/x.md": _okf_doc("Glue Table", "x"),
+            "orders/tables/notes.txt": "x",
+            "loose.md": "x",
+        },
+    )
+    res = _validate_import(cfg)
+    assert res["ok"] is False
+    codes = {b["code"] for b in res["blockers"]}
+    assert codes == {
+        "unsafe-path",
+        "reserved-path",
+        "dataset-mismatch",
+        "not-markdown",
+        "stray-file",
+    }
+    assert res["files"] == 0  # nothing from a blocked archive is kept
+
+
+def test_validate_import_manifest_dataset_mismatch_blocks(cfg):
+    _stage_import(
+        cfg,
+        _clean_import_entries(),
+        manifest={"data_domain": "sales", "dataset": "f1"},
+    )
+    res = _validate_import(cfg)
+    assert res["ok"] is False
+    assert any(b["code"] == "dataset-mismatch" for b in res["blockers"])
+
+
+def test_validate_import_manifest_domain_mismatch_is_a_warning(cfg):
+    _stage_import(
+        cfg,
+        _clean_import_entries(),
+        manifest={"data_domain": "motorsport", "dataset": "orders"},
+    )
+    res = _validate_import(cfg)
+    assert res["ok"] is True and res["clean"] is False
+    assert [f["code"] for f in res["findings"]] == ["domain-mismatch"]
+
+
+def test_validate_import_surfaces_lint_findings(cfg):
+    entries = _clean_import_entries()
+    entries["orders/tables/broken.md"] = "no frontmatter at all\n"
+    _stage_import(cfg, entries)
+    res = _validate_import(cfg)
+    assert res["ok"] is True  # lint problems never block — the human decides
+    assert res["clean"] is False
+    assert any(
+        f["code"] in ("invalid-doc", "invalid-frontmatter")
+        and f["path"] == "tables/broken.md"
+        for f in res["findings"]
+    )
+
+
+def test_validate_import_explains_sql_against_this_catalog(cfg):
+    from tests.fakes import FakeAthena
+
+    entries = _clean_import_entries()
+    entries["orders/queries/examples.md"] = _okf_doc(
+        "Reference",
+        "Examples",
+        "```sql\nSELECT 1 FROM good_t\n```\n\n```sql\nSELECT 2 FROM missing_t\n```\n",
+    )
+    _stage_import(cfg, entries)
+    athena = FakeAthena(fail_on=["missing_t"])
+    res = _validate_import(cfg, athena=athena, athena_workgroup="wg")
+    assert res["sql"]["checked"] == 2 and res["sql"]["failed"] == 1
+    assert all(q.startswith("EXPLAIN ") for q in athena.started)
+    # Bound against the DATASET's mapped database, not a default.
+    assert all(c.get("Database") == "orders" for c in athena.contexts)
+    failed = [f for f in res["findings"] if f["code"] == "sql-explain-failed"]
+    assert len(failed) == 1
+    assert failed[0]["path"] == "queries/examples.md"
+    assert "TABLE_NOT_FOUND" in failed[0]["message"]
+
+
+def test_validate_import_skips_external_sql(cfg):
+    """external/ docs quote SQL against a COUNTERPART dataset's database —
+    outside this dataset's engine session, so EXPLAINing them here would fail
+    spuriously and burn the budget (the harvest gate skips them for the same
+    reason)."""
+    from tests.fakes import FakeAthena
+
+    entries = _clean_import_entries()
+    entries["orders/external/sport/f1/overview.md"] = _okf_doc(
+        "Cross-Dataset Reference",
+        "F1 pairing",
+        "```sql\nSELECT 1 FROM f1_db.races\n```\n",
+    )
+    _stage_import(cfg, entries)
+    athena = FakeAthena(fail_on=["f1_db"])
+    res = _validate_import(cfg, athena=athena)
+    assert athena.started == []
+    assert res["sql"]["checked"] == 0
+    assert not any(f["code"] == "sql-explain-failed" for f in res["findings"])
+
+
+def test_validate_import_no_engine_skips_sql_honestly(cfg):
+    entries = _clean_import_entries()
+    entries["orders/queries/examples.md"] = _okf_doc(
+        "Reference", "Examples", "```sql\nSELECT 1 FROM t\n```\n"
+    )
+    _stage_import(cfg, entries)
+    res = _validate_import(cfg)  # athena=None
+    assert res["sql"]["checked"] == 0 and res["sql"]["skipped"] == 1
+    assert "no Athena engine" in res["sql"]["note"]
+
+
+def test_validate_import_404s_without_an_upload(cfg):
+    handlers.upsert_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders",
+        glue_database="orders",
+    )
+    with pytest.raises(ApiError) as ei:
+        _validate_import(cfg)
+    assert ei.value.status == 404
+
+
+def test_apply_import_writes_tree_marker_and_deletes_stale(cfg):
+    # Live state an import must respect: a stale published doc (goes), a
+    # .context upload (deployment state — stays).
+    _stage_import(cfg, _clean_import_entries())
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key="okf/sales/orders/tables/stale.md",
+        Body=b"---\ntitle: stale\n---\nold",
+    )
+    cfg.s3.put_object(Bucket=BUCKET, Key="okf/sales/orders/.context/spec.md", Body=b"x")
+
+    res = _apply_import(cfg)
+    assert res["status"] == "complete"
+    # 5 archive files + the 3 gap-filled directory indexes
+    assert res["files"] == 8
+    assert res["deleted"] == 1
+    assert res["tables"] == ["customers", "orders"]
+
+    listed = {
+        o["Key"]
+        for o in cfg.s3.list_objects_v2(Bucket=BUCKET, Prefix="okf/sales/orders/")[
+            "Contents"
+        ]
+    }
+    assert "okf/sales/orders/tables/orders.md" in listed
+    assert "okf/sales/orders/tables/index.md" in listed  # gap-filled
+    assert "okf/sales/orders/tables/stale.md" not in listed
+    assert "okf/sales/orders/.context/spec.md" in listed  # untouched
+    # dir markers: without them the S3 Files mount presents the restored tree
+    # read-only and the NEXT harvest dies EACCES.
+    assert "okf/sales/orders/" in listed
+    assert "okf/sales/orders/tables/" in listed
+
+    marker = json.loads(
+        cfg.s3.get_object(Bucket=BUCKET, Key="okf/sales/orders/.harvest/state.json")[
+            "Body"
+        ].read()
+    )
+    assert marker["status"] == "complete"
+    assert marker["tables"] == ["customers", "orders"]
+    assert marker["table_versions"] == {}  # synthesized: reconcile trues up
+    assert marker["imported_by"] == "admin@example.com"
+    assert marker["imported_files"] == 8
+
+    graph = json.loads(
+        cfg.s3.get_object(Bucket=BUCKET, Key="okf/sales/orders/.harvest/graph.json")[
+            "Body"
+        ].read()
+    )
+    assert graph["completed_at"] == marker["completed_at"]
+
+    row = cfg.ddb.get_item(
+        TableName=REGISTRY,
+        Key={"pk": {"S": "HARVEST#sales#orders"}, "sk": {"S": "IMPORT"}},
+    )["Item"]
+    assert int(row["total"]["N"]) == len(row["copied"]["L"]) + len(row["deleted"]["L"])
+    assert row["requested_by"]["S"] == "admin@example.com"
+
+    status = cfg.ddb.get_item(
+        TableName=REGISTRY,
+        Key={"pk": {"S": "HARVEST#sales#orders"}, "sk": {"S": "STATUS"}},
+    )["Item"]
+    assert status["status"]["S"] == "complete"
+    assert status["mode"]["S"] == "import"
+    assert status["detail"]["S"] == "imported 8 files"
+
+
+def test_apply_import_preserves_authored_indexes(cfg):
+    entries = _clean_import_entries()
+    entries["orders/tables/index.md"] = "# Tables\n\nAuthored description.\n"
+    _stage_import(cfg, entries)
+    _apply_import(cfg)
+    text = (
+        cfg.s3.get_object(Bucket=BUCKET, Key="okf/sales/orders/tables/index.md")[
+            "Body"
+        ]
+        .read()
+        .decode()
+    )
+    assert "Authored description." in text
+
+
+def test_apply_import_requires_acknowledged_findings(cfg):
+    entries = _clean_import_entries()
+    del entries["orders/references/usage_guardrails.md"]  # a lint error
+    _stage_import(cfg, entries)
+    with pytest.raises(ApiError) as ei:
+        _apply_import(cfg)
+    assert ei.value.status == 409
+    assert "finding" in ei.value.message
+    res = _apply_import(cfg, acknowledged=True)
+    assert res["status"] == "complete"
+
+
+def test_apply_import_requires_a_validation_record(cfg):
+    """Apply without a prior validate must refuse: the record is what proves
+    the reviewed bytes are the staged bytes AND carries the finding count
+    (the EXPLAIN findings can't be re-derived at apply time)."""
+    _stage_import(cfg, _clean_import_entries())
+    with pytest.raises(ApiError) as ei:
+        _apply_import(cfg, validate_first=False)
+    assert ei.value.status == 409
+    assert "validation on record" in ei.value.message
+    # A record for DIFFERENT bytes is equally refused: re-upload after
+    # validate invalidates the record.
+    _validate_import(cfg)
+    entries = _clean_import_entries()
+    entries["orders/tables/extra.md"] = _okf_doc("Glue Table", "extra")
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key="imports/sales/orders/upload.zip",
+        Body=_import_zip(entries),
+    )
+    with pytest.raises(ApiError) as ei:
+        _apply_import(cfg, validate_first=False)
+    assert ei.value.status == 409
+
+
+def test_apply_import_gates_on_non_lint_findings_too(cfg):
+    """A domain-mismatch (or EXPLAIN) finding lives only in the validate
+    report — the record makes it gate apply exactly like a lint finding."""
+    _stage_import(
+        cfg,
+        _clean_import_entries(),
+        manifest={"data_domain": "motorsport", "dataset": "orders"},
+    )
+    with pytest.raises(ApiError) as ei:
+        _apply_import(cfg)  # offline lint is clean; the finding is domain-mismatch
+    assert ei.value.status == 409
+    assert "finding" in ei.value.message
+    assert _apply_import(cfg, acknowledged=True)["status"] == "complete"
+
+
+def test_apply_import_refuses_blockers_and_stale_sha(cfg):
+    _stage_import(cfg, {"other/tables/x.md": _okf_doc("Glue Table", "x")})
+    with pytest.raises(ApiError) as ei:
+        _apply_import(cfg)
+    assert ei.value.status == 400
+
+    _stage_import(cfg, _clean_import_entries())
+    with pytest.raises(ApiError) as ei:
+        _apply_import(cfg, archive_sha256="not-the-validated-digest")
+    assert ei.value.status == 409
+
+    digest = _validate_import(cfg)["archive_sha256"]
+    assert _apply_import(cfg, archive_sha256=digest)["status"] == "complete"
+
+
+def test_apply_import_409_when_lease_held(cfg):
+    _stage_import(cfg, _clean_import_entries())
+    from control_api.handlers import _now_iso
+
+    cfg.ddb.put_item(
+        TableName=REGISTRY,
+        Item={
+            "pk": {"S": "HARVEST#sales#orders"},
+            "sk": {"S": "STATUS"},
+            "status": {"S": "running"},
+            "mode": {"S": "full"},
+            "started_at": {"S": _now_iso()},
+        },
+    )
+    with pytest.raises(ApiError) as ei:
+        _apply_import(cfg)
+    assert ei.value.status == 409
+    assert "already queued or running" in ei.value.message
+
+
+def _seed_dead_import_lease(cfg, age_s=300):
+    from datetime import datetime, timedelta, timezone
+
+    started = (
+        datetime.now(timezone.utc) - timedelta(seconds=age_s)
+    ).isoformat()
+    cfg.ddb.put_item(
+        TableName=REGISTRY,
+        Item={
+            "pk": {"S": "HARVEST#sales#orders"},
+            "sk": {"S": "STATUS"},
+            "status": {"S": "queued"},
+            "mode": {"S": "import"},
+            "started_at": {"S": started},
+        },
+    )
+
+
+def test_dead_import_lease_is_stealable_by_a_harvest(cfg):
+    """A crashed import Lambda leaves {queued, mode=import}; without the sync
+    takeover clause a harvest start would 409 for the full 8h staleness while
+    harvest_lease_held reported the lease free."""
+    _seed_dead_import_lease(cfg)
+    assert (
+        handlers.harvest_lease_held(
+            cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders"
+        )
+        is False
+    )
+    assert handlers.acquire_harvest_lease(
+        cfg.ddb,
+        registry_table=REGISTRY,
+        data_domain="sales",
+        dataset="orders",
+        mode="full",
+        session_id="s" * 33,
+    )
+
+
+def test_repromote_status_reports_a_stalled_import_without_retry(cfg):
+    """The stalled-lease surface must SEE a dead import (no phantom 'running'
+    forever) but must not offer the repromote retry — an import retries by
+    re-applying."""
+    _seed_dead_import_lease(cfg)
+    res = handlers.get_repromote_status(
+        cfg.ddb,
+        registry_table=REGISTRY,
+        freshness_table=FRESHNESS,
+        data_domain="sales",
+        dataset="orders",
+    )
+    assert res["state"] == "stalled_lease"
+    assert res["can_retry"] is False
+    assert res["mode"] == "import"
+
+
+def test_validate_import_refuses_duplicates_and_path_collisions(cfg):
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("orders/tables/x.md", "first copy")
+        zf.writestr("orders/tables/x.md", "second copy")  # duplicate name
+        zf.writestr("orders/a.md", "a file")
+        zf.writestr("orders/a.md/b.md", "…and a directory")  # file-vs-dir clash
+    handlers.upsert_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders",
+        glue_database="orders",
+    )
+    cfg.s3.put_object(
+        Bucket=BUCKET, Key="imports/sales/orders/upload.zip", Body=buf.getvalue()
+    )
+    res = _validate_import(cfg)
+    codes = {b["code"] for b in res["blockers"]}
+    assert "duplicate-entry" in codes
+    assert "path-collision" in codes
+    assert res["ok"] is False
+
+
+def test_validate_import_blocks_corrupt_member_and_scratch_paths(cfg):
+    import io
+    import zipfile
+
+    entries = _clean_import_entries()
+    entries["orders/large_tool_results/leak.md"] = _okf_doc("Reference", "leak")
+    blob = _import_zip(entries)
+    # Corrupt the FIRST stored member's data in place: ZipFile() still opens
+    # (central directory intact) but reading the member fails CRC — which
+    # must surface as a blocker, not a 500.
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        info = zf.infolist()[0]
+        data_at = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    corrupted = bytearray(blob)
+    corrupted[data_at] ^= 0xFF
+    handlers.upsert_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders",
+        glue_database="orders",
+    )
+    cfg.s3.put_object(
+        Bucket=BUCKET, Key="imports/sales/orders/upload.zip", Body=bytes(corrupted)
+    )
+    res = _validate_import(cfg)
+    codes = {b["code"] for b in res["blockers"]}
+    # The deepagents scratch dir is refused by the SHARED non-concept rule
+    # (is_reserved_rel_segments), not just the dot-prefix check.
+    assert "reserved-path" in codes
+    assert "unreadable-entry" in codes
+
+
+def test_validate_import_caps_actual_decompressed_bytes(cfg):
+    """The per-file cap must bind on what actually decompresses (bounded
+    read), not the central directory's declared size."""
+    entries = _clean_import_entries()
+    entries["orders/tables/huge.md"] = "x" * (handlers._IMPORT_MAX_FILE_BYTES + 1)
+    _stage_import(cfg, entries)
+    res = _validate_import(cfg)
+    assert any(
+        b["code"] == "file-too-large" and b["path"].endswith("huge.md")
+        for b in res["blockers"]
+    )
+
+
+def test_validate_import_oversized_manifest_blocks(cfg):
+    entries = _clean_import_entries()
+    manifest_pad = {"dataset": "orders", "pad": "y" * (256 * 1024 + 1)}
+    _stage_import(cfg, entries, manifest=manifest_pad)
+    res = _validate_import(cfg)
+    assert any(b["code"] == "bad-manifest" for b in res["blockers"])
+
+
+def test_apply_import_seeds_freshness_for_documented_tables(cfg):
+    """The reconcile reads TABLE#…/VERSION rows; seeding them for the tables
+    the archive documents is what stops the nightly sweep from re-authoring
+    the whole imported bundle. Undocumented catalog tables stay unseeded so
+    reconcile authors them."""
+    from tests.fakes import FakeGlue
+
+    _stage_import(cfg, _clean_import_entries())
+    glue = FakeGlue(
+        [{"Name": "orders", "Description": ""}],
+        tables={
+            "orders": [
+                {"Name": "orders", "VersionId": "7"},
+                {"Name": "customers", "VersionId": "3"},
+                {"Name": "undocumented", "VersionId": "9"},
+            ]
+        },
+    )
+    res = _apply_import(cfg, glue=glue, freshness_table=FRESHNESS)
+    assert res["status"] == "complete"
+    marker = json.loads(
+        cfg.s3.get_object(Bucket=BUCKET, Key="okf/sales/orders/.harvest/state.json")[
+            "Body"
+        ].read()
+    )
+    assert marker["table_versions"] == {"customers": "3", "orders": "7"}
+    row = cfg.ddb.get_item(
+        TableName=FRESHNESS,
+        Key={"pk": {"S": "TABLE#sales#orders#orders"}, "sk": {"S": "VERSION"}},
+    ).get("Item")
+    assert row and row["version_id"]["S"] == "7"
+    # The catalog table the archive does NOT document is left unseeded —
+    # reconcile must still author it.
+    assert not cfg.ddb.get_item(
+        TableName=FRESHNESS,
+        Key={"pk": {"S": "TABLE#sales#orders#undocumented"}, "sk": {"S": "VERSION"}},
+    ).get("Item")
+    # Staging is consumed on success.
+    listed = cfg.s3.list_objects_v2(Bucket=BUCKET, Prefix="imports/sales/orders/")
+    assert listed.get("KeyCount", 0) == 0
+
+
+def test_apply_import_leaves_live_non_markdown_alone(cfg):
+    """The delete set is .md-only: bundle versions never snapshot non-md, so
+    deleting one here would be irreversible."""
+    _stage_import(cfg, _clean_import_entries())
+    cfg.s3.put_object(
+        Bucket=BUCKET, Key="okf/sales/orders/tables/diagram.png", Body=b"\x89PNG"
+    )
+    res = _apply_import(cfg)
+    assert res["deleted"] == 0
+    assert (
+        cfg.s3.get_object(Bucket=BUCKET, Key="okf/sales/orders/tables/diagram.png")[
+            "Body"
+        ].read()
+        == b"\x89PNG"
+    )
+
+
+def test_apply_import_keeps_index_of_unparseable_dir(cfg):
+    """index_gen's default remove_file unlinks the index of a directory whose
+    docs it can't parse — the import must preserve every sha-pinned file."""
+    entries = _clean_import_entries()
+    entries["orders/guides/index.md"] = "# Guides\n\nAuthored index.\n"
+    _stage_import(cfg, entries)
+    res = _apply_import(cfg, acknowledged=True)  # guides/ has no concept doc
+    assert res["status"] == "complete"
+    text = (
+        cfg.s3.get_object(Bucket=BUCKET, Key="okf/sales/orders/guides/index.md")[
+            "Body"
+        ]
+        .read()
+        .decode()
+    )
+    assert "Authored index." in text
+
+
+def test_delete_dataset_purges_import_state(cfg):
+    """A deleted-then-re-registered dataset must not inherit the previous
+    owner's staged archive, validation record, or IMPORT provenance row."""
+    _stage_import(cfg, _clean_import_entries())
+    _apply_import(cfg)
+    # Re-stage after the consumed-on-success cleanup so the purge has staging
+    # objects (and their noncurrent versions) to remove.
+    cfg.s3.put_object(
+        Bucket=BUCKET,
+        Key="imports/sales/orders/upload.zip",
+        Body=_import_zip(_clean_import_entries()),
+    )
+    handlers.delete_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders",
+        s3=cfg.s3, bundle_bucket=BUCKET, freshness_table=FRESHNESS,
+    )
+    assert not cfg.ddb.get_item(
+        TableName=REGISTRY,
+        Key={"pk": {"S": "HARVEST#sales#orders"}, "sk": {"S": "IMPORT"}},
+    ).get("Item")
+    for prefix in ("imports/sales/orders/", "exports/sales/orders/"):
+        versions = cfg.s3.list_object_versions(Bucket=BUCKET, Prefix=prefix)
+        assert not versions.get("Versions") and not versions.get("DeleteMarkers")
 
 
 def test_read_bundle_file_rejects_other_dataset(cfg):

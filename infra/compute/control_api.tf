@@ -8,8 +8,13 @@ module "control_api_fn" {
   handler     = "control_api.app.lambda_handler"
   source_dir  = "${local.build_root}/control_api"
   policy_json = data.aws_iam_policy_document.control_api.json
-  timeout     = 30
-  memory_size = 512
+  timeout = 30
+  # 1024, not the default 512: the bundle import validate/apply endpoints hold
+  # the staged zip + its decoded documents in memory at the same time (caps in
+  # control_api.handlers: 64MB archive / 128MB decompressed) with a /tmp
+  # materialization for lint on top — an honest archive near the caps exceeds
+  # 512MB. More memory also buys proportional CPU for the zip/lint work.
+  memory_size = 1024
   # Keep N environments pre-warmed to eliminate cold starts on the browser-facing
   # control plane. 0 disables it. See modules/lambda for how the alias is wired.
   provisioned_concurrency = var.control_api_provisioned_concurrency
