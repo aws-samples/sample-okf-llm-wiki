@@ -402,7 +402,13 @@ function FilesPane({
                     )}
                   </Button>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
+                {/* w-auto: the kit content matches the TRIGGER's width, and
+                    this trigger is a 32px icon button — labels wrapped. Size
+                    to the items instead; nowrap keeps them one-line. */}
+                <DropdownMenuContent
+                  align="end"
+                  className="w-auto min-w-36 *:whitespace-nowrap"
+                >
                   {/* Download the published bundle as a zip (authored docs
                       only — no .metadata/.harvest/.context). */}
                   <DropdownMenuItem onSelect={exportBundle} disabled={exporting}>
