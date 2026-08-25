@@ -303,13 +303,18 @@ def _run_agent(agent, prompt: str, config: dict[str, Any], emitter) -> None:
             emitter.emit_subagent_event(chunk)
 
 
-def _sandbox_for(dataset_root: str | Path):
+def _sandbox_for(dataset_root: str | Path, emitter=None):
     """A started CodeSandbox with .context/ uploaded, or None if unavailable.
 
     The lifecycle contextmanager lives in harvest.code_interpreter
     (``sandbox_session``) — shared with Benchmark Studio's judge; this wrapper
-    just brands the log lines for the crawl.
+    brands the log lines for the crawl and, given the step ``emitter``,
+    narrates the start into the live feed: a cold Code Interpreter can take
+    minutes to provision and nothing else logs meanwhile, so without this
+    the feed reads as a hung run (seen live: ~2 silent minutes).
     """
+    if emitter is not None:
+        emitter.emit_status("Starting the code-execution sandbox…")
     return sandbox_session(dataset_root, label="Harvest")
 
 
@@ -508,7 +513,7 @@ def run_full_harvest(
         # The step emitter (built above, before the snapshot) rides into
         # build_harvest_agent so its usage-metering callback sits on the shared
         # model instance (catches QuickJS sub-agent turns too).
-        with _sandbox_for(dataset_root) as sandbox:
+        with _sandbox_for(dataset_root, emitter) as sandbox:
             built = build_harvest_agent(
                 source,
                 dataset_root,
@@ -728,7 +733,7 @@ def run_incremental_harvest(
         frozen = frozen_computation_paths(
             dataset_root, data_domain=data_domain, dataset=dataset
         )
-        with _sandbox_for(dataset_root) as sandbox:
+        with _sandbox_for(dataset_root, emitter) as sandbox:
             built = build_harvest_agent(
                 source,
                 dataset_root,
@@ -1001,7 +1006,7 @@ def run_cross_harvest(
         frozen = frozen_computation_paths(
             dataset_root, data_domain=data_domain, dataset=dataset
         )
-        with _sandbox_for(dataset_root) as sandbox:
+        with _sandbox_for(dataset_root, emitter) as sandbox:
             built = build_harvest_agent(
                 source,
                 dataset_root,
@@ -1254,6 +1259,16 @@ def run_annotation_harvest(
             reviewer_effort=(reviewer_model_config or {}).get("effort"),
         )
 
+        # Built BEFORE the snapshot so it narrates into the live feed like
+        # every other mode: this used to be the one runner whose snapshot ran
+        # silently (the emitter was built after it, with no progress hook),
+        # so the UI showed dead air from the `running` flip until the sandbox
+        # log line — ~6 minutes on formula_1's 213-file .metadata rewrite +
+        # sandbox start, read live as "the run produces no logs". Reused for
+        # the agent run below.
+        emitter = _build_emitter(
+            data_domain=data_domain, dataset=dataset, session_id=session_id
+        )
         # Refresh the read-only .metadata/ snapshot so the agent verifies each
         # annotation against current Glue metadata. Best-effort accelerator.
         # "cross" mode, deliberately: it reuses every fingerprint-matched
@@ -1261,7 +1276,18 @@ def run_annotation_harvest(
         # stays a cheap catalog refresh — the default ("full") would re-bill
         # the whole profile + relationship pass just to verify annotations.
         try:
-            export_metadata(source, dataset_root, profile_mode="cross")
+            if emitter is not None:
+                emitter.emit_status(
+                    "Snapshotting catalog metadata (cached column profiles "
+                    "reused where unchanged)…"
+                )
+            snap = export_metadata(
+                source,
+                dataset_root,
+                profile_mode="cross",
+                progress=emitter.emit_progress if emitter is not None else None,
+            )
+            _emit_profile_summary(emitter, snap)
         except Exception:  # noqa: BLE001 - snapshot is an accelerator, not a hard dep
             log.warning(
                 "Metadata snapshot failed for %s/%s (annotated); continuing",
@@ -1283,9 +1309,6 @@ def run_annotation_harvest(
             domain_context=domain_context,
             dataset_guidance=dataset_guidance,
         )
-        emitter = _build_emitter(
-            data_domain=data_domain, dataset=dataset, session_id=session_id
-        )
         # In-place run: pre-create the canonical authored folders so a
         # promotion (e.g. the bundle's first Attested Computation) never
         # needs a brand-new directory — the backend's raw mkdir has failed
@@ -1297,7 +1320,7 @@ def run_annotation_harvest(
         frozen = frozen_computation_paths(
             dataset_root, data_domain=data_domain, dataset=dataset
         )
-        with _sandbox_for(dataset_root) as sandbox:
+        with _sandbox_for(dataset_root, emitter) as sandbox:
             built = build_harvest_agent(
                 source,
                 dataset_root,

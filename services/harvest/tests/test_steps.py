@@ -1325,11 +1325,16 @@ def test_runner_threads_progress_into_the_snapshot():
     from harvest import runner as rn
 
     src = inspect.getsource(rn)
-    # Both emitter-scoped export_metadata call sites (full + incremental)
-    # thread the live-feed progress callback into the snapshot passes.
+    # Every emitter-scoped export_metadata call site (full, cross, and — since
+    # the dead-air fix — annotation) threads the live-feed progress callback
+    # into the snapshot pass. The incremental path re-profiles ONE table and
+    # stays summary-only by design.
     assert (
         src.count(
             "progress=emitter.emit_progress if emitter is not None else None"
         )
-        == 2
+        == 3
     )
+    # The sandbox start narrates too — a cold Code Interpreter provisions for
+    # minutes with nothing else logging, so every mode passes the emitter.
+    assert src.count("_sandbox_for(dataset_root, emitter)") == 4

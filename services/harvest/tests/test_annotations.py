@@ -387,4 +387,9 @@ def test_annotation_snapshot_refresh_reuses_caches():
     from harvest import runner as rn
 
     src = inspect.getsource(rn.run_annotation_harvest)
-    assert 'export_metadata(source, dataset_root, profile_mode="cross")' in src
+    assert 'profile_mode="cross"' in src
+    # And the refresh NARRATES into the live feed (emitter built before it,
+    # progress threaded) — this used to be the one mode whose snapshot ran
+    # silently, reading live as a hung run for the whole .metadata rewrite.
+    assert "progress=emitter.emit_progress" in src
+    assert src.index("emitter = _build_emitter") < src.index("export_metadata")
