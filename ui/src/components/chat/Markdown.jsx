@@ -113,10 +113,14 @@ const CITE_PREFIX_TAIL_RE = /<\/?(?:c(?:i(?:t(?:e)?)?)?)?$/i
 //  3. skips list bullets (line-start `* ` after only whitespace);
 //  4. applies FLANKING rules so prose asterisks are never read as emphasis:
 //     a run may OPEN only after start/whitespace/an opening bracket or quote
-//     and before a non-space, non-closing-punct char; it may CLOSE only after
-//     a non-space, non-opening-bracket char. `COUNT(*)`, `3*4`, and
-//     `price * quantity` all fail both tests and stay plain text — the old
-//     scanner pushed them as openers and appended a spurious closer to every
+//     and before a non-space, non-closing-punct char — quotes are NOT in the
+//     closing-punct class: CommonMark lets `**` open before `"` when preceded
+//     by whitespace, and the model constantly writes bold-quoted names
+//     (`**"deploy-bot"**`), which excluding quotes left unrepaired (raw
+//     `**"deploy` until the real closer arrived). A run may CLOSE only after
+//     a non-space, non-opening-bracket char. `COUNT(*)`, `3 * 4`, and
+//     `2 ** 8` all fail both tests and stay plain text — the old scanner
+//     pushed them as openers and appended a spurious closer to every
 //     streaming frame;
 //  5. tracks open bold/italic as a stack and appends the missing closers in
 //     reverse order (`**a *b` → `**a *b***`).
@@ -155,7 +159,7 @@ function scanEmphasis(text) {
     }
     const canOpen =
       next !== "" &&
-      !/[\s)\]},.;:!?'"]/.test(next) &&
+      !/[\s)\]},.;:!?]/.test(next) &&
       (prev === "" || /[\s([{"'\-–—]/.test(prev))
     const canClose = prev !== "" && !/[\s([{]/.test(prev)
     if (n >= 3) {
@@ -180,7 +184,31 @@ function balanceEmphasis(md) {
     const before = scanEmphasis(out.slice(0, -1))
     if (before[before.length - 1] === "**") out += "*"
   }
-  const stack = scanEmphasis(out)
+  // Same repair for a split `***bold-italic***` closer: 2 of its 3 stars have
+  // arrived. If both bold and italic are open before the partial run, complete
+  // the third star — otherwise the scanner's bold-close unwind eats the italic
+  // too and a stray literal `*` shows for a frame.
+  if (/[^\s*]\*\*$/.test(out)) {
+    const before = scanEmphasis(out.slice(0, -2))
+    if (
+      before[before.length - 1] === "*" &&
+      before[before.length - 2] === "**"
+    )
+      out += "*"
+  }
+  let stack = scanEmphasis(out)
+  if (stack.length > 0) {
+    // CommonMark refuses a space-preceded closer, so appending after trailing
+    // whitespace ("**Severity:  " + "**") renders the whole span as literal
+    // asterisks for that frame — bold flashing on and off as tokens land.
+    // Drop the trailing whitespace so the closer binds; the next frame
+    // re-derives from the full buffer, so nothing is lost.
+    const trimmed = out.replace(/\s+$/, "")
+    if (trimmed !== out) {
+      out = trimmed
+      stack = scanEmphasis(out)
+    }
+  }
   for (let j = stack.length - 1; j >= 0; j--) out += stack[j]
   return out
 }
