@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="3.25 3.14 17.5 17.5">
+  <title>Data Wiki</title>
+  <style>
+    .cube { fill: #007595; }
+    @media (prefers-color-scheme: dark) { .cube { fill: #108db1; } }
+  </style>
+  <polygon class="cube" points="12,3.45 19.2,7.5 12,11.55 4.8,7.5" />
+  <polygon class="cube" opacity=".65" points="12.4,12.225 19.6,8.175 19.6,16.275 12.4,20.325" />
+  <polygon class="cube" opacity=".4" points="4.4,8.175 11.6,12.225 11.6,20.325 4.4,16.275" />
+</svg>

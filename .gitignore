@@ -16,6 +16,7 @@ __pycache__/
 node_modules/
 ui/dist/
 ui/dist-report-harness/
+site/
 # Build-time staging of the report harness into the chat image context.
 services/chat/.harness/
 ui/.env

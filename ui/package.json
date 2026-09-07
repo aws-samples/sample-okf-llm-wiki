@@ -1,13 +1,17 @@
 {
   "name": "okf-ui",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "dev:env": "../scripts/deploy.sh dev-env",
     "build": "vite build",
     "build:report-harness": "BUILD_REPORT_HARNESS=1 vite build",
+    "docs:check": "node scripts/check-doc-style.mjs",
+    "docs:dev": "npm run docs:check && vite --config vite.docs.config.js",
+    "docs:build": "npm run docs:check && vite build --config vite.docs.config.js && node scripts/build-doc-routes.mjs",
+    "docs:preview": "vite preview --config vite.docs.config.js",
     "lint": "eslint .",
     "format": "prettier --write \"**/*.{js,jsx,css}\"",
     "preview": "vite preview"

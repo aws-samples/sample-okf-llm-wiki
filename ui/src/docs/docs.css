@@ -1,0 +1,224 @@
+@reference "../index.css";
+
+:root {
+  --docs-link: var(--primary);
+}
+
+.docs-topbar {
+  background-color: color-mix(in oklch, var(--background) 94%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.docs-sidebar [data-sidebar="menu-button"][data-active="true"] {
+  color: var(--sidebar-primary);
+  background-color: color-mix(
+    in oklch,
+    var(--sidebar-primary) 16%,
+    transparent
+  );
+}
+
+.docs-sidebar [data-sidebar="group-label"] {
+  letter-spacing: 0.02em;
+}
+
+@layer components {
+  .docs-prose {
+    @apply text-[0.9375rem] leading-7 text-foreground;
+  }
+
+  .docs-prose > :first-child {
+    @apply mt-0;
+  }
+
+  .docs-prose > :last-child {
+    @apply mb-0;
+  }
+
+  .docs-prose h1 {
+    @apply mb-7 text-3xl font-semibold tracking-tight;
+  }
+
+  .docs-prose h2 {
+    @apply mt-10 mb-4 text-xl font-semibold tracking-tight;
+  }
+
+  .docs-prose h3 {
+    @apply mt-8 mb-3 text-base font-semibold tracking-tight;
+  }
+
+  .docs-prose h4 {
+    @apply mt-6 mb-2 text-sm font-semibold;
+  }
+
+  .docs-heading {
+    scroll-margin-top: 1.5rem;
+  }
+
+  .docs-prose p {
+    @apply my-4;
+  }
+
+  .docs-prose ul {
+    @apply my-4 list-disc pl-6;
+  }
+
+  .docs-prose ol {
+    @apply my-4 list-decimal pl-6;
+  }
+
+  .docs-prose li + li {
+    @apply mt-1.5;
+  }
+
+  .docs-prose li > ul,
+  .docs-prose li > ol {
+    @apply my-1;
+  }
+
+  .docs-prose strong {
+    @apply font-semibold;
+  }
+
+  .docs-prose a {
+    @apply font-medium underline underline-offset-4;
+    color: var(--docs-link);
+  }
+
+  .docs-prose .docs-heading-link,
+  .docs-prose .docs-heading-link:hover {
+    @apply inline-flex items-center gap-2;
+    color: inherit;
+    font-weight: inherit;
+    text-decoration: none;
+  }
+
+  .docs-heading-link-icon {
+    @apply size-4 shrink-0 text-primary opacity-0 transition-opacity;
+  }
+
+  .docs-heading-link:hover .docs-heading-link-icon,
+  .docs-heading-link:focus-visible .docs-heading-link-icon {
+    @apply opacity-100;
+  }
+
+  .docs-prose blockquote {
+    @apply my-5 border-l-2 pl-4 text-muted-foreground;
+  }
+
+  .docs-prose hr {
+    @apply my-8 border-border;
+  }
+
+  .docs-prose code {
+    @apply rounded px-1.5 py-0.5 font-mono text-[0.82em];
+    background-color: color-mix(in oklch, var(--foreground) 8%, transparent);
+    border: 1px solid color-mix(in oklch, var(--foreground) 8%, transparent);
+  }
+
+  .docs-prose .docs-codeview {
+    @apply my-5;
+  }
+
+  .docs-prose .docs-codeview code {
+    @apply rounded-none border-0 bg-transparent p-0;
+  }
+
+  .docs-prose .docs-alert {
+    @apply my-5 px-4 py-3;
+  }
+
+  .docs-prose .docs-alert p {
+    @apply m-0;
+  }
+
+  .docs-prose .docs-alert [data-slot="alert-description"] {
+    @apply text-sm leading-6;
+  }
+
+  .docs-table {
+    @apply my-5 max-w-full overflow-x-auto rounded-lg border border-edge;
+  }
+
+  .docs-table table {
+    @apply w-full border-collapse text-sm;
+  }
+
+  .docs-table th {
+    @apply border-b bg-primary/5 px-3 py-2 text-left font-medium;
+  }
+
+  .docs-table td {
+    @apply border-b px-3 py-2 align-top;
+  }
+
+  .docs-table tr:last-child td {
+    @apply border-b-0;
+  }
+
+  .docs-prose kbd {
+    @apply rounded border border-edge bg-muted px-1.5 py-0.5 font-mono text-xs shadow-xs;
+  }
+
+  .docs-figure {
+    @apply my-6 flex flex-col gap-3;
+  }
+
+  .docs-image-shell {
+    @apply relative overflow-hidden rounded-xl border border-edge bg-card p-2 shadow-xs;
+  }
+
+  .docs-image-shell img {
+    @apply block h-auto w-full rounded-lg;
+  }
+
+  .docs-image-expand {
+    @apply absolute top-3 right-3 shadow-sm;
+  }
+
+  .docs-figure figcaption {
+    @apply text-sm text-muted-foreground;
+  }
+}
+
+.docs-image-dialog {
+  top: 4svh;
+  left: 2vw;
+  display: flex;
+  width: 96vw;
+  height: 92svh;
+  max-width: none;
+  translate: 0 0;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow: hidden;
+  padding: 1rem;
+}
+
+.docs-image-dialog-body {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  padding: 0.5rem;
+}
+
+.docs-image-dialog-body img {
+  display: block;
+  width: 100%;
+  min-width: 64rem;
+  max-width: none;
+  height: auto;
+}
+
+@media (max-width: 639px) {
+  .docs-prose {
+    font-size: 0.925rem;
+    line-height: 1.7;
+  }
+
+  .docs-prose h1 {
+    font-size: 1.75rem;
+  }
+}

@@ -7,9 +7,17 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
-export function CopyButton({ text, className, label = "Copy" }) {
+export function CopyButton({
+  text,
+  className,
+  label = "Copy",
+  showLabel = false,
+  variant = "ghost",
+  size,
+}) {
   const [copied, setCopied] = useState(false)
   const timerRef = useRef(null)
+  const buttonLabel = copied ? "Copied" : label
 
   useEffect(() => () => clearTimeout(timerRef.current), [])
 
@@ -27,18 +35,22 @@ export function CopyButton({ text, className, label = "Copy" }) {
   return (
     <Button
       type="button"
-      variant="ghost"
-      size="icon"
+      variant={variant}
+      size={size || (showLabel ? "sm" : "icon")}
       onClick={onCopy}
-      aria-label={copied ? "Copied" : label}
-      title={copied ? "Copied" : label}
-      className={cn("size-7 text-muted-foreground hover:text-foreground", className)}
+      aria-label={buttonLabel}
+      title={buttonLabel}
+      className={cn(
+        !showLabel && "size-7 text-muted-foreground hover:text-foreground",
+        className
+      )}
     >
       {copied ? (
-        <CheckIcon className="size-3.5 text-emerald-500" />
+        <CheckIcon data-icon="inline-start" className="text-primary" />
       ) : (
-        <CopyIcon className="size-3.5" />
+        <CopyIcon data-icon="inline-start" />
       )}
+      {showLabel ? buttonLabel : null}
     </Button>
   )
 }
