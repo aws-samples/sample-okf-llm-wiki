@@ -16,8 +16,14 @@ const FALLBACK_CATALOG = [
     default_effort: "xhigh",
   },
   {
-    model: "openai.gpt-6-sol",
+    model: "global.openai.gpt-6-sol",
     label: "GPT-6 Sol",
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+    default_effort: "xhigh",
+  },
+  {
+    model: "global.openai.gpt-6-astra",
+    label: "GPT-6 Astra",
     efforts: ["low", "medium", "high", "xhigh", "max"],
     default_effort: "xhigh",
   },
@@ -34,7 +40,7 @@ const FALLBACK_CATALOG = [
     default_effort: "xhigh",
   },
   {
-    model: "openai.gpt-5.6-terra",
+    model: "global.openai.gpt-5.6-terra",
     label: "GPT-5.6 Terra",
     efforts: ["low", "medium", "high", "xhigh", "max"],
     default_effort: "xhigh",
@@ -46,18 +52,31 @@ const FALLBACK_CATALOG = [
     default_effort: "xhigh",
   },
   {
-    model: "openai.gpt-6-luna",
+    model: "global.openai.gpt-6-luna",
     label: "GPT-6 Luna",
     efforts: ["low", "medium", "high", "xhigh", "max"],
     default_effort: "xhigh",
   },
 ]
 
+export function normalizeModelId(model) {
+  if (typeof model !== "string") return ""
+  const prefix = model.match(/^(global|apac|eu|us)\./)?.[0] ?? ""
+  let bare = model.slice(prefix.length)
+  if (bare.startsWith("gpt-")) bare = `openai.${bare}`
+  return bare.startsWith("openai.") ? `${prefix || "global."}${bare}` : model
+}
+
 function decodeCatalog(raw) {
   if (!raw) return FALLBACK_CATALOG
   try {
     const parsed = JSON.parse(atob(raw))
-    if (Array.isArray(parsed) && parsed.length) return parsed
+    if (Array.isArray(parsed) && parsed.length) {
+      return parsed.map((entry) => ({
+        ...entry,
+        model: normalizeModelId(entry.model),
+      }))
+    }
   } catch {
     // fall through to the default — a broken env shouldn't blank the picker
   }
@@ -70,7 +89,7 @@ export const MODEL_CATALOG = decodeCatalog(
 
 // The catalog entry for a model id, or undefined.
 export function entryFor(model) {
-  return MODEL_CATALOG.find((e) => e.model === model)
+  return MODEL_CATALOG.find((e) => e.model === normalizeModelId(model))
 }
 
 // The efforts a model offers (empty array if unknown).
@@ -85,12 +104,13 @@ export function defaultEffortFor(model) {
 
 // -- picker grouping ---------------------------------------------------------
 // The pickers render the catalog grouped by provider family, most capable
-// first within each family: tier (Fable > Opus > Sonnet > Haiku; Sol > Terra
+// first within each family: tier (Fable > Opus > Sonnet > Haiku; Astra > Sol > Terra
 // > Luna), then newer version. Ranking is a heuristic over the model id — an
 // id with an unknown tier or version sorts last in its family instead of
 // breaking. Fable is Anthropic's Mythos-class tier ABOVE Opus, hence rank -1.
 const FAMILY_ORDER = ["Anthropic", "OpenAI", "Other"]
 const TIER_RANK = {
+  astra: -1,
   fable: -1,
   opus: 0,
   sol: 0,
@@ -101,7 +121,7 @@ const TIER_RANK = {
 }
 
 function familyOf(model) {
-  if (model.startsWith("openai.") || model.startsWith("gpt-")) return "OpenAI"
+  if (/^(?:(?:global|apac|eu|us)\.)?(?:openai\.|gpt-)/.test(model)) return "OpenAI"
   if (model.includes("anthropic") || model.includes("claude")) return "Anthropic"
   return "Other"
 }
@@ -178,7 +198,7 @@ export function loadPreference() {
   let subagentModel = ""
   let subagentEffort = ""
   if (saved.subagentModel && entryFor(saved.subagentModel)) {
-    subagentModel = saved.subagentModel
+    subagentModel = entryFor(saved.subagentModel).model
     subagentEffort = effortsFor(subagentModel).includes(saved.subagentEffort)
       ? saved.subagentEffort
       : defaultEffortFor(subagentModel)
@@ -187,13 +207,13 @@ export function loadPreference() {
   let reviewerModel = ""
   let reviewerEffort = ""
   if (saved.reviewerModel && entryFor(saved.reviewerModel)) {
-    reviewerModel = saved.reviewerModel
+    reviewerModel = entryFor(saved.reviewerModel).model
     reviewerEffort = effortsFor(reviewerModel).includes(saved.reviewerEffort)
       ? saved.reviewerEffort
       : defaultEffortFor(reviewerModel)
   }
   return {
-    model: saved.model,
+    model: entryFor(saved.model).model,
     effort,
     subagentModel,
     subagentEffort,

@@ -45,8 +45,8 @@ def test_model_config_from_payload_absent_is_none():
 
 def test_model_config_from_payload_builds_override(monkeypatch):
     monkeypatch.delenv("OKF_HARVEST_MAX_TOKENS", raising=False)
-    cfg = ep._model_config_from_payload({"model": "openai.gpt-6-sol", "effort": "high"})
-    assert cfg["model"] == "openai.gpt-6-sol"
+    cfg = ep._model_config_from_payload({"model": "global.openai.gpt-6-sol", "effort": "high"})
+    assert cfg["model"] == "global.openai.gpt-6-sol"
     assert cfg["effort"] == "high"
 
 
@@ -58,17 +58,17 @@ def test_model_config_from_payload_reads_subagent_keys(monkeypatch):
     payload = {
         "model": "global.anthropic.claude-opus-4-8",
         "effort": "xhigh",
-        "subagent_model": "openai.gpt-6-sol",
+        "subagent_model": "global.openai.gpt-6-sol",
         "subagent_effort": "high",
     }
     cfg = ep._model_config_from_payload(
         payload, model_key="subagent_model", effort_key="subagent_effort"
     )
-    assert cfg["model"] == "openai.gpt-6-sol"
+    assert cfg["model"] == "global.openai.gpt-6-sol"
     assert cfg["effort"] == "high"
     assert (
         ep._model_config_from_payload(
-            {"model": "openai.gpt-6-sol"},
+            {"model": "global.openai.gpt-6-sol"},
             model_key="subagent_model",
             effort_key="subagent_effort",
         )

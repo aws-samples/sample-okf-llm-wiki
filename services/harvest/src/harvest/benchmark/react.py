@@ -9,7 +9,7 @@ attaches ``BedrockPromptCachingMiddleware`` (the chat agent's setup, see
 cache settings via ``model_settings`` and ``ChatBedrockConverse`` inserts the
 ``cachePoint`` blocks at request time, so the static prefix AND the growing
 conversation bill as cache READS (~0.1x input) turn over turn instead of full
-price. On a Mantle GPT model the middleware warns once and no-ops — the
+price. On a Bedrock Runtime GPT model the middleware warns once and no-ops — the
 Responses API already caches prefixes implicitly server-side. The usage
 plumbing (``steps.UsageForwarder``, report telemetry) already meters
 ``cache_read``/``cache_creation``, so cache traffic shows up without changes.

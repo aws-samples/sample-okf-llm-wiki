@@ -1,6 +1,6 @@
 """The shared LLM client factory (okf_aws.model_factory).
 
-Provider dispatch, effort mapping, adaptive-thinking fields, and the Mantle GPT
+Provider dispatch, effort mapping, adaptive-thinking fields, and the Bedrock Runtime GPT
 builder wiring — all exercised against STUBBED SDKs (langchain_aws /
 langchain_openai / aws_bedrock_token_generator are imported lazily inside the
 builders, so the module imports without them and tests inject fakes). This is
@@ -21,7 +21,19 @@ from okf_aws import model_factory as mf
 
 @pytest.mark.parametrize(
     "model",
-    ["openai.gpt-6-sol", "openai.gpt-5.4", "openai.gpt-oss-120b", "gpt-5.5"],
+    [
+        "global.openai.gpt-6-sol",
+        "global.openai.gpt-6-astra",
+        "global.openai.gpt-6-luna",
+        "openai.gpt-6-sol",
+        "gpt-6-sol",
+        "us.openai.gpt-5.4",
+        "eu.openai.gpt-5.4",
+        "apac.openai.gpt-5.4",
+        "openai.gpt-5.4",
+        "openai.gpt-oss-120b",
+        "gpt-5.5",
+    ],
 )
 def test_is_openai_model_true_for_gpt(model):
     assert mf.is_openai_model(model) is True
@@ -92,7 +104,7 @@ def test_gpt_effort_unknown_falls_back_to_xhigh():
 def test_gpt_effort_no_reasoning_never_hits_the_fallback():
     # The extraction/classifier efforts must NOT hit the unknown-value
     # fallthrough: billing a max-reasoning run for a pass that asked for none
-    # is the silent-upgrade bug. "none" passes VERBATIM (the GPT-5.6 Mantle
+    # is the silent-upgrade bug. "none" passes VERBATIM (the GPT-5.6 Bedrock Runtime
     # fleet accepts it — live-verified on Luna; the policy classifiers depend
     # on a genuine no-reasoning pass); "minimal" floors to "low" (Luna 400s
     # on that name, so it has no fleet-safe verbatim meaning).
@@ -107,7 +119,7 @@ def test_gpt_effort_empty_rejected():
         mf.gpt_effort("")
 
 
-# --- Mantle GPT builder wiring (stubbed SDKs) --------------------------------
+# --- Bedrock Runtime GPT builder wiring (stubbed SDKs) --------------------------------
 
 
 def _install_openai_stubs(monkeypatch):
@@ -139,43 +151,111 @@ def _install_openai_stubs(monkeypatch):
     return captured, state
 
 
-def test_build_mantle_openai_defaults_to_responses_api(monkeypatch):
+def test_build_bedrock_openai_defaults_to_responses_api(monkeypatch):
     captured, _state = _install_openai_stubs(monkeypatch)
+    region = "eu-west-1"
 
-    mf.build_mantle_openai(
-        "openai.gpt-6-sol", "xhigh", 32000, region=mf.DEFAULT_MANTLE_REGION
+    mf.build_bedrock_openai(
+        "global.openai.gpt-6-sol", "xhigh", 32000, region=region
     )
 
-    assert captured["model"] == "openai.gpt-6-sol"
+    assert captured["model"] == "global.openai.gpt-6-sol"
     # Responses API at /openai/v1, derived from the region.
     assert captured["base_url"] == (
-        f"https://bedrock-mantle.{mf.DEFAULT_MANTLE_REGION}.api.aws/openai/v1"
+        f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
     )
     assert captured["use_responses_api"] is True
     # api_key is a PROVIDER CALLABLE (re-minted per request), not a static string.
     assert callable(captured["api_key"])
     assert captured["api_key"]().startswith(
-        f"bedrock-api-key-{mf.DEFAULT_MANTLE_REGION}"
+        f"bedrock-api-key-{region}"
     )
     assert captured["max_tokens"] == 32000
     assert captured["reasoning_effort"] == "xhigh"  # preserved, not capped
+    assert captured["store"] is False
+    assert captured["use_previous_response_id"] is False
 
 
-def test_build_mantle_openai_region_drives_url_and_token(monkeypatch):
+@pytest.mark.parametrize(
+    ("variant", "output_budget"),
+    [("astra", 128000), ("sol", 32000), ("luna", 32000)],
+)
+def test_gpt6_responses_request_uses_runtime_global_profile_and_local_history(
+    monkeypatch, variant, output_budget
+):
+    """Exercise the real SDK's serialized request without calling AWS."""
+    import json
+
+    httpx = pytest.importorskip("httpx")
+    lco = pytest.importorskip("langchain_openai")
+    chat_openai = lco.ChatOpenAI
+    requests = []
+    expected_model = f"global.openai.gpt-6-{variant}"
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": expected_model,
+                "output": [{
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "hello", "annotations": []}],
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        monkeypatch.setattr(
+            lco, "ChatOpenAI",
+            lambda **kwargs: chat_openai(http_client=http_client, **kwargs),
+        )
+        monkeypatch.setattr(
+            mf, "bedrock_token_provider", lambda *args, **kwargs: lambda: "test-token"
+        )
+        model = mf.build_bedrock_openai(
+            f"openai.gpt-6-{variant}", "high", 128000,
+            region="us-east-1", reasoning_summary="auto",
+        )
+        model.invoke([("user", "hello")])
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert str(request.url) == (
+        "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/responses"
+    )
+    assert request.headers["authorization"] == "Bearer test-token"
+    payload = json.loads(request.content)
+    assert payload["model"] == expected_model
+    assert payload["max_output_tokens"] == output_budget
+    assert payload["store"] is False
+    assert "previous_response_id" not in payload
+    assert payload["reasoning"] == {"effort": "high", "summary": "auto"}
+
+
+def test_build_bedrock_openai_region_drives_url_and_token(monkeypatch):
     captured, _state = _install_openai_stubs(monkeypatch)
 
-    mf.build_mantle_openai("openai.gpt-5.4", "medium", 16000, region="us-west-2")
+    mf.build_bedrock_openai("openai.gpt-5.4", "medium", 16000, region="us-west-2")
 
-    assert captured["base_url"] == "https://bedrock-mantle.us-west-2.api.aws/openai/v1"
+    assert captured["base_url"] == "https://bedrock-runtime.us-west-2.amazonaws.com/openai/v1"
     assert captured["api_key"]().startswith("bedrock-api-key-us-west-2")
     assert captured["reasoning_effort"] == "medium"
 
 
-def test_build_mantle_openai_chat_completions_opt_out(monkeypatch):
+def test_build_bedrock_openai_chat_completions_opt_out(monkeypatch):
     # gpt-oss models use Chat Completions on /v1 instead of Responses on /openai/v1.
     captured, _state = _install_openai_stubs(monkeypatch)
 
-    mf.build_mantle_openai(
+    mf.build_bedrock_openai(
         "openai.gpt-oss-120b",
         "high",
         16000,
@@ -183,15 +263,15 @@ def test_build_mantle_openai_chat_completions_opt_out(monkeypatch):
         use_responses_api=False,
     )
 
-    assert captured["base_url"] == "https://bedrock-mantle.us-west-2.api.aws/v1"
+    assert captured["base_url"] == "https://bedrock-runtime.us-west-2.amazonaws.com/openai/v1"
     assert captured["use_responses_api"] is False
 
 
-def test_build_mantle_openai_explicit_base_url_wins(monkeypatch):
+def test_build_bedrock_openai_explicit_base_url_wins(monkeypatch):
     captured, _state = _install_openai_stubs(monkeypatch)
 
-    mf.build_mantle_openai(
-        "openai.gpt-6-sol",
+    mf.build_bedrock_openai(
+        "global.openai.gpt-6-sol",
         "high",
         32000,
         region="us-east-2",
@@ -201,21 +281,21 @@ def test_build_mantle_openai_explicit_base_url_wins(monkeypatch):
     assert captured["base_url"] == "https://internal.example/openai/v1"
 
 
-def test_build_mantle_openai_no_summary_uses_reasoning_effort(monkeypatch):
+def test_build_bedrock_openai_no_summary_uses_reasoning_effort(monkeypatch):
     # Default (harvest): no summary requested -> plain reasoning_effort, no
     # `reasoning` object (so nothing changes for callers that don't show thinking).
     captured, _state = _install_openai_stubs(monkeypatch)
-    mf.build_mantle_openai("openai.gpt-6-sol", "high", 32000, region="us-east-2")
+    mf.build_bedrock_openai("global.openai.gpt-6-sol", "high", 32000, region="us-east-2")
     assert captured["reasoning_effort"] == "high"
     assert "reasoning" not in captured
 
 
-def test_build_mantle_openai_summary_uses_reasoning_object(monkeypatch):
+def test_build_bedrock_openai_summary_uses_reasoning_object(monkeypatch):
     # Chat: summary requested -> `reasoning={effort, summary}` so GPT RETURNS its
     # thinking on the Responses API; the bare reasoning_effort knob is superseded.
     captured, _state = _install_openai_stubs(monkeypatch)
-    mf.build_mantle_openai(
-        "openai.gpt-6-sol",
+    mf.build_bedrock_openai(
+        "global.openai.gpt-6-sol",
         "high",
         32000,
         region="us-east-2",
@@ -229,29 +309,29 @@ def test_build_mantle_openai_summary_uses_reasoning_object(monkeypatch):
     assert captured["output_version"] == "responses/v1"
 
 
-def test_build_mantle_openai_omits_temperature_by_default(monkeypatch):
+def test_build_bedrock_openai_omits_temperature_by_default(monkeypatch):
     # Absent kwarg -> the model's own default; the agent paths must be untouched.
     captured, _state = _install_openai_stubs(monkeypatch)
-    mf.build_mantle_openai("openai.gpt-6-sol", "high", 32000, region="us-east-2")
+    mf.build_bedrock_openai("global.openai.gpt-6-sol", "high", 32000, region="us-east-2")
     assert "temperature" not in captured
 
 
-def test_build_mantle_openai_forwards_zero_temperature(monkeypatch):
+def test_build_bedrock_openai_forwards_zero_temperature(monkeypatch):
     # 0 is FALSY: the forward must test `is not None`, or the one value an
     # extraction pass actually asks for is the one value silently dropped.
     captured, _state = _install_openai_stubs(monkeypatch)
-    mf.build_mantle_openai(
-        "openai.gpt-6-sol", "minimal", 4096, region="us-east-2", temperature=0
+    mf.build_bedrock_openai(
+        "global.openai.gpt-6-sol", "minimal", 4096, region="us-east-2", temperature=0
     )
     assert captured["temperature"] == 0
     assert captured["reasoning_effort"] == "low"
 
 
-def test_build_mantle_openai_summary_ignored_on_chat_completions(monkeypatch):
+def test_build_bedrock_openai_summary_ignored_on_chat_completions(monkeypatch):
     # Chat Completions (gpt-oss) has no reasoning-summary concept; fall back to the
     # plain reasoning_effort even if a summary was requested.
     captured, _state = _install_openai_stubs(monkeypatch)
-    mf.build_mantle_openai(
+    mf.build_bedrock_openai(
         "openai.gpt-oss-120b",
         "high",
         16000,
@@ -263,7 +343,7 @@ def test_build_mantle_openai_summary_ignored_on_chat_completions(monkeypatch):
     assert "reasoning" not in captured
 
 
-def test_mantle_token_provider_caches_then_remints(monkeypatch):
+def test_bedrock_token_provider_caches_then_remints(monkeypatch):
     # Caches within the TTL, re-mints once it lapses — the fix for the ~1h
     # presign expiry killing a long run. Drive a fake clock.
     _captured, state = _install_openai_stubs(monkeypatch)
@@ -272,7 +352,7 @@ def test_mantle_token_provider_caches_then_remints(monkeypatch):
 
     monkeypatch.setattr(_time, "time", lambda: clock["t"])
 
-    provider = mf.mantle_token_provider("us-east-2", ttl_seconds=1800)
+    provider = mf.bedrock_token_provider("us-east-2", ttl_seconds=1800)
     first = provider()
     again = provider()  # within TTL -> cached, no new mint
     assert first == again
@@ -440,17 +520,17 @@ def test_thinking_budget_is_ignored_when_thinking_is_off(monkeypatch):
 # --- dispatcher --------------------------------------------------------------
 
 
-def test_build_model_dispatches_gpt_to_mantle(monkeypatch):
+def test_build_model_dispatches_gpt_in_the_deployment_region(monkeypatch):
     captured, _state = _install_openai_stubs(monkeypatch)
 
     mf.build_model(
-        "openai.gpt-6-sol", "high", 32000, region="us-east-1", mantle_region="us-east-2"
+        "global.openai.gpt-6-sol", "high", 32000, region="eu-west-1"
     )
 
-    # Went through the OpenAI stub (Mantle path), with the Mantle region — not
-    # the Converse region.
-    assert captured["model"] == "openai.gpt-6-sol"
-    assert captured["base_url"] == "https://bedrock-mantle.us-east-2.api.aws/openai/v1"
+    # The endpoint and bearer use the same deployment region as Converse.
+    assert captured["model"] == "global.openai.gpt-6-sol"
+    assert captured["base_url"] == "https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1"
+    assert captured["api_key"]().startswith("bedrock-api-key-eu-west-1")
 
 
 def test_build_model_dispatches_claude_to_converse(monkeypatch):

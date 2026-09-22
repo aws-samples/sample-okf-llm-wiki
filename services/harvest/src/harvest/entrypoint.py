@@ -25,7 +25,7 @@ Payload (from the Control API's InvokeAgentRuntime call):
     "checks": ["sql","behavior"],     # benchmark only, + runs/version_id/
                                       #   questions_key/solver_*/judge_* — see
                                       #   harvest/benchmark/studio.py
-    "model": "openai.gpt-6-sol",    # optional per-harvest override; falls
+    "model": "global.openai.gpt-6-sol",    # optional per-harvest override; falls
     "effort": "xhigh",                # back to OKF_HARVEST_* env when omitted
     "subagent_model": "...",          # optional SUB-AGENT override (authors/
     "subagent_effort": "high",        # extractors); absent -> the

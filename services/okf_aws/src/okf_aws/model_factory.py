@@ -1,18 +1,18 @@
 """Shared LLM client factory: build a LangChain chat model from a model id,
 dispatching on provider.
 
-This is the single construction path behind every OKF agent (harvest today, the
-chat agent next). It is deliberately **pure and parameterized** — it reads NO
+This is the shared construction path for harvest, benchmarks, and chat.
+It is deliberately **pure and parameterized** — it reads NO
 environment variables. Each service supplies its own env-driven config (its
-region, botocore timeouts, Mantle knobs) under its own ``OKF_<SERVICE>_*``
+region, botocore timeouts, OpenAI client knobs) under its own ``OKF_<SERVICE>_*``
 namespace and passes the resolved values in, so the provider logic lives in one
 place while the deploy-time knobs stay service-scoped.
 
 Provider selection is by model-id prefix (see :func:`is_openai_model`):
 
-* ``openai.<name>`` / ``gpt-…`` → :func:`build_mantle_openai` — a ``ChatOpenAI``
-  pointed at the Bedrock **Mantle** OpenAI-compatible endpoint, authed with a
-  short-lived SigV4-derived bearer token (no API key / Secrets Manager).
+* GPT IDs, including ``global.openai.*`` → :func:`build_bedrock_openai` —
+  ``ChatOpenAI`` using the Bedrock Runtime Responses API and a renewable,
+  short-term Bedrock bearer. Bare GPT IDs gain a ``global.`` profile.
 * everything else (the ``us./eu./global.anthropic.*`` inference profiles) →
   :func:`build_bedrock_converse` — a ``ChatBedrockConverse`` with adaptive
   thinking configured.
@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import re
 from typing import Any
+
+from okf_core.harvest_models import is_openai_model, normalize_model_id
 
 # --- Bedrock Converse (Claude / Anthropic) ----------------------------------
 
@@ -156,11 +158,23 @@ def build_bedrock_converse(
     return ChatBedrockConverse(**kwargs)
 
 
-# --- GPT on Bedrock Mantle (OpenAI-compatible) ------------------------------
+# --- GPT on Bedrock Runtime (OpenAI-compatible) ------------------------------
 
-# GPT-5.x on Mantle lives only in us-east-2 / us-west-2 — independent of a
-# service's own AWS_REGION — so the Mantle region is always an explicit param.
-DEFAULT_MANTLE_REGION = "us-east-2"
+# Keep the configured context and output budgets available to LangChain even
+# when its registry does not recognize Bedrock inference-profile IDs.
+_GPT_PROFILES = {
+    "openai.gpt-6-astra": {"max_input_tokens": 1050000, "max_output_tokens": 128000},
+    "openai.gpt-6-sol": {"max_input_tokens": 1000000, "max_output_tokens": 32000},
+    "openai.gpt-6-luna": {"max_input_tokens": 1000000, "max_output_tokens": 32000},
+    "openai.gpt-5.6-terra": {"max_input_tokens": 1000000, "max_output_tokens": 32000},
+}
+
+
+def gpt_profile(model: str) -> dict[str, int]:
+    """Configured limits for a known GPT model, independent of its profile prefix."""
+    normalized = normalize_model_id(model)
+    return dict(_GPT_PROFILES.get(normalized.split(".", 1)[-1], {}))
+
 
 # Map Converse effort levels onto OpenAI's ``reasoning_effort`` scale
 # (none|minimal|low|medium|high|xhigh|max). GPT-5.6 (Sol/Luna/Terra) added
@@ -176,15 +190,9 @@ DEFAULT_MANTLE_REGION = "us-east-2"
 # "this call is extraction/classification, not reasoning" (a transcript pass,
 # a rewrite, a policy judge), and
 # letting them reach the xhigh default would silently bill a max-reasoning run
-# for a job that wanted none. "none" passes VERBATIM: the whole GPT-5.6
-# Mantle fleet accepts it (LIVE-VERIFIED 2026-08-01 on the previous Luna version:
-# `'minimal' is not supported ... Supported values are: 'none', 'low',
-# 'medium', 'high', 'xhigh'`), and the policy classifiers (judge + rewrite)
-# depend on a genuine no-reasoning pass — an older GPT-5.x id that rejects
-# the name fails loudly at invoke, which is the codebase's standing posture
-# (Bedrock/the catalog are the authority, no client-side allow-list).
-# "minimal" still floors to "low": Luna 400s on that name, so it has no
-# fleet-safe verbatim meaning.
+# for a job that wanted none. Keep the existing mapping: "none" passes through
+# for the policy classifiers, and "minimal" floors to "low". Bedrock validates
+# the actual model's supported levels at invocation.
 FLOOR_GPT_REASONING_EFFORT = "low"
 GPT_EFFORT_MAP = {
     "max": "max",
@@ -197,22 +205,12 @@ GPT_EFFORT_MAP = {
 }
 DEFAULT_GPT_REASONING_EFFORT = "xhigh"
 
-# How long a minted Mantle bearer token is trusted before we re-mint. The token
+# How long a minted Bedrock Runtime bearer token is trusted before we re-mint. The token
 # is a SigV4-PRESIGNED URL, so its effective life is min(requested expiry, life
 # of the signing credentials). On AgentCore the signing creds are TEMPORARY
 # role creds (~1h), so a token minted once and cached for a whole multi-hour run
 # would die mid-run. Re-mint well inside that window.
 DEFAULT_TOKEN_TTL_SECONDS = 1800  # 30 min: comfortably under the ~1h creds life
-
-
-def is_openai_model(model: str) -> bool:
-    """True when ``model`` names an OpenAI GPT model served on Bedrock Mantle.
-
-    Mantle GPT ids are ``openai.<name>`` (e.g. ``openai.gpt-6-sol``); the bare
-    ``gpt-`` form is accepted too for local/dev use. Everything else — the
-    ``us./eu./global.anthropic.*`` Converse profiles — stays on Converse.
-    """
-    return model.startswith("openai.") or model.startswith("gpt-")
 
 
 def gpt_effort(effort: str) -> str:
@@ -222,8 +220,8 @@ def gpt_effort(effort: str) -> str:
     return GPT_EFFORT_MAP.get(effort, DEFAULT_GPT_REASONING_EFFORT)
 
 
-def mantle_token_provider(region: str, *, ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS):
-    """A callable that returns a FRESH Mantle bearer token, cached briefly.
+def bedrock_token_provider(region: str, *, ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS):
+    """A callable that returns a FRESH Bedrock Runtime bearer token, cached briefly.
 
     ``langchain_openai`` / the openai SDK accept ``api_key`` as a
     ``Callable[[], str]`` and invoke it PER REQUEST, so returning a callable
@@ -250,7 +248,7 @@ def mantle_token_provider(region: str, *, ttl_seconds: int = DEFAULT_TOKEN_TTL_S
     return _provider
 
 
-def build_mantle_openai(
+def build_bedrock_openai(
     model: str,
     effort: str,
     max_tokens: int,
@@ -265,7 +263,7 @@ def build_mantle_openai(
     callbacks: Any = None,
     temperature: float | None = None,
 ):
-    """Construct a ``ChatOpenAI`` pointed at the Bedrock Mantle OpenAI endpoint.
+    """Construct ``ChatOpenAI`` for Bedrock Runtime's OpenAI-compatible route.
 
     Auth is a short-lived bearer token minted by ``provide_token(region=...)``:
     a SigV4-derived Bedrock API key that inherits the runtime role's IAM (so an
@@ -274,14 +272,19 @@ def build_mantle_openai(
     token is a presigned URL whose life is bounded by the signing role creds
     (~1h on AgentCore), so a single token can't cover a multi-hour run; the
     openai SDK re-invokes the callable per request (see
-    :func:`mantle_token_provider`).
+    :func:`bedrock_token_provider`).
 
-    ``base_url`` defaults to the Mantle endpoint for ``region``: the Responses
-    API at ``/openai/v1`` (which GPT-5.x requires) unless ``use_responses_api``
-    is False, in which case Chat Completions at ``/v1`` (for gpt-oss models).
+    ``base_url`` defaults to ``bedrock-runtime.<region>.amazonaws.com/openai/v1``.
+    The SDK calls Responses by default, or Chat Completions when
+    ``use_responses_api=False``; both use the same base URL.
     Pass an explicit ``base_url`` to override. The botocore config doesn't apply
     to ``ChatOpenAI`` (it's an httpx client), so read timeout + retry budget map
     onto ``timeout`` / ``max_retries``.
+
+    GPT IDs carry an inference profile; bare IDs gain ``global.``. Known GPT
+    models supply context metadata and clamp ``max_tokens`` to their configured
+    output ceiling. Responses requests set ``store=False`` and replay local
+    conversation history rather than referring to a previous server response.
 
     ``reasoning_summary`` (e.g. ``"auto"``/``"detailed"``): on the Responses API,
     reasoning models THINK regardless of ``reasoning_effort`` but only RETURN the
@@ -299,20 +302,29 @@ def build_mantle_openai(
     from langchain_openai import ChatOpenAI
 
     if base_url is None:
-        default_path = "openai/v1" if use_responses_api else "v1"
-        base_url = f"https://bedrock-mantle.{region}.api.aws/{default_path}"
+        base_url = f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
     kwargs: dict[str, Any] = {
-        "model": model,
+        "model": normalize_model_id(model),
         "base_url": base_url,
-        "api_key": mantle_token_provider(region, ttl_seconds=token_ttl_seconds),
+        "api_key": bedrock_token_provider(region, ttl_seconds=token_ttl_seconds),
         "use_responses_api": use_responses_api,
         "max_tokens": max_tokens,
         "timeout": timeout,
         "max_retries": max_retries,
         "callbacks": callbacks,
     }
+    profile = gpt_profile(model)
+    if profile:
+        kwargs["profile"] = profile
+        kwargs["max_tokens"] = min(max_tokens, profile["max_output_tokens"])
     if temperature is not None:
         kwargs["temperature"] = temperature
+    if use_responses_api:
+        # Conversation history lives in our checkpoints and is replayed on each
+        # request. Do not depend on provider-side stored response IDs.
+        kwargs["store"] = False
+        kwargs["use_previous_response_id"] = False
+        kwargs["output_version"] = "responses/v1"
     if reasoning_summary and use_responses_api:
         # The `reasoning` object controls BOTH effort and whether a summary is
         # returned; use it INSTEAD of reasoning_effort (they're the same knob).
@@ -320,12 +332,6 @@ def build_mantle_openai(
             "effort": gpt_effort(effort),
             "summary": reasoning_summary,
         }
-        # output_version="responses/v1" puts the reasoning SUMMARY into the
-        # message CONTENT as {"type":"reasoning","summary":[{"text":…}]} blocks
-        # (streamable + where our chunk parser reads it). Without it the summary
-        # lands in additional_kwargs and never surfaces in the stream — the
-        # "GPT shows no reasoning" bug.
-        kwargs["output_version"] = "responses/v1"
     else:
         kwargs["reasoning_effort"] = gpt_effort(effort)
     return ChatOpenAI(**kwargs)
@@ -341,21 +347,19 @@ def build_model(
     *,
     region: str,
     botocore_config: Any = None,
-    mantle_region: str | None = None,
-    mantle_use_responses_api: bool = True,
-    mantle_base_url: str | None = None,
-    mantle_timeout: int = 600,
-    mantle_max_retries: int = 5,
+    openai_use_responses_api: bool = True,
+    openai_base_url: str | None = None,
+    openai_timeout: int = 600,
+    openai_max_retries: int = 5,
     token_ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS,
-    mantle_reasoning_summary: str | None = None,
+    openai_reasoning_summary: str | None = None,
     callbacks: Any = None,
 ):
     """Build the chat model, dispatching on the model id's provider.
 
-    ``openai.``/``gpt-`` ids build a Mantle ``ChatOpenAI`` (using the
-    ``mantle_*`` params, with ``mantle_region`` defaulting to
-    :data:`DEFAULT_MANTLE_REGION`); everything else builds a Converse model in
-    ``region``. Either way the result is a plain ``BaseChatModel``.
+    GPT IDs build a Bedrock Runtime ``ChatOpenAI`` using the ``openai_*``
+    params; everything else builds a Converse model. Both use the supplied
+    deployment ``region``. Either way the result is a plain ``BaseChatModel``.
 
     A convenience for callers that don't need per-field env overrides; services
     with their own ``OKF_<SERVICE>_*`` knobs may instead dispatch on
@@ -363,17 +367,17 @@ def build_model(
     does).
     """
     if is_openai_model(model):
-        return build_mantle_openai(
+        return build_bedrock_openai(
             model,
             effort,
             max_tokens,
-            region=mantle_region or DEFAULT_MANTLE_REGION,
-            use_responses_api=mantle_use_responses_api,
-            base_url=mantle_base_url,
-            timeout=mantle_timeout,
-            max_retries=mantle_max_retries,
+            region=region,
+            use_responses_api=openai_use_responses_api,
+            base_url=openai_base_url,
+            timeout=openai_timeout,
+            max_retries=openai_max_retries,
             token_ttl_seconds=token_ttl_seconds,
-            reasoning_summary=mantle_reasoning_summary,
+            reasoning_summary=openai_reasoning_summary,
             callbacks=callbacks,
         )
     return build_bedrock_converse(

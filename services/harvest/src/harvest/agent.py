@@ -97,22 +97,19 @@ DEFAULT_BEDROCK_READ_TIMEOUT = 600
 DEFAULT_BEDROCK_CONNECT_TIMEOUT = 10
 DEFAULT_BEDROCK_MAX_ATTEMPTS = 5
 
-# --- GPT on Bedrock Mantle --------------------------------------------------
+# --- GPT on Bedrock Runtime -------------------------------------------------
 # The harvest agent can also run on OpenAI GPT models, which Bedrock serves via
-# the Mantle endpoint's OpenAI-COMPATIBLE API (Chat Completions), NOT the native
+# the Bedrock Runtime endpoint's OpenAI-compatible Responses API, not the native
 # Converse API. So the LangChain client is ChatOpenAI (langchain-openai) pointed
-# at the Mantle base URL, authed with a short-lived bearer token from
+# at the Bedrock Runtime base URL, authed with a short-lived bearer token from
 # aws_bedrock_token_generator.provide_token() — a SigV4-derived Bedrock API key
 # that inherits the runtime's IAM identity (no API key / Secrets Manager). A
-# model id starting with "openai." / "gpt-" selects this path (see
+# GPT ID, including a global inference profile, selects this path (see
 # _is_openai_model); anything else stays on Converse. Set OKF_HARVEST_MODEL to
-# e.g. "openai.gpt-6-sol" to run GPT.
+# e.g. "global.openai.gpt-6-sol" to run GPT.
 #
-# Region is INDEPENDENT of AWS_REGION: GPT-5.x on Mantle lives only in
-# us-east-2 / us-west-2, while the harvest runtime itself may deploy elsewhere
-# (e.g. eu-west-1). So the Mantle region has its own env var and both the base
-# URL and the token are minted for it. Override via OKF_HARVEST_MANTLE_REGION.
-DEFAULT_MANTLE_REGION = "us-east-2"
+# The Bedrock Runtime base URL and bearer token use the deployment's AWS_REGION,
+# matching the Converse client.
 
 # GPT reasoning models cap output well below Opus 4.8's 128K; give the GPT path
 # its own default so we don't send a Claude-sized ceiling. Overridable via the
@@ -256,7 +253,7 @@ def _bedrock_config():
 
 
 def _is_openai_model(model: str) -> bool:
-    """True when ``model`` names an OpenAI GPT model served on Bedrock Mantle.
+    """True when ``model`` names an OpenAI GPT model served on Bedrock Runtime.
 
     Thin wrapper over the shared :func:`okf_aws.model_factory.is_openai_model`.
     """
@@ -285,8 +282,8 @@ def _build_model(
 ):
     """Build the harvest chat model, dispatching on the model id's provider.
 
-    ``openai.``/``gpt-`` ids build a ChatOpenAI against the Bedrock Mantle
-    OpenAI-compatible endpoint (see ``_build_mantle_openai``); everything else
+    ``openai.``/``gpt-`` ids build a ChatOpenAI against the Bedrock Runtime
+    OpenAI-compatible endpoint (see ``_build_bedrock_openai``); everything else
     builds a ChatBedrockConverse (see ``_build_bedrock_converse``). Either way
     the model is a plain ``BaseChatModel`` that ``create_deep_agent`` accepts and
     both sub-agents inherit.
@@ -300,14 +297,14 @@ def _build_model(
 
     ``surface_reasoning`` makes the model RETURN its reasoning to the client
     (Converse: ``thinking.display="summarized"`` → ``reasoning_content`` blocks;
-    Mantle GPT: ``reasoning={effort, summary:"auto"}`` → ``reasoning`` blocks).
+    Bedrock Runtime GPT: ``reasoning={effort, summary:"auto"}`` → ``reasoning`` blocks).
     Both models think regardless — this only controls whether the thinking comes
     back. Harvests leave it off (nothing renders it; the summary tokens are pure
     cost); the benchmark SOLVER turns it on, because its reasoning is the heart
     of the solver trace the judge and the report UI read.
     """
     if _is_openai_model(model):
-        return _build_mantle_openai(
+        return _build_bedrock_openai(
             model,
             effort,
             max_tokens,
@@ -353,29 +350,29 @@ def _build_bedrock_converse(
     )
 
 
-# How long a minted Mantle bearer token is trusted before we re-mint. The token
+# How long a minted Bedrock Runtime bearer token is trusted before we re-mint. The token
 # is a SigV4-PRESIGNED URL, so its effective life is min(requested expiry, the
 # life of the signing credentials). On AgentCore the signing creds are TEMPORARY
 # role creds (~1h), so a token minted once and cached for a whole 8h harvest dies
 # mid-run ("security token ... is expired"). We re-mint well inside that window.
-_MANTLE_TOKEN_TTL_SECONDS = 1800  # 30 min: comfortably under the ~1h creds life
+_BEDROCK_TOKEN_TTL_SECONDS = 1800  # 30 min: comfortably under the ~1h creds life
 
 
-def _mantle_token_provider(region: str):
-    """A callable that returns a FRESH Mantle bearer token, cached briefly.
+def _bedrock_token_provider(region: str):
+    """A callable that returns a FRESH Bedrock Runtime bearer token, cached briefly.
 
-    Thin wrapper over :func:`okf_aws.model_factory.mantle_token_provider`, pinned
-    to harvest's ``_MANTLE_TOKEN_TTL_SECONDS``. The token is a SigV4-presigned
+    Thin wrapper over :func:`okf_aws.model_factory.bedrock_token_provider`, pinned
+    to harvest's ``_BEDROCK_TOKEN_TTL_SECONDS``. The token is a SigV4-presigned
     URL whose life is bounded by the signing role creds (~1h on AgentCore), so a
     single token can't cover an 8h harvest; the openai SDK re-invokes this
     callable per request, so each call re-reads a fresh (cached ~30 min) token.
     """
-    from okf_aws.model_factory import mantle_token_provider
+    from okf_aws.model_factory import bedrock_token_provider
 
-    return mantle_token_provider(region, ttl_seconds=_MANTLE_TOKEN_TTL_SECONDS)
+    return bedrock_token_provider(region, ttl_seconds=_BEDROCK_TOKEN_TTL_SECONDS)
 
 
-def _build_mantle_openai(
+def _build_bedrock_openai(
     model: str,
     effort: str,
     max_tokens: int,
@@ -383,42 +380,42 @@ def _build_mantle_openai(
     *,
     reasoning_summary: str | None = None,
 ):
-    """Construct a ChatOpenAI pointed at the Bedrock Mantle OpenAI endpoint.
+    """Construct ChatOpenAI for the Bedrock Runtime Responses API.
 
-    Reads harvest's Mantle knobs (OKF_HARVEST_MANTLE_*) and delegates
+    Reads harvest's Bedrock Runtime knobs (OKF_HARVEST_OPENAI_*) and delegates
     construction to the shared factory. Auth is a short-lived bearer token: a
     SigV4-derived Bedrock API key that inherits the runtime role's IAM (so the
     existing ``bedrock:InvokeModel*`` grant covers it — no API key or Secrets
     Manager), passed as a PROVIDER CALLABLE the openai SDK re-invokes per request.
 
-    The Mantle REGION is deliberately separate from ``AWS_REGION`` (GPT-5.x is
-    only in us-east-2/us-west-2); both the base URL and the token use it. GPT-5.x
-    is served ONLY on the Responses API (/openai/v1); an operator running a
-    gpt-oss model can flip OKF_HARVEST_MANTLE_USE_RESPONSES_API=false (→ /v1 Chat
-    Completions). The botocore config doesn't apply to ChatOpenAI (httpx client),
+    ``AWS_REGION`` supplies the deployment region for both the base URL and
+    the bearer token. GPT uses the Responses API; an
+    operator running a gpt-oss model can set
+    OKF_HARVEST_OPENAI_USE_RESPONSES_API=false for Chat Completions on the same
+    /openai/v1 base URL. The botocore config doesn't apply to ChatOpenAI (httpx client),
     so the read timeout + retry budget map onto ``timeout``/``max_retries``.
     """
-    from okf_aws.model_factory import build_mantle_openai
+    from okf_aws.model_factory import build_bedrock_openai
 
-    region = os.environ.get("OKF_HARVEST_MANTLE_REGION", DEFAULT_MANTLE_REGION)
+    region = os.environ.get("AWS_REGION", "us-east-1")
     use_responses = os.environ.get(
-        "OKF_HARVEST_MANTLE_USE_RESPONSES_API", "true"
+        "OKF_HARVEST_OPENAI_USE_RESPONSES_API", "true"
     ).lower() not in ("false", "0", "")
     # An explicit base-URL override wins; otherwise the shared factory derives it
-    # from region + the Responses/ChatCompletions choice.
-    base_url = os.environ.get("OKF_HARVEST_MANTLE_BASE_URL")
-    return build_mantle_openai(
+    # from the request region.
+    base_url = os.environ.get("OKF_HARVEST_OPENAI_BASE_URL")
+    return build_bedrock_openai(
         model,
         effort,
         max_tokens,
         region=region,
         use_responses_api=use_responses,
         base_url=base_url,
-        timeout=_int_env("OKF_HARVEST_MANTLE_READ_TIMEOUT", DEFAULT_BEDROCK_READ_TIMEOUT),
+        timeout=_int_env("OKF_HARVEST_OPENAI_READ_TIMEOUT", DEFAULT_BEDROCK_READ_TIMEOUT),
         max_retries=_int_env(
-            "OKF_HARVEST_MANTLE_MAX_ATTEMPTS", DEFAULT_BEDROCK_MAX_ATTEMPTS
+            "OKF_HARVEST_OPENAI_MAX_ATTEMPTS", DEFAULT_BEDROCK_MAX_ATTEMPTS
         ),
-        token_ttl_seconds=_MANTLE_TOKEN_TTL_SECONDS,
+        token_ttl_seconds=_BEDROCK_TOKEN_TTL_SECONDS,
         reasoning_summary=reasoning_summary,
         callbacks=callbacks,
     )
@@ -699,7 +696,7 @@ def build_harvest_agent(
     # EVERY turn of the supervisor and every sub-agent across a multi-hour run;
     # with the middleware, ChatBedrockConverse inserts cachePoint blocks at
     # request time and that traffic bills as cache READS (~0.1x input) instead
-    # of full price. On a Mantle GPT model it warns once and no-ops (the
+    # of full price. On a Bedrock Runtime GPT model it warns once and no-ops (the
     # Responses API caches prefixes implicitly server-side). Attached to the
     # MAIN agent and EVERY sub-agent (middleware REPLACES, never inherits).
     from langchain_aws.middleware import BedrockPromptCachingMiddleware

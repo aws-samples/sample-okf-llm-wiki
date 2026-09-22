@@ -4,7 +4,7 @@ Two responsibilities:
 
 1. :class:`ChatConfig` — the deploy-time knobs read from ``OKF_CHAT_*`` env
    (bundle/vector/registry pointers reused by the tools, the chat model catalog,
-   the default model/effort/max-tokens, the Mantle region, and the checkpoint
+   the default model/effort/max-tokens, the Bedrock Runtime region, and the checkpoint
    table). Resolved once and passed explicitly so nothing reads process env at
    call time (mirrors ``ConsumptionConfig``).
 
@@ -36,9 +36,15 @@ from okf_core.harvest_models import (
 
 # Chat defaults. Opus 5.5 (Converse) with adaptive thinking, like harvest — but
 # an operator can point OKF_CHAT_MODEL at a lighter/faster model for interactive
-# chat without touching harvest. A GPT id (openai.*) routes to Bedrock Mantle.
+# chat without touching harvest. A GPT id (openai.*) routes to Bedrock Runtime.
 # Opus 5 streaming requires langchain-aws >= 1.6.4 (pinned in requirements).
 DEFAULT_MODEL = "global.anthropic.claude-opus-5-5"
+DEFAULT_CHAT_CATALOG = [{
+    "model": DEFAULT_MODEL,
+    "label": "Claude Opus 5.5",
+    "efforts": ["low", "medium", "high", "xhigh", "max"],
+    "default_effort": "high",
+}]
 
 # GPT reasoning models cap output below Opus; the shared factory keys the
 # provider-aware default off the resolved model, so we only need the Converse
@@ -52,18 +58,14 @@ DEFAULT_BEDROCK_READ_TIMEOUT = 300
 DEFAULT_BEDROCK_CONNECT_TIMEOUT = 10
 DEFAULT_BEDROCK_MAX_ATTEMPTS = 5
 
-# GPT-5.x on Mantle lives only in us-east-2 / us-west-2 — independent of the
-# runtime's own AWS_REGION.
-DEFAULT_MANTLE_REGION = "us-east-2"
-
 # The policy check's pre-pass (chat/policy_check.py) is EXTRACTION — rewrite the
 # question, narrate the chain — so it runs with no reasoning pass rather than
 # on the conversation's own model. Deploy-time only: unlike the per-run chat
 # model this never comes from a client, so it deliberately bypasses the catalog
 # trust boundary (`resolve_model_effort`). Sonnet 5, no reasoning — mirrors
 # var.chat_policy_check_model's default. An openai.* value means the chat
-# role's Mantle grants must be on — infra derives that from the same var (see
-# agentcore_iam.tf chat_mantle_enabled).
+# role's Bedrock Runtime grants must be on — infra derives that from the same var (see
+# agentcore_iam.tf chat_openai_enabled).
 DEFAULT_POLICY_CHECK_MODEL = "global.anthropic.claude-sonnet-5"
 
 # The rewrite emits one small JSON object; a few thousand tokens is the whole
@@ -71,7 +73,7 @@ DEFAULT_POLICY_CHECK_MODEL = "global.anthropic.claude-sonnet-5"
 POLICY_CHECK_MAX_TOKENS = 4000
 
 # Effort for the QUESTION-REWRITE call (extraction, not reasoning). Meaningless
-# with reasoning off on Converse; on Mantle "none" passes VERBATIM (the whole
+# with reasoning off on Converse; on Bedrock Runtime "none" passes VERBATIM (the whole
 # GPT-5.6 fleet accepts it — a genuine no-reasoning pass).
 POLICY_CHECK_EFFORT = "none"
 
@@ -151,14 +153,13 @@ class ChatConfig:
     default_effort: str = DEFAULT_EFFORT
     default_max_tokens: int = DEFAULT_MAX_TOKENS
 
-    # Regions + botocore knobs.
+    # Deployment region (all model providers) + botocore knobs.
     region: str = "us-east-1"
-    mantle_region: str = DEFAULT_MANTLE_REGION
     bedrock_read_timeout: int = DEFAULT_BEDROCK_READ_TIMEOUT
     bedrock_connect_timeout: int = DEFAULT_BEDROCK_CONNECT_TIMEOUT
     bedrock_max_attempts: int = DEFAULT_BEDROCK_MAX_ATTEMPTS
-    mantle_use_responses_api: bool = True
-    mantle_base_url: str | None = None
+    openai_use_responses_api: bool = True
+    openai_base_url: str | None = None
 
     # Optional TTL (seconds) for checkpoint rows; None = no expiry.
     checkpoint_ttl_seconds: int | None = None
@@ -219,6 +220,7 @@ class ChatConfig:
     def from_env(cls, env: dict[str, str] | None = None) -> "ChatConfig":
         env = env if env is not None else dict(os.environ)
         ttl_raw = env.get("OKF_CHAT_CHECKPOINT_TTL_SECONDS")
+        catalog_raw = env.get("OKF_CHAT_MODEL_CATALOG", "")
         return cls(
             bundle_bucket=env["OKF_BUNDLE_BUCKET"],
             vector_bucket=env["OKF_VECTOR_BUCKET"],
@@ -232,12 +234,11 @@ class ChatConfig:
             not in ("false", "0", ""),
             checkpoint_table=env.get("OKF_CHAT_CHECKPOINT_TABLE", "okf-chat-checkpoints"),
             threads_table=env.get("OKF_CHAT_THREADS_TABLE", "okf-chat"),
-            catalog=parse_catalog(env.get("OKF_CHAT_MODEL_CATALOG")),
+            catalog=parse_catalog(catalog_raw) if catalog_raw.strip() else DEFAULT_CHAT_CATALOG,
             default_model=env.get("OKF_CHAT_MODEL", DEFAULT_MODEL),
             default_effort=env.get("OKF_CHAT_EFFORT", DEFAULT_EFFORT),
             default_max_tokens=_int_env("OKF_CHAT_MAX_TOKENS", DEFAULT_MAX_TOKENS, env),
             region=env.get("AWS_REGION", "us-east-1"),
-            mantle_region=env.get("OKF_CHAT_MANTLE_REGION", DEFAULT_MANTLE_REGION),
             bedrock_read_timeout=_int_env(
                 "OKF_CHAT_BEDROCK_READ_TIMEOUT", DEFAULT_BEDROCK_READ_TIMEOUT, env
             ),
@@ -247,11 +248,11 @@ class ChatConfig:
             bedrock_max_attempts=_int_env(
                 "OKF_CHAT_BEDROCK_MAX_ATTEMPTS", DEFAULT_BEDROCK_MAX_ATTEMPTS, env
             ),
-            mantle_use_responses_api=env.get(
-                "OKF_CHAT_MANTLE_USE_RESPONSES_API", "true"
+            openai_use_responses_api=env.get(
+                "OKF_CHAT_OPENAI_USE_RESPONSES_API", "true"
             ).lower()
             not in ("false", "0", ""),
-            mantle_base_url=env.get("OKF_CHAT_MANTLE_BASE_URL"),
+            openai_base_url=env.get("OKF_CHAT_OPENAI_BASE_URL"),
             checkpoint_ttl_seconds=int(ttl_raw) if ttl_raw else None,
             checkpoint_offload_bucket=env.get("OKF_CHAT_CHECKPOINT_BUCKET", ""),
             sql_enabled=env.get("OKF_CHAT_SQL_ENABLED", "").lower()
@@ -317,7 +318,7 @@ def _bedrock_config(cfg: ChatConfig):
 def build_chat_model(cfg: ChatConfig, model: str, effort: str, max_tokens: int | None = None):
     """Build the pinned chat model for a conversation via the shared factory.
 
-    Dispatches on the model id (``openai.``/``gpt-`` → Mantle ``ChatOpenAI``; else
+    Dispatches on the model id (``openai.``/``gpt-`` → Bedrock Runtime ``ChatOpenAI``; else
     ``ChatBedrockConverse``) using ``cfg``'s regions/knobs. ``max_tokens`` defaults
     to the config's ceiling; the factory's own provider-aware default is not used
     here because chat pins an explicit ceiling per conversation.
@@ -326,13 +327,13 @@ def build_chat_model(cfg: ChatConfig, model: str, effort: str, max_tokens: int |
 
     max_tokens = max_tokens or cfg.default_max_tokens
     if mf.is_openai_model(model):
-        return mf.build_mantle_openai(
+        return mf.build_bedrock_openai(
             model,
             effort,
             max_tokens,
-            region=cfg.mantle_region,
-            use_responses_api=cfg.mantle_use_responses_api,
-            base_url=cfg.mantle_base_url,
+            region=cfg.region,
+            use_responses_api=cfg.openai_use_responses_api,
+            base_url=cfg.openai_base_url,
             timeout=cfg.bedrock_read_timeout,
             max_retries=cfg.bedrock_max_attempts,
             # The chat UI displays reasoning, so request a summary — on the
@@ -372,13 +373,13 @@ def build_policy_check_model(cfg: ChatConfig):
 
     model = cfg.policy_check_model
     if mf.is_openai_model(model):
-        return mf.build_mantle_openai(
+        return mf.build_bedrock_openai(
             model,
             POLICY_CHECK_EFFORT,
             POLICY_CHECK_MAX_TOKENS,
-            region=cfg.mantle_region,
-            use_responses_api=cfg.mantle_use_responses_api,
-            base_url=cfg.mantle_base_url,
+            region=cfg.region,
+            use_responses_api=cfg.openai_use_responses_api,
+            base_url=cfg.openai_base_url,
             timeout=cfg.bedrock_read_timeout,
             max_retries=cfg.bedrock_max_attempts,
         )
@@ -412,13 +413,13 @@ def build_policy_judge_model(cfg: ChatConfig):
 
     model = cfg.policy_check_model
     if mf.is_openai_model(model):
-        return mf.build_mantle_openai(
+        return mf.build_bedrock_openai(
             model,
             "none",  # classifier: no reasoning pass
             POLICY_JUDGE_MAX_TOKENS,
-            region=cfg.mantle_region,
-            use_responses_api=cfg.mantle_use_responses_api,
-            base_url=cfg.mantle_base_url,
+            region=cfg.region,
+            use_responses_api=cfg.openai_use_responses_api,
+            base_url=cfg.openai_base_url,
             timeout=cfg.bedrock_read_timeout,
             max_retries=cfg.bedrock_max_attempts,
         )

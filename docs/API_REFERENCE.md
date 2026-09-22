@@ -58,6 +58,26 @@ don't drift. Sources are at the end of each section.
   `langchain-aws` package (`pip install langchain-aws`), not the `langchain[aws]`
   extra. Building the model explicitly lets adaptive-thinking config ride on it
   via `additional_model_request_fields` (see §7 of `OKF_DESIGN.md`).
+- **GPT models.** `okf_aws.model_factory.build_bedrock_openai` builds
+  `ChatOpenAI` against
+  `https://bedrock-runtime.<region>.amazonaws.com/openai/v1`, with
+  `use_responses_api=True`. Harvest and benchmarks offer GPT-6 Astra, Sol,
+  and Luna through `global.openai.gpt-6-*` inference profiles; GPT-5.6 Terra
+  remains available. Bare GPT IDs are normalized to their global profile.
+  Chat keeps its separate Opus 5.5 catalog and the Converse client.
+  The OpenAI client uses a renewable short-term Bedrock bearer, `store=False`,
+  and local message history. The execution role grants `bedrock:InvokeModel`,
+  `bedrock:InvokeModelWithResponseStream`, and short-term
+  `bedrock:CallWithBearerToken`; no Mantle project permissions are needed.
+  Known GPT models also supply context metadata and enforce their configured
+  output ceilings: Astra 128K, Sol/Luna/Terra 32K.
+
+  The former `OKF_<SERVICE>_MANTLE_*` client settings are now
+  `OKF_<SERVICE>_OPENAI_*`, except the separate provider region setting, which
+  is removed. All model requests use the solution's deployment region:
+  Terraform `var.region` is injected as `AWS_REGION` for both runtimes.
+  That region determines the request endpoint and bearer; the global inference
+  profile determines where Bedrock serves the request.
 - **Backends** (`from deepagents.backends import ...`): `StateBackend` (default,
   ephemeral in graph state), `FilesystemBackend(root_dir=<abs>,
   virtual_mode=True)` (real files — `virtual_mode=True` is required, the default
@@ -167,7 +187,7 @@ gets it by talking MCP to a gateway whose single target is the built-in
 > in a URL, fetch it). The chat agent deliberately does NOT use it: the gateway
 > connector serves every chat model (Anthropic included), is search-only, and
 > stays in-AWS; the chat role holds no `bedrock-websearch:*` actions, and our
-> Mantle requests never send the built-in tool (our LangChain `web_search` is a
+> Responses requests never send the built-in tool (our LangChain `web_search` is a
 > `type: "function"` tool — the shared name does not trigger the `type:
 > "web_search"` built-in).
 
