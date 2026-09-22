@@ -106,7 +106,7 @@ DEFAULT_BEDROCK_MAX_ATTEMPTS = 5
 # that inherits the runtime's IAM identity (no API key / Secrets Manager). A
 # model id starting with "openai." / "gpt-" selects this path (see
 # _is_openai_model); anything else stays on Converse. Set OKF_HARVEST_MODEL to
-# e.g. "openai.gpt-5.6-sol" to run GPT.
+# e.g. "openai.gpt-6-sol" to run GPT.
 #
 # Region is INDEPENDENT of AWS_REGION: GPT-5.x on Mantle lives only in
 # us-east-2 / us-west-2, while the harvest runtime itself may deploy elsewhere

@@ -665,7 +665,7 @@ function TopbarHeader({
 // item; when chat (or its Memory sub-page) is the ACTIVE section its controls
 // (new chat, history, memory) reveal as sub-items beneath it — driven by the
 // shared chat controller so they operate the same conversation the chat page
-// renders. The model is fixed (Opus 5); effort lives in the composer, so no
+// renders. The model is fixed (Opus 5.5); effort lives in the composer, so no
 // model/effort controls here.
 function ChatNav({ item, section, onNavigate, ctrl, tooltip = item.label }) {
   const { historyOpen, setHistoryOpen } = ctrl

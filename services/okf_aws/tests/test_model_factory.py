@@ -21,7 +21,7 @@ from okf_aws import model_factory as mf
 
 @pytest.mark.parametrize(
     "model",
-    ["openai.gpt-5.6-sol", "openai.gpt-5.4", "openai.gpt-oss-120b", "gpt-5.5"],
+    ["openai.gpt-6-sol", "openai.gpt-5.4", "openai.gpt-oss-120b", "gpt-5.5"],
 )
 def test_is_openai_model_true_for_gpt(model):
     assert mf.is_openai_model(model) is True
@@ -143,10 +143,10 @@ def test_build_mantle_openai_defaults_to_responses_api(monkeypatch):
     captured, _state = _install_openai_stubs(monkeypatch)
 
     mf.build_mantle_openai(
-        "openai.gpt-5.6-sol", "xhigh", 32000, region=mf.DEFAULT_MANTLE_REGION
+        "openai.gpt-6-sol", "xhigh", 32000, region=mf.DEFAULT_MANTLE_REGION
     )
 
-    assert captured["model"] == "openai.gpt-5.6-sol"
+    assert captured["model"] == "openai.gpt-6-sol"
     # Responses API at /openai/v1, derived from the region.
     assert captured["base_url"] == (
         f"https://bedrock-mantle.{mf.DEFAULT_MANTLE_REGION}.api.aws/openai/v1"
@@ -191,7 +191,7 @@ def test_build_mantle_openai_explicit_base_url_wins(monkeypatch):
     captured, _state = _install_openai_stubs(monkeypatch)
 
     mf.build_mantle_openai(
-        "openai.gpt-5.6-sol",
+        "openai.gpt-6-sol",
         "high",
         32000,
         region="us-east-2",
@@ -205,7 +205,7 @@ def test_build_mantle_openai_no_summary_uses_reasoning_effort(monkeypatch):
     # Default (harvest): no summary requested -> plain reasoning_effort, no
     # `reasoning` object (so nothing changes for callers that don't show thinking).
     captured, _state = _install_openai_stubs(monkeypatch)
-    mf.build_mantle_openai("openai.gpt-5.6-sol", "high", 32000, region="us-east-2")
+    mf.build_mantle_openai("openai.gpt-6-sol", "high", 32000, region="us-east-2")
     assert captured["reasoning_effort"] == "high"
     assert "reasoning" not in captured
 
@@ -215,7 +215,7 @@ def test_build_mantle_openai_summary_uses_reasoning_object(monkeypatch):
     # thinking on the Responses API; the bare reasoning_effort knob is superseded.
     captured, _state = _install_openai_stubs(monkeypatch)
     mf.build_mantle_openai(
-        "openai.gpt-5.6-sol",
+        "openai.gpt-6-sol",
         "high",
         32000,
         region="us-east-2",
@@ -232,7 +232,7 @@ def test_build_mantle_openai_summary_uses_reasoning_object(monkeypatch):
 def test_build_mantle_openai_omits_temperature_by_default(monkeypatch):
     # Absent kwarg -> the model's own default; the agent paths must be untouched.
     captured, _state = _install_openai_stubs(monkeypatch)
-    mf.build_mantle_openai("openai.gpt-5.6-sol", "high", 32000, region="us-east-2")
+    mf.build_mantle_openai("openai.gpt-6-sol", "high", 32000, region="us-east-2")
     assert "temperature" not in captured
 
 
@@ -241,7 +241,7 @@ def test_build_mantle_openai_forwards_zero_temperature(monkeypatch):
     # extraction pass actually asks for is the one value silently dropped.
     captured, _state = _install_openai_stubs(monkeypatch)
     mf.build_mantle_openai(
-        "openai.gpt-5.6-sol", "minimal", 4096, region="us-east-2", temperature=0
+        "openai.gpt-6-sol", "minimal", 4096, region="us-east-2", temperature=0
     )
     assert captured["temperature"] == 0
     assert captured["reasoning_effort"] == "low"
@@ -444,12 +444,12 @@ def test_build_model_dispatches_gpt_to_mantle(monkeypatch):
     captured, _state = _install_openai_stubs(monkeypatch)
 
     mf.build_model(
-        "openai.gpt-5.6-sol", "high", 32000, region="us-east-1", mantle_region="us-east-2"
+        "openai.gpt-6-sol", "high", 32000, region="us-east-1", mantle_region="us-east-2"
     )
 
     # Went through the OpenAI stub (Mantle path), with the Mantle region — not
     # the Converse region.
-    assert captured["model"] == "openai.gpt-5.6-sol"
+    assert captured["model"] == "openai.gpt-6-sol"
     assert captured["base_url"] == "https://bedrock-mantle.us-east-2.api.aws/openai/v1"
 
 

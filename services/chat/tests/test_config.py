@@ -51,7 +51,7 @@ def test_from_env_defaults():
     assert cfg.web_search_filters_enabled is False
     assert [e["model"] for e in cfg.catalog] == [
         "us.anthropic.claude-opus-4-8",
-        "openai.gpt-5.6-sol",
+        "openai.gpt-6-sol",
     ]
 
 
@@ -93,7 +93,7 @@ def test_from_env_web_search():
 def test_from_env_overrides():
     cfg = ChatConfig.from_env(
         _env(
-            OKF_CHAT_MODEL="openai.gpt-5.6-sol",
+            OKF_CHAT_MODEL="openai.gpt-6-sol",
             OKF_CHAT_EFFORT="max",
             OKF_CHAT_MAX_TOKENS="16000",
             OKF_CHAT_CHECKPOINT_TABLE="my-checkpoints",
@@ -102,7 +102,7 @@ def test_from_env_overrides():
             OKF_CHAT_MANTLE_REGION="us-west-2",
         )
     )
-    assert cfg.default_model == "openai.gpt-5.6-sol"
+    assert cfg.default_model == "openai.gpt-6-sol"
     assert cfg.default_effort == "max"
     assert cfg.default_max_tokens == 16000
     assert cfg.checkpoint_table == "my-checkpoints"
@@ -119,9 +119,9 @@ def test_resolve_model_effort_fills_default_effort():
 
 
 def test_resolve_model_effort_none_model_falls_back_to_config_default():
-    cfg = ChatConfig.from_env(_env(OKF_CHAT_MODEL="openai.gpt-5.6-sol"))
+    cfg = ChatConfig.from_env(_env(OKF_CHAT_MODEL="openai.gpt-6-sol"))
     model, effort = cfg.resolve_model_effort(None, None)
-    assert model == "openai.gpt-5.6-sol"
+    assert model == "openai.gpt-6-sol"
     assert effort == "high"
 
 
@@ -157,8 +157,8 @@ def test_build_chat_model_dispatches_gpt_to_mantle(monkeypatch):
     monkeypatch.setitem(sys.modules, "aws_bedrock_token_generator", tg)
 
     cfg = ChatConfig.from_env(_env(OKF_CHAT_MANTLE_REGION="us-east-2"))
-    build_chat_model(cfg, "openai.gpt-5.6-sol", "high")
-    assert captured["model"] == "openai.gpt-5.6-sol"
+    build_chat_model(cfg, "openai.gpt-6-sol", "high")
+    assert captured["model"] == "openai.gpt-6-sol"
     assert captured["base_url"] == "https://bedrock-mantle.us-east-2.api.aws/openai/v1"
     # Chat requests a reasoning SUMMARY so GPT returns its thinking on the
     # Responses API — this maps to `reasoning={effort, summary}` (which supersedes

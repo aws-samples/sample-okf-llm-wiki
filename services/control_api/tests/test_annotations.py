@@ -267,7 +267,7 @@ def test_run_forwards_valid_model_effort_triple(cfg):
     resp = _run(
         cfg,
         body={
-            "model": "openai.gpt-5.6-sol",
+            "model": "openai.gpt-6-sol",
             "effort": "high",
             "subagent_model": "global.anthropic.claude-sonnet-5",
             "reviewer_model": "openai.gpt-5.6-terra",
@@ -276,7 +276,7 @@ def test_run_forwards_valid_model_effort_triple(cfg):
     )
     assert resp["statusCode"] == 200
     payload = json.loads(cfg.agentcore.calls[-1]["payload"].decode())
-    assert payload["model"] == "openai.gpt-5.6-sol"
+    assert payload["model"] == "openai.gpt-6-sol"
     assert payload["effort"] == "high"
     assert payload["subagent_model"] == "global.anthropic.claude-sonnet-5"
     assert payload["reviewer_model"] == "openai.gpt-5.6-terra"

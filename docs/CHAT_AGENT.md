@@ -231,7 +231,7 @@ resolved, not an open risk.
 
 ## 6. Model configuration
 
-Requirement: pick model (Opus 4.8 / GPT-5.6 Sol) + effort like harvest does, but
+Requirement: pick model (Opus 4.8 / GPT-6 Sol) + effort like harvest does, but
 **model is pinned per conversation** — switching model **starts a new thread**,
 because Opus and GPT checkpoints are **not portable** (provider-specific thinking
 signatures + tool/reasoning content formats; resuming across providers makes the

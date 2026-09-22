@@ -34,11 +34,11 @@ from okf_core.harvest_models import (
     validate_model_effort,
 )
 
-# Chat defaults. Opus 5 (Converse) with adaptive thinking, like harvest — but
+# Chat defaults. Opus 5.5 (Converse) with adaptive thinking, like harvest — but
 # an operator can point OKF_CHAT_MODEL at a lighter/faster model for interactive
 # chat without touching harvest. A GPT id (openai.*) routes to Bedrock Mantle.
 # Opus 5 streaming requires langchain-aws >= 1.6.4 (pinned in requirements).
-DEFAULT_MODEL = "global.anthropic.claude-opus-5"
+DEFAULT_MODEL = "global.anthropic.claude-opus-5-5"
 
 # GPT reasoning models cap output below Opus; the shared factory keys the
 # provider-aware default off the resolved model, so we only need the Converse

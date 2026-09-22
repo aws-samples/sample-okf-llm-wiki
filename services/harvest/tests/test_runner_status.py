@@ -274,14 +274,14 @@ def test_full_harvest_stamps_subagent_override_on_running(tmp_path, monkeypatch)
         data_domain="s",
         dataset="db",
         subagent_model_config={
-            "model": "openai.gpt-5.6-sol",
+            "model": "openai.gpt-6-sol",
             "effort": "high",
             "max_tokens": 32000,
         },
     )
 
     running = next(t for t in transitions if t[0] == "running")
-    assert running[2] == "openai.gpt-5.6-sol"
+    assert running[2] == "openai.gpt-6-sol"
     assert running[3] == "high"
 
 
@@ -295,14 +295,14 @@ def test_full_harvest_stamps_reviewer_override_on_running(tmp_path, monkeypatch)
         data_domain="s",
         dataset="db",
         reviewer_model_config={
-            "model": "openai.gpt-5.6-sol",
+            "model": "openai.gpt-6-sol",
             "effort": "high",
             "max_tokens": 32000,
         },
     )
 
     running = next(t for t in transitions if t[0] == "running")
-    assert running[4] == "openai.gpt-5.6-sol"
+    assert running[4] == "openai.gpt-6-sol"
 
 
 def test_full_harvest_no_subagent_stamp_without_override(tmp_path, monkeypatch):

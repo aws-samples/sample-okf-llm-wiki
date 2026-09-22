@@ -177,7 +177,7 @@ DEFAULT_MANTLE_REGION = "us-east-2"
 # a rewrite, a policy judge), and
 # letting them reach the xhigh default would silently bill a max-reasoning run
 # for a job that wanted none. "none" passes VERBATIM: the whole GPT-5.6
-# Mantle fleet accepts it (LIVE-VERIFIED 2026-08-01 on gpt-5.6-luna:
+# Mantle fleet accepts it (LIVE-VERIFIED 2026-08-01 on the previous Luna version:
 # `'minimal' is not supported ... Supported values are: 'none', 'low',
 # 'medium', 'high', 'xhigh'`), and the policy classifiers (judge + rewrite)
 # depend on a genuine no-reasoning pass — an older GPT-5.x id that rejects
@@ -208,7 +208,7 @@ DEFAULT_TOKEN_TTL_SECONDS = 1800  # 30 min: comfortably under the ~1h creds life
 def is_openai_model(model: str) -> bool:
     """True when ``model`` names an OpenAI GPT model served on Bedrock Mantle.
 
-    Mantle GPT ids are ``openai.<name>`` (e.g. ``openai.gpt-5.6-sol``); the bare
+    Mantle GPT ids are ``openai.<name>`` (e.g. ``openai.gpt-6-sol``); the bare
     ``gpt-`` form is accepted too for local/dev use. Everything else — the
     ``us./eu./global.anthropic.*`` Converse profiles — stays on Converse.
     """

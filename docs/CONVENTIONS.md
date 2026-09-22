@@ -1454,7 +1454,7 @@ id>, payload=json.dumps({...}).encode())`, where the payload is either:
 ```json
 { "data_domain": "sales", "dataset": "orders", "mode": "full",
   "source": { "type": "glue", "glue_database": "orders" },
-  "model": "openai.gpt-5.6-sol", "effort": "xhigh",
+  "model": "openai.gpt-6-sol", "effort": "xhigh",
   "domain_description": "Revenue & order pipelines",
   "domain_context": "Covers all B2C sales; refunds excluded." }
 ```
@@ -1524,7 +1524,7 @@ or, for an annotation run (apply a user's wiki feedback in place):
       "quote": "one row per order", "prefix": "", "suffix": "",
       "block_line": 12, "note": "grain is per line-item, not per order" }
   ],
-  "model": "openai.gpt-5.6-sol", "effort": "high",
+  "model": "openai.gpt-6-sol", "effort": "high",
   "subagent_model": "…", "subagent_effort": "…",
   "reviewer_model": "…", "reviewer_effort": "…",
   "domain_description": "Revenue & order pipelines",
@@ -1570,7 +1570,7 @@ are retired end to end. The payload (`okf_core.benchmark_report` field names):
   "questions_key": "benchmark/sales/orders/questions.csv",
   "questions_version_id": "3sL4kqQJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo",
   "solver_model": "global.anthropic.claude-sonnet-5", "solver_effort": "high",
-  "judge_model": "global.anthropic.claude-opus-5", "judge_effort": "xhigh",
+  "judge_model": "global.anthropic.claude-opus-5-5", "judge_effort": "xhigh",
   "behavior_live_sql": false,
   "source": {"type": "glue", "glue_database": "orders"} }
 ```
@@ -1942,7 +1942,7 @@ USER — never facts about the data (tables/joins/metrics belong to the wiki):
 | `OKF_MOUNT_PATH` | S3 Files mount (default `/mnt/data`) |
 | `OKF_CODE_INTERPRETER_ID` | AgentCore Code Interpreter id backing the harvest agent's `run_code` tool (extracts text from binary `.context/` docs). A network-isolated SANDBOX-mode interpreter. Unset → harvest runs without `run_code` (text-only `.context` reading) |
 | `OKF_ENABLE_LAKEFORMATION` | Set (`"true"`) when the harvested Glue catalog is Lake Formation-governed → adds `lakeformation:GetDataAccess` to the harvest data role's per-invocation session policy so LF can vend S3 creds for governed table data. Set by `var.enable_lakeformation`; requires adopter-side LF grants + data-location registration (see `docs/LAKE_FORMATION.md`). Unset → plain IAM catalog access |
-| `OKF_HARVEST_MODEL` | harvest model id — the **fallback default** used when a harvest request omits `model` (default `us.anthropic.claude-opus-4-8`). An `anthropic.*` id runs on the Bedrock **Converse** API (`ChatBedrockConverse`); an `openai.*` / `gpt-*` id (e.g. `openai.gpt-5.6-sol`) runs on the Bedrock **Mantle** OpenAI-compatible endpoint (`ChatOpenAI`, bearer-token auth via `aws_bedrock_token_generator`). The prefix selects the provider; see `agent._build_model` |
+| `OKF_HARVEST_MODEL` | harvest model id — the **fallback default** used when a harvest request omits `model` (default `us.anthropic.claude-opus-4-8`). An `anthropic.*` id runs on the Bedrock **Converse** API (`ChatBedrockConverse`); an `openai.*` / `gpt-*` id (e.g. `openai.gpt-6-sol`) runs on the Bedrock **Mantle** OpenAI-compatible endpoint (`ChatOpenAI`, bearer-token auth via `aws_bedrock_token_generator`). The prefix selects the provider; see `agent._build_model` |
 | `OKF_HARVEST_MODEL_CATALOG` | (Control API) JSON array of `{model, label, efforts, default_effort}` — the models + efforts the UI picker offers and the Control API validates a per-harvest `model`/`effort` against. From `var.harvest_model_catalog`; unset → `okf_core.harvest_models.DEFAULT_CATALOG`. The UI receives the same catalog **base64-encoded** as `VITE_HARVEST_MODEL_CATALOG` (base64 so it survives `deploy.sh`'s `eval "export k=v"`) |
 | `OKF_HARVEST_MANTLE_REGION` | AWS region for the Bedrock Mantle endpoint when `OKF_HARVEST_MODEL` is a GPT id (default `us-east-2`). **Independent of `AWS_REGION`** — GPT-5.x on Mantle is only in us-east-2/us-west-2, while the harvest runtime may deploy elsewhere. Drives both the Mantle base URL and the region the bearer token is minted for. Ignored on the Converse path |
 | `OKF_HARVEST_MANTLE_USE_RESPONSES_API` | selects the Mantle API surface (default `true` → OpenAI **Responses** API on the `/openai/v1` path, which is what GPT-5.x requires). Set `false` for a gpt-oss model (Chat Completions on `/v1`). GPT path only |
