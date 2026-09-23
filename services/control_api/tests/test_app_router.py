@@ -527,7 +527,7 @@ def test_post_harvest_forwards_valid_model_effort(cfg, agentcore):
             body={
                 "data_domain": "sales",
                 "dataset": "orders",
-                "model": "openai.gpt-5.6-sol",
+                "model": "global.openai.gpt-6-sol",
                 "effort": "high",
             },
         ),
@@ -535,7 +535,7 @@ def test_post_harvest_forwards_valid_model_effort(cfg, agentcore):
     )
     assert resp["statusCode"] == 200
     payload = agentcore.last_payload()
-    assert payload["model"] == "openai.gpt-5.6-sol"
+    assert payload["model"] == "global.openai.gpt-6-sol"
     assert payload["effort"] == "high"
 
 
@@ -547,12 +547,12 @@ def test_post_harvest_defaults_effort_when_only_model_given(cfg, agentcore):
             body={
                 "data_domain": "sales",
                 "dataset": "orders",
-                "model": "openai.gpt-5.6-sol",
+                "model": "global.openai.gpt-6-sol",
             },
         ),
         cfg,
     )
-    # Catalog default effort for gpt-5.6-sol is xhigh.
+    # Catalog default effort for gpt-6-sol is xhigh.
     assert agentcore.last_payload()["effort"] == "xhigh"
 
 
@@ -582,7 +582,7 @@ def test_post_harvest_effort_not_offered_400(cfg, agentcore):
             body={
                 "data_domain": "sales",
                 "dataset": "orders",
-                "model": "openai.gpt-5.6-sol",
+                "model": "global.openai.gpt-6-sol",
                 "effort": "ultra",
             },
         ),
@@ -602,7 +602,7 @@ def test_post_harvest_forwards_valid_reviewer_pair(cfg, agentcore):
                 "data_domain": "sales",
                 "dataset": "orders",
                 "subagent_model": "global.anthropic.claude-sonnet-5",
-                "reviewer_model": "openai.gpt-5.6-sol",
+                "reviewer_model": "global.openai.gpt-6-sol",
                 "reviewer_effort": "high",
             },
         ),
@@ -611,7 +611,7 @@ def test_post_harvest_forwards_valid_reviewer_pair(cfg, agentcore):
     assert resp["statusCode"] == 200
     payload = agentcore.last_payload()
     assert payload["subagent_model"] == "global.anthropic.claude-sonnet-5"
-    assert payload["reviewer_model"] == "openai.gpt-5.6-sol"
+    assert payload["reviewer_model"] == "global.openai.gpt-6-sol"
     assert payload["reviewer_effort"] == "high"
 
 
@@ -674,7 +674,7 @@ def test_post_harvest_forwards_valid_subagent_pair(cfg, agentcore):
                 "dataset": "orders",
                 "model": "global.anthropic.claude-opus-4-8",
                 "effort": "xhigh",
-                "subagent_model": "openai.gpt-5.6-sol",
+                "subagent_model": "global.openai.gpt-6-sol",
                 "subagent_effort": "high",
             },
         ),
@@ -683,7 +683,7 @@ def test_post_harvest_forwards_valid_subagent_pair(cfg, agentcore):
     assert resp["statusCode"] == 200
     payload = agentcore.last_payload()
     assert payload["model"] == "global.anthropic.claude-opus-4-8"
-    assert payload["subagent_model"] == "openai.gpt-5.6-sol"
+    assert payload["subagent_model"] == "global.openai.gpt-6-sol"
     assert payload["subagent_effort"] == "high"
 
 
@@ -697,7 +697,7 @@ def test_post_harvest_omits_subagent_pair_by_default(cfg, agentcore):
             body={
                 "data_domain": "sales",
                 "dataset": "orders",
-                "model": "openai.gpt-5.6-sol",
+                "model": "global.openai.gpt-6-sol",
             },
         ),
         cfg,
@@ -714,7 +714,7 @@ def test_post_harvest_subagent_defaults_effort_when_only_model_given(cfg, agentc
             body={
                 "data_domain": "sales",
                 "dataset": "orders",
-                "subagent_model": "openai.gpt-5.6-sol",
+                "subagent_model": "global.openai.gpt-6-sol",
             },
         ),
         cfg,
@@ -847,12 +847,12 @@ def test_get_harvest_status_surfaces_model_effort(cfg):
             "sk": {"S": "STATUS"},
             "status": {"S": "running"},
             "mode": {"S": "full"},
-            "model": {"S": "openai.gpt-5.6-sol"},
+            "model": {"S": "global.openai.gpt-6-sol"},
             "effort": {"S": "xhigh"},
         },
     )
     body = _json(app.route(_event("GET", "/harvest/sales/orders"), cfg))
-    assert body["status"]["model"] == "openai.gpt-5.6-sol"
+    assert body["status"]["model"] == "global.openai.gpt-6-sol"
     assert body["status"]["effort"] == "xhigh"
 
 

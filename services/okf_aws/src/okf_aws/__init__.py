@@ -12,11 +12,11 @@ from okf_aws.embeddings import (
 )
 from okf_aws.model_factory import (
     build_bedrock_converse,
-    build_mantle_openai,
+    build_bedrock_openai,
     build_model,
     gpt_effort,
     is_openai_model,
-    mantle_token_provider,
+    bedrock_token_provider,
     thinking_fields,
 )
 from okf_aws.s3_bundle import (
@@ -49,11 +49,11 @@ __all__ = [
     "put_vector",
     "query_vectors",
     "build_bedrock_converse",
-    "build_mantle_openai",
+    "build_bedrock_openai",
     "build_model",
     "gpt_effort",
     "is_openai_model",
-    "mantle_token_provider",
+    "bedrock_token_provider",
     "thinking_fields",
     "ConceptLocation",
     "bundle_prefix",

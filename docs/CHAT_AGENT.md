@@ -231,7 +231,7 @@ resolved, not an open risk.
 
 ## 6. Model configuration
 
-Requirement: pick model (Opus 4.8 / GPT-5.6 Sol) + effort like harvest does, but
+Requirement: pick model (Opus 4.8 / GPT-6 Sol) + effort like harvest does, but
 **model is pinned per conversation** — switching model **starts a new thread**,
 because Opus and GPT checkpoints are **not portable** (provider-specific thinking
 signatures + tool/reasoning content formats; resuming across providers makes the
@@ -243,7 +243,7 @@ new provider's API reject the stored history).
   provider-agnostic despite the name): the `{model, label, efforts, default_effort}`
   schema, `EFFORT_LEVELS`, and `validate_model_effort`.
 - **Provider factory:** **extract** `_build_model` / `_is_openai_model` /
-  `_build_bedrock_converse` / `_build_mantle_openai` / `_mantle_token_provider` /
+  `_build_bedrock_converse` / `_build_bedrock_openai` / `_bedrock_token_provider` /
   `_thinking_fields` / `_gpt_effort` out of `services/harvest/src/harvest/agent.py`
   into a shared module (proposed: `okf_aws` or a new `okf_core/model_factory.py`)
   so harvest and chat build identical model clients. Harvest keeps its
@@ -265,8 +265,8 @@ Harvest validates `(model, effort)` in the Control API before it reaches
 **runtime itself** validates the pinned `(model, effort)` against
 `OKF_CHAT_MODEL_CATALOG` at session creation, before the first `InvokeModel`.
 Same principle (validate server-side, never trust the client), enforced one hop
-later. The IAM role grants Mantle only if a catalog entry is `openai.*` — reuse
-harvest's `local.*_mantle_enabled` pattern (`infra/compute/agentcore_iam.tf:14`).
+later. The IAM role grants short-term Bedrock bearer-token access when a GPT model is reachable, including `global.openai.*` IDs — reuse
+harvest's `local.*_openai_enabled` pattern (`infra/compute/agentcore_iam.tf:14`).
 
 ### 6.4 Pinning
 
@@ -491,10 +491,10 @@ the chat run.
   `lifecycle_configuration` (idle ~900–1800s), `OKF_CHAT_*` env.
 - `agentcore_iam.tf`: `aws_iam_role "chat"` = baseline + consumption grants
   (bundle read, Bedrock embed, S3 Vectors query, registry read) + `bedrock:InvokeModel*`
-  + conditional Mantle (reuse the `*_mantle_enabled` local over `chat_model_catalog`)
+  + conditional Bedrock bearer-token permissions (reuse the `*_openai_enabled` local over `chat_model_catalog`)
   + DDB read/write on both chat tables.
 - `variables.tf`: `chat_image_uri`, `chat_model_catalog`, `chat_model`,
-  `chat_effort`, `chat_mantle_region`, `chat_max_tokens`, idle timeout.
+  `chat_effort`, `chat_max_tokens`, idle timeout.
 - `outputs.tf`: add `chat_runtime_arn`; add `VITE_CHAT_RUNTIME_ARN`,
   `VITE_CHAT_SCOPE`, `VITE_CHAT_MODEL_CATALOG` to `ui_env`.
 - `control_api.tf`: pass `OKF_CHAT_THREADS_TABLE`.
@@ -515,7 +515,7 @@ alongside harvest + consumption.
   `prepare`). Note `threadId == runtimeSessionId` and the ≥33-char rule.
 - **`OKF_CHAT_*` env vars** in the env table:
   `OKF_CHAT_MODEL`, `OKF_CHAT_EFFORT`, `OKF_CHAT_MAX_TOKENS`,
-  `OKF_CHAT_MANTLE_REGION`, `OKF_CHAT_MODEL_CATALOG` (raw JSON),
+  `OKF_CHAT_MODEL_CATALOG` (raw JSON),
   `OKF_CHAT_CHECKPOINT_TABLE`, `OKF_CHAT_THREADS_TABLE`.
 - **New scope** `okf-chat/invoke` in "HTTP and auth".
 
@@ -529,7 +529,7 @@ alongside harvest + consumption.
   per-user checkpoint **namespacing** (`user_sub` prefix); server CORS headers on
   the streaming response; `RUN_ERROR` on tool exception. Mock the LLM (no Bedrock).
 - **Shared model factory:** move harvest's existing factory tests with it; assert
-  `openai.*`→Mantle and `anthropic.*`→Converse still hold for both callers.
+  `global.openai.*`→Bedrock Runtime Responses and `anthropic.*`→Converse still hold for both callers.
 - **control_api:** `/chat/threads` filters by `sub` (moto DynamoDB), can't read
   another user's rows.
 - **UI:** `npm run build` + `lint`; a light test that the `HttpAgent` custom-fetch

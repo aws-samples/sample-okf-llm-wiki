@@ -2,7 +2,7 @@
 per-harvest model picker.
 
 A harvest can run on one of several models (an Anthropic Claude model on the
-Bedrock Converse API, or an OpenAI GPT model on the Bedrock Mantle endpoint),
+Bedrock Converse API, or an OpenAI GPT model on the Bedrock Runtime endpoint),
 each at a chosen reasoning **effort**. Which model/effort a given harvest uses is
 selected per-run in the UI, sent in the ``POST /harvest`` body, validated by the
 Control API, and threaded into the harvest invocation payload (see
@@ -26,8 +26,8 @@ Mirrors the design of :mod:`okf_core.sources`.
         "default_effort": "xhigh"
       },
       {
-        "model": "openai.gpt-5.6-sol",
-        "label": "GPT-5.6 Sol",
+        "model": "global.openai.gpt-6-sol",
+        "label": "GPT-6 Sol",
         "efforts": ["low", "medium", "high", "xhigh", "max"],
         "default_effort": "xhigh"
       }
@@ -43,6 +43,29 @@ from __future__ import annotations
 
 import json
 from typing import Any
+
+
+def _without_inference_profile(model: str) -> tuple[str, str]:
+    for prefix in ("global.", "apac.", "eu.", "us."):
+        if model.startswith(prefix):
+            return prefix, model[len(prefix):]
+    return "", model
+
+
+def is_openai_model(model: str) -> bool:
+    """Recognize GPT IDs with or without a Bedrock inference-profile prefix."""
+    _, bare = _without_inference_profile(model)
+    return bare.startswith(("openai.", "gpt-"))
+
+
+def normalize_model_id(model: str) -> str:
+    """Add the global inference profile to bare GPT IDs; retain explicit profiles."""
+    prefix, bare = _without_inference_profile(model)
+    if bare.startswith("gpt-"):
+        bare = f"openai.{bare}"
+    if bare.startswith("openai."):
+        return f"{prefix or 'global.'}{bare}"
+    return model
 
 # -- effort vocabulary -------------------------------------------------------
 
@@ -65,11 +88,11 @@ LABEL_KEY = "label"
 EFFORTS_KEY = "efforts"
 DEFAULT_EFFORT_KEY = "default_effort"
 
-#: The built-in catalog: two Anthropic models (Converse) + one OpenAI model
-#: (Mantle). GPT-5.6 (Sol/Luna/Terra) added ``max`` as a distinct native level
-#: above ``xhigh`` (``harvest.agent._GPT_EFFORT`` now passes it through verbatim),
-#: so the GPT entry offers the full ladder — same as Claude. Opus 4.8 stays
-#: FIRST: the first entry is the UI picker's default, and Opus 5 is offered as
+#: The built-in catalog: Anthropic models (Converse) + OpenAI models (Bedrock Runtime).
+#: The GPT entries offer the full effort ladder, including ``max`` above
+#: ``xhigh`` (``harvest.agent._GPT_EFFORT`` passes it through verbatim).
+#: Opus 4.8 stays FIRST: the first entry is the UI picker's default, and
+#: Opus 5.5 is offered as
 #: an additional choice, not the new default. Terraform's
 #: ``var.harvest_model_catalog`` overrides this in a real deployment.
 DEFAULT_CATALOG: list[dict[str, Any]] = [
@@ -80,14 +103,20 @@ DEFAULT_CATALOG: list[dict[str, Any]] = [
         DEFAULT_EFFORT_KEY: "xhigh",
     },
     {
-        MODEL_KEY: "openai.gpt-5.6-sol",
-        LABEL_KEY: "GPT-5.6 Sol",
+        MODEL_KEY: "global.openai.gpt-6-sol",
+        LABEL_KEY: "GPT-6 Sol",
         EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
         DEFAULT_EFFORT_KEY: "xhigh",
     },
     {
-        MODEL_KEY: "global.anthropic.claude-opus-5",
-        LABEL_KEY: "Claude Opus 5",
+        MODEL_KEY: "global.openai.gpt-6-astra",
+        LABEL_KEY: "GPT-6 Astra",
+        EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
+        DEFAULT_EFFORT_KEY: "xhigh",
+    },
+    {
+        MODEL_KEY: "global.anthropic.claude-opus-5-5",
+        LABEL_KEY: "Claude Opus 5.5",
         EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
         DEFAULT_EFFORT_KEY: "xhigh",
     },
@@ -98,20 +127,20 @@ DEFAULT_CATALOG: list[dict[str, Any]] = [
         DEFAULT_EFFORT_KEY: "xhigh",
     },
     {
-        MODEL_KEY: "openai.gpt-5.6-terra",
+        MODEL_KEY: "global.openai.gpt-5.6-terra",
         LABEL_KEY: "GPT-5.6 Terra",
         EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
         DEFAULT_EFFORT_KEY: "xhigh",
     },
     {
-        MODEL_KEY: "global.anthropic.claude-fable-5",
-        LABEL_KEY: "Claude Fable 5",
+        MODEL_KEY: "global.anthropic.claude-fable-5-1",
+        LABEL_KEY: "Claude Fable 5.1",
         EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
         DEFAULT_EFFORT_KEY: "xhigh",
     },
     {
-        MODEL_KEY: "openai.gpt-5.6-luna",
-        LABEL_KEY: "GPT-5.6 Luna",
+        MODEL_KEY: "global.openai.gpt-6-luna",
+        LABEL_KEY: "GPT-6 Luna",
         EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
         DEFAULT_EFFORT_KEY: "xhigh",
     },
@@ -145,8 +174,15 @@ def parse_catalog(raw: str | None) -> list[dict[str, Any]]:
 
 
 def _entry_for(catalog: list[dict[str, Any]], model: str) -> dict[str, Any] | None:
+    if not isinstance(model, str):
+        return None
+    normalized = normalize_model_id(model)
     for entry in catalog:
-        if isinstance(entry, dict) and entry.get(MODEL_KEY) == model:
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get(MODEL_KEY), str)
+            and normalize_model_id(entry[MODEL_KEY]) == normalized
+        ):
             return entry
     return None
 
@@ -198,4 +234,4 @@ def validate_model_effort(
             f"effort {chosen!r} not offered for model {model!r}; "
             f"allowed: {', '.join(efforts)}"
         )
-    return model, chosen
+    return _entry_for(catalog, model)[MODEL_KEY], chosen

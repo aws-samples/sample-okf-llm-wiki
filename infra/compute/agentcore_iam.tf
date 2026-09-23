@@ -2,34 +2,23 @@
 # agent code and can't be scoped per-invocation, so keep them least-privilege.
 
 locals {
-  # Bedrock Mantle (OpenAI-compatible) perms are needed whenever a GPT model is
-  # REACHABLE at harvest time — NOT just when it's the deploy-time default. The
-  # harvest UI's per-run picker lets a caller select any model in
-  # harvest_model_catalog, and the Control API validates against that catalog and
-  # passes the choice through as a per-invocation override (the runtime does not
-  # re-allowlist it). So a Claude-default deploy can still route a single harvest
-  # to Mantle. Gating the grant on var.harvest_model alone left those runs failing
-  # with 401 permission_denied on bedrock-mantle:CreateInference. Grant when the
-  # default OR any catalog entry is an openai.* id.
-  harvest_mantle_enabled = anytrue(concat(
-    [startswith(var.harvest_model, "openai.")],
-    [for m in var.harvest_model_catalog : startswith(m.model, "openai.")],
-    # The AR rules-preprocessing pass runs in the harvest runtime at finalize;
-    # a GPT preprocess id is only reachable when policy builds are on.
-    # The policy-document AUTHOR agent (mode="ar_rules").
-    [local.ar_build_enabled && startswith(var.policy_preprocess_model, "openai.")],
-  ))
-
-  # Same reasoning for the chat runtime: grant Mantle when a GPT id is reachable
-  # at chat time (the deploy-time default, any catalog entry the picker offers,
-  # or the policy check's pre-pass model — the documented footgun: the pre-pass
-  # id never passes through the catalog, so it must be listed here explicitly).
-  chat_mantle_enabled = anytrue(concat(
-    [startswith(var.chat_model, "openai.")],
-    [for m in var.chat_model_catalog : startswith(m.model, "openai.")],
-    # The policy check's rewrite + JUDGE fleet (chat/policy_check.py).
-    [local.ar_enabled && startswith(var.chat_policy_check_model, "openai.")],
-  ))
+  # The Responses API uses a short-term Bedrock bearer. Recognize inference
+  # profiles as well as bare IDs, including models selected by policy agents.
+  openai_model_pattern = "^((global|apac|eu|us)\\.)?(openai\\.|gpt-)"
+  harvest_openai_enabled = anytrue([
+    for model in concat(
+      [var.harvest_model],
+      var.harvest_model_catalog[*].model,
+      local.ar_build_enabled ? [var.policy_preprocess_model] : [],
+    ) : can(regex(local.openai_model_pattern, model))
+  ])
+  chat_openai_enabled = anytrue([
+    for model in concat(
+      [var.chat_model],
+      var.chat_model_catalog[*].model,
+      local.ar_enabled ? [var.chat_policy_check_model] : [],
+    ) : can(regex(local.openai_model_pattern, model))
+  ])
 }
 
 data "aws_iam_policy_document" "agentcore_assume" {
@@ -264,41 +253,19 @@ data "aws_iam_policy_document" "harvest" {
     resources = ["*"]
   }
 
-  # Bedrock Mantle (OpenAI-compatible endpoint) — needed when a GPT id is
-  # reachable at harvest time (see local.harvest_mantle_enabled: the deploy-time
-  # default OR any catalog entry the UI picker can select). Mantle is a SEPARATE
-  # IAM namespace from bedrock:* — the bedrock:InvokeModel grant above does NOT
-  # cover it. The bearer token provide_token() mints inherits THIS role's
-  # identity, so the role itself needs these actions:
-  #   - CreateInference: invoke time (missing -> 401 permission_denied at call)
-  #   - Get*/List*: model discovery/sync
-  # ...scoped to the Mantle "default" project in the Mantle region (independent
-  # of var.region; GPT-5.x is only in us-east-2/us-west-2). CallWithBearerToken
-  # is the bearer-auth action itself and is not project- or region-scopable, so
-  # it takes resources=["*"]. Absent when no GPT model is reachable, so the role
-  # stays least-privilege on a Converse-only (Claude) catalog.
+  # GPT calls use the Bedrock Runtime Responses route and the InvokeModel
+  # grants above. Allow the short-term bearer used by the OpenAI SDK.
   dynamic "statement" {
-    for_each = local.harvest_mantle_enabled ? [1] : []
+    for_each = local.harvest_openai_enabled ? [1] : []
     content {
-      sid = "BedrockMantleInvoke"
-      actions = [
-        "bedrock-mantle:CreateInference",
-        "bedrock-mantle:GetInference",
-        "bedrock-mantle:GetModel",
-        "bedrock-mantle:ListModels",
-      ]
-      resources = [
-        "arn:aws:bedrock-mantle:${var.harvest_mantle_region}:${local.account_id}:project/default",
-      ]
-    }
-  }
-
-  dynamic "statement" {
-    for_each = local.harvest_mantle_enabled ? [1] : []
-    content {
-      sid       = "BedrockMantleBearerToken"
-      actions   = ["bedrock-mantle:CallWithBearerToken"]
+      sid       = "BedrockOpenAIBearerToken"
+      actions   = ["bedrock:CallWithBearerToken"]
       resources = ["*"]
+      condition {
+        test     = "StringEquals"
+        variable = "bedrock:bearerTokenType"
+        values   = ["SHORT_TERM"]
+      }
     }
   }
 
@@ -503,7 +470,7 @@ resource "aws_iam_role_policy" "consumption" {
 # The chat agent reads the wiki with the SAME read-only reach as consumption
 # (bundle read, Bedrock embed for semantic_search, S3 Vectors query, registry
 # read — it reuses ConsumptionTools in-process), PLUS: Bedrock InvokeModel for the
-# chat LLM (+ conditional Mantle for GPT), and read/write on the two chat tables
+# chat LLM (+ conditional Bedrock bearer access), and read/write on the two chat tables
 # (the DynamoDBSaver checkpoints + the per-user conversation index). It has NO
 # Glue/Athena reach (it never touches source data) and NO bundle WRITE (read-only
 # over the wiki).
@@ -642,34 +609,18 @@ data "aws_iam_policy_document" "chat" {
     resources = [local.d.chat_checkpoint_bucket_arn]
   }
 
-  # Bedrock Mantle (OpenAI-compatible) — needed when a GPT id is reachable at chat
-  # time (deploy-time default OR any catalog entry the picker offers). Separate IAM
-  # namespace from bedrock:*; the bearer token provide_token() mints inherits this
-  # role's identity. Scoped to the Mantle "default" project in chat_mantle_region;
-  # CallWithBearerToken is not project/region-scopable so it takes "*". Absent when
-  # no GPT model is reachable, keeping the role least-privilege on a Claude catalog.
+  # Policy agents may select a GPT model even while chat stays on Claude.
   dynamic "statement" {
-    for_each = local.chat_mantle_enabled ? [1] : []
+    for_each = local.chat_openai_enabled ? [1] : []
     content {
-      sid = "BedrockMantleInvoke"
-      actions = [
-        "bedrock-mantle:CreateInference",
-        "bedrock-mantle:GetInference",
-        "bedrock-mantle:GetModel",
-        "bedrock-mantle:ListModels",
-      ]
-      resources = [
-        "arn:aws:bedrock-mantle:${var.chat_mantle_region}:${local.account_id}:project/default",
-      ]
-    }
-  }
-
-  dynamic "statement" {
-    for_each = local.chat_mantle_enabled ? [1] : []
-    content {
-      sid       = "BedrockMantleBearerToken"
-      actions   = ["bedrock-mantle:CallWithBearerToken"]
+      sid       = "BedrockOpenAIBearerToken"
+      actions   = ["bedrock:CallWithBearerToken"]
       resources = ["*"]
+      condition {
+        test     = "StringEquals"
+        variable = "bedrock:bearerTokenType"
+        values   = ["SHORT_TERM"]
+      }
     }
   }
 

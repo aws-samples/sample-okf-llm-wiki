@@ -1157,7 +1157,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # cachePoint blocks at request time — so the tool schemas + the static
         # system prompt + prior turns become a CACHE READ on every tool-loop
         # iteration instead of full-price input. No-ops (with a warning) on a
-        # non-Bedrock model (a Mantle GPT catalog entry).
+        # non-Bedrock model (a Bedrock Runtime GPT catalog entry).
         # AskHumanMiddleware owns the human-in-the-loop interrupt for ask_human.
         # SteeringMiddleware injects derailment <system-reminder>s (repetition /
         # futility — see chat.steering); env kill switch, default on.
@@ -1431,7 +1431,7 @@ def read_history(
     checkpointed prefix must stay in history while the buffer appends only the
     continuation.
     """
-    graph = build_agent("global.anthropic.claude-opus-5", "high", None, checkpointer)
+    graph = build_agent("global.anthropic.claude-opus-5-5", "high", None, checkpointer)
     cfg = {"configurable": {"thread_id": internal_thread_id}}
     state = graph.get_state(cfg)
     messages = (state.values or {}).get("messages", []) if state else []

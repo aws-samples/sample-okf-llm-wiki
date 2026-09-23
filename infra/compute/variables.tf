@@ -60,14 +60,8 @@ variable "harvest_vpc_security_group_ids" {
 
 variable "harvest_model" {
   type        = string
-  description = "Harvest model id. An anthropic.* Converse inference profile (e.g. global.anthropic.claude-opus-4-8) runs on the bedrock-runtime Converse API; an openai.* id (e.g. openai.gpt-5.6-sol) runs on the Bedrock Mantle OpenAI-compatible endpoint in harvest_mantle_region."
+  description = "Harvest model id. An anthropic.* Converse inference profile (e.g. global.anthropic.claude-opus-4-8) runs on the bedrock-runtime Converse API; a GPT id (e.g. global.openai.gpt-6-sol) runs on the Bedrock Runtime OpenAI-compatible endpoint. Both use the deployment region (var.region)."
   default     = "global.anthropic.claude-opus-4-8"
-}
-
-variable "harvest_mantle_region" {
-  type        = string
-  description = "AWS region for the Bedrock Mantle endpoint when harvest_model is an openai.* GPT id. Independent of var.region because GPT-5.x on Mantle is only in us-east-2/us-west-2 while the harvest runtime may deploy elsewhere. Ignored for Converse (anthropic.*) models."
-  default     = "us-east-2"
 }
 
 variable "harvest_effort" {
@@ -115,14 +109,20 @@ variable "harvest_model_catalog" {
       default_effort = "xhigh"
     },
     {
-      model          = "openai.gpt-5.6-sol"
-      label          = "GPT-5.6 Sol"
+      model          = "global.openai.gpt-6-sol"
+      label          = "GPT-6 Sol"
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "xhigh"
     },
     {
-      model          = "global.anthropic.claude-opus-5"
-      label          = "Claude Opus 5"
+      model          = "global.openai.gpt-6-astra"
+      label          = "GPT-6 Astra"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "xhigh"
+    },
+    {
+      model          = "global.anthropic.claude-opus-5-5"
+      label          = "Claude Opus 5.5"
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "xhigh"
     },
@@ -133,20 +133,20 @@ variable "harvest_model_catalog" {
       default_effort = "xhigh"
     },
     {
-      model          = "openai.gpt-5.6-terra"
+      model          = "global.openai.gpt-5.6-terra"
       label          = "GPT-5.6 Terra"
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "xhigh"
     },
     {
-      model          = "global.anthropic.claude-fable-5"
-      label          = "Claude Fable 5"
+      model          = "global.anthropic.claude-fable-5-1"
+      label          = "Claude Fable 5.1"
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "xhigh"
     },
     {
-      model          = "openai.gpt-5.6-luna"
-      label          = "GPT-5.6 Luna"
+      model          = "global.openai.gpt-6-luna"
+      label          = "GPT-6 Luna"
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "xhigh"
     },
@@ -157,8 +157,8 @@ variable "harvest_model_catalog" {
 
 variable "chat_model" {
   type        = string
-  description = "Deploy-time DEFAULT chat model, used when a conversation omits a model. An anthropic.* Converse profile runs on the Converse API; an openai.* id runs on Bedrock Mantle in chat_mantle_region."
-  default     = "global.anthropic.claude-opus-5"
+  description = "Deploy-time DEFAULT chat model, used when a conversation omits a model. An anthropic.* Converse profile runs on the Converse API; a GPT id uses the Bedrock Runtime OpenAI-compatible endpoint. Both use the deployment region (var.region)."
+  default     = "global.anthropic.claude-opus-5-5"
 }
 
 variable "chat_effort" {
@@ -171,12 +171,6 @@ variable "chat_max_tokens" {
   type        = number
   description = "Default max output tokens for a chat turn. Lower than harvest's — interactive chat wants snappier turns."
   default     = 32000
-}
-
-variable "chat_mantle_region" {
-  type        = string
-  description = "AWS region for the Bedrock Mantle endpoint when a chat model is an openai.* GPT id. Independent of var.region (GPT-5.x on Mantle is only in us-east-2/us-west-2)."
-  default     = "us-east-2"
 }
 
 variable "chat_checkpoint_ttl_seconds" {
@@ -208,14 +202,12 @@ variable "chat_model_catalog" {
     default_effort = string
   }))
   description = "Catalog of (model, allowed efforts) the chat UI offers and the chat runtime validates against."
-  # Chat is pinned to Opus 5 — a single-entry catalog (no model choice in the
-  # UI; the runtime rejects anything else). Needs langchain-aws >= 1.6.4, the
-  # first release that streams Opus 5. GPT-5.6 on Bedrock Mantle didn't return
-  # reasoning summaries and behaved inconsistently, so it's dropped here.
+  # Chat stays on Opus 5.5. GPT-6 choices belong to the harvest/benchmark
+  # catalog above. The runtime validates chat selections against this catalog.
   default = [
     {
-      model          = "global.anthropic.claude-opus-5"
-      label          = "Claude Opus 5"
+      model          = "global.anthropic.claude-opus-5-5"
+      label          = "Claude Opus 5.5"
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "high"
     },
@@ -590,19 +582,19 @@ variable "enable_policy_build" {
 
 
 variable "chat_policy_check_model" {
-  type        = string
+  type = string
   # Sonnet 5, no reasoning: both consumers run classifier-style anyway, and a
   # Claude 5 head gives better verdicts than a small model at the same
-  # single-pass latency. "openai.gpt-5.6-terra" (reasoning "none") remains a
+  # single-pass latency. "global.openai.gpt-5.6-terra" (reasoning "none") remains a
   # tested alternative.
   default     = "global.anthropic.claude-sonnet-5"
-  description = "The policy checks' model id, serving BOTH the curated-question rewrite (minimal effort — extraction) and the judge fleets. Judges run CLASSIFIER-style on every family — thinking off + temperature 0 on a Converse (Anthropic) id, reasoning \"none\" on an openai.* id (e.g. openai.gpt-5.6-terra) — with a FORCED report_violations tool call: fast single-pass verdicts. An openai.* value is fully supported: chat_mantle_enabled derives the role's Mantle grants from this var too (gated on enable_policy_checks)."
+  description = "The policy checks' model id, serving BOTH the curated-question rewrite (minimal effort — extraction) and the judge fleets. Judges run CLASSIFIER-style on every family — thinking off + temperature 0 on a Converse (Anthropic) id, reasoning \"none\" on an openai.* id (e.g. global.openai.gpt-5.6-terra) — with a FORCED report_violations tool call: fast single-pass verdicts. An openai.* value is fully supported: chat_openai_enabled derives the role's bearer-token grants from this var too (gated on enable_policy_checks)."
 }
 
 variable "policy_preprocess_model" {
   type        = string
   default     = "global.anthropic.claude-sonnet-5"
-  description = "Model for the ar_rules.md authoring agent (harvest.ar_author), run with FULL reasoning (effort high — OKF_POLICY_AUTHOR_EFFORT) — turning wiki prose into decidable rules is judgment work, and it runs only when policy sources actually change. Runs exclusively on the harvest runtime (mode=\"ar_rules\"); harvest_mantle_enabled derives the Mantle grants from this var (gated on enable_policy_build). Kept separate from chat_policy_check_model — different services, different env namespaces."
+  description = "Model for the ar_rules.md authoring agent (harvest.ar_author), run with FULL reasoning (effort high — OKF_POLICY_AUTHOR_EFFORT) — turning wiki prose into decidable rules is judgment work, and it runs only when policy sources actually change. Runs exclusively on the harvest runtime (mode=\"ar_rules\"); harvest_openai_enabled derives the bearer-token grants from this var (gated on enable_policy_build). Kept separate from chat_policy_check_model — different services, different env namespaces."
 }
 
 variable "tags" {

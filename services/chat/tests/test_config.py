@@ -38,7 +38,7 @@ def test_from_env_defaults():
     assert cfg.registry_table == "okf-registry"  # default
     assert cfg.checkpoint_table == "okf-chat-checkpoints"  # default
     assert cfg.default_model == DEFAULT_MODEL
-    assert cfg.mantle_region == "us-east-2"
+    assert cfg.region == "us-east-1"
     assert cfg.checkpoint_ttl_seconds is None
     # SQL is OFF by default (deploy-gated) — the browser can't self-enable it.
     assert cfg.sql_enabled is False
@@ -51,8 +51,20 @@ def test_from_env_defaults():
     assert cfg.web_search_filters_enabled is False
     assert [e["model"] for e in cfg.catalog] == [
         "us.anthropic.claude-opus-4-8",
-        "openai.gpt-5.6-sol",
+        "global.openai.gpt-6-sol",
     ]
+
+
+def test_chat_without_catalog_override_only_offers_opus_5_5():
+    env = _env()
+    env.pop("OKF_CHAT_MODEL_CATALOG")
+    cfg = ChatConfig.from_env(env)
+    assert cfg.resolve_model_effort(None, None) == (
+        "global.anthropic.claude-opus-5-5", "high"
+    )
+    for variant in ("astra", "sol", "luna"):
+        with pytest.raises(ModelCatalogError):
+            cfg.resolve_model_effort(f"global.openai.gpt-6-{variant}", "high")
 
 
 def test_from_env_sql_flag_and_athena():
@@ -93,22 +105,20 @@ def test_from_env_web_search():
 def test_from_env_overrides():
     cfg = ChatConfig.from_env(
         _env(
-            OKF_CHAT_MODEL="openai.gpt-5.6-sol",
+            OKF_CHAT_MODEL="global.openai.gpt-6-sol",
             OKF_CHAT_EFFORT="max",
             OKF_CHAT_MAX_TOKENS="16000",
             OKF_CHAT_CHECKPOINT_TABLE="my-checkpoints",
             OKF_CHAT_CHECKPOINT_TTL_SECONDS="604800",
             AWS_REGION="eu-west-1",
-            OKF_CHAT_MANTLE_REGION="us-west-2",
         )
     )
-    assert cfg.default_model == "openai.gpt-5.6-sol"
+    assert cfg.default_model == "global.openai.gpt-6-sol"
     assert cfg.default_effort == "max"
     assert cfg.default_max_tokens == 16000
     assert cfg.checkpoint_table == "my-checkpoints"
     assert cfg.checkpoint_ttl_seconds == 604800
     assert cfg.region == "eu-west-1"
-    assert cfg.mantle_region == "us-west-2"
 
 
 def test_resolve_model_effort_fills_default_effort():
@@ -119,9 +129,9 @@ def test_resolve_model_effort_fills_default_effort():
 
 
 def test_resolve_model_effort_none_model_falls_back_to_config_default():
-    cfg = ChatConfig.from_env(_env(OKF_CHAT_MODEL="openai.gpt-5.6-sol"))
+    cfg = ChatConfig.from_env(_env(OKF_CHAT_MODEL="global.openai.gpt-6-sol"))
     model, effort = cfg.resolve_model_effort(None, None)
-    assert model == "openai.gpt-5.6-sol"
+    assert model == "global.openai.gpt-6-sol"
     assert effort == "high"
 
 
@@ -138,7 +148,7 @@ def test_resolve_model_effort_rejects_effort_not_offered():
         cfg.resolve_model_effort("us.anthropic.claude-opus-4-8", "extreme")
 
 
-def test_build_chat_model_dispatches_gpt_to_mantle(monkeypatch):
+def test_build_chat_model_dispatches_gpt_in_the_deployment_region(monkeypatch):
     import sys
     import types
 
@@ -156,10 +166,11 @@ def test_build_chat_model_dispatches_gpt_to_mantle(monkeypatch):
     tg.provide_token = lambda region: f"tok-{region}"
     monkeypatch.setitem(sys.modules, "aws_bedrock_token_generator", tg)
 
-    cfg = ChatConfig.from_env(_env(OKF_CHAT_MANTLE_REGION="us-east-2"))
-    build_chat_model(cfg, "openai.gpt-5.6-sol", "high")
-    assert captured["model"] == "openai.gpt-5.6-sol"
-    assert captured["base_url"] == "https://bedrock-mantle.us-east-2.api.aws/openai/v1"
+    cfg = ChatConfig.from_env(_env(AWS_REGION="eu-west-1"))
+    build_chat_model(cfg, "global.openai.gpt-6-sol", "high")
+    assert captured["model"] == "global.openai.gpt-6-sol"
+    assert captured["base_url"] == "https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1"
+    assert captured["api_key"]() == "tok-eu-west-1"
     # Chat requests a reasoning SUMMARY so GPT returns its thinking on the
     # Responses API — this maps to `reasoning={effort, summary}` (which supersedes
     # the bare `reasoning_effort` knob). Without it, GPT thinks silently.
@@ -217,10 +228,10 @@ def test_policy_judge_model_openai_runs_reasoning_none(monkeypatch):
     monkeypatch.setitem(sys.modules, "langchain_openai", lo)
 
     cfg = ChatConfig.from_env(
-        _env(OKF_CHAT_POLICY_CHECK_MODEL="openai.gpt-5.6-terra")
+        _env(OKF_CHAT_POLICY_CHECK_MODEL="global.openai.gpt-5.6-terra")
     )
     build_policy_judge_model(cfg)
-    assert captured["model"] == "openai.gpt-5.6-terra"
+    assert captured["model"] == "global.openai.gpt-5.6-terra"
     assert captured["reasoning_effort"] == "none"
 
 

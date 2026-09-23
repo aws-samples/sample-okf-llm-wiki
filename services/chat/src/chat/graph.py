@@ -233,7 +233,7 @@ def build_graph(
 ):
     """Compile the react agent graph.
 
-    ``chat_model`` is a built ``BaseChatModel`` (Converse or Mantle GPT) with
+    ``chat_model`` is a built ``BaseChatModel`` (Converse or Bedrock Runtime GPT) with
     reasoning configured; ``tools`` are the (optionally dataset-scoped)
     consumption tools; ``checkpointer`` is a ``DynamoDBSaver`` (or any
     ``BaseCheckpointSaver`` — tests pass an in-memory one). ``middleware`` is the

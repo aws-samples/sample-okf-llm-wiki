@@ -23,7 +23,7 @@ Design constraints (from the investigation):
   short summary of AIMessage text. Keeps the event payload tiny. THREE
   exceptions, each bounded: a FAILED tool call / errored sub-agent carries an
   ``error`` snippet, because without it a transient provider failure (e.g. a
-  Mantle 400 killing a reviewer) is undiagnosable from the feed — the body
+  Bedrock Runtime 400 killing a reviewer) is undiagnosable from the feed — the body
   never reaches the logs; a successful ``lint_bundle`` result carries a
   ``lint`` report (already structured and self-capped by the tool), because
   the lint gate's findings ARE the content the UI must surface on the feed
@@ -1058,7 +1058,7 @@ class UsageForwarder(BaseCallbackHandler):  # type: ignore[misc]
     """A model-instance callback that meters token usage on EVERY model turn.
 
     Attached to a chat-model INSTANCE — ``ChatBedrockConverse`` (Claude) or
-    ``ChatOpenAI`` on Bedrock Mantle (GPT), whichever the model id selected —
+    ``ChatOpenAI`` on Bedrock Runtime (GPT), whichever the model id selected —
     NOT to the run config. That distinction is the fix: LangChain normalizes
     ``usage_metadata`` across both providers, and fires a model's *local*
     (instance) callbacks on every invocation of that model object regardless of

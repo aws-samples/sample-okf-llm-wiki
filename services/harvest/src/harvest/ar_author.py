@@ -41,7 +41,7 @@ from okf_core import policy_doc
 log = logging.getLogger("harvest.ar_author")
 
 #: Sonnet 5 with high-effort reasoning. An openai.* value is still supported
-#: (needs the harvest role's Mantle grants, derived from
+#: (needs the harvest role's Bedrock Runtime grants, derived from
 #: var.policy_preprocess_model).
 DEFAULT_AUTHOR_MODEL = "global.anthropic.claude-sonnet-5"
 #: Reasoning at HIGH: policy distillation is judgment work, and this path runs
@@ -424,12 +424,11 @@ def _build_author_model() -> Any:
     byte, and botocore's default 60s read timeout kills it with
     ReadTimeoutError (live 2026-08-03: every Converse-backed authoring run
     for bird/european_football timed out and the dataset marked failed —
-    the GPT/Mantle path never hit this because it doesn't ride botocore).
+    the GPT/Bedrock Runtime path never hit this because it doesn't ride botocore).
     """
     from okf_aws.model_factory import (
-        DEFAULT_MANTLE_REGION,
         build_bedrock_converse,
-        build_mantle_openai,
+        build_bedrock_openai,
         is_openai_model,
     )
 
@@ -438,11 +437,11 @@ def _build_author_model() -> Any:
     model_id = os.environ.get("OKF_POLICY_PREPROCESS_MODEL", DEFAULT_AUTHOR_MODEL)
     effort = os.environ.get("OKF_POLICY_AUTHOR_EFFORT", DEFAULT_AUTHOR_EFFORT)
     if is_openai_model(model_id):
-        return build_mantle_openai(
+        return build_bedrock_openai(
             model_id,
             effort,
             _AUTHOR_MAX_TOKENS,
-            region=os.environ.get("OKF_HARVEST_MANTLE_REGION", DEFAULT_MANTLE_REGION),
+            region=os.environ.get("AWS_REGION", "us-east-1"),
         )
     budget_raw = os.environ.get("OKF_POLICY_AUTHOR_THINKING_BUDGET", "")
     return build_bedrock_converse(
@@ -524,9 +523,8 @@ def _build_extractor_model() -> Any:
     synthesizer, not here.
     """
     from okf_aws.model_factory import (
-        DEFAULT_MANTLE_REGION,
         build_bedrock_converse,
-        build_mantle_openai,
+        build_bedrock_openai,
         is_openai_model,
     )
 
@@ -534,11 +532,11 @@ def _build_extractor_model() -> Any:
 
     model_id = os.environ.get("OKF_POLICY_PREPROCESS_MODEL", DEFAULT_AUTHOR_MODEL)
     if is_openai_model(model_id):
-        return build_mantle_openai(
+        return build_bedrock_openai(
             model_id,
             "none",
             _EXTRACT_MAX_TOKENS,
-            region=os.environ.get("OKF_HARVEST_MANTLE_REGION", DEFAULT_MANTLE_REGION),
+            region=os.environ.get("AWS_REGION", "us-east-1"),
         )
     return build_bedrock_converse(
         model_id,

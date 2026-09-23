@@ -76,8 +76,8 @@ def test_resolve_model_config_overrides_win_over_env(monkeypatch):
     monkeypatch.setenv("OKF_HARVEST_MODEL", "us.anthropic.claude-opus-4-8")
     monkeypatch.setenv("OKF_HARVEST_EFFORT", "medium")
     monkeypatch.delenv("OKF_HARVEST_MAX_TOKENS", raising=False)
-    cfg = ag.resolve_model_config(model_override="openai.gpt-5.6-sol", effort_override="high")
-    assert cfg["model"] == "openai.gpt-5.6-sol"
+    cfg = ag.resolve_model_config(model_override="global.openai.gpt-6-sol", effort_override="high")
+    assert cfg["model"] == "global.openai.gpt-6-sol"
     assert cfg["effort"] == "high"
     # max_tokens default keys off the RESOLVED (override) model -> GPT ceiling.
     assert cfg["max_tokens"] == ag.DEFAULT_GPT_MAX_TOKENS
@@ -87,8 +87,8 @@ def test_resolve_model_config_partial_override_falls_back_per_field(monkeypatch)
     # Only a model override: effort still comes from env (or its default).
     monkeypatch.setenv("OKF_HARVEST_EFFORT", "low")
     monkeypatch.delenv("OKF_HARVEST_MODEL", raising=False)
-    cfg = ag.resolve_model_config(model_override="openai.gpt-5.6-sol")
-    assert cfg["model"] == "openai.gpt-5.6-sol"
+    cfg = ag.resolve_model_config(model_override="global.openai.gpt-6-sol")
+    assert cfg["model"] == "global.openai.gpt-6-sol"
     assert cfg["effort"] == "low"  # from env, not overridden
 
 
@@ -163,9 +163,9 @@ def test_cap_subagent_concurrency_ignores_bad_limit(monkeypatch):
     assert repl._MAX_TASK_CALLS_PER_THREAD == 32
 
 
-# --- GPT on Bedrock Mantle --------------------------------------------------
+# --- GPT on Bedrock Runtime --------------------------------------------------
 # The provider is selected by the model id's prefix; GPT ids route to a
-# ChatOpenAI against the Mantle OpenAI-compatible endpoint, everything else to
+# ChatOpenAI against the Bedrock Runtime OpenAI-compatible endpoint, everything else to
 # ChatBedrockConverse. These exercise the pure helpers + the GPT builder wiring
 # with langchain_openai / aws_bedrock_token_generator STUBBED (neither package is
 # needed to import the module — the imports are deferred inside the builder).
@@ -173,7 +173,7 @@ def test_cap_subagent_concurrency_ignores_bad_limit(monkeypatch):
 
 @pytest.mark.parametrize(
     "model",
-    ["openai.gpt-5.6-sol", "openai.gpt-5.4", "openai.gpt-oss-120b", "gpt-5.5"],
+    ["global.openai.gpt-6-sol", "openai.gpt-5.4", "openai.gpt-oss-120b", "gpt-5.5"],
 )
 def test_is_openai_model_true_for_gpt(model):
     assert ag._is_openai_model(model) is True
@@ -215,15 +215,15 @@ def test_resolve_model_config_gpt_max_tokens_default(monkeypatch):
     # An UNSET OKF_HARVEST_MAX_TOKENS picks the GPT ceiling for a GPT model...
     for k in ("OKF_HARVEST_MAX_TOKENS", "OKF_HARVEST_EFFORT"):
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("OKF_HARVEST_MODEL", "openai.gpt-5.6-sol")
+    monkeypatch.setenv("OKF_HARVEST_MODEL", "global.openai.gpt-6-sol")
     cfg = ag.resolve_model_config()
-    assert cfg["model"] == "openai.gpt-5.6-sol"
+    assert cfg["model"] == "global.openai.gpt-6-sol"
     assert cfg["max_tokens"] == ag.DEFAULT_GPT_MAX_TOKENS
 
 
 def test_resolve_model_config_explicit_max_tokens_wins_for_gpt(monkeypatch):
     # ...but an explicit value is authoritative regardless of provider.
-    monkeypatch.setenv("OKF_HARVEST_MODEL", "openai.gpt-5.6-sol")
+    monkeypatch.setenv("OKF_HARVEST_MODEL", "global.openai.gpt-6-sol")
     monkeypatch.setenv("OKF_HARVEST_MAX_TOKENS", "8000")
     assert ag.resolve_model_config()["max_tokens"] == 8000
 
@@ -233,7 +233,7 @@ def _install_openai_stubs(monkeypatch):
 
     ChatOpenAI records its kwargs; provide_token returns a bearer that includes a
     monotonically increasing counter so a test can PROVE the token is re-minted on
-    repeated calls (the fix for the presign-expiry bug). Lets _build_mantle_openai
+    repeated calls (the fix for the presign-expiry bug). Lets _build_bedrock_openai
     run with neither real package installed. Returns (captured_kwargs, call_state).
     """
     import sys
@@ -261,49 +261,49 @@ def _install_openai_stubs(monkeypatch):
     return captured, state
 
 
-def test_build_mantle_openai_wiring_defaults(monkeypatch):
+def test_build_bedrock_openai_wiring_defaults(monkeypatch):
     for k in (
-        "OKF_HARVEST_MANTLE_REGION",
-        "OKF_HARVEST_MANTLE_BASE_URL",
-        "OKF_HARVEST_MANTLE_USE_RESPONSES_API",
+        "AWS_REGION",
+        "OKF_HARVEST_OPENAI_BASE_URL",
+        "OKF_HARVEST_OPENAI_USE_RESPONSES_API",
     ):
         monkeypatch.delenv(k, raising=False)
     captured, _state = _install_openai_stubs(monkeypatch)
 
-    ag._build_mantle_openai("openai.gpt-5.6-sol", "xhigh", 32000, callbacks=None)
+    ag._build_bedrock_openai("global.openai.gpt-6-sol", "xhigh", 32000, callbacks=None)
 
-    assert captured["model"] == "openai.gpt-5.6-sol"
-    # Default Mantle region (independent of AWS_REGION) drives the base URL + token.
+    assert captured["model"] == "global.openai.gpt-6-sol"
+    # With AWS_REGION unset, the local fallback drives the base URL and token.
     # GPT-5.x is served on the Responses API at the /openai/v1 path.
     assert captured["base_url"] == (
-        f"https://bedrock-mantle.{ag.DEFAULT_MANTLE_REGION}.api.aws/openai/v1"
+        "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
     )
     assert captured["use_responses_api"] is True
     # api_key is a PROVIDER CALLABLE (not a static string) so the SDK re-mints per
     # request — calling it yields a region-scoped bearer.
     assert callable(captured["api_key"])
     assert captured["api_key"]().startswith(
-        f"bedrock-api-key-{ag.DEFAULT_MANTLE_REGION}"
+        "bedrock-api-key-us-east-1"
     )
     assert captured["max_tokens"] == 32000
     assert captured["reasoning_effort"] == "xhigh"  # xhigh preserved, not capped
 
 
-def test_build_mantle_openai_region_override(monkeypatch):
-    for k in ("OKF_HARVEST_MANTLE_BASE_URL", "OKF_HARVEST_MANTLE_USE_RESPONSES_API"):
+def test_build_bedrock_openai_uses_deployment_region(monkeypatch):
+    for k in ("OKF_HARVEST_OPENAI_BASE_URL", "OKF_HARVEST_OPENAI_USE_RESPONSES_API"):
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("OKF_HARVEST_MANTLE_REGION", "us-west-2")
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
     captured, _state = _install_openai_stubs(monkeypatch)
 
-    ag._build_mantle_openai("openai.gpt-5.4", "medium", 16000, callbacks=None)
+    ag._build_bedrock_openai("openai.gpt-5.4", "medium", 16000, callbacks=None)
 
-    assert captured["base_url"] == "https://bedrock-mantle.us-west-2.api.aws/openai/v1"
+    assert captured["base_url"] == "https://bedrock-runtime.us-west-2.amazonaws.com/openai/v1"
     assert callable(captured["api_key"])
     assert captured["api_key"]().startswith("bedrock-api-key-us-west-2")
     assert captured["reasoning_effort"] == "medium"
 
 
-def test_mantle_token_provider_caches_then_remints(monkeypatch):
+def test_bedrock_token_provider_caches_then_remints(monkeypatch):
     # The provider caches within the TTL (so we don't presign every request) but
     # re-mints once the TTL lapses — this is the fix for the ~1h presign expiry
     # killing an 8h harvest. Drive a fake clock via monkeypatched time.time.
@@ -313,40 +313,40 @@ def test_mantle_token_provider_caches_then_remints(monkeypatch):
 
     monkeypatch.setattr(_time, "time", lambda: clock["t"])
 
-    provider = ag._mantle_token_provider("us-east-2")
+    provider = ag._bedrock_token_provider("us-east-2")
     first = provider()
     again = provider()  # within TTL -> same cached token, no new mint
     assert first == again
     assert state["mints"] == 1
 
-    clock["t"] += ag._MANTLE_TOKEN_TTL_SECONDS + 1  # TTL lapses
+    clock["t"] += ag._BEDROCK_TOKEN_TTL_SECONDS + 1  # TTL lapses
     third = provider()
     assert third != first  # re-minted
     assert state["mints"] == 2
 
 
-def test_build_mantle_openai_chat_completions_opt_out(monkeypatch):
+def test_build_bedrock_openai_chat_completions_opt_out(monkeypatch):
     # gpt-oss models use Chat Completions on /v1 instead of Responses on /openai/v1.
-    monkeypatch.delenv("OKF_HARVEST_MANTLE_BASE_URL", raising=False)
-    monkeypatch.setenv("OKF_HARVEST_MANTLE_REGION", "us-west-2")
-    monkeypatch.setenv("OKF_HARVEST_MANTLE_USE_RESPONSES_API", "false")
+    monkeypatch.delenv("OKF_HARVEST_OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    monkeypatch.setenv("OKF_HARVEST_OPENAI_USE_RESPONSES_API", "false")
     captured, _state = _install_openai_stubs(monkeypatch)
 
-    ag._build_mantle_openai("openai.gpt-oss-120b", "high", 16000, callbacks=None)
+    ag._build_bedrock_openai("openai.gpt-oss-120b", "high", 16000, callbacks=None)
 
-    assert captured["base_url"] == "https://bedrock-mantle.us-west-2.api.aws/v1"
+    assert captured["base_url"] == "https://bedrock-runtime.us-west-2.amazonaws.com/openai/v1"
     assert captured["use_responses_api"] is False
 
 
 def test_build_model_dispatches_gpt_to_mantle(monkeypatch):
-    # _build_model routes a GPT id to the Mantle builder (not Converse).
-    for k in ("OKF_HARVEST_MANTLE_REGION", "OKF_HARVEST_MANTLE_BASE_URL"):
+    # _build_model routes a GPT id to the Bedrock Runtime builder (not Converse).
+    for k in ("AWS_REGION", "OKF_HARVEST_OPENAI_BASE_URL"):
         monkeypatch.delenv(k, raising=False)
     captured, _state = _install_openai_stubs(monkeypatch)
 
-    ag._build_model("openai.gpt-5.6-sol", "high", 32000, callbacks=None)
+    ag._build_model("global.openai.gpt-6-sol", "high", 32000, callbacks=None)
 
-    assert captured["model"] == "openai.gpt-5.6-sol"  # went through the OpenAI stub
+    assert captured["model"] == "global.openai.gpt-6-sol"  # went through the OpenAI stub
 
 
 def test_build_model_surfaces_reasoning_when_asked_converse(monkeypatch):
@@ -380,18 +380,18 @@ def test_build_model_surfaces_reasoning_when_asked_converse(monkeypatch):
 
 
 def test_build_model_surfaces_reasoning_when_asked_gpt(monkeypatch):
-    for k in ("OKF_HARVEST_MANTLE_REGION", "OKF_HARVEST_MANTLE_BASE_URL",
-              "OKF_HARVEST_MANTLE_USE_RESPONSES_API"):
+    for k in ("AWS_REGION", "OKF_HARVEST_OPENAI_BASE_URL",
+              "OKF_HARVEST_OPENAI_USE_RESPONSES_API"):
         monkeypatch.delenv(k, raising=False)
     captured, _state = _install_openai_stubs(monkeypatch)
 
-    ag._build_model("openai.gpt-5.6-sol", "high", 32000)
+    ag._build_model("global.openai.gpt-6-sol", "high", 32000)
     # Default: plain effort, no summary requested, no reasoning in the content.
     assert captured["reasoning_effort"] == "high"
     assert "reasoning" not in captured
 
     captured.clear()
-    ag._build_model("openai.gpt-5.6-sol", "high", 32000, surface_reasoning=True)
+    ag._build_model("global.openai.gpt-6-sol", "high", 32000, surface_reasoning=True)
     # The `reasoning` object replaces reasoning_effort, and output_version puts
     # the summary into message CONTENT where the trace capture reads it.
     assert captured["reasoning"] == {"effort": "high", "summary": "auto"}

@@ -226,7 +226,7 @@ def test_report_tools_wire_into_the_agent_toolset():
             {"s3": object(), "s3vectors": None, "bedrock_runtime": None, "ddb": None},
         )
         build_agent(
-            "global.anthropic.claude-opus-5",
+            "global.anthropic.claude-opus-5-5",
             "high",
             None,
             object(),

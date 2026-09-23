@@ -71,13 +71,13 @@ def test_report_status_records_model_and_effort():
         data_domain="d",
         dataset="ds",
         status="running",
-        model="openai.gpt-5.6-sol",
+        model="global.openai.gpt-6-sol",
         effort="xhigh",
     )
     call = ddb.calls[0]
     assert call["ExpressionAttributeNames"]["#m"] == "model"
     assert call["ExpressionAttributeNames"]["#e"] == "effort"
-    assert call["ExpressionAttributeValues"][":m"] == {"S": "openai.gpt-5.6-sol"}
+    assert call["ExpressionAttributeValues"][":m"] == {"S": "global.openai.gpt-6-sol"}
     assert call["ExpressionAttributeValues"][":e"] == {"S": "xhigh"}
 
 
@@ -92,12 +92,12 @@ def test_report_status_records_subagent_override():
         status="running",
         model="global.anthropic.claude-opus-4-8",
         effort="xhigh",
-        subagent_model="openai.gpt-5.6-sol",
+        subagent_model="global.openai.gpt-6-sol",
         subagent_effort="high",
     )
     call = ddb.calls[0]
     assert "subagent_model = :sm" in call["UpdateExpression"]
-    assert call["ExpressionAttributeValues"][":sm"] == {"S": "openai.gpt-5.6-sol"}
+    assert call["ExpressionAttributeValues"][":sm"] == {"S": "global.openai.gpt-6-sol"}
     assert call["ExpressionAttributeValues"][":se"] == {"S": "high"}
 
 
@@ -108,12 +108,12 @@ def test_report_status_records_reviewer_override():
         data_domain="d",
         dataset="ds",
         status="running",
-        reviewer_model="openai.gpt-5.6-sol",
+        reviewer_model="global.openai.gpt-6-sol",
         reviewer_effort="high",
     )
     call = ddb.calls[0]
     assert "reviewer_model = :rm" in call["UpdateExpression"]
-    assert call["ExpressionAttributeValues"][":rm"] == {"S": "openai.gpt-5.6-sol"}
+    assert call["ExpressionAttributeValues"][":rm"] == {"S": "global.openai.gpt-6-sol"}
     assert call["ExpressionAttributeValues"][":re"] == {"S": "high"}
 
 

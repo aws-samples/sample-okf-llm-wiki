@@ -81,13 +81,11 @@ resource "aws_bedrockagentcore_agent_runtime" "harvest" {
     # without run_code (build_sandbox returns None on an unset id).
     OKF_CODE_INTERPRETER_ID = var.enable_code_interpreter ? aws_bedrockagentcore_code_interpreter.harvest[0].code_interpreter_id : ""
     # Harvest model. Default: Claude Opus 4.8 (Converse) with adaptive thinking.
-    # An openai.* id instead routes to Bedrock Mantle in OKF_HARVEST_MANTLE_REGION
-    # (see agent._build_model / _build_mantle_openai). The Mantle region is set
-    # unconditionally — it's inert for Converse models and only read for GPT.
-    OKF_HARVEST_MODEL         = var.harvest_model
-    OKF_HARVEST_MANTLE_REGION = var.harvest_mantle_region
-    OKF_HARVEST_EFFORT        = var.harvest_effort
-    OKF_HARVEST_MAX_TOKENS    = tostring(var.harvest_max_tokens)
+    # GPT uses the Bedrock Runtime Responses API. Both model providers use
+    # AWS_REGION above for requests; GPT bearer tokens use that same region.
+    OKF_HARVEST_MODEL      = var.harvest_model
+    OKF_HARVEST_EFFORT     = var.harvest_effort
+    OKF_HARVEST_MAX_TOKENS = tostring(var.harvest_max_tokens)
     # Cap concurrent dynamic-subagent (task()) crawls; the rest queue.
     OKF_HARVEST_MAX_SUBAGENT_CONCURRENCY = tostring(var.harvest_max_subagent_concurrency)
 
@@ -268,11 +266,10 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     # Deploy-time DEFAULT model + the catalog the runtime validates a per-
     # conversation (model, effort) against (RAW JSON — set directly by TF, never
     # shell-eval'd; the UI gets base64 via VITE_CHAT_MODEL_CATALOG). An openai.* id
-    # routes to Bedrock Mantle in OKF_CHAT_MANTLE_REGION (inert for Converse).
+    # routes to Bedrock Runtime in the deployment's AWS_REGION.
     OKF_CHAT_MODEL         = var.chat_model
     OKF_CHAT_EFFORT        = var.chat_effort
     OKF_CHAT_MAX_TOKENS    = tostring(var.chat_max_tokens)
-    OKF_CHAT_MANTLE_REGION = var.chat_mantle_region
     OKF_CHAT_MODEL_CATALOG = jsonencode(var.chat_model_catalog)
 
     # Optional read-only SQL tool (var.enable_chat_sql). When off, the flag is
@@ -323,7 +320,7 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     # the judge fleets (CLASSIFIER-style on every family: thinking off +
     # temperature 0 on a Converse id, reasoning "none" on an openai.* id,
     # with a forced report_violations tool call).
-    # chat_mantle_enabled derives the Mantle grants from this var, so an
+    # chat_openai_enabled derives the bearer-token grants from this var, so an
     # openai.* value or a Converse id (the default) both just work.
     OKF_CHAT_POLICY_CHECK_MODEL = var.chat_policy_check_model
 
