@@ -8,17 +8,17 @@ version = "0.1.0"
 description = "OKF chat agent: LangGraph agent on Bedrock AgentCore Runtime, streamed to the UI as Sparky-style typed SSE chunks"
 requires-python = ">=3.11"
 dependencies = [
-    "okf-core",
+    # Sibling libs (okf-core, okf-aws, okf-consumption-mcp) are deliberately NOT
+    # declared: they are not published to PyPI (and "okf-core" there is an
+    # unrelated third-party project), so a bare name would resolve from the public
+    # index. Install them from local source first — see the Dockerfile and README.
+    # okf-aws carries the shared LLM client factory (chat builds its models the
+    # same way harvest does); okf-consumption-mcp's ConsumptionTools are reused
+    # IN-PROCESS as the agent's tools — no MCP hop.
     # Deterministic policy-rules evaluator (okf_core.policy_rules): parse +
     # qualify agent SQL against the dataset schema. Optional in okf-core;
     # a REAL dependency here — this runtime evaluates (or self-tests) rules.
     "sqlglot>=30.0",
-    # Shared LLM client factory (Converse + Bedrock Runtime GPT builders) — chat builds
-    # its models the same way harvest does.
-    "okf-aws",
-    # The consumption tool logic (pure ConsumptionTools) is reused IN-PROCESS as
-    # the agent's tools — no MCP hop. Depend on the package for its tools module.
-    "okf-consumption-mcp",
     # LangGraph react agent, streamed DIRECTLY by chat.server (graph.astream ->
     # Sparky-style typed SSE chunks: text / think / tool / end). No AG-UI adapter.
     "langchain>=1.0",

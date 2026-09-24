@@ -7,7 +7,13 @@ name = "okf-aws"
 version = "0.1.0"
 description = "Shared boto3 helpers for OKF on AWS: Titan embeddings, S3 Vectors, S3 bundle keys"
 requires-python = ">=3.11"
-dependencies = ["okf-core", "boto3>=1.43"]
+dependencies = [
+    # okf-core (sibling lib) is deliberately NOT declared: it is not published to
+    # PyPI by this project ("okf-core" there is an unrelated third-party package),
+    # so a bare name would resolve from the public index. Install it from local
+    # source first — see the Dockerfiles, scripts/build_lambdas.sh, README.
+    "boto3>=1.43",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "moto[s3,dynamodb]>=5.0"]

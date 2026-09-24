@@ -8,8 +8,10 @@ version = "0.1.0"
 description = "OKF consumption MCP server: stateless streamable-HTTP FastMCP on Bedrock AgentCore Runtime"
 requires-python = ">=3.11"
 dependencies = [
-    "okf-core",
-    "okf-aws",
+    # Sibling libs (okf-core, okf-aws) are deliberately NOT declared: they
+    # are not published to PyPI (and "okf-core" there is an unrelated third-party
+    # project), so a bare name would resolve from the public index. Install them
+    # from local source first — see the Dockerfiles, scripts/build_lambdas.sh, README.
     # <2: mcp 2.0.0 removed mcp.server.fastmcp (FastMCP split out of the SDK);
     # build_app() imports it, so an unpinned image build crash-loops the runtime.
     "mcp>=1.28,<2",
