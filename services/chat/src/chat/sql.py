@@ -598,26 +598,30 @@ def make_sql_tool(
 # The known, server-recognized optional features (the browser may request a
 # subset via the run envelope's ``features``). Kept here so config/server share
 # it. The ``policy:*`` values are the composer's Policy field (Computational /
-# Behavioural / Strict = both) — they arm the mid-turn policy checks and are
-# valid ONLY alongside ``sql`` (the checks judge SQL conduct; without the SQL
-# tool there is nothing to check), a dependency the UI mirrors but the server
-# enforces independently here.
+# Behavioural / Strict = both) — they arm the mid-turn policy checks and take
+# effect ONLY alongside ``sql`` (the checks judge SQL conduct; without the SQL
+# tool there is nothing to check). The UI no longer enforces this — guardrails
+# are selectable with SQL off — so the server alone ignores them here.
 POLICY_FEATURES: frozenset[str] = frozenset(
     {"policy:computational", "policy:behavioural", "policy:strict"}
 )
 KNOWN_FEATURES: frozenset[str] = frozenset({"sql"}) | POLICY_FEATURES
 
 
-def normalize_features(raw: Any) -> set[str]:
+def normalize_features(raw: Any, *, sql_enabled: bool = True) -> set[str]:
     """Coerce a client-sent ``features`` value to the recognized subset (a set).
 
-    Unknown values are dropped; ``policy:*`` values arriving WITHOUT ``sql``
-    are dropped too (orphaned opt-in — the hard dependency, enforced
-    server-side regardless of what the UI sent).
+    Unknown values are dropped. ``sql`` is dropped when the deployment has SQL
+    off (``sql_enabled``), and ``policy:*`` values without ``sql`` are dropped
+    too: the composer lets the user pick guardrails whether or not SQL is on,
+    and the server simply ignores them on a run without the SQL tool (the
+    checks judge SQL conduct — nothing to check without it).
     """
     if not isinstance(raw, (list, tuple, set)):
         return set()
     out = {str(f) for f in raw if str(f) in KNOWN_FEATURES}
+    if not sql_enabled:
+        out.discard("sql")
     if "sql" not in out:
         out -= POLICY_FEATURES
     return out

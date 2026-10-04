@@ -7,7 +7,9 @@
 //   {type:"steer", content}                                     harness steering note
 //   {type:"text",  content}                                     answer tokens
 //   {type:"error", error_code, message}                         a failure
-//   {end:true, token_stats, checkpoint_id}                      terminal marker
+//   {type:"context", context}                                   context-window reading
+//   {type:"compaction", compaction}                             auto compaction ran
+//   {end:true, token_stats, checkpoint_id, context}             terminal marker
 //
 // We read the response body ourselves and hand each parsed chunk to `onChunk`.
 // The consumer (useChatSession) appends chunks to the current turn's raw event

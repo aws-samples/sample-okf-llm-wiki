@@ -825,7 +825,7 @@ def test_read_history_empty_for_unknown_thread():
 
     cp = InMemorySaver()
     data = server.read_history(lambda *a, **k: _scripted_graph(cp), cp, "alice:nope")
-    assert data == {"history": []}
+    assert data == {"history": [], "model": None, "compactions": [], "context": None}
 
 
 def test_read_history_surfaces_pending_ask_when_paused():
@@ -1256,7 +1256,12 @@ def test_prompt_caching_middleware_always_wired(monkeypatch):
     # tool schemas + static system prompt + prior turns become cache reads on
     # every tool-loop iteration. First in the list, before AskHumanMiddleware.
     cap = _factory_tool_names(monkeypatch, sql_enabled=False, features=set())
-    assert cap["middleware"][0] == "BedrockPromptCachingMiddleware"
+    # Compaction is outermost (every inner middleware sees the compacted
+    # view); prompt caching comes right after it.
+    assert cap["middleware"][:2] == [
+        "CompactionMiddleware",
+        "BedrockPromptCachingMiddleware",
+    ]
     assert "AskHumanMiddleware" in cap["middleware"]
 
 
@@ -1402,7 +1407,10 @@ def test_read_history_end_event_carries_token_stats():
     end = turns[0]["aiMessage"][-1]
     assert end["end"] is True
     stats = end["token_stats"]
-    assert stats["input_tokens"] == 150
+    # FRESH input: each call's total minus its cache read + write
+
+    # ((100 - 40 - 30) + (50 - 10 - 3)) — the cache parts are separate keys.
+    assert stats["input_tokens"] == 67
     assert stats["output_tokens"] == 17
     assert stats["cache_read_input_tokens"] == 50
     # 25+5 (ephemeral buckets beat the zeroed cache_creation) + 3 (native shape)

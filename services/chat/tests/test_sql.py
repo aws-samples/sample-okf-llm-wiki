@@ -581,6 +581,19 @@ def test_exploration_queries_never_wait_on_the_verdict():
 # --- the policy opt-in feature vocabulary -------------------------------------
 
 
+def test_normalize_features_ignores_sql_and_guardrails_when_sql_is_off():
+    # The composer offers guardrails whether or not SQL is on; with the
+    # deployment's SQL off, both are silently dropped.
+    from chat.sql import normalize_features
+
+    assert normalize_features(["sql", "policy:strict"], sql_enabled=False) == set()
+    assert normalize_features(["policy:behavioural"], sql_enabled=True) == set()
+    assert normalize_features(["sql", "policy:strict"], sql_enabled=True) == {
+        "sql",
+        "policy:strict",
+    }
+
+
 def test_normalize_features_policy_requires_sql():
     from chat.sql import policy_tracks
 

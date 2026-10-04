@@ -1,12 +1,13 @@
-// The chat page — now just the transcript + the (optional) history drawer. The
-// chat CONTROLS (model/effort select, new-chat, history toggle) live in the
-// sidebar as sub-items under "Chat" (see App.jsx ChatNav); their shared state is
-// the `ctrl` controller (useChatController), owned by the app shell so the
-// sidebar and this page drive the same conversation.
+// The chat page — the transcript + the (optional) history drawer. New-chat and
+// the history toggle live in the sidebar under "Chat" (see App.jsx ChatNav); the
+// run settings (model, effort, guardrails, SQL) live in the row under the
+// composer. Their shared state is the `ctrl` controller (useChatController),
+// owned by the app shell so the sidebar and this page drive the same
+// conversation.
 //
 // ChatPanel still owns the per-conversation session store (useChatSession) via
-// the inner Conversation, keyed by threadId so a new-chat/model-switch/resume
-// remounts with clean state.
+// the inner Conversation, keyed by threadId so a new-chat/resume remounts with
+// clean state (a same-family model switch keeps the thread, so no remount).
 
 import { useCallback, useEffect, useRef, useState } from "react"
 
@@ -28,6 +29,10 @@ function Conversation({
   onTurnComplete,
   historyResume,
   efforts,
+  modelGroups,
+  lockedFamily,
+  onModelChange,
+  onModelRestore,
   onEffortChange,
   onFeaturesChange,
   datasets,
@@ -48,6 +53,11 @@ function Conversation({
     resume,
     prepare,
     loadHistory,
+    context,
+    compactions,
+    compacting,
+    compact,
+    historyModel,
   } = useChatSession({
     threadId: conv.threadId,
     getToken,
@@ -75,10 +85,17 @@ function Conversation({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Tell the controller once the first turn lands (locks the model, binds the URL).
+  // Tell the controller once the first turn lands (locks the model's family,
+  // binds the URL).
   useEffect(() => {
     if (chatTurns.length > 0) onStarted()
   }, [chatTurns.length, onStarted])
+
+  // A reopened thread's history names the model the server pinned it to —
+  // adopt it so the picker's family lock agrees with the runtime.
+  useEffect(() => {
+    if (historyModel) onModelRestore?.(historyModel)
+  }, [historyModel, onModelRestore])
 
   // Refresh the sidebar history list on each turn-COMPLETE (isStreaming true→false)
   // — by then the runtime has committed the thread's index row, so a NEW chat shows
@@ -104,6 +121,12 @@ function Conversation({
       pendingAsk={pendingAsk}
       onStop={stop}
       onPrepare={prepare}
+      model={conv.model}
+      modelGroups={modelGroups}
+      lockedFamily={lockedFamily}
+      // No model switch while paused on a question: answer_human resumes the
+      // turn mid-tool-loop, on whatever model the composer then sends.
+      onModelChange={pendingAsk ? undefined : onModelChange}
       effort={conv.effort}
       efforts={efforts}
       onEffortChange={onEffortChange}
@@ -113,6 +136,10 @@ function Conversation({
       datasetsLoading={datasetsLoading}
       datasetScope={conv.datasetScope}
       onScopeChange={onScopeChange}
+      context={context}
+      compactions={compactions}
+      compacting={compacting}
+      onCompact={compact}
       onOpenDoc={onOpenDoc}
       onOpenReport={onOpenReport}
     />
@@ -143,6 +170,10 @@ export function ChatPanel({
     conv,
     resumed,
     efforts,
+    modelGroups,
+    lockedFamily,
+    onModelChange,
+    onModelRestore,
     historyOpen,
     setHistoryOpen,
     historyReloadKey,
@@ -228,7 +259,7 @@ export function ChatPanel({
 
   return (
     <div className="flex h-full min-h-0 w-full">
-      {/* key=threadId remounts on new-chat / model switch / resume. */}
+      {/* key=threadId remounts on new-chat / resume. */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <Conversation
           key={conv.threadId}
@@ -238,6 +269,10 @@ export function ChatPanel({
           onTurnComplete={onTurnComplete}
           historyResume={resumed}
           efforts={efforts}
+          modelGroups={modelGroups}
+          lockedFamily={lockedFamily}
+          onModelChange={onModelChange}
+          onModelRestore={onModelRestore}
           onEffortChange={onEffortChange}
           onFeaturesChange={onFeaturesChange}
           datasets={datasets}

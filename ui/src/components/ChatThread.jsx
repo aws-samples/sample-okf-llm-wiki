@@ -8,7 +8,8 @@
 //     the answer streams in below it (view holds still — we scroll once when the
 //     turn arrives, NOT per token). The tail turn carries a ~full-viewport
 //     min-height so a short answer still pins its question up top. Composer docks
-//     at the bottom.
+//     at the bottom. A timeline rail on the mid-left edge (TurnRail) jumps
+//     between questions once the transcript overflows.
 
 import { AlertCircleIcon, ArrowDownIcon } from "lucide-react"
 import {
@@ -22,9 +23,13 @@ import {
 
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
+import { CompactionDivider } from "@/components/chat/CompactionDivider"
+import { ContextGauge } from "@/components/chat/ContextGauge"
+import { SLACK, TurnRail } from "@/components/chat/TurnRail"
 import { WikiCubeIcon } from "@/components/WikiCubeIcon"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import { modelLabel } from "@/lib/chatModels"
 import { collectWikiSources, wikiSourcesSignature } from "@/lib/sources"
 
 // Loading placeholder for a resumed conversation — a couple of turn-shaped
@@ -49,8 +54,13 @@ function HistorySkeleton() {
   )
 }
 
-const FOOTER_NOTE =
-  "The agent reads the wiki to answer. It can be wrong — verify against the source docs."
+// Bring a turn's TOP near the top of the viewport, leaving a gap so the question
+// lands just BELOW the top scroll-fade (~40px) rather than dissolving into it.
+const TOP_GAP = 44
+
+const prefersReducedMotion = () =>
+  window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false
+
 
 export function ChatThread({
   chatTurns,
@@ -64,6 +74,10 @@ export function ChatThread({
   pendingAsk = null,
   onStop,
   onPrepare,
+  model,
+  modelGroups,
+  lockedFamily,
+  onModelChange,
   effort,
   efforts,
   onEffortChange,
@@ -73,12 +87,25 @@ export function ChatThread({
   datasetsLoading,
   datasetScope,
   onScopeChange,
+  context,
+  compactions,
+  compacting = false,
+  onCompact,
   onOpenDoc,
   onOpenReport,
-  composerLeftSlot,
   disabled,
 }) {
   const viewportRef = useRef(null)
+  // The rail tracks the viewport and the content column itself, so both live in
+  // state (set by callback refs) — it re-subscribes when either remounts.
+  const [viewportEl, setViewportElState] = useState(null)
+  const [contentEl, setContentElState] = useState(null)
+  // The same node for event handlers (the jump reads it outside render).
+  const contentRef = useRef(null)
+  const setContentEl = useCallback((el) => {
+    contentRef.current = el
+    setContentElState(el)
+  }, [])
   const lastTurnRef = useRef(null)
   const prevCountRef = useRef(0)
   const roRef = useRef(null)
@@ -113,6 +140,7 @@ export function ChatThread({
   // min-height → no space + no scroll-to-top. Measuring on attach fixes that.
   const setViewportEl = useCallback((el) => {
     viewportRef.current = el
+    setViewportElState(el)
     if (roRef.current) {
       roRef.current.disconnect()
       roRef.current = null
@@ -133,7 +161,7 @@ export function ChatThread({
     // Show the jump-to-bottom button EARLY — as soon as content starts slipping
     // behind the bottom fade, not after a big scroll. Small threshold so it's a
     // hint the moment you leave the bottom.
-    setShowButton(gap > 24)
+    setShowButton(gap > SLACK)
   }, [])
 
   const scrollToBottom = useCallback((smooth = true) => {
@@ -143,9 +171,7 @@ export function ChatThread({
   }, [])
 
   // Bring the last turn's TOP near the top of the viewport (Sparky's new-message
-  // behavior). Leave a gap (TOP_GAP) above it so the question lands just BELOW the
-  // top scroll-fade (~40px) rather than dissolving into it or sitting flush.
-  const TOP_GAP = 44
+  // behavior), TOP_GAP below the edge.
   const scrollLastTurnToTop = useCallback((smooth = true) => {
     const el = viewportRef.current
     const turn = lastTurnRef.current
@@ -154,6 +180,82 @@ export function ChatThread({
       turn.getBoundingClientRect().top - el.getBoundingClientRect().top - TOP_GAP
     el.scrollTo({ top: el.scrollTop + delta, behavior: smooth ? "smooth" : "auto" })
   }, [])
+
+  // The rail's jump: turn i's top to TOP_GAP below the viewport's, clamped to the
+  // scroll range; returns where the scroll is heading so the rail can hold its
+  // tick lit on the way. `focus` hands keyboard focus on to the turn.
+  const jumpToTurn = useCallback(
+    (i, focus) => {
+      const el = viewportRef.current
+      const turn = contentRef.current?.children[i]
+      if (!el || !turn) return null
+      const delta =
+        turn.getBoundingClientRect().top - el.getBoundingClientRect().top - TOP_GAP
+      const top = Math.max(
+        0,
+        Math.min(el.scrollTop + delta, el.scrollHeight - el.clientHeight)
+      )
+      el.scrollTo({ top, behavior: prefersReducedMotion() ? "auto" : "smooth" })
+      if (focus) {
+        turn.setAttribute("tabindex", "-1")
+        turn.focus({ preventScroll: true })
+      }
+      return top
+    },
+    []
+  )
+
+  // Compaction marks by turn: "during" ones draw inside the turn (between the
+  // question and the answer), "after" ones below it. Indices past the transcript
+  // (a manual compact after the last turn, then a reload) clamp to the last turn.
+  // Memoized so a turn's array keeps its identity across stream flushes.
+  const turnCount = chatTurns.length
+  const marks = useMemo(() => {
+    const during = new Map()
+    const after = new Map()
+    for (const c of compactions || []) {
+      const raw = Number.isInteger(c?.turn) ? c.turn : turnCount - 1
+      const i = Math.max(0, Math.min(raw, turnCount - 1))
+      const into = c?.phase === "during" ? during : after
+      if (!into.has(i)) into.set(i, [])
+      into.get(i).push(c)
+    }
+    return { during, after }
+  }, [compactions, turnCount])
+
+  const contextSlot = (
+    <ContextGauge
+      context={context}
+      modelName={context?.model ? modelLabel(context.model) : modelLabel(model)}
+      onCompact={onCompact}
+      compacting={compacting}
+      disabled={isStreaming || loadingHistory || turnCount === 0 || Boolean(pendingAsk)}
+    />
+  )
+
+  const composerProps = {
+    onSend,
+    onAnswer,
+    pendingAsk,
+    onStop,
+    onPrepare,
+    isStreaming,
+    model,
+    modelGroups,
+    lockedFamily,
+    onModelChange,
+    effort,
+    efforts,
+    onEffortChange,
+    features,
+    onFeaturesChange,
+    datasets,
+    datasetsLoading,
+    datasetScope,
+    onScopeChange,
+    compacting,
+    contextSlot,
+  }
 
   useLayoutEffect(() => {
     const count = chatTurns.length
@@ -217,28 +319,7 @@ export function ChatThread({
             ) : null}
           </div>
           <div className="w-full">
-            <ChatInput
-              onSend={onSend}
-              onAnswer={onAnswer}
-              pendingAsk={pendingAsk}
-              onStop={onStop}
-              onPrepare={onPrepare}
-              isStreaming={isStreaming}
-              disabled={disabled}
-              leftSlot={composerLeftSlot}
-              effort={effort}
-              efforts={efforts}
-              onEffortChange={onEffortChange}
-              features={features}
-              onFeaturesChange={onFeaturesChange}
-              datasets={datasets}
-              datasetsLoading={datasetsLoading}
-              datasetScope={datasetScope}
-              onScopeChange={onScopeChange}
-            />
-            <p className="mt-1.5 text-center text-[11px] text-muted-foreground/60">
-              {FOOTER_NOTE}
-            </p>
+            <ChatInput {...composerProps} disabled={disabled} />
           </div>
         </div>
       </div>
@@ -248,59 +329,79 @@ export function ChatThread({
   // --- LOADING / POPULATED: scroll list + docked composer --------------------
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {/* okf-chat-fade (index.css) dissolves BOTH edges so text fades out (not
-          hard-cuts) as it scrolls under the composer (bottom, ~4rem) and off the
-          top of the layout (~2.5rem). The inner pt-10/pb-24 buffer the first/last
-          lines so they clear the mask at rest.
-          scrollbar-gutter reserves the scrollbar lane even while the transcript
-          fits the viewport — otherwise expanding a thinking block on a short
-          conversation summons the (classic, non-overlay) scrollbar and the
-          centered column jumps left, then back right on collapse. both-edges
-          keeps the column optically centered. */}
-      <div
-        ref={setViewportEl}
-        onScroll={checkScroll}
-        className="okf-thin-scroll okf-chat-fade min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable_both-edges]"
-      >
-        {loadingHistory ? (
-          <HistorySkeleton />
-        ) : (
-          <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 pt-10 pb-24">
-            {/* pb-24: gap below the LAST message so it clears the composer + the
-                bottom scroll-fade at rest, instead of ending right at the edge. */}
-            {chatTurns.map((turn, i) => {
-              const isLast = i === chatTurns.length - 1
-              return (
-                <div
-                  key={turn.id}
-                  ref={isLast ? lastTurnRef : null}
-                  // Tail turn reserves just enough height that its question can
-                  // PIN near the top. Uses the FROZEN tailMinH (captured when the
-                  // turn arrived), NOT live viewportH — so the composer growing as
-                  // you type doesn't resize this and jerk the transcript.
-                  style={
-                    isLast && tailMinH ? { minHeight: `${tailMinH}px` } : undefined
-                  }
-                >
-                  <ChatMessage
-                    turn={turn}
-                    streaming={isStreaming && isLast}
-                    datasetScope={datasetScope}
-                    wikiSources={wikiSources}
-                    onOpenDoc={onOpenDoc}
-                    onOpenReport={onOpenReport}
-                  />
+      {/* The transcript box: the rail is its sibling (outside the scroll and the
+          fade mask), centred on it rather than on transcript + composer. */}
+      <div className="relative isolate flex min-h-0 flex-1 flex-col">
+        {/* okf-chat-fade (index.css) dissolves BOTH edges so text fades out (not
+            hard-cuts) as it scrolls under the composer (bottom, ~4rem) and off the
+            top of the layout (~2.5rem). The inner pt-10/pb-24 buffer the first/last
+            lines so they clear the mask at rest.
+            scrollbar-gutter reserves the scrollbar lane even while the transcript
+            fits the viewport — otherwise expanding a thinking block on a short
+            conversation summons the (classic, non-overlay) scrollbar and the
+            centered column jumps left, then back right on collapse. both-edges
+            keeps the column optically centered. */}
+        <div
+          ref={setViewportEl}
+          onScroll={checkScroll}
+          className="okf-thin-scroll okf-chat-fade min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable_both-edges]"
+        >
+          {loadingHistory ? (
+            <HistorySkeleton />
+          ) : (
+            <div
+              ref={setContentEl}
+              className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 pt-10 pb-24"
+            >
+              {/* pb-24: gap below the LAST message so it clears the composer + the
+                  bottom scroll-fade at rest, instead of ending right at the edge.
+                  Each turn is a DIRECT child of this column (the rail indexes
+                  children), so dividers render inside their turn's wrapper. */}
+              {chatTurns.map((turn, i) => {
+                const isLast = i === chatTurns.length - 1
+                return (
+                  <div
+                    key={turn.id}
+                    ref={isLast ? lastTurnRef : null}
+                    data-turn-id={turn.id}
+                    className="flex flex-col gap-6 outline-none"
+                    // Tail turn reserves just enough height that its question can
+                    // PIN near the top. Uses the FROZEN tailMinH (captured when the
+                    // turn arrived), NOT live viewportH — so the composer growing as
+                    // you type doesn't resize this and jerk the transcript.
+                    style={
+                      isLast && tailMinH ? { minHeight: `${tailMinH}px` } : undefined
+                    }
+                  >
+                    <ChatMessage
+                      turn={turn}
+                      streaming={isStreaming && isLast}
+                      datasetScope={datasetScope}
+                      wikiSources={wikiSources}
+                      onOpenDoc={onOpenDoc}
+                      onOpenReport={onOpenReport}
+                      compactionMarks={marks.during.get(i)}
+                    />
+                    <CompactionDivider marks={marks.after.get(i)} />
+                  </div>
+                )
+              })}
+              {error ? (
+                <div className="flex items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                  <AlertCircleIcon className="size-4 shrink-0" />
+                  <span>{error}</span>
                 </div>
-              )
-            })}
-            {error ? (
-              <div className="flex items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                <AlertCircleIcon className="size-4 shrink-0" />
-                <span>{error}</span>
-              </div>
-            ) : null}
-          </div>
-        )}
+              ) : null}
+            </div>
+          )}
+        </div>
+        <TurnRail
+          turns={loadingHistory ? [] : chatTurns}
+          viewport={viewportEl}
+          content={contentEl}
+          topGap={TOP_GAP}
+          onJump={jumpToTurn}
+        />
       </div>
 
       {/* Composer, centered + capped to match the transcript column. */}
@@ -318,28 +419,7 @@ export function ChatThread({
           </Button>
         ) : null}
 
-        <ChatInput
-          onSend={onSend}
-          onAnswer={onAnswer}
-          pendingAsk={pendingAsk}
-          onStop={onStop}
-          onPrepare={onPrepare}
-          isStreaming={isStreaming}
-          disabled={disabled || loadingHistory}
-          leftSlot={composerLeftSlot}
-          effort={effort}
-          efforts={efforts}
-          onEffortChange={onEffortChange}
-          features={features}
-          onFeaturesChange={onFeaturesChange}
-          datasets={datasets}
-          datasetsLoading={datasetsLoading}
-          datasetScope={datasetScope}
-          onScopeChange={onScopeChange}
-        />
-        <p className="mt-1.5 text-center text-[11px] text-muted-foreground/60">
-          {FOOTER_NOTE}
-        </p>
+        <ChatInput {...composerProps} disabled={disabled || loadingHistory} />
       </div>
     </div>
   )

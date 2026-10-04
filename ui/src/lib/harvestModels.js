@@ -120,7 +120,7 @@ const TIER_RANK = {
   luna: 2,
 }
 
-function familyOf(model) {
+export function familyOf(model) {
   if (/^(?:(?:global|apac|eu|us)\.)?(?:openai\.|gpt-)/.test(model)) return "OpenAI"
   if (model.includes("anthropic") || model.includes("claude")) return "Anthropic"
   return "Other"
@@ -141,16 +141,21 @@ function versionOf(model) {
 }
 
 // [{family, models}] — families in FAMILY_ORDER (empty ones dropped), models
-// most-capable-first. Derived once from the static MODEL_CATALOG.
-export const GROUPED_MODEL_CATALOG = FAMILY_ORDER.map((family) => ({
-  family,
-  models: MODEL_CATALOG.filter((e) => familyOf(e.model) === family).sort(
-    (a, b) =>
-      tierRankOf(a.model) - tierRankOf(b.model) ||
-      versionOf(b.model) - versionOf(a.model) ||
-      a.label.localeCompare(b.label)
-  ),
-})).filter((g) => g.models.length)
+// most-capable-first.
+// Shared with the chat picker (chatModels.js), which groups its own catalog.
+export function groupModels(catalog) {
+  return FAMILY_ORDER.map((family) => ({
+    family,
+    models: catalog.filter((e) => familyOf(e.model) === family).sort(
+      (a, b) =>
+        tierRankOf(a.model) - tierRankOf(b.model) ||
+        versionOf(b.model) - versionOf(a.model) ||
+        a.label.localeCompare(b.label)
+    ),
+  })).filter((g) => g.models.length)
+}
+
+export const GROUPED_MODEL_CATALOG = groupModels(MODEL_CATALOG)
 
 // -- persisted user preference ---------------------------------------------
 // The picker selection is a user preference: persisted to localStorage so it

@@ -39,12 +39,57 @@ from okf_core.harvest_models import (
 # chat without touching harvest. A GPT id (openai.*) routes to Bedrock Runtime.
 # Opus 5 streaming requires langchain-aws >= 1.6.4 (pinned in requirements).
 DEFAULT_MODEL = "global.anthropic.claude-opus-5-5"
-DEFAULT_CHAT_CATALOG = [{
-    "model": DEFAULT_MODEL,
-    "label": "Claude Opus 5.5",
-    "efforts": ["low", "medium", "high", "xhigh", "max"],
-    "default_effort": "high",
-}]
+# Mirrors var.chat_model_catalog's default (Terraform is the authority).
+DEFAULT_CHAT_CATALOG = [
+    {
+        "model": "global.anthropic.claude-opus-5-5",
+        "label": "Claude Opus 5.5",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "default_effort": "high",
+    },
+    {
+        "model": "global.anthropic.claude-opus-4-8",
+        "label": "Claude Opus 4.8",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "default_effort": "high",
+    },
+    {
+        "model": "global.anthropic.claude-sonnet-5-5",
+        "label": "Claude Sonnet 5.5",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "default_effort": "high",
+    },
+    {
+        "model": "global.anthropic.claude-fable-5-1",
+        "label": "Claude Fable 5.1",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "default_effort": "high",
+    },
+    {
+        "model": "global.openai.gpt-6-astra",
+        "label": "GPT-6 Astra",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "default_effort": "high",
+    },
+    {
+        "model": "global.openai.gpt-6.1-sol",
+        "label": "GPT-6.1 Sol",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "default_effort": "high",
+    },
+    {
+        "model": "global.openai.gpt-6-luna",
+        "label": "GPT-6 Luna",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "default_effort": "high",
+    },
+    {
+        "model": "global.openai.gpt-5.6-terra",
+        "label": "GPT-5.6 Terra",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "default_effort": "high",
+    },
+]
 
 # GPT reasoning models cap output below Opus; the shared factory keys the
 # provider-aware default off the resolved model, so we only need the Converse

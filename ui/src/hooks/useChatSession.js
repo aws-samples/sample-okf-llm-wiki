@@ -3,7 +3,9 @@
 // threads, canvas, or attachments to juggle). Owns:
 //   - chatTurns: [{ id, userMessage, aiMessage:[…raw chunks…] }]
 //   - isStreaming, error
-//   - send(prompt), stop(), loadHistory(), reset(threadId)
+//   - context (the context-window reading), compactions (transcript divider
+//     marks), compacting
+//   - send(prompt), stop(), loadHistory(), compact(), reset(threadId)
 //
 // A turn's `aiMessage` is the raw typed-chunk array the SSE reader appends to;
 // buildMessageBlocks (in the renderer) turns it into blocks. We keep the raw
@@ -11,9 +13,11 @@
 // like Sparky's and a mid-stream re-render is cheap.
 
 import { useCallback, useEffect, useRef, useState } from "react"
+import { toast } from "sonner"
 
 import {
   answerHumanAPI,
+  compactAPI,
   deleteHistoryAPI,
   fetchHistoryAPI,
   prepareAPI,
@@ -22,9 +26,30 @@ import {
   stopAPI,
 } from "@/lib/chatApi"
 import { consumeSSE } from "@/lib/chatStream"
+import { formatTokens } from "@/lib/utils"
 
 function turnId() {
   return `turn_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+}
+
+// The runtime refuses a cross-provider model switch mid-conversation (the
+// checkpoint's reasoning blocks are provider-specific); the picker prevents it,
+// so this only shows if the two disagree.
+function errorMessage(chunk, fallback) {
+  if (chunk.error_code === "model_family_locked") {
+    return (
+      chunk.message ||
+      "This conversation is locked to its model provider. Start a new chat to switch."
+    )
+  }
+  return chunk.message || fallback
+}
+
+// Why a manual compaction did nothing, for its toast.
+const COMPACT_REASONS = {
+  busy: "A turn is running — wait for it to finish, then compact.",
+  awaiting_answer: "Answer the pending question first, then compact.",
+  nothing_to_compact: "There is not enough history to summarize yet.",
 }
 
 export function useChatSession({
@@ -45,6 +70,23 @@ export function useChatSession({
   // True while a resumed conversation's history is being fetched (drives the
   // skeleton placeholders in the transcript).
   const [loadingHistory, setLoadingHistory] = useState(false)
+  // The context-window reading ({tokens, window, percent, threshold, model,
+  // compactions}) — from history, mid-turn `context` chunks, the end chunk, and
+  // a compact's response. null until measured.
+  const [context, setContext] = useState(null)
+  // Compaction marks ({source, turn, phase, pre_tokens, post_tokens}) the
+  // transcript draws dividers for.
+  const [compactions, setCompactions] = useState([])
+  const [compacting, setCompacting] = useState(false)
+  // The model the server reports the conversation pinned to (history read);
+  // the controller adopts it so the picker's family lock matches the server.
+  const [historyModel, setHistoryModel] = useState(null)
+  // The live turn count, for stamping a mid-turn auto compaction onto the turn
+  // that is streaming.
+  const turnCountRef = useRef(0)
+  useEffect(() => {
+    turnCountRef.current = chatTurns.length
+  }, [chatTurns.length])
 
   const abortRef = useRef(null)
   // A pending EXPLICIT stop (the stopAPI round-trip). The server's stop handler
@@ -258,9 +300,28 @@ export function useChatSession({
           res,
           (chunk) => {
             if (chunk.type === "error") {
-              setError(chunk.message || "the agent hit an error")
+              setError(errorMessage(chunk, "the agent hit an error"))
               return
             }
+            if (chunk.type === "context") {
+              if (chunk.context) setContext(chunk.context)
+              return
+            }
+            if (chunk.type === "compaction") {
+              // An AUTO compaction ran mid-turn: a divider inside this turn.
+              if (chunk.compaction) {
+                setCompactions((cur) => [
+                  ...cur,
+                  {
+                    ...chunk.compaction,
+                    turn: Math.max(0, turnCountRef.current - 1),
+                    phase: "during",
+                  },
+                ])
+              }
+              return
+            }
+            if (chunk.end && chunk.context) setContext(chunk.context)
             if (chunk.type === "ask_human") {
               // The agent paused to ask the user. Surface the questions for the
               // composer's QA form; the run has ended server-side (graph paused at
@@ -446,9 +507,29 @@ export function useChatSession({
         (chunk) => {
           if (chunk.type === "no_active_stream") return // nothing in flight — no-op
           if (chunk.type === "error") {
-            if (opened) setError(chunk.message || "the agent hit an error")
+            if (opened) setError(errorMessage(chunk, "the agent hit an error"))
             return
           }
+          if (chunk.type === "context") {
+            if (chunk.context) setContext(chunk.context)
+            return
+          }
+          if (chunk.type === "compaction") {
+            if (chunk.compaction) {
+              setCompactions((cur) => [
+                ...cur,
+                {
+                  ...chunk.compaction,
+                  // The resumed turn opens with its first real chunk; until
+                  // then it would land on the turn before.
+                  turn: Math.max(0, turnCountRef.current - (opened ? 1 : 0)),
+                  phase: "during",
+                },
+              ])
+            }
+            return
+          }
+          if (chunk.end && chunk.context) setContext(chunk.context)
           if (chunk.type === "ask_human") {
             ensureTurnOpen()
             setPendingAsk({ questions: chunk.questions || [] })
@@ -490,11 +571,24 @@ export function useChatSession({
     const cfg = cfgRef.current
     setLoadingHistory(true)
     try {
-      const { history, pendingAsk: pending } = await fetchHistoryAPI({
+      const {
+        history,
+        pendingAsk: pending,
+        context: ctx,
+        compactions: marks,
+        model: pinned,
+      } = await fetchHistoryAPI({
         threadId: cfg.threadId,
         getToken: cfg.getToken,
       })
       if (history.length > 0) setChatTurns(history)
+      if (ctx) setContext(ctx)
+      // A mark past the last history turn belongs to the IN-FLIGHT turn the
+      // server dropped from history; the resumed stream replays its
+      // `compaction` chunk onto that turn, so keeping it here would draw it
+      // twice (once clamped onto the turn before).
+      setCompactions((marks || []).filter((m) => m.turn < history.length))
+      if (pinned) setHistoryModel(pinned)
       // If the conversation is paused at an ask_human interrupt (durable in the
       // checkpoint), restore the QA form so a page reload can still answer it.
       if (pending && Array.isArray(pending.questions) && pending.questions.length) {
@@ -506,6 +600,42 @@ export function useChatSession({
       setLoadingHistory(false)
     }
   }, [])
+
+  // Compact now: the runtime summarizes the older history into the agent's
+  // context; the transcript keeps every message and gains the divider the
+  // response carries (no history re-read — that would remount every turn).
+  const compact = useCallback(async () => {
+    const cfg = cfgRef.current
+    if (isStreaming || compacting) return
+    if (pendingAsk) {
+      toast.message("Nothing Was Compacted", { description: COMPACT_REASONS.awaiting_answer })
+      return
+    }
+    setCompacting(true)
+    try {
+      const res = await compactAPI({
+        threadId: cfg.threadId,
+        getToken: cfg.getToken,
+      })
+      if (res.compacted) {
+        if (res.context) setContext(res.context)
+        const c = res.compaction || {}
+        toast.success("Context Compacted", {
+          description:
+            c.pre_tokens && c.post_tokens
+              ? `${formatTokens(c.pre_tokens)} → ${formatTokens(c.post_tokens)} tokens`
+              : undefined,
+        })
+        if (res.compaction) setCompactions((cur) => [...cur, res.compaction])
+      } else {
+        toast.message("Nothing Was Compacted", {
+          description: COMPACT_REASONS[res.reason] || res.message || undefined,
+        })
+      }
+    } finally {
+      setCompacting(false)
+    }
+  }, [isStreaming, compacting, pendingAsk])
 
   // Purge the runtime-side checkpoints for this conversation.
   const clearRuntimeHistory = useCallback(async () => {
@@ -544,6 +674,10 @@ export function useChatSession({
     setIsStreaming(false)
     setLoadingHistory(false)
     setPendingAsk(null)
+    setContext(null)
+    setCompactions([])
+    setCompacting(false)
+    setHistoryModel(null)
   }, [threadId, cancelPump])
 
   // Cancel any pending frame on unmount so the pump never fires post-teardown.
@@ -563,5 +697,10 @@ export function useChatSession({
     loadHistory,
     clearRuntimeHistory,
     setError,
+    context,
+    compactions,
+    compacting,
+    compact,
+    historyModel,
   }
 }
