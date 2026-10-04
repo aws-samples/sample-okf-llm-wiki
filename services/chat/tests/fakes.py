@@ -182,8 +182,8 @@ CHAT_CATALOG = [
         "default_effort": "high",
     },
     {
-        "model": "global.openai.gpt-6-sol",
-        "label": "GPT-6 Sol",
+        "model": "global.openai.gpt-6.1-sol",
+        "label": "GPT-6.1 Sol",
         "efforts": ["low", "medium", "high", "xhigh", "max"],
         "default_effort": "high",
     },

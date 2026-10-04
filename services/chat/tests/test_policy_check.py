@@ -1637,6 +1637,35 @@ def test_decided_policies_never_reach_the_judges(env, monkeypatch):
     checker.close()
 
 
+@pytest.mark.parametrize(
+    ("model", "forced"),
+    [
+        ("global.anthropic.claude-opus-4-8", True),
+        ("global.openai.gpt-5.6-terra", True),
+        # Sonnet 5.5 rejects a forced tool choice: forcing would 400 every
+        # shard into a silent fail-open.
+        ("global.anthropic.claude-sonnet-5-5", False),
+    ],
+)
+def test_fleet_forces_the_verdict_tool_only_where_the_model_allows(
+    env, monkeypatch, model, forced
+):
+    _seed_usable_policy(env)
+    seen: list[bool] = []
+
+    def _recording_judge(model_, policies, evidence, **kw):
+        seen.append(kw["force_tool"])
+        return [], 0, len(policies)
+
+    monkeypatch.setattr(pc, "judge_policies", _recording_judge)
+    cfg = _cfg()
+    cfg.policy_check_model = model
+    checker = _checker(env, judge=_RaisingModel(), cfg=cfg)
+    checker.submit(_VIOLATING_SQL).result(timeout=10)
+    assert seen and all(f is forced for f in seen)
+    checker.close()
+
+
 @_needs_sqlglot
 def test_unknown_verdicts_fall_through_to_the_judges(env, monkeypatch):
     _seed_ruled(env)

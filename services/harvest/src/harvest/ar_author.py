@@ -40,10 +40,17 @@ from okf_core import policy_doc
 
 log = logging.getLogger("harvest.ar_author")
 
-#: Sonnet 5 with high-effort reasoning. An openai.* value is still supported
+#: Sonnet 5.5 with high-effort reasoning (its classifier extractor runs at
+#: adaptive effort low — Sonnet 5.5 cannot turn thinking off). An openai.* value is still supported
 #: (needs the harvest role's Bedrock Runtime grants, derived from
 #: var.policy_preprocess_model).
-DEFAULT_AUTHOR_MODEL = "global.anthropic.claude-sonnet-5"
+DEFAULT_AUTHOR_MODEL = "global.anthropic.claude-sonnet-5-5"
+
+
+def _policy_model_id() -> str:
+    """The author's AND the extractor's model id — read in one place, so the
+    extractor's forced-tool decision can never drift from the model it built."""
+    return os.environ.get("OKF_POLICY_PREPROCESS_MODEL", DEFAULT_AUTHOR_MODEL)
 #: Reasoning at HIGH: policy distillation is judgment work, and this path runs
 #: rarely (per source change) and off every hot path.
 DEFAULT_AUTHOR_EFFORT = "high"
@@ -434,7 +441,7 @@ def _build_author_model() -> Any:
 
     from harvest.agent import _bedrock_config
 
-    model_id = os.environ.get("OKF_POLICY_PREPROCESS_MODEL", DEFAULT_AUTHOR_MODEL)
+    model_id = _policy_model_id()
     effort = os.environ.get("OKF_POLICY_AUTHOR_EFFORT", DEFAULT_AUTHOR_EFFORT)
     if is_openai_model(model_id):
         return build_bedrock_openai(
@@ -457,7 +464,10 @@ def _build_author_model() -> Any:
 # --- the extractor fleet (map side of from-scratch authoring) -----------------
 
 #: A cluster's rules are a page of YAML at most; extraction is not authoring.
-_EXTRACT_MAX_TOKENS = 8000
+#: Headroom beyond that page because models that cannot turn thinking off
+#: (Sonnet 5.5+) spend their adaptive-low thinking from the same budget — a
+#: cap only bounds output, so the headroom costs nothing when unused.
+_EXTRACT_MAX_TOKENS = 16000
 #: Forced-call attempts per cluster before the fleet fails that cluster open.
 _EXTRACT_ATTEMPTS = 3
 #: Concurrent extractors (env-tunable; the fleet is minutes-rare, so this only
@@ -518,9 +528,11 @@ def _build_extractor_model() -> Any:
     Same model id as the author (``OKF_POLICY_PREPROCESS_MODEL``) but thinking
     OFF + temperature 0 on Converse (which is exactly what makes the FORCED
     ``submit_rules`` tool choice legal on Anthropic) and reasoning ``"none"``
-    on an openai.* id — the judge fleet's proven dual-family contract. The
-    deep judgment (dedupe, proportionality, verification) belongs to the
-    synthesizer, not here.
+    on an openai.* id — the judge fleet's proven dual-family contract. On
+    Claude ids that cannot turn thinking off (Sonnet 5.5+, the default) the
+    factory builds adaptive effort low with no temperature instead, and
+    :func:`_forced_extract` binds the tool on auto. The deep judgment (dedupe,
+    proportionality, verification) belongs to the synthesizer, not here.
     """
     from okf_aws.model_factory import (
         build_bedrock_converse,
@@ -530,7 +542,7 @@ def _build_extractor_model() -> Any:
 
     from harvest.agent import _bedrock_config
 
-    model_id = os.environ.get("OKF_POLICY_PREPROCESS_MODEL", DEFAULT_AUTHOR_MODEL)
+    model_id = _policy_model_id()
     if is_openai_model(model_id):
         return build_bedrock_openai(
             model_id,
@@ -661,28 +673,47 @@ def _submit_rules_tool():
 def _forced_extract(model: Any, prompt: str, allowed_sources: set[str]) -> list[dict]:
     """One cluster's extraction: forced submit_rules call + gate-retry.
 
-    The CALL is guaranteed by the API (forced tool choice); the PAYLOAD by the
+    The CALL is guaranteed by the API (forced tool choice — or, on models
+    that cannot force one, nudged by the missing-call retry); the PAYLOAD by the
     validation round trip; the PIPELINE by salvage-on-exhaustion — the valid
     subset of the final attempt still counts, and an empty result fails open
     to the synthesizer (whose coverage nudge names the hole).
     """
     from langchain_core.messages import HumanMessage, ToolMessage
+    from okf_aws.model_factory import supports_forced_tool_choice
 
-    bound = model.bind_tools([_submit_rules_tool()], tool_choice="submit_rules")
+    if supports_forced_tool_choice(_policy_model_id()):
+        bound = model.bind_tools([_submit_rules_tool()], tool_choice="submit_rules")
+    else:
+        # Claude ids that cannot turn thinking off (Sonnet 5.5+) reject a
+        # forced tool choice; auto + the missing-call re-ask below instead.
+        bound = model.bind_tools([_submit_rules_tool()])
     messages: list[Any] = [HumanMessage(content=prompt)]
     valid: list[dict] = []
     for attempt in range(1, _EXTRACT_ATTEMPTS + 1):
         reply = bound.invoke(messages)
         calls = getattr(reply, "tool_calls", None) or []
         if not calls:
-            # Unreachable under a working forced tool choice; belt-and-braces.
-            messages += [
-                reply,
-                HumanMessage(content="Reply ONLY with a submit_rules call."),
+            # Unreachable under a working forced tool choice; the live path on
+            # auto. Re-ask from scratch rather than echoing the tool-less reply
+            # (some providers reject a dangling or empty assistant turn — the
+            # judge fleet's _forced_tool_call does the same).
+            messages = [
+                HumanMessage(
+                    content=prompt + "\n\nReply ONLY with a submit_rules call."
+                )
             ]
             continue
-        args = calls[0].get("args") or {}
-        valid, errors = _validate_rules(args.get("rules"), allowed_sources)
+        # On auto a model may split its rules across several submit_rules
+        # calls: they are ONE submission, validated together.
+        if len(calls) == 1:
+            rules = (calls[0].get("args") or {}).get("rules")
+        else:
+            rules = []
+            for call in calls:
+                part = _coerce_rules((call.get("args") or {}).get("rules"))
+                rules.extend(part if isinstance(part, list) else [part])
+        valid, errors = _validate_rules(rules, allowed_sources)
         if not errors or attempt == _EXTRACT_ATTEMPTS:
             if errors:
                 log.warning(
@@ -690,17 +721,24 @@ def _forced_extract(model: Any, prompt: str, allowed_sources: set[str]) -> list[
                     "(dropped: %s)", len(valid), "; ".join(errors[:5]),
                 )
             return valid
-        messages += [
-            reply,
+        error_text = (
+            "Error: " + "; ".join(errors[:10]) + " — resubmit ONE "
+            "submit_rules call shaped exactly like: {\"rules\": "
+            "[{\"type\": \"computational\", \"condition\": \"…\", "
+            "\"action\": \"…\", \"source\": \"<a cluster page>\"}]}"
+        )
+        # Every tool call needs its own result, or the next request is
+        # rejected (toolUse without toolResult).
+        messages += [reply] + [
             ToolMessage(
                 content=(
-                    "Error: " + "; ".join(errors[:10]) + " — resubmit ONE "
-                    "submit_rules call shaped exactly like: {\"rules\": "
-                    "[{\"type\": \"computational\", \"condition\": \"…\", "
-                    "\"action\": \"…\", \"source\": \"<a cluster page>\"}]}"
+                    error_text
+                    if i == 0
+                    else "See the error on the first submit_rules call."
                 ),
-                tool_call_id=calls[0].get("id") or "submit_rules",
-            ),
+                tool_call_id=call.get("id") or f"submit_rules-{i}",
+            )
+            for i, call in enumerate(calls)
         ]
     return valid
 

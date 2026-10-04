@@ -58,19 +58,29 @@ don't drift. Sources are at the end of each section.
   `langchain-aws` package (`pip install langchain-aws`), not the `langchain[aws]`
   extra. Building the model explicitly lets adaptive-thinking config ride on it
   via `additional_model_request_fields` (see §7 of `OKF_DESIGN.md`).
+- **No "thinking off" from Claude 5.5 on.** Live 2026-10-04 (Converse):
+  `claude-sonnet-5-5` returns `ValidationException` for
+  `thinking.type="disabled"`, for ANY forced `toolChoice` (`tool`/`any` —
+  `thinking.type="between_tools"` does not lift it; Opus 5.5 rejects forced
+  tools too), and for a caller-set `temperature` ("deprecated for this
+  model"). Omitting `thinking` selects adaptive (default effort `high`).
+  Sonnet 5 rejects `temperature` as well, but `langchain-aws` drops it
+  silently for ids its model profiles know — new ids get no such cover.
+  `okf_aws.model_factory.converse_requires_thinking` owns this knowledge.
 - **GPT models.** `okf_aws.model_factory.build_bedrock_openai` builds
   `ChatOpenAI` against
   `https://bedrock-runtime.<region>.amazonaws.com/openai/v1`, with
-  `use_responses_api=True`. Harvest and benchmarks offer GPT-6 Astra, Sol,
-  and Luna through `global.openai.gpt-6-*` inference profiles; GPT-5.6 Terra
-  remains available. Bare GPT IDs are normalized to their global profile.
+  `use_responses_api=True`. Harvest and benchmarks offer GPT-6 Astra, GPT-6.1
+  Sol and GPT-6 Luna through `global.openai.gpt-6-astra`, `gpt-6.1-sol` and
+  `gpt-6-luna` inference profiles; GPT-5.6 Terra remains available. Bare GPT IDs are normalized to their global profile.
   Chat keeps its separate Opus 5.5 catalog and the Converse client.
   The OpenAI client uses a renewable short-term Bedrock bearer, `store=False`,
   and local message history. The execution role grants `bedrock:InvokeModel`,
   `bedrock:InvokeModelWithResponseStream`, and short-term
   `bedrock:CallWithBearerToken`; no Mantle project permissions are needed.
   Known GPT models also supply context metadata and enforce their configured
-  output ceilings: Astra 128K, Sol/Luna/Terra 32K.
+  output ceilings: GPT-6.1 Sol 131,072, Astra/Luna 128K, Terra 32K (GPT-6
+  Sol, no longer offered, keeps its 128K entry for pinned deployments).
 
   The former `OKF_<SERVICE>_MANTLE_*` client settings are now
   `OKF_<SERVICE>_OPENAI_*`, except the separate provider region setting, which

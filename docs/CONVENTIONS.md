@@ -424,8 +424,11 @@ topics fold into a catch-all, the confidentiality/disclosure topic and the
 `usage_guardrails.md` contract stay ISOLATED however thin — isolation is the
 remedy for the pages single-pass kept dropping); a fleet of per-cluster
 extractors (classifier contract: thinking off / reasoning `"none"`, FORCED
-`submit_rules` tool call, schema + source-attribution validation with
-bounded retry, salvage-on-exhaustion) mines candidate rules in parallel;
+`submit_rules` tool call — or, on Claude ids that cannot turn thinking off
+(Sonnet 5.5+, the default), adaptive effort `low` + an auto tool choice with
+a missing-call re-ask; multiple `submit_rules` calls in one reply count as one
+submission — schema + source-attribution validation with bounded retry,
+salvage-on-exhaustion) mines candidate rules in parallel;
 and the authoring agent becomes the SYNTHESIZER — it receives the candidate
 union, dedupes/merges/prunes (proportionality is its explicit job, backed by
 the `OKF_POLICY_MAX_RULES` cap), verifies doubtful candidates via
@@ -526,7 +529,11 @@ REMOVED; the shield timeline steps are the only policy surface):
   EVERY family — thinking OFF + temperature 0 on a Converse (Anthropic) id,
   reasoning `"none"` on an openai.* id — with a FORCED `report_violations`
   tool choice (legal on Anthropic exactly because thinking is off), single
-  fast pass. They answer
+  fast pass. Claude ids that cannot turn thinking off (Sonnet 5.5+, the
+  default — they reject `thinking.type=disabled`, a forced tool choice and a
+  caller-set temperature) run adaptive effort `low` with an AUTO tool choice
+  and the missing-call retry as backstop; forcing there would 400 every
+  shard into a silent fail-open (`okf_aws.model_factory.supports_forced_tool_choice`). They answer
   through exactly ONE tool, `report_violations`, whose
   contract is **violated policy IDS ONLY** — no evidence, no explanations
   (saves judge output tokens, and the reminder the main agent reads is built
@@ -1454,7 +1461,7 @@ id>, payload=json.dumps({...}).encode())`, where the payload is either:
 ```json
 { "data_domain": "sales", "dataset": "orders", "mode": "full",
   "source": { "type": "glue", "glue_database": "orders" },
-  "model": "global.openai.gpt-6-sol", "effort": "xhigh",
+  "model": "global.openai.gpt-6.1-sol", "effort": "xhigh",
   "domain_description": "Revenue & order pipelines",
   "domain_context": "Covers all B2C sales; refunds excluded." }
 ```
@@ -1524,7 +1531,7 @@ or, for an annotation run (apply a user's wiki feedback in place):
       "quote": "one row per order", "prefix": "", "suffix": "",
       "block_line": 12, "note": "grain is per line-item, not per order" }
   ],
-  "model": "global.openai.gpt-6-sol", "effort": "high",
+  "model": "global.openai.gpt-6.1-sol", "effort": "high",
   "subagent_model": "…", "subagent_effort": "…",
   "reviewer_model": "…", "reviewer_effort": "…",
   "domain_description": "Revenue & order pipelines",
@@ -1569,7 +1576,7 @@ are retired end to end. The payload (`okf_core.benchmark_report` field names):
   "version_id": "",
   "questions_key": "benchmark/sales/orders/questions.csv",
   "questions_version_id": "3sL4kqQJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo",
-  "solver_model": "global.anthropic.claude-sonnet-5", "solver_effort": "high",
+  "solver_model": "global.anthropic.claude-sonnet-5-5", "solver_effort": "high",
   "judge_model": "global.anthropic.claude-opus-5-5", "judge_effort": "xhigh",
   "behavior_live_sql": false,
   "source": {"type": "glue", "glue_database": "orders"} }
@@ -1942,13 +1949,13 @@ USER — never facts about the data (tables/joins/metrics belong to the wiki):
 | `OKF_MOUNT_PATH` | S3 Files mount (default `/mnt/data`) |
 | `OKF_CODE_INTERPRETER_ID` | AgentCore Code Interpreter id backing the harvest agent's `run_code` tool (extracts text from binary `.context/` docs). A network-isolated SANDBOX-mode interpreter. Unset → harvest runs without `run_code` (text-only `.context` reading) |
 | `OKF_ENABLE_LAKEFORMATION` | Set (`"true"`) when the harvested Glue catalog is Lake Formation-governed → adds `lakeformation:GetDataAccess` to the harvest data role's per-invocation session policy so LF can vend S3 creds for governed table data. Set by `var.enable_lakeformation`; requires adopter-side LF grants + data-location registration (see `docs/LAKE_FORMATION.md`). Unset → plain IAM catalog access |
-| `OKF_HARVEST_MODEL` | harvest model id — the **fallback default** used when a harvest request omits `model` (default `us.anthropic.claude-opus-4-8`). An `anthropic.*` id runs on the Bedrock **Converse** API (`ChatBedrockConverse`); a GPT id, including an inference profile (e.g. `global.openai.gpt-6-sol`) runs on the Bedrock Runtime **Responses API** (`ChatOpenAI`, bearer-token auth via `aws_bedrock_token_generator`). The prefix selects the provider; see `agent._build_model` |
+| `OKF_HARVEST_MODEL` | harvest model id — the **fallback default** used when a harvest request omits `model` (default `us.anthropic.claude-opus-4-8`). An `anthropic.*` id runs on the Bedrock **Converse** API (`ChatBedrockConverse`); a GPT id, including an inference profile (e.g. `global.openai.gpt-6.1-sol`) runs on the Bedrock Runtime **Responses API** (`ChatOpenAI`, bearer-token auth via `aws_bedrock_token_generator`). The prefix selects the provider; see `agent._build_model` |
 | `OKF_HARVEST_MODEL_CATALOG` | (Control API) JSON array of `{model, label, efforts, default_effort}` — the models + efforts the UI picker offers and the Control API validates a per-harvest `model`/`effort` against. From `var.harvest_model_catalog`; unset → `okf_core.harvest_models.DEFAULT_CATALOG`. The UI receives the same catalog **base64-encoded** as `VITE_HARVEST_MODEL_CATALOG` (base64 so it survives `deploy.sh`'s `eval "export k=v"`) |
 | `OKF_HARVEST_OPENAI_USE_RESPONSES_API` | selects the Bedrock Runtime OpenAI API surface (default `true` → OpenAI **Responses** API on the `/openai/v1` path, which is what GPT-5.x requires). Set `false` for a gpt-oss model (Chat Completions on the same `/openai/v1` base path). GPT path only |
 | `OKF_HARVEST_OPENAI_BASE_URL` | override for the OpenAI base URL (default `https://bedrock-runtime.<region>.amazonaws.com/openai/v1` for both Responses and Chat Completions; deployment region from `AWS_REGION`, injected from Terraform `var.region`). GPT path only |
 | `OKF_HARVEST_OPENAI_READ_TIMEOUT` / `OKF_HARVEST_OPENAI_MAX_ATTEMPTS` | httpx read timeout (s) and retry budget for the `ChatOpenAI` client (defaults `600` / `5`, mirroring the Converse knobs). The botocore `OKF_HARVEST_BEDROCK_*` knobs do NOT apply to the GPT path |
 | `OKF_HARVEST_EFFORT` | reasoning effort. On Converse, passed verbatim to Bedrock `output_config.effort` (default `xhigh`; valid values are model-specific). On the GPT path it maps onto OpenAI's `reasoning_effort` scale — verbatim on GPT-5.6 (which added `max` above `xhigh`), so `low`/`medium`/`high`/`xhigh`/`max` all pass through unchanged. Which efforts a given model accepts is model-specific (an older GPT id rejects `max`); the model catalog is the trust boundary that only offers a level a model supports |
-| `OKF_HARVEST_MAX_TOKENS` | harvest model max output tokens. Default is provider-aware when unset: `128000` for Converse (Opus 4.8), `32000` for GPT. Explicit budgets are clamped by the GPT client to the configured model ceiling: `128000` for GPT-6 Astra and `32000` for Sol, Luna, and GPT-5.6 Terra |
+| `OKF_HARVEST_MAX_TOKENS` | harvest model max output tokens. Default is `128000` for both providers when unset (Converse: Opus 4.8; GPT: the GPT-6 generation's ceiling). Budgets are clamped by the GPT client to the configured model ceiling: `131072` for GPT-6.1 Sol, `128000` for GPT-6 Astra and Luna, `32000` for GPT-5.6 Terra |
 | `OKF_HARVEST_MAX_SUBAGENT_CONCURRENCY` | how many dynamic subagents run at once on a `task()` fan-out (default `5`). This lowers langchain_quickjs's per-REPL `task()` semaphore, so a `Promise.all` keeps at most this many crawls in flight and queues the rest. It is not `config.max_concurrency` — the fan-out is a QuickJS `Promise.all`, not a LangGraph batch, so only the semaphore bounds it. The same value bounds the `run_review` tool's in-flight cluster pipelines. |
 | `OKF_HARVEST_REVIEW_DISPATCH_TIMEOUT_S` | wall-clock cap per `run_review` dispatch (one reviewer or one fixer; default `1800`). On timeout the dispatch is cancelled and its cluster is recorded as `failed` — retryable via `run_review(cluster_ids=[...])`. |
 | `OKF_HARVEST_REVIEW_CLUSTER_SIZE` | docs per `run_review` review cluster (default `7`). The supervisor-owned hubs — `datasets/*` overview docs and `references/usage_guardrails` — are excluded from clustering entirely (they'd hub-steal unrelated spokes, and only the supervisor may edit them; corrections reach it as propagation notes). |
@@ -1988,8 +1995,8 @@ USER — never facts about the data (tables/joins/metrics belong to the wiki):
 | `OKF_CHAT_MEMORY_DEFAULT_ON` | (chat runtime + Control API) what a MISSING per-user memory switch row means: `true` (default) = opt-out — memory on until the user switches it off; `false` = opt-in — off until explicitly enabled on the Memory page. Set from `var.chat_memory_default_on` on BOTH services so the switch the page shows agrees with what the runtime does; rows users already set are never affected |
 | `OKF_CHAT_GUARDRAILS_GATE_ENABLED` | (chat runtime, env-read — not Terraform-plumbed) default `true` → `read_page` on any page of a dataset is DENIED at the tool boundary until that dataset's `references/usage_guardrails` has been read in the thread (`chat.guardrails_gate.GuardrailsGateMiddleware`). Per-dataset marks live in CHECKPOINTED agent state (`guardrails_read` channel, dict-merge reducer), so resumes remember; the guardrails read itself always passes and marks on any completed attempt (a guardrails-less legacy bundle can't lock out). Browse/search tools are never gated. `"false"`/`"0"`/`"no"`/`"off"` disables |
 | `OKF_CHAT_POLICY_CHECK_ENABLED` | (chat runtime) `"true"` → the mid-turn policy checks may be armed per run via `features: ["sql", "policy:*"]` (default `false`). Unset → no checker is ever constructed, whatever the client sends — the master gate above the per-run opt-in, set from `var.enable_policy_checks` |
-| `OKF_CHAT_POLICY_CHECK_MODEL` | (chat runtime) the policy checks' model id, serving BOTH the curated-question rewrite (no reasoning pass — extraction) and the JUDGE fleets. Default `global.anthropic.claude-sonnet-5` — judges run classifier-style on every family (thinking off + temperature 0 on Anthropic, reasoning `"none"` on openai.* ids like `global.openai.gpt-5.6-terra`, forced `report_violations` either way); from `var.chat_policy_check_model`, which also drives the chat role's Bedrock bearer-token grants, so an openai.* value needs no extra wiring. Code-level companions (env-read, not Terraform-plumbed): `OKF_CHAT_POLICY_SHARD_SIZE` (default `10` — policies per mini-judge), `OKF_CHAT_POLICY_QUERY_TIMEOUT_S` (default `60` — residual wait after the query returns) and `OKF_CHAT_POLICY_QUERY_MAX_PER_TURN` (default `3` — judged analytical queries per turn). Deploy-time only — deliberately NOT validated against `OKF_CHAT_MODEL_CATALOG`, which is the trust boundary for CLIENT-supplied models |
-| `OKF_POLICY_PREPROCESS_MODEL` | (harvest runtime) model id for the `policies.yaml` AUTHORING AGENT (`harvest.ar_author` — full reasoning; policy distillation is judgment work). Default `global.anthropic.claude-sonnet-5`, from `var.policy_preprocess_model`, which also drives the harvest role's Bedrock bearer-token grants. Code-level companions (env-read, not Terraform-plumbed): `OKF_POLICY_AUTHOR_EFFORT` (default `high`), `OKF_POLICY_AUTHOR_THINKING_BUDGET` (pre-adaptive models like Haiku 4.5 — e.g. `48000`), and `OKF_POLICY_MAX_RULES` (default `60` — the author gate's policy-count BACKSTOP against enumeration pathology; the prompt's proportionality guidance, not this cap, is what sizes a document to its dataset). The incremental Lambda runs NO models: authoring dispatches to the runtime |
+| `OKF_CHAT_POLICY_CHECK_MODEL` | (chat runtime) the policy checks' model id, serving BOTH the curated-question rewrite (no reasoning pass — extraction) and the JUDGE fleets. Default `global.anthropic.claude-sonnet-5-5` — judges run classifier-style on every family (thinking off + temperature 0 + forced `report_violations` on Anthropic ids that allow it; adaptive effort `low` + an auto tool choice on ids that cannot turn thinking off — Sonnet 5.5+, see `okf_aws.model_factory.converse_requires_thinking`; reasoning `"none"` + forced on openai.* ids like `global.openai.gpt-5.6-terra`); from `var.chat_policy_check_model`, which also drives the chat role's Bedrock bearer-token grants, so an openai.* value needs no extra wiring. Code-level companions (env-read, not Terraform-plumbed): `OKF_CHAT_POLICY_SHARD_SIZE` (default `10` — policies per mini-judge), `OKF_CHAT_POLICY_QUERY_TIMEOUT_S` (default `60` — residual wait after the query returns) and `OKF_CHAT_POLICY_QUERY_MAX_PER_TURN` (default `3` — judged analytical queries per turn). Deploy-time only — deliberately NOT validated against `OKF_CHAT_MODEL_CATALOG`, which is the trust boundary for CLIENT-supplied models |
+| `OKF_POLICY_PREPROCESS_MODEL` | (harvest runtime) model id for the `policies.yaml` AUTHORING AGENT (`harvest.ar_author` — full reasoning; policy distillation is judgment work) and its per-cluster rules extractor (classifier build — forced `submit_rules`, or auto on ids that cannot turn thinking off). Default `global.anthropic.claude-sonnet-5-5`, from `var.policy_preprocess_model`, which also drives the harvest role's Bedrock bearer-token grants. Code-level companions (env-read, not Terraform-plumbed): `OKF_POLICY_AUTHOR_EFFORT` (default `high`), `OKF_POLICY_AUTHOR_THINKING_BUDGET` (pre-adaptive models like Haiku 4.5 — e.g. `48000`), and `OKF_POLICY_MAX_RULES` (default `60` — the author gate's policy-count BACKSTOP against enumeration pathology; the prompt's proportionality guidance, not this cap, is what sizes a document to its dataset). The incremental Lambda runs NO models: authoring dispatches to the runtime |
 | `VITE_CHAT_POLICY_CHECK` | (UI, from `ui_env`) shows the composer's Policy feature (the "+" menu field with Computational / Behavioural / Strict) and the Reasoning sidebar page. Defaults ON — only the literal `"false"` hides them (an unset var must not silently drop the affordance). A DISPLAY gate only, same pattern as `VITE_CHAT_SQL_ENABLED`; the server-side `OKF_CHAT_POLICY_CHECK_ENABLED` + feature normalization are the real boundary |
 
 ## HTTP and auth

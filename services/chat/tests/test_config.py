@@ -51,7 +51,7 @@ def test_from_env_defaults():
     assert cfg.web_search_filters_enabled is False
     assert [e["model"] for e in cfg.catalog] == [
         "us.anthropic.claude-opus-4-8",
-        "global.openai.gpt-6-sol",
+        "global.openai.gpt-6.1-sol",
     ]
 
 
@@ -105,7 +105,7 @@ def test_from_env_web_search():
 def test_from_env_overrides():
     cfg = ChatConfig.from_env(
         _env(
-            OKF_CHAT_MODEL="global.openai.gpt-6-sol",
+            OKF_CHAT_MODEL="global.openai.gpt-6.1-sol",
             OKF_CHAT_EFFORT="max",
             OKF_CHAT_MAX_TOKENS="16000",
             OKF_CHAT_CHECKPOINT_TABLE="my-checkpoints",
@@ -113,7 +113,7 @@ def test_from_env_overrides():
             AWS_REGION="eu-west-1",
         )
     )
-    assert cfg.default_model == "global.openai.gpt-6-sol"
+    assert cfg.default_model == "global.openai.gpt-6.1-sol"
     assert cfg.default_effort == "max"
     assert cfg.default_max_tokens == 16000
     assert cfg.checkpoint_table == "my-checkpoints"
@@ -129,9 +129,9 @@ def test_resolve_model_effort_fills_default_effort():
 
 
 def test_resolve_model_effort_none_model_falls_back_to_config_default():
-    cfg = ChatConfig.from_env(_env(OKF_CHAT_MODEL="global.openai.gpt-6-sol"))
+    cfg = ChatConfig.from_env(_env(OKF_CHAT_MODEL="global.openai.gpt-6.1-sol"))
     model, effort = cfg.resolve_model_effort(None, None)
-    assert model == "global.openai.gpt-6-sol"
+    assert model == "global.openai.gpt-6.1-sol"
     assert effort == "high"
 
 
@@ -167,8 +167,8 @@ def test_build_chat_model_dispatches_gpt_in_the_deployment_region(monkeypatch):
     monkeypatch.setitem(sys.modules, "aws_bedrock_token_generator", tg)
 
     cfg = ChatConfig.from_env(_env(AWS_REGION="eu-west-1"))
-    build_chat_model(cfg, "global.openai.gpt-6-sol", "high")
-    assert captured["model"] == "global.openai.gpt-6-sol"
+    build_chat_model(cfg, "global.openai.gpt-6.1-sol", "high")
+    assert captured["model"] == "global.openai.gpt-6.1-sol"
     assert captured["base_url"] == "https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1"
     assert captured["api_key"]() == "tok-eu-west-1"
     # Chat requests a reasoning SUMMARY so GPT returns its thinking on the
@@ -260,7 +260,7 @@ def test_policy_judge_model_converse_runs_classifier_mode(monkeypatch):
     for model_id in (
         "us.anthropic.claude-haiku-4-5",
         "global.anthropic.claude-sonnet-4-6",
-        "global.anthropic.claude-sonnet-5",  # the default
+        "global.anthropic.claude-opus-4-8",
     ):
         captured.clear()
         cfg = ChatConfig.from_env(_env(OKF_CHAT_POLICY_CHECK_MODEL=model_id))
@@ -271,3 +271,40 @@ def test_policy_judge_model_converse_runs_classifier_mode(monkeypatch):
         assert thinking is None, model_id  # no thinking of either encoding
         assert captured["temperature"] == 0
         assert captured["max_tokens"] == POLICY_JUDGE_MAX_TOKENS
+
+
+def test_policy_judge_and_rewrite_on_sonnet_5_5_run_adaptive_low(monkeypatch):
+    # The default (Sonnet 5.5) cannot turn thinking off and rejects a
+    # temperature: both classifier builds run adaptive at effort low instead,
+    # temperature dropped (live judge eval 2026-10-04).
+    import sys
+    import types
+
+    from okf_aws.model_factory import CLASSIFIER_EFFORT, thinking_fields
+
+    from chat.config import (
+        DEFAULT_POLICY_CHECK_MODEL,
+        build_policy_check_model,
+        build_policy_judge_model,
+    )
+
+    captured: dict = {}
+
+    class _FakeConverse:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    law = types.ModuleType("langchain_aws")
+    law.ChatBedrockConverse = _FakeConverse
+    monkeypatch.setitem(sys.modules, "langchain_aws", law)
+
+    assert DEFAULT_POLICY_CHECK_MODEL == "global.anthropic.claude-sonnet-5-5"
+    cfg = ChatConfig.from_env(_env())
+    for builder in (build_policy_judge_model, build_policy_check_model):
+        captured.clear()
+        builder(cfg)
+        assert captured["model"] == DEFAULT_POLICY_CHECK_MODEL
+        assert captured["additional_model_request_fields"] == thinking_fields(
+            CLASSIFIER_EFFORT
+        )
+        assert "temperature" not in captured

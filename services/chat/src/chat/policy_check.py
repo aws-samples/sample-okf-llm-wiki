@@ -353,8 +353,10 @@ def _forced_tool_call(
     ``force=True`` binds ``tool_choice`` to the tool itself — legal because
     every judge is a classifier build (thinking/reasoning OFF; Anthropic
     models reject forced tool choice alongside thinking) — and it makes the
-    missing-call retry structurally unreachable. The retry stays as the
-    backstop for any non-forced caller: it rebuilds the message list from
+    missing-call retry structurally unreachable. Callers pass ``force`` from
+    ``supports_forced_tool_choice``: on Claude ids that cannot turn thinking
+    off (Sonnet 5.5+, the default) the bind is auto and this retry is the
+    live backstop: it rebuilds the message list from
     scratch (never echoing the tool-less reply — some providers reject
     dangling assistant turns), and a judge that still won't call the tool
     fails open as a missing shard, never a fabricated verdict. Every attempt
@@ -1617,6 +1619,8 @@ class PolicyChecker:
         receiving agent is the verifier (the reminder copy says so), and the
         reminder text itself is authored policy text, never judge prose.
         """
+        from okf_aws.model_factory import supports_forced_tool_choice
+
         t0 = _monotonic()
         flagged, _failed, _total = judge_policies(
             self._judge_model(),
@@ -1624,9 +1628,12 @@ class PolicyChecker:
             evidence,
             shard_size=self._cfg.policy_shard_size,
             prompt=prompt,
-            # Every judge is a classifier build (no thinking/reasoning), so
-            # the verdict tool is FORCED on every family.
-            force_tool=True,
+            # Every judge is a classifier build, so the verdict tool is FORCED
+            # wherever the model allows it. Claude ids that cannot turn
+            # thinking off (Sonnet 5.5+) reject a forced choice — forcing
+            # there 400s every shard into a silent fail-open — so they run on
+            # auto + _forced_tool_call's missing-call retry.
+            force_tool=supports_forced_tool_choice(self._cfg.policy_check_model),
         )
         log.info(
             "policy fleet for %s/%s: %d policies, %d flagged, %.1fs",
