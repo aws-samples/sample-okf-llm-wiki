@@ -32,10 +32,13 @@ and stub the SDKs.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 from okf_core.harvest_models import is_openai_model, normalize_model_id
+
+log = logging.getLogger("okf_aws.model_factory")
 
 # --- Bedrock Converse (Claude / Anthropic) ----------------------------------
 
@@ -45,10 +48,24 @@ from okf_core.harvest_models import is_openai_model, normalize_model_id
 # allow-list that could reject a valid value.
 
 
-# Claude version extractor for the adaptive-thinking capability gate. Both id
-# shapes are covered: family-first (``claude-haiku-4-5-20251001``,
+# Claude version extractor for the thinking capability gates. Both id shapes
+# are covered: family-first (``claude-haiku-4-5-20251001``,
 # ``claude-opus-4-8-…``) and version-first (``claude-3-5-sonnet-20241022``).
-_CLAUDE_VERSION_RE = re.compile(r"claude-(?:[a-z]+-)?(\d+)[.-](\d+)")
+# The minor is optional (``claude-sonnet-5`` -> 5.0, ``claude-opus-6`` -> 6.0)
+# and at most two digits, so a date stamp is never read as one
+# (``claude-sonnet-5-20260514`` -> 5.0, not 5.20260514).
+_CLAUDE_VERSION_RE = re.compile(
+    r"claude-(?:[a-z]+-)?(\d{1,2})(?:[.-](\d{1,2})(?!\d))?(?!\d)"
+)
+
+
+def _claude_version(model: str) -> tuple[int, int] | None:
+    """``(major, minor)`` of a Claude id; None when the id names no version
+    (e.g. an application-inference-profile ARN)."""
+    m = _CLAUDE_VERSION_RE.search(model)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2) or 0)
 
 # Adaptive thinking (``thinking.type=adaptive`` + ``output_config.effort``)
 # arrived with the Claude 4.6 generation.
@@ -67,10 +84,55 @@ def converse_supports_adaptive(model: str) -> bool:
     unparseable ids default to adaptive (current generations are the common
     case, and a wrong guess there fails loudly at invoke time either way).
     """
-    m = _CLAUDE_VERSION_RE.search(model)
-    if not m:
+    version = _claude_version(model)
+    return version is None or version >= _ADAPTIVE_SINCE
+
+
+# Claude generations with NO "thinking off": from 5.5 on (Sonnet 5.5 verified
+# live 2026-10-04 — it rejects thinking.type=disabled, a forced tool_choice and
+# a caller-set temperature, each with a ValidationException; Opus 5.5 rejects
+# forced tool choice too), plus the adaptive-only Fable / Mythos families.
+_THINKING_REQUIRED_SINCE = (5, 5)
+_ADAPTIVE_ONLY_FAMILIES = ("claude-fable-", "claude-mythos-")
+
+# What a classifier pass (thinking=False) runs at on those models instead:
+# adaptive thinking at the lowest effort, which skips thinking on simple calls.
+# Live judge eval 2026-10-04 (Sonnet 5.5, auto tool choice): every call still
+# returned the verdict tool, ~2s p50.
+CLASSIFIER_EFFORT = "low"
+
+
+def converse_requires_thinking(model: str) -> bool:
+    """Whether a Converse (Anthropic) id cannot run with thinking OFF.
+
+    On these ids the classifier contract — thinking off, temperature pinned, a
+    FORCED tool choice — is unavailable: :func:`build_bedrock_converse` maps
+    ``thinking=False`` to adaptive at :data:`CLASSIFIER_EFFORT` and drops the
+    temperature, and callers must not force a tool (see
+    :func:`supports_forced_tool_choice`).
+
+    An Anthropic id or ARN that names no version (an application inference
+    profile) counts as REQUIRING thinking: adaptive low + auto tool choice
+    works on every adaptive generation, whereas guessing "thinking off" wrong
+    400s every call into a silent fail-open. Non-Anthropic Converse ids keep
+    the thinking-off path.
+    """
+    if any(f in model for f in _ADAPTIVE_ONLY_FAMILIES):
         return True
-    return (int(m.group(1)), int(m.group(2))) >= _ADAPTIVE_SINCE
+    version = _claude_version(model)
+    if version is None:
+        return "anthropic" in model or "claude" in model or model.startswith("arn:")
+    return version >= _THINKING_REQUIRED_SINCE
+
+
+def supports_forced_tool_choice(model: str) -> bool:
+    """Whether a CLASSIFIER build of ``model`` (thinking/reasoning off) accepts a
+    forced ``tool_choice``. GPT ids do; Claude ids do only while thinking can
+    be turned off. Callers that would force a tool fall back to auto + their
+    missing-call retry when this is False — forcing anyway is a 400 that a
+    fail-open caller would swallow as "no verdict".
+    """
+    return is_openai_model(model) or not converse_requires_thinking(model)
 
 
 def thinking_fields(effort: str, *, summarize: bool = False) -> dict[str, Any]:
@@ -130,6 +192,11 @@ def build_bedrock_converse(
     caller-set temperature while thinking is on, so a deterministic extraction
     pass MUST turn thinking off, not merely pin the temperature. ``temperature``
     is forwarded only when given, so the default remains the model's own.
+
+    On ids where thinking cannot be turned off (:func:`converse_requires_thinking`),
+    ``thinking=False`` instead sends adaptive thinking at
+    :data:`CLASSIFIER_EFFORT` and drops ``temperature`` — both of which those
+    models would otherwise reject.
     """
     from langchain_aws import ChatBedrockConverse
 
@@ -145,6 +212,14 @@ def build_bedrock_converse(
         # the 4.6+ shape; pre-adaptive models (e.g. Haiku 4.5) take a token
         # budget instead and REJECT the adaptive form. thinking_budget selects
         # the budget encoding; the caller's max_tokens must exceed it.
+        if thinking_budget is not None and converse_supports_adaptive(model):
+            # A budget left over from a pre-adaptive setup (e.g. Haiku 4.5)
+            # would 400 an adaptive-only model; the effort shape is its only form.
+            log.info(
+                "%s takes adaptive thinking; ignoring thinking_budget=%s",
+                model, thinking_budget,
+            )
+            thinking_budget = None
         if thinking_budget is not None:
             kwargs["additional_model_request_fields"] = {
                 "thinking": {"type": "enabled", "budget_tokens": int(thinking_budget)}
@@ -153,6 +228,15 @@ def build_bedrock_converse(
             kwargs["additional_model_request_fields"] = thinking_fields(
                 effort, summarize=summarize_reasoning
             )
+    elif converse_requires_thinking(model):
+        kwargs["additional_model_request_fields"] = thinking_fields(CLASSIFIER_EFFORT)
+        if temperature is not None:
+            log.info(
+                "%s cannot turn thinking off: classifier build runs adaptive "
+                "effort=%s, temperature=%s dropped (sampled output)",
+                model, CLASSIFIER_EFFORT, temperature,
+            )
+        temperature = None
     if temperature is not None:
         kwargs["temperature"] = temperature
     return ChatBedrockConverse(**kwargs)
@@ -164,8 +248,11 @@ def build_bedrock_converse(
 # when its registry does not recognize Bedrock inference-profile IDs.
 _GPT_PROFILES = {
     "openai.gpt-6-astra": {"max_input_tokens": 1050000, "max_output_tokens": 128000},
-    "openai.gpt-6-sol": {"max_input_tokens": 1000000, "max_output_tokens": 32000},
-    "openai.gpt-6-luna": {"max_input_tokens": 1000000, "max_output_tokens": 32000},
+    "openai.gpt-6.1-sol": {"max_input_tokens": 1000000, "max_output_tokens": 131072},
+    # No longer offered in the catalogs; kept so a deployment still pinned to
+    # it keeps its output clamp and context metadata.
+    "openai.gpt-6-sol": {"max_input_tokens": 1050000, "max_output_tokens": 128000},
+    "openai.gpt-6-luna": {"max_input_tokens": 1050000, "max_output_tokens": 128000},
     "openai.gpt-5.6-terra": {"max_input_tokens": 1000000, "max_output_tokens": 32000},
 }
 

@@ -22,11 +22,11 @@ from okf_aws import model_factory as mf
 @pytest.mark.parametrize(
     "model",
     [
-        "global.openai.gpt-6-sol",
+        "global.openai.gpt-6.1-sol",
         "global.openai.gpt-6-astra",
         "global.openai.gpt-6-luna",
-        "openai.gpt-6-sol",
-        "gpt-6-sol",
+        "openai.gpt-6.1-sol",
+        "gpt-6.1-sol",
         "us.openai.gpt-5.4",
         "eu.openai.gpt-5.4",
         "apac.openai.gpt-5.4",
@@ -156,10 +156,10 @@ def test_build_bedrock_openai_defaults_to_responses_api(monkeypatch):
     region = "eu-west-1"
 
     mf.build_bedrock_openai(
-        "global.openai.gpt-6-sol", "xhigh", 32000, region=region
+        "global.openai.gpt-6.1-sol", "xhigh", 32000, region=region
     )
 
-    assert captured["model"] == "global.openai.gpt-6-sol"
+    assert captured["model"] == "global.openai.gpt-6.1-sol"
     # Responses API at /openai/v1, derived from the region.
     assert captured["base_url"] == (
         f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
@@ -178,7 +178,7 @@ def test_build_bedrock_openai_defaults_to_responses_api(monkeypatch):
 
 @pytest.mark.parametrize(
     ("variant", "output_budget"),
-    [("astra", 128000), ("sol", 32000), ("luna", 32000)],
+    [("6-astra", 128000), ("6.1-sol", 128000), ("6-luna", 128000), ("5.6-terra", 32000)],
 )
 def test_gpt6_responses_request_uses_runtime_global_profile_and_local_history(
     monkeypatch, variant, output_budget
@@ -190,7 +190,7 @@ def test_gpt6_responses_request_uses_runtime_global_profile_and_local_history(
     lco = pytest.importorskip("langchain_openai")
     chat_openai = lco.ChatOpenAI
     requests = []
-    expected_model = f"global.openai.gpt-6-{variant}"
+    expected_model = f"global.openai.gpt-{variant}"
 
     def respond(request):
         requests.append(request)
@@ -222,7 +222,7 @@ def test_gpt6_responses_request_uses_runtime_global_profile_and_local_history(
             mf, "bedrock_token_provider", lambda *args, **kwargs: lambda: "test-token"
         )
         model = mf.build_bedrock_openai(
-            f"openai.gpt-6-{variant}", "high", 128000,
+            f"openai.gpt-{variant}", "high", 128000,
             region="us-east-1", reasoning_summary="auto",
         )
         model.invoke([("user", "hello")])
@@ -271,7 +271,7 @@ def test_build_bedrock_openai_explicit_base_url_wins(monkeypatch):
     captured, _state = _install_openai_stubs(monkeypatch)
 
     mf.build_bedrock_openai(
-        "global.openai.gpt-6-sol",
+        "global.openai.gpt-6.1-sol",
         "high",
         32000,
         region="us-east-2",
@@ -285,7 +285,7 @@ def test_build_bedrock_openai_no_summary_uses_reasoning_effort(monkeypatch):
     # Default (harvest): no summary requested -> plain reasoning_effort, no
     # `reasoning` object (so nothing changes for callers that don't show thinking).
     captured, _state = _install_openai_stubs(monkeypatch)
-    mf.build_bedrock_openai("global.openai.gpt-6-sol", "high", 32000, region="us-east-2")
+    mf.build_bedrock_openai("global.openai.gpt-6.1-sol", "high", 32000, region="us-east-2")
     assert captured["reasoning_effort"] == "high"
     assert "reasoning" not in captured
 
@@ -295,7 +295,7 @@ def test_build_bedrock_openai_summary_uses_reasoning_object(monkeypatch):
     # thinking on the Responses API; the bare reasoning_effort knob is superseded.
     captured, _state = _install_openai_stubs(monkeypatch)
     mf.build_bedrock_openai(
-        "global.openai.gpt-6-sol",
+        "global.openai.gpt-6.1-sol",
         "high",
         32000,
         region="us-east-2",
@@ -312,7 +312,7 @@ def test_build_bedrock_openai_summary_uses_reasoning_object(monkeypatch):
 def test_build_bedrock_openai_omits_temperature_by_default(monkeypatch):
     # Absent kwarg -> the model's own default; the agent paths must be untouched.
     captured, _state = _install_openai_stubs(monkeypatch)
-    mf.build_bedrock_openai("global.openai.gpt-6-sol", "high", 32000, region="us-east-2")
+    mf.build_bedrock_openai("global.openai.gpt-6.1-sol", "high", 32000, region="us-east-2")
     assert "temperature" not in captured
 
 
@@ -321,7 +321,7 @@ def test_build_bedrock_openai_forwards_zero_temperature(monkeypatch):
     # extraction pass actually asks for is the one value silently dropped.
     captured, _state = _install_openai_stubs(monkeypatch)
     mf.build_bedrock_openai(
-        "global.openai.gpt-6-sol", "minimal", 4096, region="us-east-2", temperature=0
+        "global.openai.gpt-6.1-sol", "minimal", 4096, region="us-east-2", temperature=0
     )
     assert captured["temperature"] == 0
     assert captured["reasoning_effort"] == "low"
@@ -475,6 +475,82 @@ def test_build_bedrock_converse_forwards_zero_temperature(monkeypatch):
     assert "additional_model_request_fields" not in captured
 
 
+@pytest.mark.parametrize(
+    ("model", "required"),
+    [
+        ("global.anthropic.claude-sonnet-5-5", True),
+        ("global.anthropic.claude-opus-5-5", True),
+        ("global.anthropic.claude-fable-5-1", True),
+        ("anthropic.claude-mythos-5", True),
+        ("global.anthropic.claude-opus-5", False),
+        # Major-only and dated ids: a date is never read as the minor.
+        ("global.anthropic.claude-opus-6", True),
+        ("anthropic.claude-sonnet-6-v1:0", True),
+        ("anthropic.claude-sonnet-5-20260514-v1:0", False),
+        # No version to read: an application inference profile defaults to the
+        # safe side (adaptive low + auto works on every adaptive generation).
+        ("arn:aws:bedrock:eu-west-1:111122223333:application-inference-profile/abc123", True),
+        ("global.anthropic.claude-opus-4-8", False),
+        ("us.anthropic.claude-haiku-4-5", False),
+        ("global.anthropic.claude-sonnet-4-6", False),
+    ],
+)
+def test_converse_requires_thinking_by_generation(model, required):
+    assert mf.converse_requires_thinking(model) is required
+    assert mf.supports_forced_tool_choice(model) is (not required)
+
+
+def test_non_anthropic_converse_ids_keep_the_thinking_off_path():
+    assert mf.converse_requires_thinking("amazon.nova-pro-v1:0") is False
+
+
+def test_converse_supports_adaptive_reads_dated_and_major_only_ids():
+    assert mf.converse_supports_adaptive("anthropic.claude-haiku-4-5-20251001-v1:0") is False
+    assert mf.converse_supports_adaptive("anthropic.claude-3-5-sonnet-20241022-v2:0") is False
+    assert mf.converse_supports_adaptive("anthropic.claude-sonnet-5-20260514-v1:0") is True
+    assert mf.converse_supports_adaptive("global.anthropic.claude-opus-6") is True
+
+
+def test_retired_gpt_6_sol_keeps_its_profile_for_pinned_deployments():
+    assert mf.gpt_profile("global.openai.gpt-6-sol")["max_output_tokens"] == 128000
+    assert mf.gpt_profile("global.openai.gpt-6.1-sol")["max_output_tokens"] == 131072
+
+
+def test_thinking_budget_is_ignored_on_adaptive_models(monkeypatch):
+    # A budget left over from a Haiku setup must not 400 the Sonnet 5.5 default.
+    captured = _install_converse_stub(monkeypatch)
+    mf.build_bedrock_converse(
+        "global.anthropic.claude-sonnet-5-5", "high", 64000,
+        region="us-east-1", thinking_budget=48000,
+    )
+    assert captured["additional_model_request_fields"] == mf.thinking_fields("high")
+
+
+def test_gpt_ids_always_support_forced_tool_choice():
+    assert mf.supports_forced_tool_choice("global.openai.gpt-6.1-sol")
+    assert mf.supports_forced_tool_choice("global.openai.gpt-5.6-terra")
+
+
+def test_build_bedrock_converse_thinking_off_on_sonnet_5_5_runs_adaptive_low(monkeypatch):
+    # Sonnet 5.5 rejects thinking.type=disabled AND a caller-set temperature
+    # (live 2026-10-04): "thinking off" must become adaptive at the classifier
+    # effort, with the temperature dropped rather than 400ing the call.
+    captured = _install_converse_stub(monkeypatch)
+
+    mf.build_bedrock_converse(
+        "global.anthropic.claude-sonnet-5-5",
+        "none",
+        8000,
+        region="us-east-1",
+        thinking=False,
+        temperature=0,
+    )
+    assert captured["additional_model_request_fields"] == mf.thinking_fields(
+        mf.CLASSIFIER_EFFORT
+    )
+    assert "temperature" not in captured
+
+
 def test_build_bedrock_converse_defaults_unchanged(monkeypatch):
     # The regression guard for every existing agent call site: with neither new
     # kwarg passed, the constructor sees the SAME kwarg set as before — adaptive
@@ -524,11 +600,11 @@ def test_build_model_dispatches_gpt_in_the_deployment_region(monkeypatch):
     captured, _state = _install_openai_stubs(monkeypatch)
 
     mf.build_model(
-        "global.openai.gpt-6-sol", "high", 32000, region="eu-west-1"
+        "global.openai.gpt-6.1-sol", "high", 32000, region="eu-west-1"
     )
 
     # The endpoint and bearer use the same deployment region as Converse.
-    assert captured["model"] == "global.openai.gpt-6-sol"
+    assert captured["model"] == "global.openai.gpt-6.1-sol"
     assert captured["base_url"] == "https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1"
     assert captured["api_key"]().startswith("bedrock-api-key-eu-west-1")
 

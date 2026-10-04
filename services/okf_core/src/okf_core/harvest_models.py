@@ -26,8 +26,8 @@ Mirrors the design of :mod:`okf_core.sources`.
         "default_effort": "xhigh"
       },
       {
-        "model": "global.openai.gpt-6-sol",
-        "label": "GPT-6 Sol",
+        "model": "global.openai.gpt-6.1-sol",
+        "label": "GPT-6.1 Sol",
         "efforts": ["low", "medium", "high", "xhigh", "max"],
         "default_effort": "xhigh"
       }
@@ -103,8 +103,8 @@ DEFAULT_CATALOG: list[dict[str, Any]] = [
         DEFAULT_EFFORT_KEY: "xhigh",
     },
     {
-        MODEL_KEY: "global.openai.gpt-6-sol",
-        LABEL_KEY: "GPT-6 Sol",
+        MODEL_KEY: "global.openai.gpt-6.1-sol",
+        LABEL_KEY: "GPT-6.1 Sol",
         EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
         DEFAULT_EFFORT_KEY: "xhigh",
     },
@@ -121,8 +121,8 @@ DEFAULT_CATALOG: list[dict[str, Any]] = [
         DEFAULT_EFFORT_KEY: "xhigh",
     },
     {
-        MODEL_KEY: "global.anthropic.claude-sonnet-5",
-        LABEL_KEY: "Claude Sonnet 5",
+        MODEL_KEY: "global.anthropic.claude-sonnet-5-5",
+        LABEL_KEY: "Claude Sonnet 5.5",
         EFFORTS_KEY: ["low", "medium", "high", "xhigh", "max"],
         DEFAULT_EFFORT_KEY: "xhigh",
     },

@@ -27,7 +27,7 @@
 variable "chat_memory_model" {
   type        = string
   description = "Model id for AgentCore Memory extraction + consolidation (custom strategy overrides)."
-  default     = "global.anthropic.claude-sonnet-5"
+  default     = "global.anthropic.claude-sonnet-5-5"
 }
 
 locals {

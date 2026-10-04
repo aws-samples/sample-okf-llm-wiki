@@ -106,16 +106,17 @@ DEFAULT_BEDROCK_MAX_ATTEMPTS = 5
 # that inherits the runtime's IAM identity (no API key / Secrets Manager). A
 # GPT ID, including a global inference profile, selects this path (see
 # _is_openai_model); anything else stays on Converse. Set OKF_HARVEST_MODEL to
-# e.g. "global.openai.gpt-6-sol" to run GPT.
+# e.g. "global.openai.gpt-6.1-sol" to run GPT.
 #
 # The Bedrock Runtime base URL and bearer token use the deployment's AWS_REGION,
 # matching the Converse client.
 
-# GPT reasoning models cap output well below Opus 4.8's 128K; give the GPT path
-# its own default so we don't send a Claude-sized ceiling. Overridable via the
-# usual OKF_HARVEST_MAX_TOKENS (resolve_model_config), but this is the fallback
-# the GPT builder uses if the caller didn't lower it from the Claude default.
-DEFAULT_GPT_MAX_TOKENS = 32000
+# The GPT path's default output budget: 128K, the ceiling of the offered GPT-6
+# generation (Astra / Luna 128,000, GPT-6.1 Sol 131,072). The GPT builder clamps
+# it to each known model's configured ceiling (okf_aws.model_factory
+# _GPT_PROFILES — e.g. GPT-5.6 Terra 32K), so a smaller model never receives
+# more than it accepts. Overridable via the usual OKF_HARVEST_MAX_TOKENS.
+DEFAULT_GPT_MAX_TOKENS = 128000
 
 # Converse effort levels map onto OpenAI's reasoning_effort scale verbatim (the
 # mapping now lives in okf_aws.model_factory.GPT_EFFORT_MAP — GPT-5.6 added "max"

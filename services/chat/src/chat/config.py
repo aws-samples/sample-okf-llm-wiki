@@ -62,11 +62,13 @@ DEFAULT_BEDROCK_MAX_ATTEMPTS = 5
 # question, narrate the chain — so it runs with no reasoning pass rather than
 # on the conversation's own model. Deploy-time only: unlike the per-run chat
 # model this never comes from a client, so it deliberately bypasses the catalog
-# trust boundary (`resolve_model_effort`). Sonnet 5, no reasoning — mirrors
+# trust boundary (`resolve_model_effort`). Sonnet 5.5 — which cannot turn
+# thinking off, so the classifier builds run at adaptive effort low (see
+# okf_aws.model_factory.converse_requires_thinking) — mirrors
 # var.chat_policy_check_model's default. An openai.* value means the chat
 # role's Bedrock Runtime grants must be on — infra derives that from the same var (see
 # agentcore_iam.tf chat_openai_enabled).
-DEFAULT_POLICY_CHECK_MODEL = "global.anthropic.claude-sonnet-5"
+DEFAULT_POLICY_CHECK_MODEL = "global.anthropic.claude-sonnet-5-5"
 
 # The rewrite emits one small JSON object; a few thousand tokens is the whole
 # budget.
@@ -85,7 +87,10 @@ POLICY_CHECK_EFFORT = "none"
 # a FORCED report_violations tool choice (see build_policy_judge_model —
 # live 2026-08-03, reasoning judges spent 40-50s per shard and sometimes
 # exhausted into prose with no tool call). No effort knob remains: shallow
-# is not a tuning choice, it is the judge's contract.
+# is not a tuning choice, it is the judge's contract. Claude ids that cannot
+# turn thinking off (Sonnet 5.5+, the default) are the one exception the
+# factory owns: adaptive effort low, auto tool choice, the missing-call retry
+# live (okf_aws.model_factory.converse_requires_thinking).
 POLICY_JUDGE_MAX_TOKENS = 8000
 
 # Judges lose precision when a single rubric grows long; ≤ this many policies
@@ -360,7 +365,9 @@ def build_policy_check_model(cfg: ChatConfig):
     The rewrite resolves cross-turn anaphora — extraction, not reasoning — so
     determinism matters more than depth. On Converse, thinking is turned OFF
     (not merely dialed down — Converse rejects a caller-set temperature while
-    thinking is on) and temperature pinned to 0. On the GPT path reasoning is
+    thinking is on) and temperature pinned to 0 — except on ids that cannot
+    turn thinking off (Sonnet 5.5+, the default), where the factory runs
+    adaptive effort low and drops the temperature, so the rewrite is sampled. On the GPT path reasoning is
     ``"none"`` (verbatim — the GPT-5.6 fleet accepts it): GPT-5.x reasoning
     models reject a non-default temperature outright, so none is sent.
 
@@ -403,7 +410,10 @@ def build_policy_judge_model(cfg: ChatConfig):
     ``"none"``. Single forward pass either way, and policy_check binds a
     FORCED ``report_violations`` tool choice (legal on Anthropic exactly
     because thinking is off), so a prose-only reply is structurally
-    unreachable. Two reasons, both observed live (2026-08-03): reasoning
+    unreachable. Claude ids that cannot turn thinking off (Sonnet 5.5+, the
+    default) reject both: the factory builds them at adaptive effort low and
+    policy_check binds the tool on auto, the missing-call retry as backstop
+    (live 2026-10-04: every call still returned the tool). Two reasons, both observed live (2026-08-03): reasoning
     judges spent 40-50s per shard (5-6k thinking tokens for a checklist),
     and occasionally exhausted into prose WITHOUT the verdict tool call,
     tripping the missing-call retry and doubling the shard. Same

@@ -262,7 +262,7 @@ def test_author_converse_client_gets_the_long_read_timeout(monkeypatch):
     law.ChatBedrockConverse = _FakeConverse
     monkeypatch.setitem(sys.modules, "langchain_aws", law)
     monkeypatch.setenv(
-        "OKF_POLICY_PREPROCESS_MODEL", "global.anthropic.claude-sonnet-5"
+        "OKF_POLICY_PREPROCESS_MODEL", "global.anthropic.claude-sonnet-5-5"
     )
 
     ar_author._build_author_model()
@@ -305,23 +305,27 @@ def test_validate_rules_schema_and_attribution():
 
 
 class _ScriptedExtractorModel:
-    """bind_tools/invoke double: records the forced tool choice, plays replies."""
+    """bind_tools/invoke double: records the tool choice and every request's
+    messages, plays replies."""
 
     def __init__(self, replies):
         self.replies = list(replies)
         self.tool_choices = []
+        self.requests = []
 
     def bind_tools(self, tools, tool_choice=None):
         self.tool_choices.append((tuple(t.name for t in tools), tool_choice))
         return self
 
-    def invoke(self, _messages):
+    def invoke(self, messages):
         from types import SimpleNamespace
 
+        self.requests.append(list(messages))
         return SimpleNamespace(tool_calls=self.replies.pop(0))
 
 
-def test_forced_extract_retries_invalid_payloads_then_returns_valid():
+def test_forced_extract_retries_invalid_payloads_then_returns_valid(monkeypatch):
+    monkeypatch.setenv("OKF_POLICY_PREPROCESS_MODEL", "global.anthropic.claude-opus-4-8")
     allowed = {"references/enums/status.md"}
     model = _ScriptedExtractorModel(
         [
@@ -335,7 +339,66 @@ def test_forced_extract_retries_invalid_payloads_then_returns_valid():
     assert model.tool_choices == [(("submit_rules",), "submit_rules")]
 
 
-def test_forced_extract_salvages_the_valid_subset_on_exhaustion():
+def test_forced_extract_runs_on_auto_where_forcing_is_rejected(monkeypatch):
+    # Sonnet 5.5 (the default) cannot force a tool choice — a forced bind would
+    # 400 every cluster. Auto + the missing-call nudge recovers a tool-less reply.
+    monkeypatch.delenv("OKF_POLICY_PREPROCESS_MODEL", raising=False)
+    allowed = {"references/enums/status.md"}
+    model = _ScriptedExtractorModel(
+        [
+            [],  # prose, no tool call
+            [{"id": "t1", "args": {"rules": [_rule(source="references/enums/status.md")]}}],
+        ]
+    )
+    out = ar_author._forced_extract(model, "prompt", allowed)
+    assert [r["source"] for r in out] == ["references/enums/status.md"]
+    assert model.tool_choices == [(("submit_rules",), None)]
+    # The tool-less reply is never echoed back: the re-ask is ONE fresh user turn.
+    retry = model.requests[1]
+    assert len(retry) == 1 and "Reply ONLY with a submit_rules call." in retry[0].content
+
+
+def test_forced_extract_merges_rules_split_across_calls(monkeypatch):
+    # On auto a model may split one submission across several calls.
+    monkeypatch.delenv("OKF_POLICY_PREPROCESS_MODEL", raising=False)
+    allowed = {"references/enums/status.md", "references/enums/region.md"}
+    model = _ScriptedExtractorModel(
+        [
+            [
+                {"id": "a", "args": {"rules": [_rule(source="references/enums/status.md")]}},
+                {"id": "b", "args": {"rules": [_rule(source="references/enums/region.md")]}},
+            ]
+        ]
+    )
+    out = ar_author._forced_extract(model, "prompt", allowed)
+    assert sorted(r["source"] for r in out) == sorted(allowed)
+
+
+def test_forced_extract_answers_every_call_on_a_validation_retry(monkeypatch):
+    # Bedrock rejects a toolUse without its toolResult: a retry after a
+    # multi-call reply must carry one ToolMessage PER call id.
+    from langchain_core.messages import ToolMessage
+
+    monkeypatch.delenv("OKF_POLICY_PREPROCESS_MODEL", raising=False)
+    allowed = {"references/enums/status.md"}
+    model = _ScriptedExtractorModel(
+        [
+            [
+                {"id": "a", "args": {"rules": [_rule(source="references/ghost.md")]}},
+                {"id": "b", "args": {"rules": [_rule(source="references/enums/status.md")]}},
+            ],
+            [{"id": "c", "args": {"rules": [_rule(source="references/enums/status.md")]}}],
+        ]
+    )
+    out = ar_author._forced_extract(model, "prompt", allowed)
+    assert [r["source"] for r in out] == ["references/enums/status.md"]
+    results = [m for m in model.requests[1] if isinstance(m, ToolMessage)]
+    assert [m.tool_call_id for m in results] == ["a", "b"]
+    assert "Error:" in results[0].content
+
+
+def test_forced_extract_salvages_the_valid_subset_on_exhaustion(monkeypatch):
+    monkeypatch.setenv("OKF_POLICY_PREPROCESS_MODEL", "global.anthropic.claude-opus-4-8")
     allowed = {"references/enums/status.md"}
     bad_and_good = {
         "rules": [

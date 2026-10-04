@@ -16,8 +16,8 @@ const FALLBACK_CATALOG = [
     default_effort: "xhigh",
   },
   {
-    model: "global.openai.gpt-6-sol",
-    label: "GPT-6 Sol",
+    model: "global.openai.gpt-6.1-sol",
+    label: "GPT-6.1 Sol",
     efforts: ["low", "medium", "high", "xhigh", "max"],
     default_effort: "xhigh",
   },
@@ -34,8 +34,8 @@ const FALLBACK_CATALOG = [
     default_effort: "xhigh",
   },
   {
-    model: "global.anthropic.claude-sonnet-5",
-    label: "Claude Sonnet 5",
+    model: "global.anthropic.claude-sonnet-5-5",
+    label: "Claude Sonnet 5.5",
     efforts: ["low", "medium", "high", "xhigh", "max"],
     default_effort: "xhigh",
   },
@@ -133,7 +133,7 @@ function tierRankOf(model) {
   return 9
 }
 
-// "claude-opus-5-5" -> 5.5, "claude-fable-5-1" -> 5.1, "gpt-6-sol" -> 6.
+// "claude-opus-5-5" -> 5.5, "claude-fable-5-1" -> 5.1, "gpt-6.1-sol" -> 6.1.
 function versionOf(model) {
   const m = model.match(/(?:fable|opus|sonnet|haiku|gpt)[-.]?(\d+)(?:[.-](\d+))?/)
   if (!m) return 0

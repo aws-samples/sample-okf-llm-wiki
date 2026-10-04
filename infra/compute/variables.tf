@@ -60,7 +60,7 @@ variable "harvest_vpc_security_group_ids" {
 
 variable "harvest_model" {
   type        = string
-  description = "Harvest model id. An anthropic.* Converse inference profile (e.g. global.anthropic.claude-opus-4-8) runs on the bedrock-runtime Converse API; a GPT id (e.g. global.openai.gpt-6-sol) runs on the Bedrock Runtime OpenAI-compatible endpoint. Both use the deployment region (var.region)."
+  description = "Harvest model id. An anthropic.* Converse inference profile (e.g. global.anthropic.claude-opus-4-8) runs on the bedrock-runtime Converse API; a GPT id (e.g. global.openai.gpt-6.1-sol) runs on the Bedrock Runtime OpenAI-compatible endpoint. Both use the deployment region (var.region)."
   default     = "global.anthropic.claude-opus-4-8"
 }
 
@@ -109,8 +109,8 @@ variable "harvest_model_catalog" {
       default_effort = "xhigh"
     },
     {
-      model          = "global.openai.gpt-6-sol"
-      label          = "GPT-6 Sol"
+      model          = "global.openai.gpt-6.1-sol"
+      label          = "GPT-6.1 Sol"
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "xhigh"
     },
@@ -127,8 +127,8 @@ variable "harvest_model_catalog" {
       default_effort = "xhigh"
     },
     {
-      model          = "global.anthropic.claude-sonnet-5"
-      label          = "Claude Sonnet 5"
+      model          = "global.anthropic.claude-sonnet-5-5"
+      label          = "Claude Sonnet 5.5"
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "xhigh"
     },
@@ -583,17 +583,19 @@ variable "enable_policy_build" {
 
 variable "chat_policy_check_model" {
   type = string
-  # Sonnet 5, no reasoning: both consumers run classifier-style anyway, and a
-  # Claude 5 head gives better verdicts than a small model at the same
-  # single-pass latency. "global.openai.gpt-5.6-terra" (reasoning "none") remains a
-  # tested alternative.
-  default     = "global.anthropic.claude-sonnet-5"
-  description = "The policy checks' model id, serving BOTH the curated-question rewrite (minimal effort — extraction) and the judge fleets. Judges run CLASSIFIER-style on every family — thinking off + temperature 0 on a Converse (Anthropic) id, reasoning \"none\" on an openai.* id (e.g. global.openai.gpt-5.6-terra) — with a FORCED report_violations tool call: fast single-pass verdicts. An openai.* value is fully supported: chat_openai_enabled derives the role's bearer-token grants from this var too (gated on enable_policy_checks)."
+  # Sonnet 5.5: both consumers run classifier-style anyway, and a Claude 5 head
+  # gives better verdicts than a small model at near single-pass latency. It
+  # cannot turn thinking off, so its classifier builds run at adaptive effort
+  # low with an auto tool choice (live judge eval 2026-10-04: 35/36 exact vs
+  # Sonnet 5's 27/36, ~2s p50). "global.openai.gpt-5.6-terra" (reasoning
+  # "none") remains a tested alternative.
+  default     = "global.anthropic.claude-sonnet-5-5"
+  description = "The policy checks' model id, serving BOTH the curated-question rewrite (minimal effort — extraction) and the judge fleets. Judges run CLASSIFIER-style on every family — thinking off + temperature 0 + a FORCED report_violations tool call on a Converse (Anthropic) id that allows it, adaptive effort low + an auto tool choice on one that cannot turn thinking off (Sonnet 5.5+), reasoning \"none\" + forced on an openai.* id (e.g. global.openai.gpt-5.6-terra): fast verdicts. An openai.* value is fully supported: chat_openai_enabled derives the role's bearer-token grants from this var too (gated on enable_policy_checks)."
 }
 
 variable "policy_preprocess_model" {
   type        = string
-  default     = "global.anthropic.claude-sonnet-5"
+  default     = "global.anthropic.claude-sonnet-5-5"
   description = "Model for the ar_rules.md authoring agent (harvest.ar_author), run with FULL reasoning (effort high — OKF_POLICY_AUTHOR_EFFORT) — turning wiki prose into decidable rules is judgment work, and it runs only when policy sources actually change. Runs exclusively on the harvest runtime (mode=\"ar_rules\"); harvest_openai_enabled derives the bearer-token grants from this var (gated on enable_policy_build). Kept separate from chat_policy_check_model — different services, different env namespaces."
 }
 

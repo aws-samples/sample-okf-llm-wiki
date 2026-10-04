@@ -15,10 +15,10 @@ from okf_core import harvest_models as hm
 def test_default_catalog_offers_the_full_model_set():
     models = [e["model"] for e in hm.DEFAULT_CATALOG]
     assert "global.anthropic.claude-opus-4-8" in models
-    assert "global.openai.gpt-6-sol" in models
+    assert "global.openai.gpt-6.1-sol" in models
     assert "global.openai.gpt-6-astra" in models
     assert "global.anthropic.claude-opus-5-5" in models
-    assert "global.anthropic.claude-sonnet-5" in models
+    assert "global.anthropic.claude-sonnet-5-5" in models
     assert "global.openai.gpt-5.6-terra" in models
     # The Claude 5 flagship tier + GPT-6 Luna:
     # available to the harvest picker (supervisor/sub-agents/reviewer) AND the
@@ -78,47 +78,47 @@ def test_parse_catalog_non_list_raises():
 
 def test_allowed_efforts_and_default():
     cat = hm.DEFAULT_CATALOG
-    assert "xhigh" in hm.allowed_efforts(cat, "global.openai.gpt-6-sol")
+    assert "xhigh" in hm.allowed_efforts(cat, "global.openai.gpt-6.1-sol")
     # GPT-5.6 added "max" as a native level, so it IS offered now (same as Claude).
-    assert "max" in hm.allowed_efforts(cat, "global.openai.gpt-6-sol")
+    assert "max" in hm.allowed_efforts(cat, "global.openai.gpt-6.1-sol")
     assert "max" in hm.allowed_efforts(cat, "global.anthropic.claude-opus-4-8")
     assert hm.allowed_efforts(cat, "nope") == ()
-    assert hm.default_effort_for(cat, "global.openai.gpt-6-sol") == "xhigh"
+    assert hm.default_effort_for(cat, "global.openai.gpt-6.1-sol") == "xhigh"
     assert hm.default_effort_for(cat, "unknown") == hm.DEFAULT_EFFORT
 
 
 def test_validate_model_effort_ok():
     cat = hm.DEFAULT_CATALOG
-    assert hm.validate_model_effort(cat, "global.openai.gpt-6-sol", "high") == (
-        "global.openai.gpt-6-sol",
+    assert hm.validate_model_effort(cat, "global.openai.gpt-6.1-sol", "high") == (
+        "global.openai.gpt-6.1-sol",
         "high",
     )
 
 
 @pytest.mark.parametrize(
-    "model", ["openai.gpt-6-sol", "gpt-6-sol", "global.openai.gpt-6-sol"]
+    "model", ["openai.gpt-6.1-sol", "gpt-6.1-sol", "global.openai.gpt-6.1-sol"]
 )
 def test_bare_gpt_selections_resolve_to_the_offered_global_profile(model):
     assert hm.validate_model_effort(hm.DEFAULT_CATALOG, model, "high") == (
-        "global.openai.gpt-6-sol",
+        "global.openai.gpt-6.1-sol",
         "high",
     )
 
 
 def test_explicit_inference_profile_must_be_offered():
     with pytest.raises(hm.ModelCatalogError):
-        hm.validate_model_effort(hm.DEFAULT_CATALOG, "eu.openai.gpt-6-sol", "high")
+        hm.validate_model_effort(hm.DEFAULT_CATALOG, "eu.openai.gpt-6.1-sol", "high")
 
 
 def test_non_string_model_is_rejected_as_a_catalog_error():
     with pytest.raises(hm.ModelCatalogError):
-        hm.validate_model_effort(hm.DEFAULT_CATALOG, {"model": "gpt-6-sol"}, "high")
+        hm.validate_model_effort(hm.DEFAULT_CATALOG, {"model": "gpt-6.1-sol"}, "high")
 
 
 def test_validate_model_effort_defaults_when_effort_omitted():
     cat = hm.DEFAULT_CATALOG
-    assert hm.validate_model_effort(cat, "global.openai.gpt-6-sol", None) == (
-        "global.openai.gpt-6-sol",
+    assert hm.validate_model_effort(cat, "global.openai.gpt-6.1-sol", None) == (
+        "global.openai.gpt-6.1-sol",
         "xhigh",
     )
 
@@ -137,4 +137,4 @@ def test_validate_model_effort_effort_not_offered_raises():
     # An effort the model doesn't list (here a bogus level) -> reject. Guards the
     # trust boundary: only catalog-offered (model, effort) pairs reach Bedrock.
     with pytest.raises(hm.ModelCatalogError):
-        hm.validate_model_effort(hm.DEFAULT_CATALOG, "global.openai.gpt-6-sol", "ultra")
+        hm.validate_model_effort(hm.DEFAULT_CATALOG, "global.openai.gpt-6.1-sol", "ultra")

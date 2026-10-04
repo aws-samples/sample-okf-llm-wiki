@@ -123,12 +123,12 @@ def test_start_run_validates_models_against_catalog(cfg):
     assert resp["statusCode"] == 400
     resp = _start(
         cfg,
-        {"solver_model": "global.anthropic.claude-sonnet-5", "solver_effort": "high",
+        {"solver_model": "global.anthropic.claude-sonnet-5-5", "solver_effort": "high",
          "judge_model": "global.anthropic.claude-opus-5-5"},
     )
     assert resp["statusCode"] == 200
     payload = json.loads(cfg.agentcore.calls[-1]["payload"])
-    assert payload["solver_model"] == "global.anthropic.claude-sonnet-5"
+    assert payload["solver_model"] == "global.anthropic.claude-sonnet-5-5"
     assert payload["solver_effort"] == "high"
     assert payload["judge_model"] == "global.anthropic.claude-opus-5-5"
     # Judge effort fell back to the model's catalog default.
