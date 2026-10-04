@@ -490,6 +490,8 @@ def test_build_bedrock_converse_forwards_zero_temperature(monkeypatch):
         # No version to read: an application inference profile defaults to the
         # safe side (adaptive low + auto works on every adaptive generation).
         ("arn:aws:bedrock:eu-west-1:111122223333:application-inference-profile/abc123", True),
+        # A foundation-model ARN names its model: a non-Claude one stays off.
+        ("arn:aws:bedrock:eu-west-1::foundation-model/amazon.nova-pro-v1:0", False),
         ("global.anthropic.claude-opus-4-8", False),
         ("us.anthropic.claude-haiku-4-5", False),
         ("global.anthropic.claude-sonnet-4-6", False),
@@ -516,6 +518,17 @@ def test_retired_gpt_6_sol_keeps_its_profile_for_pinned_deployments():
     assert mf.gpt_profile("global.openai.gpt-6.1-sol")["max_output_tokens"] == 131072
 
 
+def test_thinking_budget_is_kept_for_an_opaque_inference_profile(monkeypatch):
+    # An application-profile ARN doesn't say which model it is (it may be a
+    # Haiku 4.5, which needs the budget form): the operator's budget stands.
+    captured = _install_converse_stub(monkeypatch)
+    arn = "arn:aws:bedrock:eu-west-1:111122223333:application-inference-profile/abc123"
+    mf.build_bedrock_converse(arn, "high", 64000, region="us-east-1", thinking_budget=48000)
+    assert captured["additional_model_request_fields"] == {
+        "thinking": {"type": "enabled", "budget_tokens": 48000}
+    }
+
+
 def test_thinking_budget_is_ignored_on_adaptive_models(monkeypatch):
     # A budget left over from a Haiku setup must not 400 the Sonnet 5.5 default.
     captured = _install_converse_stub(monkeypatch)
@@ -524,6 +537,22 @@ def test_thinking_budget_is_ignored_on_adaptive_models(monkeypatch):
         region="us-east-1", thinking_budget=48000,
     )
     assert captured["additional_model_request_fields"] == mf.thinking_fields("high")
+
+
+@pytest.mark.parametrize(
+    ("model", "window"),
+    [
+        ("global.anthropic.claude-opus-5-5", 1_000_000),
+        ("global.anthropic.claude-opus-4-8", 1_000_000),
+        ("global.anthropic.claude-sonnet-5-5", 1_000_000),
+        ("global.anthropic.claude-fable-5-1", 1_000_000),
+        ("anthropic.claude-3-5-sonnet-20241022-v2:0", 200_000),
+        ("global.openai.gpt-6-astra", 1_050_000),
+        ("global.openai.gpt-5.6-terra", 1_000_000),
+    ],
+)
+def test_context_window_by_model(model, window):
+    assert mf.context_window(model) == window
 
 
 def test_gpt_ids_always_support_forced_tool_choice():

@@ -111,18 +111,34 @@ def converse_requires_thinking(model: str) -> bool:
     temperature, and callers must not force a tool (see
     :func:`supports_forced_tool_choice`).
 
-    An Anthropic id or ARN that names no version (an application inference
-    profile) counts as REQUIRING thinking: adaptive low + auto tool choice
-    works on every adaptive generation, whereas guessing "thinking off" wrong
-    400s every call into a silent fail-open. Non-Anthropic Converse ids keep
-    the thinking-off path.
+    An id that names no version — an Anthropic id without one, or an
+    APPLICATION inference-profile ARN (opaque: it doesn't name its model) —
+    counts as REQUIRING thinking: adaptive low + auto tool choice works on every
+    adaptive generation, and guessing "thinking off" wrong 400s every call into a
+    silent fail-open, while a wrong guess this way (a non-Claude profile) fails
+    loudly. Other ids — non-Anthropic model ids and foundation-model ARNs, which
+    do name their model — keep the thinking-off path.
     """
     if any(f in model for f in _ADAPTIVE_ONLY_FAMILIES):
         return True
     version = _claude_version(model)
     if version is None:
-        return "anthropic" in model or "claude" in model or model.startswith("arn:")
+        return (
+            "anthropic" in model
+            or "claude" in model
+            or ":application-inference-profile/" in model
+        )
     return version >= _THINKING_REQUIRED_SINCE
+
+
+def _known_adaptive(model: str) -> bool:
+    """Whether the id is KNOWN to take only the adaptive thinking shape — a
+    parsed 4.6+ version or an adaptive-only family. Opaque ids (inference-profile
+    ARNs) are not known, so an operator's explicit thinking budget stands."""
+    if any(f in model for f in _ADAPTIVE_ONLY_FAMILIES):
+        return True
+    version = _claude_version(model)
+    return version is not None and version >= _ADAPTIVE_SINCE
 
 
 def supports_forced_tool_choice(model: str) -> bool:
@@ -212,7 +228,7 @@ def build_bedrock_converse(
         # the 4.6+ shape; pre-adaptive models (e.g. Haiku 4.5) take a token
         # budget instead and REJECT the adaptive form. thinking_budget selects
         # the budget encoding; the caller's max_tokens must exceed it.
-        if thinking_budget is not None and converse_supports_adaptive(model):
+        if thinking_budget is not None and _known_adaptive(model):
             # A budget left over from a pre-adaptive setup (e.g. Haiku 4.5)
             # would 400 an adaptive-only model; the effort shape is its only form.
             log.info(
@@ -255,6 +271,26 @@ _GPT_PROFILES = {
     "openai.gpt-6-luna": {"max_input_tokens": 1050000, "max_output_tokens": 128000},
     "openai.gpt-5.6-terra": {"max_input_tokens": 1000000, "max_output_tokens": 32000},
 }
+
+
+# Claude context windows (input tokens), by generation: every adaptive-era model
+# the catalogs offer — Opus 4.8, Opus 5.5, Sonnet 5.5, Fable 5.1 — has a 1M
+# window (Bedrock model cards, 2026-10). Older generations fall back to 200K.
+_CLAUDE_1M_SINCE = (4, 6)
+_CLAUDE_WINDOW_1M = 1_000_000
+_CLAUDE_WINDOW_DEFAULT = 200_000
+
+
+def context_window(model: str) -> int:
+    """The model's context window in input tokens — the denominator of the
+    chat's context gauge and its auto-compaction trigger. GPT ids read their
+    configured profile; Claude ids go by generation."""
+    if is_openai_model(model):
+        return gpt_profile(model).get("max_input_tokens") or _CLAUDE_WINDOW_DEFAULT
+    version = _claude_version(model)
+    if version is None or version >= _CLAUDE_1M_SINCE:
+        return _CLAUDE_WINDOW_1M
+    return _CLAUDE_WINDOW_DEFAULT
 
 
 def gpt_profile(model: str) -> dict[str, int]:

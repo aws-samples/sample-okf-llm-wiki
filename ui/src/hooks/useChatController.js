@@ -1,29 +1,43 @@
 // Shared chat control state, lifted OUT of ChatPanel so the sidebar (rendered by
 // the app shell, above ChatPanel) and the chat page drive the same conversation:
-// new-chat, resume-from-history, the history drawer toggle, and the reasoning
-// EFFORT. The model is FIXED to Opus 5.5 (no model choice), so there's no model
-// state and effort can change freely on any conversation.
+// new-chat, resume-from-history, the history drawer toggle, and the run settings
+// (model, effort, features, dataset scope).
+//
+// The MODEL is free until the conversation starts. After that only its FAMILY
+// (Anthropic vs GPT) can be picked — switching within a family keeps the thread
+// (no remount), crossing providers needs a new chat (the checkpoint's reasoning
+// blocks are provider-specific; the runtime refuses it too).
 
 import { useCallback, useEffect, useState } from "react"
 
 import { newThreadId } from "@/lib/chatApi"
-import { loadFeatures, sanitizeFeatures, saveFeatures } from "@/lib/chatFeatures"
 import {
-  CHAT_EFFORTS,
-  CHAT_MODEL,
+  loadFeatures,
+  sanitizeFeatures,
+  saveFeatures,
+} from "@/lib/chatFeatures"
+import {
+  clampEffort,
+  effortsFor,
+  groupedChatModels,
   loadEffort,
+  loadModel,
+  modelFamily,
+  resolveModel,
   saveEffort,
+  saveModel,
 } from "@/lib/chatModels"
 import { clearLastThread, loadLastThread, saveLastThread } from "@/lib/lastChat"
 
-function newConversation() {
+function newConversation(threadId = newThreadId()) {
+  const model = loadModel()
   return {
-    threadId: newThreadId(),
-    model: CHAT_MODEL,
-    effort: loadEffort(),
+    threadId,
+    model,
+    effort: loadEffort(model),
     features: loadFeatures(),
     // The `@`-mention dataset scope ({ data_domain, dataset }) or null (whole
-    // wiki). Advisory relevance context, resolved per-run — not pinned like model.
+    // wiki). Advisory relevance context, resolved per-run.
     datasetScope: null,
   }
 }
@@ -38,24 +52,18 @@ export function useChatController({
   // otherwise fall back to this user's last conversation (localStorage) so
   // returning to Chat after a reload — even one that landed on another section —
   // reopens where they left off. Computed once (initializer), so a later
-  // localStorage change doesn't yank the live conversation.
+  // localStorage change doesn't yank the live conversation. A reopened thread's
+  // model comes back with its history (onModelRestore).
   const [initialThreadId] = useState(
     () => urlThreadId || loadLastThread(userSub)
   )
   const [conv, setConv] = useState(() =>
-    initialThreadId
-      ? {
-          threadId: initialThreadId,
-          model: CHAT_MODEL,
-          effort: loadEffort(),
-          features: loadFeatures(),
-          datasetScope: null,
-        }
-      : newConversation()
+    newConversation(initialThreadId || undefined)
   )
   // Opened from a link/history/last-session (needs a load) vs freshly minted.
   const [resumed, setResumed] = useState(Boolean(initialThreadId))
-  // Initiated (first turn sent, or resumed) — gates the URL binding.
+  // Initiated (first turn sent, or resumed) — gates the URL binding and locks
+  // the model's family.
   const [started, setStarted] = useState(Boolean(initialThreadId))
   const [historyOpen, setHistoryOpen] = useState(false)
   // Bumped to re-fetch the history list (after a turn writes/renames a row).
@@ -85,10 +93,10 @@ export function useChatController({
   }, [started, conv.threadId, userSub])
 
   // First turn landed: lock the conversation as started (binds the URL, locks the
-  // model). We do NOT refresh the history list here — at turn-OPEN the server's
-  // index-row write (touch_thread, best-effort, async) may not have committed yet,
-  // so a fetch now can miss the new row. The refresh happens on turn COMPLETE
-  // (onTurnComplete), by which point the row is written.
+  // model's family). We do NOT refresh the history list here — at turn-OPEN the
+  // server's index-row write (touch_thread, best-effort, async) may not have
+  // committed yet, so a fetch now can miss the new row. The refresh happens on
+  // turn COMPLETE (onTurnComplete), by which point the row is written.
   const onStarted = useCallback(() => {
     setStarted(true)
     // Also mark it resumable: once a turn has landed the conversation is
@@ -121,10 +129,13 @@ export function useChatController({
   }, [onThreadChange, userSub])
 
   const resumeThread = useCallback((t) => {
+    // The thread row's last-used model; a model the catalog dropped falls back
+    // to the default of the SAME family.
+    const model = resolveModel(t.model)
     setConv({
       threadId: t.thread_id,
-      model: CHAT_MODEL,
-      effort: t.effort || loadEffort(),
+      model,
+      effort: clampEffort(model, t.effort || loadEffort(model)),
       // Features aren't pinned by the checkpoint (resolved per-run like effort),
       // so a resumed chat starts from the saved preference; the user can retoggle.
       features: loadFeatures(),
@@ -144,26 +155,54 @@ export function useChatController({
     [conv.threadId, startNewChat]
   )
 
-  // Effort is changeable at any time (resolved per-run by the runtime; not pinned
-  // by the checkpoint like the model would be).
+  // The family a started conversation is held to (null = any model).
+  const lockedFamily = started ? modelFamily(conv.model) : null
+
+  // Pick a model: any before the first turn, the conversation's family after.
+  // Effort clamps to what the new model offers. Persisted as the next new chat's
+  // default.
+  const onModelChange = useCallback(
+    (model) => {
+      const next = resolveModel(model)
+      if (lockedFamily && modelFamily(next) !== lockedFamily) return
+      saveModel(next)
+      setConv((c) => ({
+        ...c,
+        model: next,
+        effort: clampEffort(next, c.effort),
+      }))
+    },
+    [lockedFamily]
+  )
+
+  // The server's pinned model for a reopened thread (its history read) — the
+  // source of truth for the family lock. Not persisted as a preference.
+  const onModelRestore = useCallback((model) => {
+    const next = resolveModel(model)
+    setConv((c) =>
+      c.model === next
+        ? c
+        : { ...c, model: next, effort: clampEffort(next, c.effort) }
+    )
+  }, [])
+
+  // Effort is changeable at any time (resolved per-run by the runtime).
   const onEffortChange = useCallback((effort) => {
     saveEffort(effort)
     setConv((c) => ({ ...c, effort }))
   }, [])
 
-  // Optional features (e.g. SQL / Policy) toggle at any time too — resolved
-  // per-run, and persisted as the default for the next new chat. Sanitizing
-  // here (not just at load) keeps the policy→SQL dependency enforced however
-  // the change arrives: removing SQL drops the policy selection with it.
+  // SQL + Guardrails toggle at any time too — resolved per-run, and persisted as
+  // the default for the next new chat.
   const onFeaturesChange = useCallback((features) => {
     const next = sanitizeFeatures(Array.isArray(features) ? features : [])
     saveFeatures(next)
     setConv((c) => ({ ...c, features: next }))
   }, [])
 
-  // The `@`-mention dataset scope — changeable any time (advisory per-run context,
-  // not pinned). null clears it (whole wiki). Not persisted: scope is a per-chat
-  // intent, not a global preference like effort.
+  // The `@`-mention dataset scope — changeable any time (advisory per-run context).
+  // null clears it (whole wiki). Not persisted: scope is a per-chat intent, not a
+  // global preference like effort.
   const onScopeChange = useCallback((scope) => {
     setConv((c) => ({ ...c, datasetScope: scope || null }))
   }, [])
@@ -175,12 +214,16 @@ export function useChatController({
     historyOpen,
     setHistoryOpen,
     historyReloadKey,
-    efforts: CHAT_EFFORTS,
+    efforts: effortsFor(conv.model),
+    modelGroups: groupedChatModels(lockedFamily),
+    lockedFamily,
     onStarted,
     onTurnComplete,
     startNewChat,
     resumeThread,
     onThreadDeleted,
+    onModelChange,
+    onModelRestore,
     onEffortChange,
     onFeaturesChange,
     onScopeChange,

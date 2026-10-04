@@ -202,12 +202,57 @@ variable "chat_model_catalog" {
     default_effort = string
   }))
   description = "Catalog of (model, allowed efforts) the chat UI offers and the chat runtime validates against."
-  # Chat stays on Opus 5.5. GPT-6 choices belong to the harvest/benchmark
-  # catalog above. The runtime validates chat selections against this catalog.
+  # The harvest catalog's models at chat's "high" default effort (Opus 5.5 is
+  # the default via var.chat_model). A conversation switches models only within
+  # its provider family (the runtime refuses Claude<->GPT mid-conversation);
+  # any openai.* entry turns on the chat role's bearer-token grants
+  # (chat_openai_enabled).
   default = [
     {
       model          = "global.anthropic.claude-opus-5-5"
       label          = "Claude Opus 5.5"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "high"
+    },
+    {
+      model          = "global.anthropic.claude-opus-4-8"
+      label          = "Claude Opus 4.8"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "high"
+    },
+    {
+      model          = "global.anthropic.claude-sonnet-5-5"
+      label          = "Claude Sonnet 5.5"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "high"
+    },
+    {
+      model          = "global.anthropic.claude-fable-5-1"
+      label          = "Claude Fable 5.1"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "high"
+    },
+    {
+      model          = "global.openai.gpt-6-astra"
+      label          = "GPT-6 Astra"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "high"
+    },
+    {
+      model          = "global.openai.gpt-6.1-sol"
+      label          = "GPT-6.1 Sol"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "high"
+    },
+    {
+      model          = "global.openai.gpt-6-luna"
+      label          = "GPT-6 Luna"
+      efforts        = ["low", "medium", "high", "xhigh", "max"]
+      default_effort = "high"
+    },
+    {
+      model          = "global.openai.gpt-5.6-terra"
+      label          = "GPT-5.6 Terra"
       efforts        = ["low", "medium", "high", "xhigh", "max"]
       default_effort = "high"
     },

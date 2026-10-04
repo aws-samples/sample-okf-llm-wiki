@@ -19,15 +19,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover"
-import { cn } from "@/lib/utils"
-
-// Compact token counts (1.2K / 3.4M), matching the harvest usage popover.
-function fmtTokens(n) {
-  if (!n) return "0"
-  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M`
-  if (n >= 1e3) return `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1)}K`
-  return String(n)
-}
+import { cn, formatTokens as fmtTokens } from "@/lib/utils"
 
 function UsageStat({ label, value }) {
   return (

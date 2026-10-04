@@ -113,10 +113,14 @@ export async function answerHumanAPI({
   return res
 }
 
-// Fetch a conversation's persisted history as { history: [chatTurns], pendingAsk? }.
+// Fetch a conversation's persisted history as
+// { history: [chatTurns], pendingAsk, context, compactions, model }.
 // pendingAsk is set when the conversation is PAUSED at an ask_human interrupt (the
 // graph checkpoint is durable), so a page reload can re-render the QA form and let
-// the user still answer.
+// the user still answer. `context` is the last measured context-window reading,
+// `compactions` the compaction marks ({source, turn, phase, pre_tokens,
+// post_tokens}) the transcript draws dividers for, and `model` the model the
+// conversation is pinned to (its family bounds the picker).
 export async function fetchHistoryAPI({ threadId, getToken }) {
   const res = await post(threadId, getToken, { type: "get_session_history" })
   if (!res.ok) throw new Error(`failed to load history: ${res.status}`)
@@ -124,6 +128,28 @@ export async function fetchHistoryAPI({ threadId, getToken }) {
   return {
     history: Array.isArray(data?.history) ? data.history : [],
     pendingAsk: data?.pending_ask || null,
+    context: data?.context || null,
+    compactions: Array.isArray(data?.compactions) ? data.compactions : [],
+    model: typeof data?.model === "string" && data.model ? data.model : null,
+  }
+}
+
+// Compact the conversation now: the runtime summarizes the older history into
+// the agent's context (the transcript keeps every message). JSON envelope:
+// { compacted:true, compaction, context } or
+// { compacted:false, reason:"busy"|"nothing_to_compact"|"error", message }.
+export async function compactAPI({ threadId, getToken }) {
+  try {
+    const res = await post(threadId, getToken, { type: "compact" })
+    const data = await res.json().catch(() => null)
+    if (data && typeof data === "object" && "compacted" in data) return data
+    return {
+      compacted: false,
+      reason: "error",
+      message: data?.message || `compact failed (${res.status})`,
+    }
+  } catch (err) {
+    return { compacted: false, reason: "error", message: err.message || "compact failed" }
   }
 }
 

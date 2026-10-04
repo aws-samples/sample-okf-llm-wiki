@@ -12,6 +12,7 @@ import { memo, useMemo } from "react"
 
 import { AgentAvatar } from "@/components/chat/AgentAvatar"
 import { ChartFrame } from "@/components/chat/ChartFrame"
+import { CompactionDivider } from "@/components/chat/CompactionDivider"
 import { Markdown } from "@/components/chat/Markdown"
 import { ReportCard } from "@/components/chat/ReportCard"
 import { ResponseActions } from "@/components/chat/ResponseActions"
@@ -137,6 +138,9 @@ function ChatMessageImpl({
   wikiSources,
   onOpenDoc,
   onOpenReport,
+  // Compactions that ran DURING this turn (auto, mid-run): a divider between
+  // the question and the answer. Stable per turn (ChatThread memoizes).
+  compactionMarks,
 }) {
   const aiEvents = turn.aiMessage || []
   const isEnd = aiEvents.length > 0 && aiEvents[aiEvents.length - 1]?.end === true
@@ -191,6 +195,8 @@ function ChatMessageImpl({
           {turn.userMessage}
         </div>
       </div>
+
+      <CompactionDivider marks={compactionMarks} />
 
       {/* AI response — the twinkling dot avatar (glows while this turn streams,
           freezes when done) beside the stacked answer blocks. The avatar IS the

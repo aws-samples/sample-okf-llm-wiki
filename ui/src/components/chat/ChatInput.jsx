@@ -1,27 +1,38 @@
-// The composer — Sparky's ChatInput, ported to tailwind/shadcn. A rounded card
-// with an auto-growing textarea and a toolbar row: an effort setting + optional
-// left slot on the left, send/stop on the right. Enter sends (Shift+Enter =
-// newline); while streaming the button becomes Stop.
+// The composer (shape ported from Sentry). One row — "+", text, send — until the
+// text needs a second line, then the text takes the full width over a button row.
+// A dataset scope forces that two-line shape: its chip rides next to the "+" on
+// the button row. The shape is measured independently of the current shape (see
+// shapeFor) so it cannot oscillate. Enter sends (Shift+Enter = newline); while
+// streaming the button becomes Stop.
 //
-// Owns only its own draft text; the parent handles send/stop. Reasoning effort is
-// set HERE (Sparky-style, from the composer) rather than the sidebar — it's a
-// per-conversation setting, locked once the conversation has started.
+// Under the card, the run settings: Guardrails + the SQL switch on the left, the
+// model · effort control and the context gauge on the right. Owns only its own
+// draft text; the parent handles send/stop and every setting.
 
 import {
-  ArrowUpIcon,
   AtSignIcon,
+  CornerDownRightIcon,
   DatabaseIcon,
   PinIcon,
   PlusIcon,
-  ShieldCheckIcon,
-  SlidersHorizontalIcon,
   SquareIcon,
   XIcon,
 } from "lucide-react"
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react"
+import { toast } from "sonner"
 
 import { AskHumanForm } from "@/components/chat/AskHumanForm"
-import { RollingText } from "@/components/RollingText"
+import {
+  GuardrailsSetting,
+  ModelEffortSetting,
+  SqlSwitch,
+} from "@/components/chat/ComposerSettings"
 import { Button } from "@/components/ui/button"
 import {
   Command,
@@ -35,47 +46,50 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import {
-  Popover,
-  PopoverAnchor,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover"
-import { Slider } from "@/components/ui/slider"
-import {
-  AVAILABLE_FEATURES,
-  featureById,
-  isPolicyId,
-  POLICY_AVAILABLE,
-  POLICY_OPTIONS,
+  POLICY_CHECK_ENABLED,
+  SQL_AVAILABLE,
+  policyOf,
+  sqlOn,
+  withPolicy,
+  withSql,
 } from "@/lib/chatFeatures"
 import { cn } from "@/lib/utils"
 
-const MAX_HEIGHT = 200
+// One timing for textarea height (inline style) and card padding/radius (class):
+// they sum into one movement.
+const MOVE_MS = 150
+const MOVE_EASE = "cubic-bezier(0.4, 0, 0.2, 1)"
+const HEIGHT_TRANSITION = `height ${MOVE_MS}ms ${MOVE_EASE}`
+const CARD_TRANSITION =
+  "transition-[padding,border-radius] duration-150 ease-[cubic-bezier(0.4,0,0.2,1)] motion-reduce:transition-none"
+
+// Characters measured for the shape decision: more cannot change "wider than one
+// row?", and laying out a whole pasted block unwrapped per keystroke is costly.
+const MEASURE_CHARS = 400
+
+const prefersReducedMotion = () =>
+  window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false
 
 // The dataset key shown in the scope chip / mention list ("domain/dataset").
 function datasetKey(d) {
   return `${d.data_domain}/${d.dataset}`
 }
 
-// The `@`-mention dataset picker — a Popover(Command) anchored to the composer,
-// opened when the user types "@" (see ChatInput). Picking a dataset sets the
-// conversation's scope; the current scope shows as a removable chip.
+// The current scope as a removable chip, beside the "+" on the button row.
 function DatasetScopeChip({ scope, onRemove }) {
   return (
-    <span className="group/chip inline-flex h-8 items-center gap-1 rounded-md bg-primary/10 pr-1.5 pl-2.5 text-xs font-medium text-primary">
+    <span className="group/chip inline-flex h-7 items-center gap-1 rounded-md bg-primary/10 pr-1.5 pl-2.5 text-xs font-medium text-primary">
       <AtSignIcon className="size-3 opacity-80" />
       {datasetKey(scope)}
       <button
         type="button"
-        aria-label="Clear dataset scope"
+        aria-label="Clear Dataset Scope"
         onClick={onRemove}
-        // Zero-width until the CHIP is hovered (saves toolbar width), w-0 rather
+        // Zero-width until the CHIP is hovered (saves row width), w-0 rather
         // than hidden so it stays tabbable — keyboard focus re-expands it via
         // group-focus-within.
         className="ml-0 flex h-4 w-0 items-center justify-center overflow-hidden rounded-sm text-primary/70 opacity-0 transition-all group-focus-within/chip:ml-0.5 group-focus-within/chip:w-4 group-focus-within/chip:opacity-100 group-hover/chip:ml-0.5 group-hover/chip:w-4 group-hover/chip:opacity-100 hover:bg-primary/15 hover:text-primary"
@@ -86,6 +100,8 @@ function DatasetScopeChip({ scope, onRemove }) {
   )
 }
 
+// The `@`-mention dataset picker — a Popover(Command) anchored to the text field,
+// opened by typing "@" or from the "+" menu. Picking sets the scope.
 function DatasetMentionList({ datasets, onPick, onBackspaceEmpty }) {
   return (
     <Command>
@@ -119,52 +135,15 @@ function DatasetMentionList({ datasets, onPick, onBackspaceEmpty }) {
   )
 }
 
-// The "+" menu + enabled-feature chips (Sparky's add-capability affordance). The
-// "+" opens a menu of the deployment's optional tools; picking one adds a chip to
-// the composer that shows an × on hover to remove it. Only rendered when the
-// deployment offers any feature at all (AVAILABLE_FEATURES non-empty).
-function FeatureChip({ feature, onRemove }) {
-  const Icon = feature.icon
-  return (
-    <span className="group/chip inline-flex h-8 items-center gap-1 rounded-md bg-muted/60 pr-1.5 pl-2.5 text-xs font-medium text-foreground/80">
-      {Icon ? <Icon className="size-3 text-muted-foreground" /> : null}
-      {feature.label}
-      <button
-        type="button"
-        aria-label={`Disable ${feature.label}`}
-        onClick={onRemove}
-        // Zero-width until the CHIP is hovered — same pattern as the scope chip's ×.
-        className="ml-0 flex h-4 w-0 items-center justify-center overflow-hidden rounded-sm text-muted-foreground opacity-0 transition-all group-focus-within/chip:ml-0.5 group-focus-within/chip:w-4 group-focus-within/chip:opacity-100 group-hover/chip:ml-0.5 group-hover/chip:w-4 group-hover/chip:opacity-100 hover:bg-foreground/10 hover:text-foreground"
-      >
-        <XIcon className="size-3" />
-      </button>
-    </span>
-  )
-}
-
-// `canScope` adds a "Scope to a dataset" entry (an explicit, discoverable
-// alternative to typing "@" — see ChatInput). Picking it fires `onScope`, which
-// opens the same dataset picker the "@" mention does.
-function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) {
+// The "+" menu. For now its one entry scopes the conversation to a dataset (an
+// explicit, discoverable alternative to typing "@").
+function AddMenu({ onScope }) {
   const [open, setOpen] = useState(false)
-  // Set when the "Scope to a dataset" item is chosen, so onCloseAutoFocus knows
-  // to skip Radix's focus-restore to the "+" trigger — that restore lands
-  // OUTSIDE the dataset popover onScope just opened and would dismiss it
-  // instantly. onScope focuses the picker itself, so no focus is lost.
+  // Set when "Scope To A Dataset" is chosen, so onCloseAutoFocus skips Radix's
+  // focus-restore to the "+" trigger — that restore lands OUTSIDE the dataset
+  // popover onScope just opened and would dismiss it instantly. onScope focuses
+  // the picker itself, so no focus is lost.
   const scopeSelectedRef = useRef(false)
-  const enabledSet = new Set(enabled)
-  const remaining = AVAILABLE_FEATURES.filter((f) => !enabledSet.has(f.id))
-  // The Policy field is offered while no policy option is active. Its hard
-  // dependency: it only ENABLES while the SQL feature is checked (the checks
-  // judge SQL conduct — nothing to check without the tool). The chip cascade
-  // (removing SQL removes Policy) lives in the feature sanitizer.
-  const sqlOn = enabledSet.has("sql")
-  const policyActive = enabled.some(isPolicyId)
-  const offerPolicy = POLICY_AVAILABLE && !policyActive
-  // Hide the "+" only when there's genuinely nothing to offer — no remaining
-  // features, no policy field, AND no dataset to scope to.
-  if (remaining.length === 0 && !offerPolicy && !canScope) return null
-
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
@@ -172,9 +151,9 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
           type="button"
           variant="ghost"
           size="icon"
-          className="size-8 shrink-0 text-muted-foreground hover:text-foreground"
-          title="Add a capability"
-          aria-label="Add a capability"
+          className="size-8 shrink-0 text-muted-foreground hover:bg-foreground/5 hover:text-foreground"
+          title="Add"
+          aria-label="Add"
         >
           <PlusIcon className="size-4" />
         </Button>
@@ -182,7 +161,7 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
       <DropdownMenuContent
         align="start"
         side="top"
-        className="min-w-56"
+        className="min-w-52"
         onCloseAutoFocus={(e) => {
           if (scopeSelectedRef.current) {
             scopeSelectedRef.current = false
@@ -190,161 +169,23 @@ function AddFeatureMenu({ enabled, onToggle, onPickPolicy, canScope, onScope }) 
           }
         }}
       >
-        {canScope ? (
-          <DropdownMenuItem
-            onSelect={() => {
-              scopeSelectedRef.current = true
-              onScope()
-            }}
-          >
-            <PinIcon className="size-3.5 text-muted-foreground" />
-            Scope to a dataset
-          </DropdownMenuItem>
-        ) : null}
-        {remaining.map((f) => {
-          const Icon = f.icon
-          return (
-            <DropdownMenuItem
-              key={f.id}
-              onSelect={() => onToggle(f.id)}
-            >
-              {Icon ? <Icon className="size-3.5 text-muted-foreground" /> : null}
-              {f.menuLabel || f.label}
-            </DropdownMenuItem>
-          )
-        })}
-        {offerPolicy ? (
-          <DropdownMenuSub>
-            {/* Disabled while SQL is off — the checks judge SQL conduct. */}
-            <DropdownMenuSubTrigger disabled={!sqlOn}>
-              <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
-              Guardrails
-            </DropdownMenuSubTrigger>
-            {/* Gap to the main card (sideOffset) + bottom edge aligned with
-                the BOTTOM of the Guardrails row: Radix top-aligns sub content
-                with its trigger and has no align="end" for subs, so shift it
-                up by its own height minus the trigger row's 2rem (py-1.5 ×2 +
-                one text-sm line). avoidCollisions must be OFF — the composer
-                sits at the viewport bottom, so Radix pre-shifts the card up
-                to fit and the translate would stack on that shift; with a
-                deterministic start (top = trigger top) the math is exact.
-                The `translate` property is separate from `transform`, so the
-                open/close animation doesn't clobber the offset. */}
-            <DropdownMenuSubContent
-              sideOffset={8}
-              avoidCollisions={false}
-              className="translate-y-[calc(-100%+2rem)]"
-            >
-              {POLICY_OPTIONS.map((o) => {
-                const Icon = o.icon
-                // Icon beside a text column (not inside the label row) so the
-                // item's default items-center centers it against BOTH lines.
-                return (
-                  <DropdownMenuItem
-                    key={o.id}
-                    onSelect={() => onPickPolicy(o.id)}
-                    className="py-1"
-                  >
-                    {Icon ? (
-                      <Icon className="size-3.5 text-muted-foreground" />
-                    ) : null}
-                    <span className="flex flex-col">
-                      <span>{o.label}</span>
-                      {o.description ? (
-                        <span className="text-[11px] text-muted-foreground">
-                          {o.description}
-                        </span>
-                      ) : null}
-                    </span>
-                  </DropdownMenuItem>
-                )
-              })}
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-        ) : null}
+        <DropdownMenuItem
+          onSelect={() => {
+            scopeSelectedRef.current = true
+            onScope()
+          }}
+        >
+          <PinIcon className="size-3.5 text-muted-foreground" />
+          Scope To A Dataset
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )
 }
 
-// Display names for reasoning-effort values — "xhigh" is the wire value the
-// runtime expects but reads badly in the UI, so it shows as "Extra". Label-only:
-// never feed these back into onEffortChange.
-const EFFORT_LABELS = { xhigh: "Extra" }
-const effortLabel = (e) => EFFORT_LABELS[e] ?? e
-
-// The reasoning-effort control: a toolbar button showing the current effort,
-// opening a popover with a Faster↔Smarter SLIDER (one stop per model level).
-// Changeable at any time, INCLUDING on an existing conversation — effort is
-// resolved per-run by the runtime and isn't pinned by the checkpoint (only the
-// MODEL is, since Opus/GPT checkpoints aren't portable).
-function EffortSetting({ effort, efforts, onChange }) {
-  const [open, setOpen] = useState(false)
-  if (!efforts || efforts.length === 0) return null
-
-  const idx = Math.max(0, efforts.indexOf(effort))
-  const last = efforts.length - 1
-  // Filled fraction 0..1. The range paints the SAME full-track light→dark fade
-  // (in CSS), scaled by 1/frac so its background image spans the whole track —
-  // the range (only `frac` wide) then reveals just the 0→thumb slice of that one
-  // gradient. So the fill still fades (never a flat block) and only shows up to
-  // the thumb. Guard the divide-by-zero at frac=0.
-  const frac = last > 0 ? idx / last : 1
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="h-8 gap-1 px-2.5 text-xs text-muted-foreground capitalize hover:text-foreground"
-          title="Reasoning effort"
-        >
-          <SlidersHorizontalIcon className="size-3.5" />
-          {effortLabel(effort)}
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent align="start" side="top" className="w-60 p-2.5">
-        {/* Header: "Effort <Level>" with the level highlighted in the accent;
-            switching levels rolls the old value out below the new one. */}
-        <div className="text-sm font-medium">
-          Effort{" "}
-          <RollingText
-            text={effortLabel(effort)}
-            textClassName="text-primary capitalize"
-          />
-        </div>
-        {/* Compact: end labels + slider sit tight together, just under the header.
-            --okf-effort-frac (0..1) scales the range's fade so the filled slice
-            shows the true 0→thumb portion of the light→dark gradient. */}
-        <div
-          className="okf-effort-slider mt-1"
-          style={{ "--okf-effort-frac": frac || 0.0001 }}
-        >
-          <div className="mb-0.5 flex items-center justify-between text-[11px] text-muted-foreground">
-            <span>Faster</span>
-            <span>Smarter</span>
-          </div>
-          {/* Stepped slider: one stop per level; the dotted track is a CSS overlay
-              (repeating dots) behind the shadcn Slider's own thin track. */}
-          <Slider
-            min={0}
-            max={last}
-            step={1}
-            value={[idx]}
-            onValueChange={([v]) => onChange?.(efforts[v] ?? effort)}
-            aria-label="Reasoning effort"
-          />
-        </div>
-      </PopoverContent>
-    </Popover>
-  )
-}
-
-// Sparky's keep-warm timings (ChatInput.jsx): don't fire in the first 2s after
-// mount, fire IMMEDIATELY on the first keystroke of an empty box, then debounce
-// 500ms on subsequent typing, and ping every 300s while there's draft text.
+// Sparky's keep-warm timings: don't fire in the first 2s after mount, fire
+// IMMEDIATELY on the first keystroke of an empty box, then debounce 500ms on
+// subsequent typing, and ping every 300s while there's draft text.
 const PREPARE_MOUNT_GRACE_MS = 2000
 const PREPARE_DEBOUNCE_MS = 500
 const PREPARE_INTERVAL_MS = 300000
@@ -355,9 +196,12 @@ export function ChatInput({
   onPrepare,
   isStreaming = false,
   disabled = false,
-  placeholder = "Ask about the wiki. Use @ to pin questions to a particular dataset",
-  leftSlot = null,
+  placeholder = "Ask about the wiki — type @ to scope a dataset",
   autoFocus = true,
+  model,
+  modelGroups,
+  lockedFamily = null,
+  onModelChange,
   effort,
   efforts,
   onEffortChange,
@@ -369,9 +213,39 @@ export function ChatInput({
   onScopeChange,
   pendingAsk = null,
   onAnswer,
+  // The ContextGauge, at the right end of the settings row.
+  contextSlot = null,
+  // True while the conversation compacts: the runtime refuses turns then, so
+  // Enter keeps the text and explains instead of clearing the box.
+  compacting = false,
 }) {
   const [text, setText] = useState("")
   const ref = useRef(null)
+  const [multiline, setMultiline] = useState(false)
+  const mirrorRef = useRef(null) // measures the text's natural single-line width
+  const plusRef = useRef(null)
+  const sendRef = useRef(null)
+  // Set by the setRowEl callback ref (the row unmounts during an ask).
+  const rowRef = useRef(null)
+  const rowRoRef = useRef(null)
+  const lastWidthRef = useRef(0)
+  // The settled height; the live style.height can hold an intermediate value
+  // measured at the wrong width during a shape flip.
+  const settledHeightRef = useRef("")
+  // The draft for the resize observer, so it is not re-created per keystroke.
+  const textRef = useRef("")
+  // Set by send(): the collapse after a send must land in the SAME frame (no
+  // height animation) — ChatThread's new-turn pin measures the transcript
+  // viewport in its layout effect, and a still-animating tall composer would
+  // leave it measuring short.
+  const instantRef = useRef(false)
+
+  // When the agent has paused to ask clarifying questions, the composer becomes
+  // the QA form (a natural vertical expansion of the input) — the textarea and
+  // its row unmount until the user submits, which resumes the agent.
+  const asking = Boolean(pendingAsk && pendingAsk.questions?.length && onAnswer)
+  // A scope chip forces the two-line shape (text over the button row).
+  const twoLine = multiline || Boolean(datasetScope)
 
   // `@`-mention picker: open + the query typed after the "@" (used to seed the
   // picker's filter). The trigger "@"'s index lets us strip the fragment on pick.
@@ -379,42 +253,11 @@ export function ChatInput({
   const [mentionQuery, setMentionQuery] = useState("")
   const mentionAtRef = useRef(-1) // index of the active "@" in the textarea value
   const canMention = Boolean(onScopeChange) && datasets.length > 0
-  // Visibility for the "+" menu's scope entry. Distinct from canMention: with
-  // every feature chip enabled, "Scope to a dataset" is the "+"'s only
-  // remaining offering, and gating it on the FETCHED list makes the button pop
-  // in a beat after first paint. While the list is still loading, assume
-  // scoping will be offered (a registered deployment has datasets) so the
-  // button mounts with the composer; it hides only when the list is KNOWN
-  // empty.
+  // The "+" mounts with the composer while the dataset list is still loading (a
+  // registered deployment has datasets) and hides only when the list is KNOWN
+  // empty — gating on the fetched list would pop it in a beat after first paint.
   const offerScope =
     Boolean(onScopeChange) && (datasetsLoading || datasets.length > 0)
-
-  const enabledFeatures = Array.isArray(features) ? features : []
-  const addFeature = useCallback(
-    (id) => {
-      if (!onFeaturesChange) return
-      if (enabledFeatures.includes(id)) return
-      onFeaturesChange([...enabledFeatures, id])
-    },
-    [enabledFeatures, onFeaturesChange]
-  )
-  // Picking a policy option replaces any current one (mutually exclusive).
-  const pickPolicy = useCallback(
-    (id) =>
-      onFeaturesChange?.([...enabledFeatures.filter((f) => !isPolicyId(f)), id]),
-    [enabledFeatures, onFeaturesChange]
-  )
-  // Removing SQL also drops the policy selection (the controller's sanitizer
-  // enforces the same dependency; filtering here keeps the UI instant).
-  const removeFeature = useCallback(
-    (id) =>
-      onFeaturesChange?.(
-        enabledFeatures.filter(
-          (f) => f !== id && !(id === "sql" && isPolicyId(f))
-        )
-      ),
-    [enabledFeatures, onFeaturesChange]
-  )
 
   // Detect an active `@mention` at the caret: an "@" at the start or after
   // whitespace, followed by [\w/.-]* up to the caret. Opens the dataset picker and
@@ -439,7 +282,10 @@ export function ChatInput({
   const onTextChange = useCallback(
     (e) => {
       setText(e.target.value)
-      syncMention(e.target.value, e.target.selectionStart ?? e.target.value.length)
+      syncMention(
+        e.target.value,
+        e.target.selectionStart ?? e.target.value.length
+      )
     },
     [syncMention]
   )
@@ -451,11 +297,9 @@ export function ChatInput({
       onScopeChange?.({ data_domain: d.data_domain, dataset: d.dataset })
       const at = mentionAtRef.current
       if (at >= 0) {
-        // Strip from the "@" through the current query length.
         const before = text.slice(0, at)
         const after = text.slice(at + 1 + mentionQuery.length)
-        const next = (before + after).replace(/\s{2,}/g, " ")
-        setText(next)
+        setText((before + after).replace(/\s{2,}/g, " "))
       }
       setMentionOpen(false)
       mentionAtRef.current = -1
@@ -465,12 +309,11 @@ export function ChatInput({
   )
 
   // Open the dataset picker from the "+" menu instead of an "@" keystroke. There
-  // is no "@" fragment to strip on pick, so leave mentionAtRef at -1 (pickDataset
-  // skips the strip when it's negative). Stamp the open time: the "+" dropdown's
-  // teardown (focus restore + outside-pointer detection) fires just after this
-  // and the picker popover reads it as an outside interaction — the onOpenChange
-  // guard below ignores any dismiss within a short grace window so the picker
-  // doesn't flicker shut. (Same pattern as App.jsx's CollapsedNavTrigger.)
+  // is no "@" fragment to strip on pick, so leave mentionAtRef at -1. Stamp the
+  // open time: the "+" dropdown's teardown (focus restore + outside-pointer
+  // detection) fires just after this and the picker popover reads it as an
+  // outside interaction — the onOpenChange guard below ignores any dismiss within
+  // a short grace window so the picker doesn't flicker shut.
   const scopeOpenedAt = useRef(0)
   const openScopePicker = useCallback(() => {
     if (!canMention) return
@@ -481,8 +324,7 @@ export function ChatInput({
   }, [canMention])
 
   // Dismiss the picker WITHOUT choosing: strip the "@" (and any query typed after
-  // it in the textarea) that triggered it, close, and refocus the composer. Fired
-  // by Backspace on the empty picker search — so one keypress undoes the "@".
+  // it) that triggered it, close, and refocus the composer.
   const dismissMention = useCallback(() => {
     const at = mentionAtRef.current
     if (at >= 0) {
@@ -495,23 +337,97 @@ export function ChatInput({
     requestAnimationFrame(() => ref.current?.focus())
   }, [text, mentionQuery])
 
+  // Whether the text needs the multiline shape, without reading the live textarea
+  // (the two shapes give different widths, so that would oscillate): an
+  // off-screen mirror's single-line width vs the narrow row's. Returns, does not
+  // apply.
+  const shapeFor = useCallback((value) => {
+    const row = rowRef.current
+    const mirror = mirrorRef.current
+    if (!row || !mirror) return false
+    // A newline decides it before the mirror is touched.
+    if (value.includes("\n")) return true
+    if (!value) return false
+    if (value.length > MEASURE_CHARS) return true
+    mirror.textContent = value
+    // Button widths and the gap are read from the DOM (present in both shapes).
+    const gap = parseFloat(getComputedStyle(row).columnGap) || 0
+    const reserve =
+      (plusRef.current?.offsetWidth || 0) +
+      (sendRef.current?.offsetWidth || 0) +
+      gap * 2
+    // Clamped at 0 so an empty composer in a very narrow column stays one row.
+    const available = Math.max(row.clientWidth - reserve, 0)
+    return mirror.offsetWidth > available
+  }, [])
+
   const grow = useCallback(() => {
     const el = ref.current
     if (!el) return
+    // The cap is the CSS class's (max-h-48).
+    const cap = parseFloat(getComputedStyle(el).maxHeight) || Infinity
+    // FLIP: measure at height:auto with the transition off, restore the settled
+    // height, flush, then animate to the new one.
+    const previous = settledHeightRef.current
+    el.style.transition = "none"
     el.style.height = "auto"
-    el.style.height = `${Math.min(el.scrollHeight, MAX_HEIGHT)}px`
+    const next = `${Math.min(el.scrollHeight, cap)}px`
+    settledHeightRef.current = next
+    const instant = instantRef.current || prefersReducedMotion()
+    instantRef.current = false
+    if (!previous || previous === next || instant) {
+      el.style.height = next
+      if (!instant) el.style.transition = HEIGHT_TRANSITION
+      return
+    }
+    el.style.height = previous
+    void el.offsetHeight // forces the restored height to take effect first
+    el.style.transition = HEIGHT_TRANSITION
+    el.style.height = next
   }, [])
 
-  // LAYOUT effect, deliberately: the composer must collapse back to one row
-  // in the SAME frame the send clears the draft — ChatThread's new-turn pin
-  // runs in the parent's layout effect and measures the transcript viewport,
-  // so a post-paint resize (plain useEffect) leaves it measuring against the
-  // still-tall composer and the pin falls short for multi-line messages. Child
-  // layout effects run before the parent's, which is exactly the ordering the
-  // pin relies on. (Also removes the one-frame flash of a tall empty composer.)
+  // LAYOUT effect so the height is right before paint. The shape is applied first
+  // and growth deferred to the next pass (same frame), because `grow` measures at
+  // the width the shape decides. `asking` is a dependency because the textarea
+  // remounts after an ask; `datasetScope` because the chip moves the "+" slot's
+  // width and forces/releases the two-line shape.
   useLayoutEffect(() => {
+    textRef.current = text
+    if (asking) return
+    const next = shapeFor(text)
+    if (next !== multiline) {
+      setMultiline(next)
+      // After a send the box is empty — one line in either shape — so collapse
+      // NOW: ChatThread's new-turn pin measures in this same commit, before
+      // the shape's re-render lands.
+      if (!instantRef.current) return
+    }
     grow()
-  }, [text, grow])
+  }, [text, multiline, asking, datasetScope, shapeFor, grow])
+
+  // Re-decide the shape when the row's width changes. A callback ref because the
+  // row unmounts with every ask.
+  const setRowEl = useCallback(
+    (el) => {
+      rowRef.current = el
+      rowRoRef.current?.disconnect()
+      rowRoRef.current = null
+      lastWidthRef.current = 0
+      if (!el || typeof ResizeObserver === "undefined") return
+      rowRoRef.current = new ResizeObserver(() => {
+        // Width only: height changes every wrap and transition frame, and
+        // reacting would force layouts and "ResizeObserver loop" errors.
+        const width = el.clientWidth
+        if (width === lastWidthRef.current) return
+        lastWidthRef.current = width
+        setMultiline(shapeFor(textRef.current))
+      })
+      rowRoRef.current.observe(el)
+    },
+    [shapeFor]
+  )
+
+  useEffect(() => () => rowRoRef.current?.disconnect(), [])
 
   useEffect(() => {
     if (autoFocus && ref.current && !isStreaming) ref.current.focus()
@@ -565,12 +481,23 @@ export function ChatInput({
   const send = useCallback(() => {
     const t = text.trim()
     if (!t || disabled || isStreaming) return
+    // The runtime refuses a new turn while compacting; keep the text.
+    if (compacting) {
+      toast.message("This Conversation Is Being Compacted", {
+        description: "It takes a few seconds — send again once it finishes.",
+      })
+      return
+    }
+    instantRef.current = true
     onSend(t)
     setText("")
-  }, [text, disabled, isStreaming, onSend])
+  }, [text, disabled, isStreaming, compacting, onSend])
 
   const onKeyDown = useCallback(
     (e) => {
+      // An IME composition owns Enter (isComposing, or keyCode 229 on legacy
+      // engines).
+      if (e.nativeEvent?.isComposing || e.keyCode === 229) return
       // While the @-mention picker is open, let it own the keys (arrows/Enter to
       // choose, Escape to dismiss) instead of sending the message.
       if (mentionOpen) {
@@ -585,152 +512,191 @@ export function ChatInput({
       }
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault()
-        if (isStreaming) onStop?.()
-        else send()
+        // Enter on an empty box mid-run stops; with text it waits for the run.
+        if (isStreaming) {
+          if (!text.trim()) onStop?.()
+        } else {
+          send()
+        }
       }
     },
-    [isStreaming, onStop, send, mentionOpen]
+    [isStreaming, onStop, send, text, mentionOpen]
   )
 
   const canSend = text.trim().length > 0 && !disabled && !isStreaming
 
-  // When the agent has paused to ask clarifying questions, the composer becomes
-  // the QA form (a natural vertical expansion of the input) — the textarea/toolbar
-  // are hidden until the user submits, which resumes the agent.
-  const asking = Boolean(pendingAsk && pendingAsk.questions?.length && onAnswer)
+  const policy = policyOf(features)
+  const sql = sqlOn(features)
 
-  // The composer card is bordered in BOTH modes: on the near-white page
-  // (#FCFCFB) the white fill + shadow no longer separate it on their own, so
-  // the border carries the edge (dark mode always needed it). In DARK mode
-  // the fill is one step lighter than --card — the same effective color as
-  // Browse's file-tree pane (bg-muted/40 over the card), mixed from the
-  // tokens so it tracks theme changes — which lifts the composer off the
-  // transcript surface.
+  // Bordered in both modes: on the near-white page the fill + shadow alone don't
+  // separate it, so --edge carries the boundary. In DARK mode the fill is one step
+  // lighter than --card (mixed from the tokens), which lifts it off the transcript.
   return (
-    <div className="flex flex-col gap-2 rounded-2xl border border-edge bg-card px-4 py-3 shadow-sm dark:bg-[color-mix(in_oklch,var(--muted)_40%,var(--card))]">
-      {asking ? (
-        <AskHumanForm
-          questions={pendingAsk.questions}
-          onSubmit={onAnswer}
-          disabled={isStreaming}
-        />
-      ) : (
-        <>
-      {leftSlot ? (
-        <div className="flex flex-wrap items-center gap-1.5">{leftSlot}</div>
-      ) : null}
-
-      {/* The textarea, wrapped in a Popover anchored to it so the @-mention
-          dataset picker floats above the composer. The Command inside autofocuses
-          + filters as the user keeps typing; picking sets the scope. */}
-      <Popover
-        open={mentionOpen && canMention}
-        onOpenChange={(o) => {
-          if (!o) {
-            // Ignore the transient dismiss that fires right after opening from
-            // the "+" menu: the dropdown's teardown (focus restore + outside-
-            // pointer detection) reads as an outside interaction and would close
-            // the picker within a few hundred ms. A short grace window after a
-            // programmatic open swallows it; real dismisses arrive later.
-            if (performance.now() - scopeOpenedAt.current < 500) return
-            setMentionOpen(false)
-            mentionAtRef.current = -1
-          }
-        }}
+    <div className="flex flex-col gap-1.5">
+      <div
+        className={cn(
+          "relative border border-edge bg-card px-2 shadow-sm dark:bg-[color-mix(in_oklch,var(--muted)_40%,var(--card))]",
+          // See MOVE_MS.
+          CARD_TRANSITION,
+          // Slimmer and squarer at rest; the radius opens up with the box.
+          twoLine || asking ? "rounded-2xl py-2.5" : "rounded-xl py-1.5"
+        )}
       >
-        <PopoverAnchor asChild>
-          <textarea
-            ref={ref}
-            rows={1}
-            value={text}
-            onChange={onTextChange}
-            onKeyDown={onKeyDown}
-            disabled={disabled}
-            placeholder={isStreaming ? "Streaming response…" : placeholder}
-            className={cn(
-              "okf-thin-scroll max-h-48 min-h-6 w-full resize-none bg-transparent text-sm outline-none",
-              "placeholder:text-muted-foreground"
-            )}
-            aria-label="Chat message input"
-          />
-        </PopoverAnchor>
-        <PopoverContent align="start" side="top" className="w-72 p-0">
-          {/* CommandInput autofocuses so the user types into the filter. */}
-          <DatasetMentionList
-            datasets={datasets}
-            onPick={pickDataset}
-            onBackspaceEmpty={dismissMention}
-          />
-        </PopoverContent>
-      </Popover>
-
-      <div className="flex items-center gap-1">
-        {onFeaturesChange || offerScope ? (
-          <AddFeatureMenu
-            enabled={enabledFeatures}
-            onToggle={addFeature}
-            onPickPolicy={pickPolicy}
-            canScope={offerScope}
-            onScope={openScopePicker}
-          />
-        ) : null}
-        <EffortSetting
-          effort={effort}
-          efforts={efforts}
-          onChange={onEffortChange}
-        />
-        {/* Dataset scope chip — the active @-mention, removable. */}
-        {datasetScope ? (
-          <DatasetScopeChip
-            scope={datasetScope}
-            onRemove={() => onScopeChange?.(null)}
-          />
-        ) : null}
-        {/* Enabled-feature chips (Sparky-style) — sit just after the controls;
-            each shows an × on hover to disable. Only known+available ids render. */}
-        {enabledFeatures.length > 0 ? (
-          <div className="flex flex-wrap items-center gap-1">
-            {enabledFeatures.map((id) => {
-              const feature = featureById(id)
-              if (!feature || !feature.available) return null
-              return (
-                <FeatureChip
-                  key={id}
-                  feature={feature}
-                  onRemove={() => removeFeature(id)}
-                />
-              )
-            })}
+        {asking ? (
+          <div className="px-2">
+            <AskHumanForm
+              questions={pendingAsk.questions}
+              onSubmit={onAnswer}
+              disabled={isStreaming}
+            />
           </div>
-        ) : null}
-        <div className="ml-auto">
-          {isStreaming ? (
-            <Button
-              type="button"
-              size="icon"
-              variant="outline"
-              className="size-8"
-              onClick={() => onStop?.()}
-              aria-label="Stop"
+        ) : (
+          // One row in both shapes, same DOM nodes: two-line is the field taking
+          // `basis-full order-first`, wrapping the buttons below. Moving nodes
+          // between containers would remount them (losing the caret), so only
+          // classes change.
+          <div
+            ref={setRowEl}
+            // No row gap: wrapped, the buttons' own padding is the space under
+            // the text.
+            className="flex flex-wrap items-center gap-x-2 gap-y-0"
+          >
+            {/* The shape mirror (see shapeFor); inside the row to inherit its font. */}
+            <span
+              ref={mirrorRef}
+              aria-hidden="true"
+              className="pointer-events-none invisible absolute -z-10 text-sm whitespace-pre"
+            />
+
+            <div ref={plusRef} className="flex shrink-0 items-center gap-1.5">
+              {offerScope ? <AddMenu onScope={openScopePicker} /> : null}
+              {datasetScope ? (
+                <DatasetScopeChip
+                  scope={datasetScope}
+                  onRemove={() => onScopeChange?.(null)}
+                />
+              ) : null}
+            </div>
+
+            {/* The field, wrapped in a Popover anchored to it so the @-mention
+                dataset picker floats above the composer. */}
+            <Popover
+              open={mentionOpen && canMention}
+              onOpenChange={(o) => {
+                if (!o) {
+                  // Ignore the transient dismiss that fires right after opening
+                  // from the "+" menu (its teardown reads as an outside
+                  // interaction); real dismisses arrive later.
+                  if (performance.now() - scopeOpenedAt.current < 500) return
+                  setMentionOpen(false)
+                  mentionAtRef.current = -1
+                }
+              }}
             >
-              <SquareIcon className="size-3.5 fill-current" />
-            </Button>
-          ) : (
-            <Button
-              type="button"
-              size="icon"
-              className="size-8"
-              onClick={send}
-              disabled={!canSend}
-              aria-label="Send"
-            >
-              <ArrowUpIcon className="size-4" />
-            </Button>
-          )}
+              <PopoverAnchor asChild>
+                <div
+                  className={cn(
+                    "relative flex items-start",
+                    twoLine ? "order-first basis-full px-1" : "min-w-0 flex-1",
+                    // A lone field (no "+") still wants a little inset.
+                    !twoLine && !offerScope && "pl-1"
+                  )}
+                >
+                  <textarea
+                    ref={ref}
+                    rows={1}
+                    value={text}
+                    onChange={onTextChange}
+                    onKeyDown={onKeyDown}
+                    disabled={disabled}
+                    placeholder={
+                      isStreaming ? "Streaming response…" : placeholder
+                    }
+                    className={cn(
+                      "okf-thin-scroll max-h-48 min-h-6 min-w-0 flex-1 resize-none bg-transparent text-sm outline-none",
+                      // leading-6 matches min-h-6 so the text centres against the
+                      // buttons (the default line-height sits it 2px high).
+                      "leading-6 placeholder:text-muted-foreground"
+                    )}
+                    aria-label="Chat message input"
+                  />
+                </div>
+              </PopoverAnchor>
+              <PopoverContent
+                align="start"
+                side="top"
+                className="w-72 gap-0 p-0"
+              >
+                <DatasetMentionList
+                  datasets={datasets}
+                  onPick={pickDataset}
+                  onBackspaceEmpty={dismissMention}
+                />
+              </PopoverContent>
+            </Popover>
+
+            <div ref={sendRef} className="ml-auto flex shrink-0 items-center">
+              {/* Ghost, neutral foreground; disabled send stays visibly muted. */}
+              {isStreaming ? (
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="size-8 text-foreground hover:bg-foreground/5 hover:text-foreground"
+                  onClick={() => onStop?.()}
+                  aria-label="Stop"
+                >
+                  <SquareIcon className="size-4" />
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="size-8 text-foreground hover:bg-foreground/5 hover:text-foreground disabled:text-muted-foreground"
+                  onClick={send}
+                  disabled={!canSend}
+                  aria-label="Send"
+                >
+                  <CornerDownRightIcon className="size-4" />
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* The row under the card: run settings. It stays during an ask so the
+          composer reads as opened into a question, not replaced. */}
+      <div className="flex items-center justify-between gap-3 px-1">
+        <div className="flex min-w-0 items-center gap-1">
+          {POLICY_CHECK_ENABLED && onFeaturesChange ? (
+            <GuardrailsSetting
+              value={policy}
+              onChange={(id) => onFeaturesChange(withPolicy(features, id))}
+              inactive={Boolean(policy) && !(SQL_AVAILABLE && sql)}
+            />
+          ) : null}
+          {SQL_AVAILABLE && onFeaturesChange ? (
+            <SqlSwitch
+              checked={sql}
+              onChange={(on) => onFeaturesChange(withSql(features, on))}
+            />
+          ) : null}
+        </div>
+        <div className="flex items-center gap-0.5">
+          <ModelEffortSetting
+            model={model}
+            modelGroups={modelGroups}
+            lockedFamily={lockedFamily}
+            onModelChange={onModelChange}
+            effort={effort}
+            efforts={efforts}
+            onEffortChange={onEffortChange}
+          />
+          {contextSlot}
         </div>
       </div>
-        </>
-      )}
     </div>
   )
 }

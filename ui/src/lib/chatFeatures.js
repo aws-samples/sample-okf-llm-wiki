@@ -1,108 +1,99 @@
-// Optional chat capabilities the user can toggle per conversation from the
-// composer's "+" menu (Sparky-style: enable canvas/browser/etc).
+// Per-conversation chat run settings, set from the row under the composer:
 //
-// Two kinds of entry:
-// - flat features (SQL) — one menu row, one chip, one id.
-// - the GUARDRAILS field (internal ids still `policy:*` — the server
-//   contract) — a submenu with three mutually-exclusive options
-//   (Computational / Behavioural / Strict = both), each its own feature id.
-//   It REQUIRES the SQL feature: the menu disables it while SQL is off, and
-//   removing the SQL chip also removes the guardrails chip. The server
-//   enforces the same dependency independently (normalize_features drops
-//   orphaned policy:* values), so this is UX gating, not a security boundary.
+// - SQL — a switch. On adds the `sql` feature id (the agent gets read-only SQL
+//   against the live source data). Offered only when the deployment enables it.
+// - GUARDRAILS — a selector of four: Disabled, or one of three mutually
+//   exclusive check modes (internal ids `policy:*` — the server contract):
+//   Computational / Behavioural / Strict (= both). Always selectable, SQL on or
+//   off: the checks judge SQL conduct, so the RUNTIME ignores the selection
+//   while SQL is off (normalize_features). That is the boundary — the UI no
+//   longer cascades SQL-off into dropping the guardrail choice.
 //
-// A feature is only OFFERED when it's deploy-enabled (a VITE flag baked from the
-// Terraform output). The server re-checks both the deploy flag AND the per-run
-// opt-in.
+// Both ride the run's `features` array, e.g. ["sql", "policy:strict"]; the server
+// re-checks the deploy flags AND the per-run opt-in.
 
-import { DatabaseIcon, Layers2Icon, PiIcon, RouteIcon } from "lucide-react"
+import { Layers2Icon, PiIcon, RouteIcon, ShieldOffIcon } from "lucide-react"
 
 // Vite inlines import.meta.env.* at build time. "true" (string) when the compute
 // stack was deployed with var.enable_chat_sql = true.
-const SQL_ENABLED =
+export const SQL_AVAILABLE =
   String(import.meta.env.VITE_CHAT_SQL_ENABLED || "") === "true"
 
-// Display gate for everything policy: the composer's Policy field AND the
+// Display gate for everything policy: the composer's Guardrails selector AND the
 // Reasoning page. The runtime's OKF_CHAT_POLICY_CHECK_ENABLED is the real
 // boundary. Default ON; set VITE_CHAT_POLICY_CHECK=false to hide both.
 export const POLICY_CHECK_ENABLED =
   String(import.meta.env.VITE_CHAT_POLICY_CHECK ?? "true") !== "false"
 
-// The full catalog of flat features, each with how it presents in the "+" menu
-// and as an enabled chip. `available` gates whether it's offered at all.
-export const CHAT_FEATURES = [
-  {
-    id: "sql",
-    label: "SQL",
-    // Shown in the "+" menu row.
-    menuLabel: "Query with SQL",
-    // The backend is picked per conversation: Athena over the catalog by
-    // default; the @-mentioned dataset's Redshift when it's Redshift-backed.
-    description: "Run read-only SQL against the live source data",
-    icon: DatabaseIcon,
-    available: SQL_ENABLED,
-  },
-]
-
-// The Policy field's side options — mutually exclusive (picking one replaces
-// the current one). Each lands as its own chip next to the SQL chip.
+export const SQL_FEATURE = "sql"
 export const POLICY_PREFIX = "policy:"
-export const POLICY_AVAILABLE = SQL_ENABLED && POLICY_CHECK_ENABLED
+
+// The three check modes — mutually exclusive (picking one replaces the current).
 export const POLICY_OPTIONS = [
   {
     id: "policy:computational",
     label: "Computational",
     description: "Judge each SQL query",
     icon: PiIcon,
-    available: POLICY_AVAILABLE,
   },
   {
     id: "policy:behavioural",
     label: "Behavioural",
     description: "Judge the agent's steps",
     icon: RouteIcon,
-    available: POLICY_AVAILABLE,
   },
   {
     id: "policy:strict",
     label: "Strict",
     description: "Both checks",
     icon: Layers2Icon,
-    available: POLICY_AVAILABLE,
   },
 ]
+
+// The selector's options: Disabled (no policy id) first, then the modes.
+export const GUARDRAIL_DISABLED = {
+  id: null,
+  label: "Disabled",
+  description: "No guardrail checks",
+  icon: ShieldOffIcon,
+}
+export const GUARDRAIL_OPTIONS = [GUARDRAIL_DISABLED, ...POLICY_OPTIONS]
 
 export function isPolicyId(id) {
   return typeof id === "string" && id.startsWith(POLICY_PREFIX)
 }
 
-// The flat features actually offered in this deployment (available === true).
-export const AVAILABLE_FEATURES = CHAT_FEATURES.filter((f) => f.available)
+// The active guardrail mode's id, or null (Disabled).
+export function policyOf(features) {
+  return (features || []).find(isPolicyId) ?? null
+}
 
-// Any feature offered at all? (Hides the "+" button entirely when none are.)
-export const HAS_FEATURES = AVAILABLE_FEATURES.length > 0
+// `features` with the guardrail mode set to `id` (null = Disabled).
+export function withPolicy(features, id) {
+  const rest = (features || []).filter((f) => !isPolicyId(f))
+  return id ? [...rest, id] : rest
+}
 
-const BY_ID = new Map(
-  [...CHAT_FEATURES, ...POLICY_OPTIONS].map((f) => [f.id, f])
-)
+export function sqlOn(features) {
+  return (features || []).includes(SQL_FEATURE)
+}
 
-export function featureById(id) {
-  return BY_ID.get(id) || null
+// `features` with SQL switched on/off; the guardrail choice is kept either way.
+export function withSql(features, on) {
+  const rest = (features || []).filter((f) => f !== SQL_FEATURE)
+  return on ? [SQL_FEATURE, ...rest] : rest
 }
 
 // -- persisted feature preference (the enabled set for the next new chat) -----
-// Mirrors chatModels.js's effort-pref persistence, so a user who always wants SQL
-// gets it on new chats without re-toggling. Only known+available ids survive, the
-// policy→SQL dependency is re-enforced, and at most ONE policy:* is kept (the
-// last one — the options are mutually exclusive).
+// Only known + offered ids survive, and at most ONE policy:* is kept (the last
+// one — the modes are mutually exclusive).
 const PREF_KEY = "okf.chat.featuresPref"
 
 export function sanitizeFeatures(ids) {
-  const known = new Set(
-    [...AVAILABLE_FEATURES, ...POLICY_OPTIONS.filter((o) => o.available)].map(
-      (f) => f.id
-    )
-  )
+  const known = new Set([
+    ...(SQL_AVAILABLE ? [SQL_FEATURE] : []),
+    ...(POLICY_CHECK_ENABLED ? POLICY_OPTIONS.map((o) => o.id) : []),
+  ])
   const seen = new Set()
   let out = []
   for (const id of ids || []) {
@@ -111,8 +102,6 @@ export function sanitizeFeatures(ids) {
       out.push(id)
     }
   }
-  // Policy requires SQL; and only one policy option can be active.
-  if (!out.includes("sql")) out = out.filter((id) => !isPolicyId(id))
   const policies = out.filter(isPolicyId)
   if (policies.length > 1) {
     const keep = policies[policies.length - 1]

@@ -55,16 +55,23 @@ def test_from_env_defaults():
     ]
 
 
-def test_chat_without_catalog_override_only_offers_opus_5_5():
+def test_chat_without_catalog_override_offers_the_harvest_models():
     env = _env()
     env.pop("OKF_CHAT_MODEL_CATALOG")
     cfg = ChatConfig.from_env(env)
+    # Opus 5.5 stays the default ...
     assert cfg.resolve_model_effort(None, None) == (
         "global.anthropic.claude-opus-5-5", "high"
     )
-    for variant in ("astra", "sol", "luna"):
-        with pytest.raises(ModelCatalogError):
-            cfg.resolve_model_effort(f"global.openai.gpt-6-{variant}", "high")
+    # ... and the fallback mirrors var.chat_model_catalog's 8 models.
+    for model in (
+        "global.anthropic.claude-sonnet-5-5",
+        "global.openai.gpt-6.1-sol",
+        "global.openai.gpt-6-luna",
+    ):
+        assert cfg.resolve_model_effort(model, "high") == (model, "high")
+    with pytest.raises(ModelCatalogError):
+        cfg.resolve_model_effort("global.openai.gpt-6-sol", "high")  # retired
 
 
 def test_from_env_sql_flag_and_athena():

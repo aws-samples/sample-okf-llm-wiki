@@ -231,11 +231,14 @@ resolved, not an open risk.
 
 ## 6. Model configuration
 
-Requirement: pick model (Opus 4.8 / GPT-6.1 Sol) + effort like harvest does, but
-**model is pinned per conversation** — switching model **starts a new thread**,
-because Opus and GPT checkpoints are **not portable** (provider-specific thinking
-signatures + tool/reasoning content formats; resuming across providers makes the
-new provider's API reject the stored history).
+Requirement: pick model + effort like harvest does (the chat catalog offers the
+harvest catalog's models), but a conversation is **pinned to a provider family**:
+Claude↔Claude or GPT↔GPT switch in place mid-conversation, while crossing
+providers needs a new chat, because Converse and Responses-API checkpoints are
+**not portable** (provider-specific thinking signatures + tool/reasoning content
+formats; the other provider's API rejects the stored history). Same-family replay
+was verified live 2026-10-04: Opus 5.5 history with `reasoning_content` blocks
+continued on Sonnet 5.5, and GPT-6.1 Sol on GPT-6 Luna.
 
 ### 6.1 Reuse + extract
 
@@ -270,12 +273,66 @@ harvest's `local.*_openai_enabled` pattern (`infra/compute/agentcore_iam.tf:14`)
 
 ### 6.4 Pinning
 
-The model/effort travel in `forwardedProps` on the **first** run of a thread. The
-graph stamps them into the checkpoint state (like harvest stamps model/effort onto
-its status row at the `running` transition). On subsequent runs of the same thread
-the pinned model is read from state and the client-sent value is ignored. The UI
-locks the model picker once a thread has messages and offers "new chat to change
-model" (§10).
+Every fresh turn stamps its model into checkpointed state (`okf_model`, carried by
+`chat.compaction.CompactionMiddleware`'s state schema). Before a turn runs, the
+runtime compares the requested model's family with the pinned one
+(`chat.compaction.model_family`) and refuses a cross-family request with an
+`agent_error`-style chunk, `error_code: "model_family_locked"`, then `end`. Threads
+from before the pin carry no `okf_model` but have messages; they count as Claude
+(the UI only ever sent Opus 5.5). The UI limits a started conversation's picker to
+its family, and `get_session_history` returns the pinned `model` so a reload
+restores it.
+
+### 6.5 Context gauge + compaction
+
+The transcript the UI re-renders IS the checkpointed `messages` list, so
+compaction never removes messages. A compaction stores a summary and the id of
+the last message it covers (`okf_compaction`); `CompactionMiddleware` rewrites
+every model request to `[summary] + messages after that id`. Records for the UI's
+dividers live in `okf_compactions`; the last measured context in `okf_context`.
+
+- **Measurement**: each model call's `input_tokens` (`langchain-aws` and the
+  Responses API already include cached tokens) vs `okf_aws.model_factory.context_window`
+  (1M for every catalog Claude; GPT from its profile).
+- **Auto**: `before_model` compacts when the next request's ESTIMATE — the last
+  reading plus an approximate count of everything appended since (tool results,
+  the reply) — crosses the threshold (Sentry's rule: 95% of the window, lowered
+  to keep ≥30K headroom, never below 50%; `OKF_CHAT_COMPACT_TRIGGER` overrides
+  the fraction). It keeps ~10% of the window verbatim, cutting at a user turn or
+  an assistant step (never orphaning a tool result, never ending on a strippable
+  per-turn memory recall). A request the provider still rejects as too long is
+  compacted and retried once (`wrap_model_call`; persisted by the next
+  `after_model`). A failed summary logs and continues uncompacted.
+- The once-per-thread personal memory context (`okf_memory: "personal"`) is never
+  summarized: the compacted view keeps it verbatim ahead of the summary.
+- The summarizer call is tagged `nostream`: it runs inside the agent graph's
+  callback context, and untagged its tokens would stream to the user as the
+  agent's answer.
+- **Manual**: the `compact` type (below) covers the whole conversation.
+- The summary runs on the conversation's own model at effort `low`, over a
+  provider-neutral text transcript (reasoning blocks dropped, tool results capped
+  at 2,000 chars), folding any previous summary in.
+
+**SSE additions**: `{"type":"context","context":CTX}` after a model call whose
+reading changed; `{"type":"compaction","compaction":COMP}` when an auto compaction
+ran mid-turn; the end chunk carries `"context": CTX`. **History additions**:
+`get_session_history` returns `context` (CTX or null), `compactions` ([COMP]) and
+`model` (the pinned id or null).
+
+**`compact` request** (non-streaming, like `stop`): `{"input":{"type":"compact"}}` →
+`{"type":"compact","compacted":true,"compaction":COMP,"context":CTX}`, or
+`{"compacted":false,"reason":"busy"|"awaiting_answer"|"nothing_to_compact"|"error","message":…}`.
+Refused while a run streams or another compaction runs (`busy`; the check-and-
+claim is atomic) or while paused on `ask_human` (`awaiting_answer`); a `send` during a compaction gets an `error_code: "compacting"`
+stream error. The state is written `as_node="CompactionMiddleware.after_model"`, so
+a normally-ended turn keeps no pending next step (a stop-reconciled one may show
+`model` pending — harmless: nothing reads it and every send starts from START).
+
+- CTX = `{tokens, window, percent (0-100), threshold, model, compactions (count)}`
+- COMP = `{source: "manual"|"auto", turn (index into the history turns), phase:
+  "after" (divider below that turn) | "during" (inside it), pre_tokens, post_tokens}`
+  (`post_tokens` is an estimate: measured overhead + an approximate count of the
+  compacted view).
 
 ---
 

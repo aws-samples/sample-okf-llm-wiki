@@ -657,72 +657,103 @@
     opacity 0.18s linear;
 }
 
-/* Reasoning-effort slider — dotted track + a larger round thumb (the "Faster ↔
-   Smarter" control in the chat composer's Effort popover). Overrides the shadcn
-   Slider's thin bar: the track becomes a taller pill with a repeating-dot mask so
-   it reads as a dotted field; the filled range keeps the primary tint; the thumb
-   is a white puck. Scoped to `.okf-effort-slider` so no other slider is touched. */
+/* Reasoning-effort slider (the chat composer's model · effort popover; structure
+   ported from Sentry): a dotted pill track, a fill clipped at a slim bar thumb,
+   and a plain light-grey bar for the thumb.
+   OUR colours: the fill is the brand sky ramp — lighter at Faster, darker at
+   Smarter. SRGB mixes on purpose: white/black carry an explicit oklch hue of 0,
+   and oklch interpolation hue-rotates the sky toward violet. Scoped to
+   `.okf-effort-slider` so no other slider is touched. */
+:root {
+  --okf-meter-from: color-mix(in srgb, var(--primary) 55%, white);
+  --okf-meter-mid: var(--primary);
+  --okf-meter-to: color-mix(in srgb, var(--primary) 62%, black);
+  --okf-meter-dot: color-mix(in oklch, var(--foreground) 30%, transparent);
+  --okf-meter-fill-dot: rgb(255 255 255 / 0.28);
+}
+.dark {
+  --okf-meter-from: color-mix(in srgb, var(--primary) 45%, black);
+  --okf-meter-mid: var(--primary);
+  --okf-meter-to: color-mix(in srgb, var(--primary) 70%, white);
+  --okf-meter-dot: color-mix(in oklch, var(--foreground) 22%, transparent);
+  --okf-meter-fill-dot: rgb(0 0 0 / 0.22);
+}
 .okf-effort-slider [data-slot="slider"] {
   padding: 2px 0;
 }
-/* The TRACK is the UNFILLED base: a plain dotted field, no color. The colored
-   fill only appears where the thumb has passed (the range, below). */
+/* The unfilled base: a faint dotted field, tiled with `space` so only whole dots
+   are drawn (the spare width goes between them, never a dot cut at an edge). */
 .okf-effort-slider [data-slot="slider-track"] {
-  height: 18px !important;
-  border-radius: 6px;
-  background-color: color-mix(in oklch, var(--foreground) 8%, transparent);
+  height: 22px !important;
+  border-radius: 5px;
+  background-color: color-mix(in oklch, var(--foreground) 6%, transparent);
   background-image: radial-gradient(
     circle at center,
-    color-mix(in oklch, var(--foreground) 38%, transparent) 0.9px,
+    var(--okf-meter-dot) 0.9px,
     transparent 1.2px
   );
-  background-size: 6px 6px;
-  background-repeat: repeat;
+  background-size: 7px 7px;
+  background-repeat: space;
 }
-/* The filled RANGE spans start→thumb ONLY (Radix sizes it). It paints the SAME
-   light→dark fade the full track would show, but the linear-gradient layer is
-   sized to calc(100% / frac) so that gradient maps across the WHOLE track — the
-   range (only `frac` wide) reveals just the 0→thumb slice. Result: the fill
-   fades continuously (never a flat block) and only shows up to the thumb.
-   A brighter dot field tiles over it. */
+/* The fill spans the WHOLE track (so its ramp and dot mask map straight across
+   it and the colour at a point never depends on the value) and is clipped just
+   past the bar. The thumb's box is 14px wide, which Radix keeps inside the track,
+   so the box ends at 14px + frac * (100% - 14px) — the clip edge. */
 .okf-effort-slider [data-slot="slider-range"] {
-  --_frac: var(--okf-effort-frac, 1);
-  border-radius: 6px 0 0 6px;
+  right: 0 !important;
+  overflow: hidden;
   background-color: transparent;
-  background-image:
-    radial-gradient(
-      circle at center,
-      rgb(0 0 0 / 0.28) 0.9px,
-      transparent 1.2px
-    ),
-    linear-gradient(
-      to right,
-      /* Faster end = LIGHTER (primary lifted toward white); Smarter end = DARKER
-         (primary pushed toward black). Full opacity — no transparent mix — so the
-         light→dark swing is obvious in BOTH themes (mixing toward white/black,
-         not toward the near-black dark-mode track, is what makes it read).
-         SRGB mixes: white/black carry an explicit oklch hue of 0, and oklch
-         interpolation hue-rotates the sky primary toward violet (the xref
-         pink-card trap). */
-      color-mix(in srgb, var(--primary) 60%, white) 0%,
-      color-mix(in srgb, var(--primary) 70%, white) 30%,
-      var(--primary) 62%,
-      color-mix(in srgb, var(--primary) 62%, black) 100%
-    );
-  background-size:
-    6px 6px,
-    calc(100% / var(--_frac)) 100%;
-  background-position:
-    0 0,
-    left center;
-  background-repeat: repeat, no-repeat;
+  background-image: linear-gradient(
+    to right,
+    var(--okf-meter-from) 0%,
+    var(--okf-meter-mid) 55%,
+    var(--okf-meter-to) 100%
+  );
+  /* A rounded head at every level, with the track's own 5px radius, so any
+     level ends exactly like Max does. The fill tracks the thumb's 14px box (not
+     the 3px bar), giving a constant 5.5px head past the bar that meets the
+     track's end precisely at Max. */
+  clip-path: inset(0 calc((1 - var(--okf-effort-frac, 1)) * (100% - 14px)) 0 0 round 5px);
+}
+/* The fill's own dots on the track's grid, fading out as the colour firms up. */
+.okf-effort-slider [data-slot="slider-range"]::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: radial-gradient(
+    circle at center,
+    var(--okf-meter-fill-dot) 0.9px,
+    transparent 1.2px
+  );
+  background-size: 7px 7px;
+  background-repeat: space;
+  -webkit-mask-image: linear-gradient(to right, #000 0%, #000 35%, transparent 80%);
+  mask-image: linear-gradient(to right, #000 0%, #000 35%, transparent 80%);
 }
 .okf-effort-slider [data-slot="slider-thumb"] {
   height: 22px;
   width: 14px;
-  border-radius: 5px;
-  background-color: #fff;
-  box-shadow: 0 1px 3px rgb(0 0 0 / 0.35);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+/* The slim bar: a plain light grey in both themes — no hover, drag or size
+   effects, no edge. Keyboard focus alone gets a ring (accessibility). */
+.okf-effort-slider [data-slot="slider-thumb"]::before {
+  content: "";
+  position: absolute;
+  top: 5px;
+  bottom: 5px;
+  left: 50%;
+  width: 3px;
+  margin-left: -1.5px;
+  border-radius: 2px;
+  background-color: oklch(0.94 0 0);
+}
+.okf-effort-slider [data-slot="slider-thumb"]:focus-visible::before {
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 55%, transparent);
 }
 
 /* Label-grid table — cells rendered as gapped, zebra-tinted "label" blocks with a
@@ -1008,5 +1039,20 @@
     #000 var(--okf-fade-t),
     #000 calc(100% - var(--okf-fade-b)),
     transparent 100%
+  );
+}
+
+/* One-line text that fades out at its end instead of an ellipsis (FadeText, the
+   timeline panel's rows). Applied only while the text overflows. */
+@utility okf-fade-end {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    #000 calc(100% - var(--okf-fade-inset, 0px) - 1.5rem),
+    transparent calc(100% - var(--okf-fade-inset, 0px))
+  );
+  mask-image: linear-gradient(
+    to right,
+    #000 calc(100% - var(--okf-fade-inset, 0px) - 1.5rem),
+    transparent calc(100% - var(--okf-fade-inset, 0px))
   );
 }

@@ -49,6 +49,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 from typing import Any, AsyncGenerator, Callable
 
 # ``from __future__ import annotations`` turns every annotation into a string,
@@ -62,6 +63,16 @@ except ImportError:  # pragma: no cover
     Request = None  # type: ignore[assignment,misc]
 
 from chat import live_streams
+from chat.compaction import (
+    COMPACTIONS_KEY,
+    CONTEXT_KEY,
+    LEGACY_MODEL,
+    MODEL_KEY,
+    CompactionMiddleware,
+    context_report,
+    model_family,
+    usage_context_tokens,
+)
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -1161,7 +1172,19 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         # AskHumanMiddleware owns the human-in-the-loop interrupt for ask_human.
         # SteeringMiddleware injects derailment <system-reminder>s (repetition /
         # futility — see chat.steering); env kill switch, default on.
-        middleware = [BedrockPromptCachingMiddleware(), AskHumanMiddleware()]
+        # CompactionMiddleware: per-call context measurement, auto compaction
+        # over the threshold, and the compacted model view (chat.compaction).
+        # FIRST, so every inner middleware and the model see the compacted
+        # request; on EVERY graph (the history read's too — its state schema
+        # must carry the okf_* channels). The summary runs on the
+        # conversation's own model at low effort, built only if one fires.
+        middleware = [
+            CompactionMiddleware(
+                model, summarizer=lambda: build_chat_model(chat_config, model, "low")
+            ),
+            BedrockPromptCachingMiddleware(),
+            AskHumanMiddleware(),
+        ]
         # Guardrails-first read gate: read_page on a dataset is DENIED until
         # that dataset's references/usage_guardrails has been read in this
         # thread — tracked per dataset in CHECKPOINTED state, so resumes and
@@ -1387,17 +1410,22 @@ def _add_usage(stats: dict[str, int], u: dict) -> None:
     native langchain_anthropic shape.
     """
     details = u.get("input_token_details", {}) or {}
-    stats["input_tokens"] = stats.get("input_tokens", 0) + (u.get("input_tokens") or 0)
-    stats["output_tokens"] = stats.get("output_tokens", 0) + (
-        u.get("output_tokens") or 0
-    )
-    stats["cache_read_input_tokens"] = stats.get("cache_read_input_tokens", 0) + (
-        details.get("cache_read") or 0
-    )
+    cache_read = int(details.get("cache_read") or 0)
     cache_write = max(
         int(details.get("cache_creation") or 0),
         int(details.get("ephemeral_5m_input_tokens") or 0)
         + int(details.get("ephemeral_1h_input_tokens") or 0),
+    )
+    # ``input_tokens`` is the call's TOTAL input — langchain-aws (and the
+    # Responses API) already fold cache reads/writes into it — so the FRESH
+    # share the UI's usage popover shows next to the cache parts is the rest.
+    fresh = max(0, int(u.get("input_tokens") or 0) - cache_read - cache_write)
+    stats["input_tokens"] = stats.get("input_tokens", 0) + fresh
+    stats["output_tokens"] = stats.get("output_tokens", 0) + (
+        u.get("output_tokens") or 0
+    )
+    stats["cache_read_input_tokens"] = (
+        stats.get("cache_read_input_tokens", 0) + cache_read
     )
     stats["cache_creation_input_tokens"] = (
         stats.get("cache_creation_input_tokens", 0) + cache_write
@@ -1452,7 +1480,112 @@ def read_history(
     pending_ask = _ask_human_chunk_from_state(graph, cfg)
     if pending_ask is not None:
         out["pending_ask"] = pending_ask
+    # The context gauge, the compaction dividers and the pinned model (the
+    # composer limits a started conversation's picker to that model's family).
+    values = (state.values or {}) if state else {}
+    # Threads from before the pin report LEGACY_MODEL — the composer's family
+    # lock must not guess from a saved preference.
+    pinned = values.get(MODEL_KEY) or (LEGACY_MODEL if messages else None)
+    records = list(values.get(COMPACTIONS_KEY) or [])
+    measured = (values.get(CONTEXT_KEY) or {}).get("tokens")
+    out["model"] = pinned
+    out["compactions"] = records
+    out["context"] = context_report(
+        measured, (values.get(CONTEXT_KEY) or {}).get("model") or pinned or "", len(records)
+    ) if measured else None
     return out
+
+
+#: Conversations with a compaction in flight (in-process: AgentCore pins a
+#: session to one container). A send arriving meanwhile is refused. The lock
+#: makes check-and-claim atomic: compact runs in worker threads, so two
+#: requests (a double click, two tabs) could otherwise both pass the check.
+_COMPACTING: set[str] = set()
+_COMPACTING_LOCK = threading.Lock()
+
+
+def compact_history(
+    build_agent: Callable,
+    build_summarizer: Callable[[str], Any],
+    checkpointer: Any,
+    internal_thread_id: str,
+    *,
+    default_model: str,
+) -> dict[str, Any]:
+    """The ``compact`` invocation: summarize the whole conversation so far.
+
+    Never removes messages (the transcript is the checkpoint) — it stores the
+    summary + the last covered message id, which CompactionMiddleware turns
+    into the compacted model view on every later call. Refused while a run is
+    streaming, paused on ask_human, or another compaction is in flight.
+    """
+    from chat.compaction import (
+        COMPACTION_KEY,
+        _approx_tokens,
+        compact_messages,
+        model_view,
+        turn_index_of,
+    )
+
+    def refused(reason: str, message: str) -> dict[str, Any]:
+        return {"type": "compact", "compacted": False, "reason": reason, "message": message}
+
+    with _COMPACTING_LOCK:
+        if live_streams.is_active(internal_thread_id) or internal_thread_id in _COMPACTING:
+            return refused("busy", "Wait for the current response to finish.")
+        _COMPACTING.add(internal_thread_id)
+    try:
+        graph = build_agent(default_model, "high", None, checkpointer)
+        cfg = {"configurable": {"thread_id": internal_thread_id}}
+        state = graph.get_state(cfg)
+        values = (state.values or {}) if state else {}
+        messages = values.get("messages") or []
+        if _ask_human_chunk_from_state(graph, cfg) is not None:
+            return refused("awaiting_answer", "Answer the pending question first.")
+        model = values.get(MODEL_KEY) or default_model
+        current = values.get(COMPACTION_KEY)
+        before = model_view(messages, current)
+        result = compact_messages(
+            build_summarizer(model), messages, current, keep_tokens=0
+        )
+        if result is None:
+            return refused("nothing_to_compact", "Nothing new to compact yet.")
+        compaction, through = result
+        measured = (values.get(CONTEXT_KEY) or {}).get("tokens")
+        # System prompt + tool schemas aren't in the messages: carry the
+        # measured overhead over to the post-compaction estimate.
+        overhead = max(0, (measured or 0) - _approx_tokens(before))
+        post = overhead + _approx_tokens(model_view(messages, compaction))
+        record = {
+            "source": "manual",
+            "turn": turn_index_of(messages, through),
+            "phase": "after",
+            "pre_tokens": int(measured or _approx_tokens(before) + overhead),
+            "post_tokens": int(post),
+        }
+        records = [*(values.get(COMPACTIONS_KEY) or []), record]
+        # Written AS after_model: after a normal turn (final reply without tool
+        # calls) that leaves no pending next step; written as before_model it
+        # would always point at "model". A stop-reconciled turn (trailing
+        # synthetic tool results) can still leave "model" pending — harmless:
+        # nothing reads it, and every send starts a fresh run from START.
+        graph.update_state(
+            cfg,
+            {
+                COMPACTION_KEY: compaction,
+                COMPACTIONS_KEY: records,
+                CONTEXT_KEY: {"tokens": post, "model": model},
+            },
+            as_node="CompactionMiddleware.after_model",
+        )
+        return {
+            "type": "compact",
+            "compacted": True,
+            "compaction": record,
+            "context": context_report(post, model, len(records)),
+        }
+    finally:
+        _COMPACTING.discard(internal_thread_id)
 
 
 def delete_history(checkpointer: Any, internal_thread_id: str) -> dict[str, Any]:
@@ -1524,6 +1657,10 @@ async def _produce_run_chunks(
         "recursion_limit": RECURSION_LIMIT,
     }
     graph = None
+    # The context gauge's state for the end marker (set once the graph runs).
+    model = None
+    last_context: int | None = None
+    compaction_count = 0
     # Assigned in the try below; pre-bound because the finally's memory write
     # references it (the write gate only passes on paths where it WAS set,
     # but a NameError in a finally block would mask the real outcome).
@@ -1537,7 +1674,10 @@ async def _produce_run_chunks(
         # Per-run opted-in optional tools (composer "+" menu). Normalized to the
         # server-recognized subset; the factory further gates each on its deploy
         # flag, so an unknown/forbidden feature string is simply ignored here.
-        features = normalize_features(input_data.get("features"))
+        features = normalize_features(
+            input_data.get("features"),
+            sql_enabled=getattr(chat_config, "sql_enabled", True),
+        )
         # The mid-turn policy checker (None only when the deploy master gate
         # is off). Built for EVERY gated run — an unarmed run's checker just
         # maintains the rolling curated-question chain (prewarm below + the
@@ -1554,22 +1694,6 @@ async def _produce_run_chunks(
             thread_id=client_thread_id,
         )
 
-        # Best-effort conversation-index upsert (sidebar). Only on a fresh turn — a
-        # RESUME must NOT touch the index: its (model, effort) are the defaults (the
-        # answer_human request doesn't carry them), and touch_thread writes those
-        # every turn (SET, not if_not_exists), so writing here would overwrite the
-        # conversation's real pinned model/effort with defaults. After validation so
-        # a rejected (model, effort) never seeds an index row; never fatal.
-        if index_writer is not None and resume_answers is None:
-            index_writer(
-                user_sub=user_sub,
-                thread_id=client_thread_id,
-                title=prompt,
-                model=model,
-                effort=effort,
-                dataset_scope=scope,
-            )
-
         graph = build_agent(
             model,
             effort,
@@ -1580,6 +1704,43 @@ async def _produce_run_chunks(
             policy_checker=checker,
         )
         on_graph(graph)
+
+        # A conversation switches models only within its provider family:
+        # checkpointed reasoning blocks (Converse reasoning_content vs Responses
+        # reasoning items) don't replay on the other provider. Threads from
+        # before the pin carry no okf_model but were all Claude.
+        prior = await asyncio.to_thread(graph.get_state, cfg)
+        prior_values = (prior.values if prior else None) or {}
+        pinned = prior_values.get(MODEL_KEY) or (
+            LEGACY_MODEL if prior_values.get("messages") else None
+        )
+        if pinned and model_family(pinned) != model_family(model):
+            yield _error_chunk(
+                "model_family_locked",
+                "This conversation can only switch between "
+                f"{'GPT' if model_family(pinned) == 'openai' else 'Claude'} "
+                "models — start a new chat to use the other family.",
+            )
+            yield {"end": True}
+            return
+        compaction_count = len(prior_values.get(COMPACTIONS_KEY) or [])
+
+        # Best-effort conversation-index upsert (sidebar). Only on a fresh turn — a
+        # RESUME must NOT touch the index: its (model, effort) are the defaults (the
+        # answer_human request doesn't carry them), and touch_thread writes those
+        # every turn (SET, not if_not_exists), so writing here would overwrite the
+        # conversation's real pinned model/effort with defaults. After validation so
+        # a rejected (model, effort) — or a refused cross-family switch — never
+        # seeds or rewrites an index row; never fatal.
+        if index_writer is not None and resume_answers is None:
+            index_writer(
+                user_sub=user_sub,
+                thread_id=client_thread_id,
+                title=prompt,
+                model=model,
+                effort=effort,
+                dataset_scope=scope,
+            )
 
         # Resume a paused ask_human interrupt with the user's answers, OR start a
         # fresh turn from the user message. Command(resume=…) continues the graph
@@ -1638,7 +1799,8 @@ async def _produce_run_chunks(
             graph_input = {
                 "messages": [
                     {"role": "user", "content": scoped_prompt(prompt, scope)}
-                ]
+                ],
+                MODEL_KEY: model,
             }
             # Long-term memory turn prep (fresh turns only — a resume
             # continues a turn whose context already carries any recall):
@@ -1682,11 +1844,33 @@ async def _produce_run_chunks(
             cfg,
             stream_mode=["messages", "updates"],
         ):
-            # Accumulate token usage from streamed chunks that carry it.
+            # Accumulate token usage from streamed chunks that carry it; each
+            # model call's usage is also the context gauge's reading.
             if mode == "messages":
                 chunk = data[0] if isinstance(data, (list, tuple)) else data
                 if isinstance(chunk, AIMessageChunk) and chunk.usage_metadata:
                     _add_usage(token_stats, chunk.usage_metadata)
+                    measured = usage_context_tokens(chunk.usage_metadata)
+                    if measured and measured != last_context:
+                        last_context = measured
+                        report = context_report(measured, model, compaction_count)
+                        if report:
+                            yield {"type": "context", "context": report}
+            elif mode == "updates" and isinstance(data, dict):
+                # An auto compaction (CompactionMiddleware.before_model) ran.
+                for update in data.values():
+                    records = (
+                        update.get(COMPACTIONS_KEY) if isinstance(update, dict) else None
+                    )
+                    if not records:
+                        continue
+                    compaction_count = len(records)
+                    yield {"type": "compaction", "compaction": records[-1]}
+                    post = (update.get(CONTEXT_KEY) or {}).get("tokens")
+                    report = context_report(post, model, compaction_count)
+                    if report:
+                        last_context = post
+                        yield {"type": "context", "context": report}
 
             produced = process_stream_data(mode, data, scope)
             if not produced:
@@ -1818,6 +2002,10 @@ async def _produce_run_chunks(
     end_marker: dict[str, Any] = {"end": True}
     if token_stats:
         end_marker["token_stats"] = token_stats
+    if graph is not None and last_context:
+        report = context_report(last_context, model, compaction_count)
+        if report:
+            end_marker["context"] = report
     try:
         if graph is not None:
             state = graph.get_state(cfg)
@@ -2118,6 +2306,30 @@ def build_app(
                 )
             return JSONResponse(data, headers=CORS_HEADERS)
 
+        if req_type == "compact":
+            from chat.config import build_chat_model
+
+            try:
+                data = await asyncio.to_thread(
+                    compact_history,
+                    build_agent,
+                    lambda m: build_chat_model(chat_config, m, "low"),
+                    checkpointer,
+                    internal_id,
+                    default_model=chat_config.default_model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(
+                    {
+                        "type": "compact",
+                        "compacted": False,
+                        "reason": "error",
+                        "message": str(exc),
+                    },
+                    headers=CORS_HEADERS,
+                )
+            return JSONResponse(data, headers=CORS_HEADERS)
+
         if req_type == "delete_history":
             try:
                 data = delete_history(checkpointer, internal_id)
@@ -2174,6 +2386,11 @@ def build_app(
         # out-of-sync backend produced phantom empty-prompt replies); reject it.
         if req_type != "send":
             return _stream_error(f"unknown request type: {req_type}", "bad_request")
+        if internal_id in _COMPACTING:
+            return _stream_error(
+                "the conversation is being compacted — try again in a moment",
+                "compacting",
+            )
 
         gen = stream_run(
             input_data,
