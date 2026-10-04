@@ -10,6 +10,7 @@ from control_api import handlers
 from control_api.handlers import ApiError
 from okf_core.session import runtime_session_id
 from tests.conftest import (
+    ANALYSES,
     BUCKET,
     FRESHNESS,
     HARVEST_ARN,
@@ -538,6 +539,75 @@ def test_delete_domain_mapping_purges_bundle_and_freshness(cfg):
     )
 
 
+def test_delete_domain_mapping_purges_analysis_rows(cfg):
+    """The dataset-keyed ANALYSIS# partition goes with the dataset (documents
+    and their publication rows); another dataset's analyses survive."""
+    from okf_core.analyses import analysis_pk, publication_sk
+
+    dd, ds = "sales", "orders"
+    handlers.upsert_domain_mapping(
+        cfg.ddb,
+        registry_table=REGISTRY,
+        data_domain=dd,
+        dataset=ds,
+        glue_database="sales_curated",
+    )
+    for name in ("churn-cohorts", "campaign-roi"):
+        cfg.ddb.put_item(
+            TableName=ANALYSES,
+            Item={
+                "pk": {"S": analysis_pk(dd, ds)},
+                "sk": {"S": name},
+                "owner_sub": {"S": "u1"},
+            },
+        )
+    # A publication row shares the partition — the purge covers it for free.
+    cfg.ddb.put_item(
+        TableName=ANALYSES,
+        Item={
+            "pk": {"S": analysis_pk(dd, ds)},
+            "sk": {"S": publication_sk("churn-cohorts", "rep~sales~orders~20260817T120000Z~aaaa1111")},
+            "report_id": {"S": "rep~sales~orders~20260817T120000Z~aaaa1111"},
+        },
+    )
+    # Survivor: another dataset's analysis.
+    cfg.ddb.put_item(
+        TableName=ANALYSES,
+        Item={
+            "pk": {"S": analysis_pk(dd, "returns")},
+            "sk": {"S": "churn-cohorts"},
+            "owner_sub": {"S": "u1"},
+        },
+    )
+
+    res = handlers.delete_domain_mapping(
+        cfg.ddb,
+        registry_table=REGISTRY,
+        data_domain=dd,
+        dataset=ds,
+        analyses_table=ANALYSES,
+    )
+    assert res["purged_analysis_rows"] == 3  # two docs + one publication
+    scan = cfg.ddb.scan(TableName=ANALYSES)["Items"]
+    assert {(i["pk"]["S"], i["sk"]["S"]) for i in scan} == {
+        (analysis_pk(dd, "returns"), "churn-cohorts"),
+    }
+
+
+def test_delete_domain_mapping_without_analyses_table_skips_analysis_purge(cfg):
+    handlers.upsert_domain_mapping(
+        cfg.ddb,
+        registry_table=REGISTRY,
+        data_domain="sales",
+        dataset="orders",
+        glue_database="sales_curated",
+    )
+    res = handlers.delete_domain_mapping(
+        cfg.ddb, registry_table=REGISTRY, data_domain="sales", dataset="orders"
+    )
+    assert res["purged_analysis_rows"] == 0
+
+
 def test_delete_domain_mapping_refused_while_guardrails_author_runs(cfg):
     # An author finishing mid-delete would re-materialize policy/<d>/<ds>/
     # objects after the purge — deleting takes no lease, so it gates on the
@@ -664,6 +734,7 @@ def test_delete_domain_mapping_idempotent_when_nothing_exists(cfg):
         "purged_bundle_objects": 0,
         "purged_freshness_rows": 0,
         "purged_report_rows": 0,
+        "purged_analysis_rows": 0,
     }
 
 

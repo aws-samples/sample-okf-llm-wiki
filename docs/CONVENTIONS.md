@@ -839,7 +839,7 @@ See `okf_core.embedding`.
 
 ## DynamoDB tables
 
-Four tables (plus the checkpoint table the LangGraph saver owns); names come from
+Five tables (plus the checkpoint table the LangGraph saver owns); names come from
 env vars, with the defaults shown.
 
 ### `okf-registry` — domain registry, harvest status, credentials
@@ -1341,7 +1341,7 @@ panel — these rows are **no longer written or read**; existing ones are inert
 `POLICY#` key helpers stay in `okf_core.chat_threads` so any cleanup tooling
 can still address them.
 
-`okf-chat-checkpoints` is a fifth table owned entirely by
+`okf-chat-checkpoints` is a separate table owned entirely by
 `langgraph-checkpoint-aws`'s `DynamoDBSaver`: `PK` (S, HASH) + `SK` (S, RANGE) —
 UPPERCASE — TTL attribute `ttl` (lowercase, written only when the saver is
 constructed with `ttl_seconds`), no GSI, with checkpoints and pending writes
@@ -1369,6 +1369,15 @@ Iceberg data commits (empty column diff, +1 version) are *absorbed* — the
 new version is recorded without a re-harvest — so this row advances with
 every commit while re-harvests fire only on schema changes; see
 `OKF_INCREMENTAL_ICEBERG_COMMITS`.
+
+### `okf-analyses` — saved analysis procedures + their report publications
+
+Partition key `pk` (S), sort key `sk` (S); no TTL. Keyed by DATASET, not by
+user: `pk = "ANALYSIS#<data_domain>#<dataset>"`, `sk = <name slug>` (the
+document) or `<name>#pub#<report_id>` (a publication). Ownership is an
+attribute (`owner_sub`) enforced by conditional writes, not by the key — any
+signed-in user lists/reads/runs a dataset's analyses. Item shapes and the
+whole contract: [Analyses (saved procedures)](#analyses-saved-procedures).
 
 ### `okf-annotations` — user feedback on the wiki
 
@@ -1849,6 +1858,121 @@ lives in `okf_core/reports.py`.
   chat role holds `s3:PutObject` on `reports/*` only — the wiki stays
   read-only to chat.
 
+## Analyses (saved procedures)
+
+An ANALYSIS is a saved, human-owned procedure document the chat agent
+executes on request: ONE markdown doc whose YAML frontmatter carries `title`,
+`description`, and the prerequisite `questions` — each a VERBATIM `ask_human`
+question object (`{id, prompt, kind: single|multi|text, options}`) with an
+explicit unique id and deliberately NO defaults (an analysis asks, the user
+answers; steps reference answers as `{id}`) — and whose body is Purpose +
+`Grounding` (the wiki concept docs and computations every step traces to —
+the provenance that makes runs repeatable; the executor re-reads them) +
+the numbered steps (ad-hoc SQL embedded as exact ```sql patterns with
+`{id}` placeholders, never improvised intent) plus a `Finalize` section
+(the completion criterion, normally a report). Because the questions ARE the
+`ask_human` payload, validation reuses `chat.ask_human.normalize_questions`,
+the executor forwards unresolved questions in ONE `ask_human` call
+unchanged, and a future headless trigger is the same questions arriving
+pre-answered (`{analysis, answers: {id: answer}}` — `normalize_answers`
+already accepts the mapping).
+
+**Rows (on the `okf-analyses` table, keyed by DATASET):**
+`pk = ANALYSIS#<data_domain>#<dataset>`, `sk = <name slug>` (lowercase /
+digits / hyphen / underscore, ≤64 — `okf_core.analyses`). Attributes: `name,
+data_domain, dataset, title, description, questions (int count), owner_sub,
+created_at, updated_at, version (int), body` (the FULL document, ≤32k chars).
+Any user may list/read/execute a dataset's analyses; **only the recorded
+owner may edit or delete** (owner-conditioned expressions, optimistic-locked
+on `version`). Document validation lives in ONE place —
+`okf_core.analyses.parse_analysis` (shared by the chat tools and the
+Control API's manual edit; the chat side additionally runs the real
+`ask_human` normalizer on top, so the executor payload can't drift).
+Dataset deletion purges the whole `ANALYSIS#` partition (the Control API
+passes `analyses_table` into `delete_domain_mapping`). Rows live in DynamoDB,
+not the bundle: a full harvest re-authors the bundle, and frontmatter
+ownership would be spoofable.
+
+**Chat tools** (`chat/analyses.py`, bound when the analyses table handle + a
+verified subject exist; all in `_LOCATION_TAKING_TOOLS`, and a pinned
+conversation drops the location params from their schemas):
+`list_analyses`, `read_analysis`, `create_analysis(name, body)` (validates
+whole, refuses with named problems), and `update_analysis(name, old_string,
+new_string)` — the Edit-tool contract: `old_string` must match the stored
+doc verbatim and exactly once, the edited doc is re-validated whole and
+version-bumped. **There is deliberately NO agent delete tool** (and no
+`DeleteItem` in the chat role) — deletion is a human act on the Analysis
+page. Methodology rides two vendored skills served by `read_skill`:
+`analysis-authoring` (document shape, question design, the
+computation-first sourcing ladder: Attested Computation → semantic metric →
+ad-hoc SQL last and marked "requires SQL enabled") and `analysis-execution`
+(resolve-then-ask, follow steps as written, deviations reported never
+silent, finalize per the document).
+
+**Publications (the run's durable artifact):** `publish_report(report_id,
+analysis)` — bound only when the deploy has report storage (s3 + bundle
+bucket, the report tools' own gate) — binds a produced report to the
+analysis that produced it: a row in the SAME partition,
+`sk = <name>#pub#<report_id>` (slugs can't contain `#`, so no collision;
+the dataset-deletion partition purge covers publications for free).
+Attributes: `name` (the analysis slug), `data_domain, dataset` (denormalized
+— the cross-dataset Reports listing reads them off the row), `report_id,
+title` (read from the report's own blocks.json — the existence check),
+`analysis_version` (at publish time), `published_by, published_at`. The
+publish is a `TransactWriteItems`: a ConditionCheck asserts the analysis
+DOCUMENT still exists while the Put asserts the publication key is new —
+a plain read-then-put raced the page's delete into orphan rows. The report
+id's embedded domain/dataset must match the analysis's; duplicates are
+refused. Report ARTIFACTS in S3 are untouched either way — the row is the
+pointer that survives chat-thread deletion. `read_analysis` returns
+`published_reports` (re-showable via `present_report`), `list_analyses` a
+per-analysis count; deleting an analysis removes its publication rows. The
+execution skill publishes automatically after the finalize report.
+
+**Control API surface:** `GET /analysis/{domain}/{dataset}/{name}` — the
+chat side panel's read (an analysis tool step's panel affordance opens
+`AnalysisPeek`, the doc-peek clip/PanelShell UX; the analysis tools are all
+in the UI's `NO_RESULT_TOOLS` — the panel, not an inline JSON dump, is the
+viewing surface — and refusals returned as OK-status `Error:`/`{error}`
+results render as failed steps). Server-parsed response (questions + steps
+body + raw `document`, `owned_by_you` from the caller's sub). The
+**Analysis page** (`#/analysis[/<detail-id>]`, a primary sidebar entry; the
+single trailing-id slot is prefix-discriminated — `rep~…` opens a published
+report, `a~<domain>~<dataset>~<name>` an analysis document) has two tabs
+over two cross-dataset lists (both small-table Scans on `okf-analyses`):
+
+- *Analyses* — `GET /analyses` (document rows + per-analysis publication
+  counts, `owned_by_you`). This is where the HUMAN lifecycle lives:
+  `PUT /analysis/{d}/{ds}/{name}` (body `{document, version}`) is the
+  owner-only FULL-document edit — validated with the same
+  `okf_core.analyses.parse_analysis` rules (400 names the problems),
+  optimistic-locked on `version` (409 on a stale edit) — and
+  `DELETE /analysis/{d}/{ds}/{name}` the owner-only delete (purges the
+  analysis's publication rows FIRST, the document row last — a mid-purge
+  failure stays retryable; report artifacts stay).
+- *Reports* — `GET /analysis-reports` (publication rows, newest first),
+  filterable by dataset/analysis client-side; clicking a row renders the
+  report in the main layout via the existing `GET /report/{id}` presigns
+  (shared `ReportBody` iframe + live theme adoption) with a PDF download.
+  In chat, published reports also surface through `read_analysis` →
+  `present_report`.
+
+**Running from chat:** the composer's `+` menu carries "Run An Analysis"
+beside "Scope To A Dataset" (`AnalysisRunDialog`, wired into both the
+welcome and the docked composer; hidden while streaming or while an
+`ask_human` question is pending): a command palette over the saved analyses
+(dataset filter — LOCKED to the pin on a scoped conversation), then the
+picked analysis's questionnaire rendered through the SAME `AskHumanForm`
+the live `ask_human` round uses (the frontmatter questions are the same
+objects), then Run — which sends a composed human prompt (`Run the analysis
+"<name>" on <dd>/<ds>.` + `- <id>: <answer>` lines). The execution skill's
+resolve-from-context step finds every input pre-answered, so the run starts
+without an ask_human round.
+
+**Env + IAM:** `OKF_ANALYSES_TABLE` (chat runtime + Control API). The chat
+role holds `GetItem/PutItem/Query/ConditionCheckItem` on the table (no
+`DeleteItem`); the Control API's shared DynamoDB statement covers it.
+
 ## Long-term chat memory
 
 Per-user memory on **Bedrock AgentCore Memory** (`infra/durable/agent_memory.tf`
@@ -1942,6 +2066,7 @@ USER — never facts about the data (tables/joins/metrics belong to the wiki):
 | `OKF_VECTOR_INDEX` | S3 Vectors index name |
 | `OKF_REGISTRY_TABLE` | DynamoDB registry table (default `okf-registry`) |
 | `OKF_FRESHNESS_TABLE` | DynamoDB freshness table (default `okf-freshness`) |
+| `OKF_ANALYSES_TABLE` | DynamoDB analyses table (default `okf-analyses`) — saved analysis procedures + their report publications; chat runtime + Control API (see [Analyses](#analyses-saved-procedures)) |
 | `OKF_ANNOTATIONS_TABLE` | DynamoDB annotations table (default `okf-annotations`) — user-scoped wiki feedback + the harvest runner's resolution write-back |
 | `OKF_HARVEST_RUNTIME_ARN` | AgentCore harvest runtime ARN |
 | `OKF_ATHENA_OUTPUT` / `OKF_ATHENA_WORKGROUP` | Athena results (glue source) |

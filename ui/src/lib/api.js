@@ -250,6 +250,33 @@ export function makeApi(token) {
         `/bundle/${domain}/${dataset}/computations/${encodeURIComponent(slug)}/unverify`
       ),
 
+    // Analyses (chat-authored procedure docs): the chat side panel's read.
+    // Server-parsed — title/questions/body ride the response, no client YAML.
+    // The Analysis page adds the cross-dataset lists and the HUMAN lifecycle:
+    // full-document edit (owner-only, optimistic-locked on `version`) and
+    // delete (owner-only; the agent deliberately has no delete tool).
+    listAnalysisReports: () => request(token, "GET", "/analysis-reports"),
+    listAnalyses: () => request(token, "GET", "/analyses"),
+    updateAnalysis: (domain, dataset, name, { document, version }) =>
+      request(
+        token,
+        "PUT",
+        `/analysis/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/${encodeURIComponent(name)}`,
+        { document, version }
+      ),
+    deleteAnalysis: (domain, dataset, name) =>
+      request(
+        token,
+        "DELETE",
+        `/analysis/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/${encodeURIComponent(name)}`
+      ),
+    getAnalysis: (domain, dataset, name) =>
+      request(
+        token,
+        "GET",
+        `/analysis/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/${encodeURIComponent(name)}`
+      ),
+
     // Bundle version history (reconstructed server-side from S3 object
     // versions; a version = one completed harvest/repromote). Diff selectors
     // are marker version_ids from listBundleVersions; both optional (default:

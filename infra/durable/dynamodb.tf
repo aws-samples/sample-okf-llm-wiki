@@ -205,6 +205,41 @@ resource "aws_dynamodb_table" "annotations" {
   tags = var.tags
 }
 
+# Analyses: saved, human-owned procedure documents the chat agent executes, plus
+# the publication rows that bind a produced report to its analysis. Keyed by
+# DATASET, not user (pk = "ANALYSIS#<domain>#<dataset>", sk = <name slug> or
+# "<name>#pub#<report_id>"): any signed-in user may list/read/run a dataset's
+# analyses; only the owner recorded on the row may edit or delete — enforced by
+# conditional writes in okf_core.analyses / control_api, not by the key. A
+# dedicated table keeps the Analysis page's cross-dataset Scans off the
+# per-user chat rows. No TTL: an analysis lives until its owner deletes it or
+# its dataset is deleted (delete_domain_mapping purges the partition).
+resource "aws_dynamodb_table" "analyses" {
+  name         = "${var.name_prefix}-analyses"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = local.dynamodb_kms_key_arn
+  }
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  tags = var.tags
+}
+
 # Chat-agent conversation checkpoints. Owned + written by the LangGraph
 # `DynamoDBSaver` (langgraph-checkpoint-aws), NOT by our code — so the KEY SCHEMA
 # is DICTATED BY THAT LIBRARY, not chosen here: partition key `PK` + sort key

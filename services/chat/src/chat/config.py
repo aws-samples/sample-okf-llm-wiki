@@ -182,6 +182,10 @@ class ChatConfig:
     # (dataclass ordering) but always set from OKF_ANNOTATIONS_TABLE in from_env.
     annotations_table: str = "okf-annotations"
 
+    # Analyses (saved, human-owned procedures the agent executes): rows keyed
+    # by DATASET (okf_core.analyses). Always set from OKF_ANALYSES_TABLE.
+    analyses_table: str = "okf-analyses"
+
     # Report authoring (create_report / present_report). The harness path is
     # the chart-render page baked into the image (empty = no Chromium render
     # path: chart blocks are refused; markdown/table/kpi reports still work).
@@ -277,6 +281,7 @@ class ChatConfig:
             vector_index=env["OKF_VECTOR_INDEX"],
             registry_table=env.get("OKF_REGISTRY_TABLE", "okf-registry"),
             annotations_table=env.get("OKF_ANNOTATIONS_TABLE", "okf-annotations"),
+            analyses_table=env.get("OKF_ANALYSES_TABLE", "okf-analyses"),
             report_harness_path=env.get("OKF_CHAT_REPORT_HARNESS_PATH", ""),
             report_max_bytes=int(env.get("OKF_CHAT_REPORT_MAX_BYTES", "") or 8_000_000),
             memory_id=env.get("OKF_CHAT_MEMORY_ID", ""),

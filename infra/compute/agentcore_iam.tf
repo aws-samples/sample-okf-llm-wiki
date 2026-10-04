@@ -488,6 +488,18 @@ data "aws_iam_policy_document" "chat" {
     actions   = ["dynamodb:PutItem"]
     resources = [local.d.annotations_table_arn]
   }
+  # Analyses: list/read/create/update the dataset-keyed procedure docs (update
+  # is a conditional PutItem under an owner + version lock). ConditionCheckItem:
+  # publish_report binds a report to its analysis via a TransactWriteItems
+  # whose ConditionCheck asserts the analysis document still exists.
+  # Deliberately NO DeleteItem — the agent has no delete tool by design
+  # (deletion is a human act through the Control API, which has its own grant);
+  # adding it here would only invite the tool back.
+  statement {
+    sid       = "AnalysesRows"
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query", "dynamodb:ConditionCheckItem"]
+    resources = [local.d.analyses_table_arn]
+  }
 
   statement {
     sid = "BundleBucketRead"

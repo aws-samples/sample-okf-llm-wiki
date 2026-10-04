@@ -17,38 +17,8 @@ import { useEffect, useMemo, useState } from "react"
 import { PanelShell } from "@/components/chat/PanelShell"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
+import { useResolvedTheme } from "@/hooks/useResolvedTheme"
 import { cn } from "@/lib/utils"
-
-// The applied theme, read off <html>'s `dark` class and tracked LIVE with a
-// MutationObserver (ChartFrame's pattern): useTheme() alone can't drive this —
-// its value is often "system", which never changes when the applied class
-// flips. This is what re-themes an ALREADY-OPEN report when the user switches
-// theme (the fix for "close and reopen to re-theme").
-function readResolvedTheme() {
-  if (typeof document === "undefined") return "light"
-  return document.documentElement.classList.contains("dark") ? "dark" : "light"
-}
-
-function useResolvedTheme() {
-  const [theme, setTheme] = useState(readResolvedTheme)
-  useEffect(() => {
-    if (typeof document === "undefined") return undefined
-    const sync = () => setTheme(readResolvedTheme())
-    sync() // catch a flip between initial state + effect attach
-    const obs = new MutationObserver(sync)
-    obs.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    })
-    const mq = window.matchMedia?.("(prefers-color-scheme: dark)")
-    mq?.addEventListener?.("change", sync)
-    return () => {
-      obs.disconnect()
-      mq?.removeEventListener?.("change", sync)
-    }
-  }, [])
-  return theme
-}
 
 // The document region — the report ADOPTS the app theme: the fetched HTML's
 // data-theme switch (set below) selects the composer's dark token set, whose
@@ -57,9 +27,20 @@ function useResolvedTheme() {
 // or rounding. While the panel is being resized the iframe must not see the
 // pointer — an iframe swallows pointermove, which froze shrink-drags dead the
 // moment the cursor crossed into the document.
-function ReportBody({ loading, error, html, title, resizing = false, className }) {
+export function ReportBody({
+  loading,
+  error,
+  html,
+  title,
+  resizing = false,
+  // The Analysis page renders the document directly on the app background
+  // (the injected style makes the report's own body transparent); the chat
+  // panel keeps the seamless card surface.
+  transparent = false,
+  className,
+}) {
   return (
-    <div className={cn("flex flex-col bg-card", className)}>
+    <div className={cn("flex flex-col", !transparent && "bg-card", className)}>
       {loading ? (
         <div className="m-auto flex items-center gap-2 text-sm text-muted-foreground">
           <Spinner />
@@ -81,7 +62,13 @@ function ReportBody({ loading, error, html, title, resizing = false, className }
   )
 }
 
-export function ReportPanel({ api, target, onClose, onResizeStart, resizing = false }) {
+export function ReportPanel({
+  api,
+  target,
+  onClose,
+  onResizeStart,
+  resizing = false,
+}) {
   const [state, setState] = useState({
     loading: true,
     error: null,
@@ -140,7 +127,10 @@ export function ReportPanel({ api, target, onClose, onResizeStart, resizing = fa
   const themedHtml = useMemo(
     () =>
       state.html && theme === "dark"
-        ? state.html.replace('<html lang="en">', '<html lang="en" data-theme="dark">')
+        ? state.html.replace(
+            '<html lang="en">',
+            '<html lang="en" data-theme="dark">'
+          )
         : state.html,
     [state.html, theme]
   )
@@ -155,7 +145,12 @@ export function ReportPanel({ api, target, onClose, onResizeStart, resizing = fa
           {displayTitle}
         </span>
         {state.pdfUrl ? (
-          <Button variant="ghost" size="icon" className="size-7 shrink-0" asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7 shrink-0"
+            asChild
+          >
             <a
               href={state.pdfUrl}
               download

@@ -64,12 +64,14 @@ const Block = memo(
     wikiSources,
     onOpenDoc,
     onOpenReport,
+    onOpenAnalysis,
   }) {
     if (block.type === "think") {
       return (
         <UnifiedThinkingBlock
           contentBlocks={block.contentSegments}
           isGroupComplete={complete}
+          onOpenAnalysis={onOpenAnalysis}
         />
       )
     }
@@ -128,6 +130,7 @@ const Block = memo(
     prev.wikiSources === next.wikiSources &&
     prev.onOpenDoc === next.onOpenDoc &&
     prev.onOpenReport === next.onOpenReport &&
+    prev.onOpenAnalysis === next.onOpenAnalysis &&
     blockSig(prev.block) === blockSig(next.block)
 )
 
@@ -138,6 +141,7 @@ function ChatMessageImpl({
   wikiSources,
   onOpenDoc,
   onOpenReport,
+  onOpenAnalysis,
   // Compactions that ran DURING this turn (auto, mid-run): a divider between
   // the question and the answer. Stable per turn (ChatThread memoizes).
   compactionMarks,
@@ -233,6 +237,7 @@ function ChatMessageImpl({
                 wikiSources={wikiSources}
                 onOpenDoc={onOpenDoc}
                 onOpenReport={onOpenReport}
+                onOpenAnalysis={onOpenAnalysis}
               />
             )
           })}

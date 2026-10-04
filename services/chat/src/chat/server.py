@@ -502,6 +502,15 @@ _LOCATION_TAKING_TOOLS = frozenset(
         "semantic_search",
         "run_computation",
         "query_metric",
+        # The analysis tools: their args ARE a dataset location, so a pinned
+        # conversation's scope must fold back in for the UI labels and — like
+        # the governed tools above — for memory's TurnObservation, or a pinned
+        # chat's analysis work would be observed with no dataset.
+        "list_analyses",
+        "read_analysis",
+        "create_analysis",
+        "update_analysis",
+        "publish_report",
     }
 )
 
@@ -788,6 +797,10 @@ def build_deps(config: Any = None):
         "annotations": boto3.resource("dynamodb", region_name=region).Table(
             chat_config.annotations_table
         ),
+        # The analyses tools read/write ANALYSIS# rows here (okf_core.analyses).
+        "analyses": boto3.resource("dynamodb", region_name=region).Table(
+            chat_config.analyses_table
+        ),
     }
     # Athena client for the optional read-only SQL tool — only built when the
     # deploy flag is on (else the role has no Glue/Athena grants anyway).
@@ -905,6 +918,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     athena_client = clients.pop("athena", None)
     redshift_data_client = clients.pop("redshift_data", None)
     annotations_table = clients.pop("annotations", None)
+    analyses_table = clients.pop("analyses", None)
     # The long-term-memory clients ride the same dict so build_app's
     # make_chat_memory can grab them, but build_consumption_tools doesn't
     # know these kwargs — POP them before the **clients splat below (missing
@@ -1062,6 +1076,27 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                 *agent_tools,
                 make_submit_annotation_tool(
                     annotations_table, user_sub=user_sub, dataset_scope=scope
+                ),
+            ]
+        # Analyses: saved, human-owned procedure documents the agent executes
+        # (rows keyed by DATASET — okf_core.analyses). The chat loop is the
+        # executor. Methodology rides the analysis-authoring /
+        # analysis-execution skills via read_skill; the tools' descriptions
+        # carry the contract.
+        if analyses_table is not None and user_sub:
+            from chat.analyses import make_analysis_tools
+
+            agent_tools = [
+                *agent_tools,
+                *make_analysis_tools(
+                    analyses_table,
+                    user_sub=user_sub,
+                    dataset_scope=scope,
+                    # publish_report (binding a produced report to its
+                    # analysis) rides only where the report tools themselves
+                    # can exist: it verifies the report's stored artifacts.
+                    s3=s3_client,
+                    bundle_bucket=chat_config.bundle_bucket,
                 ),
             ]
         # Report authoring: available on every run with a verified subject —

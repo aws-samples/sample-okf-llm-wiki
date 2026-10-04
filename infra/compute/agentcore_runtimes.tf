@@ -256,6 +256,8 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     # chat/server.py). The checkpoint table's schema is dictated by DynamoDBSaver.
     OKF_CHAT_CHECKPOINT_TABLE = local.d.chat_checkpoints_table
     OKF_CHAT_THREADS_TABLE    = local.d.chat_table
+    # Analyses (saved procedure docs + report publications — chat/analyses.py).
+    OKF_ANALYSES_TABLE = local.d.analyses_table
     OKF_CHAT_CHECKPOINT_TTL_SECONDS = (
       var.chat_checkpoint_ttl_seconds > 0 ? tostring(var.chat_checkpoint_ttl_seconds) : ""
     )

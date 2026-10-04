@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 
 import { ChatHistory } from "@/components/ChatHistory"
 import { ChatThread } from "@/components/ChatThread"
+import { AnalysisPeek } from "@/components/chat/AnalysisPeek"
 import { DocPeek } from "@/components/chat/DocPeek"
 import { PanelShell } from "@/components/chat/PanelShell"
 import { ReportPanel } from "@/components/chat/ReportPanel"
@@ -23,6 +24,7 @@ import { cn } from "@/lib/utils"
 
 // The inner surface: mounts the session store. Keyed by conversation upstream.
 function Conversation({
+  api,
   conv,
   getToken,
   onStarted,
@@ -40,6 +42,7 @@ function Conversation({
   onScopeChange,
   onOpenDoc,
   onOpenReport,
+  onOpenAnalysis,
 }) {
   const {
     chatTurns,
@@ -110,6 +113,7 @@ function Conversation({
 
   return (
     <ChatThread
+      api={api}
       chatTurns={chatTurns}
       isStreaming={isStreaming}
       error={error}
@@ -142,6 +146,7 @@ function Conversation({
       onCompact={compact}
       onOpenDoc={onOpenDoc}
       onOpenReport={onOpenReport}
+      onOpenAnalysis={onOpenAnalysis}
     />
   )
 }
@@ -158,6 +163,12 @@ const PEEK_DEFAULT = 576
 const REPORT_WIDTH_KEY = "okf.chat.reportWidth"
 const REPORT_MIN = 360
 const REPORT_DEFAULT = 672
+
+// Analysis panel width bounds (px) — doc-peek-sized: it hosts a procedure
+// document, the same reading shape as a wiki page.
+const ANALYSIS_WIDTH_KEY = "okf.chat.analysisWidth"
+const ANALYSIS_MIN = 320
+const ANALYSIS_DEFAULT = 576
 
 export function ChatPanel({
   api,
@@ -219,11 +230,37 @@ export function ChatPanel({
     setReportTarget({ reportId, title })
     setReportSlot({ open: true })
   }, [])
+  // Third slot: the analysis reader (an analysis tool step's panel
+  // affordance). Same open/target split; every open sets a FRESH target so
+  // re-opening after an update_analysis re-fetches the NEW version.
+  const [analysisSlot, setAnalysisSlot] = useState({ open: false })
+  const [analysisTarget, setAnalysisTarget] = useState(null)
+  const closeAnalysis = useCallback(
+    () => setAnalysisSlot((cur) => ({ ...cur, open: false })),
+    []
+  )
+  const openAnalysis = useCallback(
+    ({ dataDomain, dataset, name }) => {
+      // Live streams fold the pinned scope into the tool args server-side,
+      // but history-rebuilt events carry the model's RAW args — in a scoped
+      // conversation those omit the location, so fall back to the pin.
+      const scope = conv.datasetScope || {}
+      setAnalysisTarget({
+        dataDomain: dataDomain || scope.data_domain,
+        dataset: dataset || scope.dataset,
+        name,
+      })
+      setAnalysisSlot({ open: true })
+    },
+    [conv.datasetScope]
+  )
   useEffect(() => {
     setSlot({ open: false })
     setPeekTarget(null)
     setReportSlot({ open: false })
     setReportTarget(null)
+    setAnalysisSlot({ open: false })
+    setAnalysisTarget(null)
   }, [conv.threadId])
 
   // Resizable width: dragged from the panel's left-edge handle, persisted as a
@@ -247,6 +284,15 @@ export function ChatPanel({
     min: REPORT_MIN,
     defaultWidth: REPORT_DEFAULT,
   })
+  const {
+    width: analysisWidth,
+    dragging: analysisDragging,
+    startResize: startAnalysisResize,
+  } = usePanelWidth({
+    storageKey: ANALYSIS_WIDTH_KEY,
+    min: ANALYSIS_MIN,
+    defaultWidth: ANALYSIS_DEFAULT,
+  })
 
   if (!CHAT_CONFIGURED) {
     return (
@@ -263,6 +309,7 @@ export function ChatPanel({
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <Conversation
           key={conv.threadId}
+          api={api}
           conv={conv}
           getToken={getToken}
           onStarted={onStarted}
@@ -280,6 +327,7 @@ export function ChatPanel({
           onScopeChange={onScopeChange}
           onOpenDoc={openDoc}
           onOpenReport={openReport}
+          onOpenAnalysis={openAnalysis}
         />
       </div>
 
@@ -337,6 +385,34 @@ export function ChatPanel({
               onClose={closeReport}
               onResizeStart={startReportResize}
               resizing={reportDragging}
+            />
+          ) : null}
+        </div>
+      </div>
+
+      {/* The analysis panel — a saved procedure doc opened from an analysis
+          tool step's affordance. Same clip + resize arrangement as the doc
+          peek (it reads like a wiki page, so it shares that width shape). */}
+      <div
+        className={cn(
+          "h-full shrink-0 overflow-hidden",
+          !analysisDragging &&
+            "transition-[width] duration-300 ease-in-out motion-reduce:transition-none"
+        )}
+        style={{ width: analysisSlot.open ? analysisWidth : 0 }}
+        aria-hidden={!analysisSlot.open}
+      >
+        <div
+          className={cn("h-full", !analysisSlot.open && "invisible")}
+          style={{ width: analysisWidth }}
+        >
+          {analysisTarget ? (
+            <AnalysisPeek
+              api={api}
+              target={analysisTarget}
+              onClose={closeAnalysis}
+              onResizeStart={startAnalysisResize}
+              resizing={analysisDragging}
             />
           ) : null}
         </div>

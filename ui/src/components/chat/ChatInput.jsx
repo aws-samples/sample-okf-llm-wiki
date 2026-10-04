@@ -13,6 +13,7 @@ import {
   AtSignIcon,
   CornerDownRightIcon,
   DatabaseIcon,
+  MicroscopeIcon,
   PinIcon,
   PlusIcon,
   SquareIcon,
@@ -135,9 +136,10 @@ function DatasetMentionList({ datasets, onPick, onBackspaceEmpty }) {
   )
 }
 
-// The "+" menu. For now its one entry scopes the conversation to a dataset (an
-// explicit, discoverable alternative to typing "@").
-function AddMenu({ onScope }) {
+// The "+" menu: scope the conversation to a dataset (an explicit, discoverable
+// alternative to typing "@"), and run a saved analysis (the questionnaire
+// dialog — ChatThread owns it). Either entry is omitted when its handler is.
+function AddMenu({ onScope, onRunAnalysis }) {
   const [open, setOpen] = useState(false)
   // Set when "Scope To A Dataset" is chosen, so onCloseAutoFocus skips Radix's
   // focus-restore to the "+" trigger — that restore lands OUTSIDE the dataset
@@ -169,15 +171,31 @@ function AddMenu({ onScope }) {
           }
         }}
       >
-        <DropdownMenuItem
-          onSelect={() => {
-            scopeSelectedRef.current = true
-            onScope()
-          }}
-        >
-          <PinIcon className="size-3.5 text-muted-foreground" />
-          Scope To A Dataset
-        </DropdownMenuItem>
+        {onScope ? (
+          <DropdownMenuItem
+            onSelect={() => {
+              scopeSelectedRef.current = true
+              onScope()
+            }}
+          >
+            <PinIcon className="size-3.5 text-muted-foreground" />
+            Scope To A Dataset
+          </DropdownMenuItem>
+        ) : null}
+        {onRunAnalysis ? (
+          <DropdownMenuItem
+            onSelect={() => {
+              // Same handoff guard as the scope item: skip the menu's
+              // focus-restore to the "+" trigger — it would land on top of
+              // the analysis dialog this opens and fight its focus trap.
+              scopeSelectedRef.current = true
+              onRunAnalysis()
+            }}
+          >
+            <MicroscopeIcon className="size-3.5 text-muted-foreground" />
+            Run An Analysis
+          </DropdownMenuItem>
+        ) : null}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -218,6 +236,9 @@ export function ChatInput({
   // True while the conversation compacts: the runtime refuses turns then, so
   // Enter keeps the text and explains instead of clearing the box.
   compacting = false,
+  // Opens the analysis-run dialog (the "+" menu's "Run An Analysis" item);
+  // null hides the item (no API, streaming, or a pending question).
+  onRunAnalysis = null,
 }) {
   const [text, setText] = useState("")
   const ref = useRef(null)
@@ -569,7 +590,12 @@ export function ChatInput({
             />
 
             <div ref={plusRef} className="flex shrink-0 items-center gap-1.5">
-              {offerScope ? <AddMenu onScope={openScopePicker} /> : null}
+              {offerScope || onRunAnalysis ? (
+                <AddMenu
+                  onScope={offerScope ? openScopePicker : null}
+                  onRunAnalysis={onRunAnalysis}
+                />
+              ) : null}
               {datasetScope ? (
                 <DatasetScopeChip
                   scope={datasetScope}
@@ -599,7 +625,7 @@ export function ChatInput({
                     "relative flex items-start",
                     twoLine ? "order-first basis-full px-1" : "min-w-0 flex-1",
                     // A lone field (no "+") still wants a little inset.
-                    !twoLine && !offerScope && "pl-1"
+                    !twoLine && !offerScope && !onRunAnalysis && "pl-1"
                   )}
                 >
                   <textarea

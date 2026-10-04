@@ -57,6 +57,14 @@ output "annotations_table_arn" {
   value = aws_dynamodb_table.annotations.arn
 }
 
+output "analyses_table" {
+  value = aws_dynamodb_table.analyses.name
+}
+
+output "analyses_table_arn" {
+  value = aws_dynamodb_table.analyses.arn
+}
+
 output "chat_checkpoints_table" {
   value = aws_dynamodb_table.chat_checkpoints.name
 }
