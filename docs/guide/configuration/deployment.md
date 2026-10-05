@@ -38,6 +38,10 @@ Model catalogs define the choices that the console offers. The runtime validates
 
 Keep harvest and chat catalogs separate. Harvest authoring often needs a stronger model than routine chat.
 
+By default, both catalogs offer the same Claude and GPT models. Policy checks use Claude Sonnet 5.5 at low effort.
+
+Chat conversations can switch models only within one provider family. GPT models in the chat catalog widen the chat runtime's model permissions.
+
 ## Update one layer
 
 Use the narrowest deployment stage:
@@ -49,6 +53,8 @@ Use the narrowest deployment stage:
 ```
 
 When runtime code changes, run `images` and then `compute`. The image stage only builds and pushes images.
+
+Run `durable` first when a release adds durable resources. For example, saved analyses need the `analyses` DynamoDB table.
 
 Run `ui` after web console changes. Run `cognito-urls` when the console URL changes.
 

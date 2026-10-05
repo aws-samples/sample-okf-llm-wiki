@@ -77,6 +77,11 @@ export const DOC_SECTIONS = [
         source: "docs/guide/user-guide/browse-and-chat.md",
       },
       {
+        title: "Run saved analyses",
+        route: "user-guide/analyses",
+        source: "docs/guide/user-guide/analyses.md",
+      },
+      {
         title: "Connect an agent",
         route: "user-guide/connect-an-agent",
         source: "docs/guide/user-guide/connect-an-agent.md",
