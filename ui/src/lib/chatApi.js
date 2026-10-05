@@ -131,6 +131,9 @@ export async function fetchHistoryAPI({ threadId, getToken }) {
     context: data?.context || null,
     compactions: Array.isArray(data?.compactions) ? data.compactions : [],
     model: typeof data?.model === "string" && data.model ? data.model : null,
+    // Part of the conversation was held back for the resume replay (a live
+    // run's turn / continuation steps).
+    inflight: data?.inflight === true,
   }
 }
 

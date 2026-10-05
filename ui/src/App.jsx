@@ -16,6 +16,7 @@ import {
   LogOutIcon,
   MessageSquarePlusIcon,
   MessagesSquareIcon,
+  MicroscopeIcon,
   MonitorIcon,
   MoonIcon,
   NetworkIcon,
@@ -104,6 +105,7 @@ import ReasoningView from "@/views/ReasoningView.jsx"
 import { POLICY_CHECK_ENABLED } from "@/lib/chatFeatures"
 import BenchmarkReportView from "@/views/BenchmarkReportView.jsx"
 import BrowseView from "@/views/BrowseView.jsx"
+import { AnalysisView } from "@/views/AnalysisView.jsx"
 import GraphView from "@/views/GraphView.jsx"
 import MemoryView from "@/views/MemoryView.jsx"
 
@@ -135,6 +137,15 @@ const NAV = [
     label: "Graph",
     icon: NetworkIcon,
     needsSelection: true,
+    group: "primary",
+  },
+  // Saved analyses + their published reports span datasets like chat; the
+  // trailing URL segment is the report id (#/analysis/<report_id>).
+  {
+    key: "analysis",
+    label: "Analysis",
+    icon: MicroscopeIcon,
+    needsSelection: false,
     group: "primary",
   },
   {
@@ -850,7 +861,9 @@ function Console({ auth, api }) {
   // lifted here so the sidebar sub-items (ChatNav) and the chat page (ChatPanel)
   // drive the SAME conversation. Reads/writes the #/chat/<threadId> URL.
   const chat = useChatController({
-    urlThreadId: route.threadId,
+    // Only a CHAT url's trailing id is a conversation id — #/analysis/<id>
+    // shares the same slot for a report/analysis id.
+    urlThreadId: route.section === "chat" ? route.threadId : null,
     onThreadChange: setChatThread,
     // Only bind the thread into the URL while chat is the active section — see
     // useChatController: this is what stops a chat→browse→chat hop from shoving
@@ -946,8 +959,9 @@ function Console({ auth, api }) {
     // not a dataset, so it never has a selectionKey. Skip normalization here — it
     // would rewrite #/chat/<threadId> to #/chat and strip the conversation id
     // (buildHash drops selectionKey/concept for chat). The chat controller owns
-    // the threadId in the URL.
-    if (route.section === "chat") return
+    // the threadId in the URL. Analysis is the same shape (#/analysis/<id>) —
+    // skip normalization too.
+    if (route.section === "chat" || route.section === "analysis") return
     const known = datasets.some(
       (d) => `${d.data_domain}/${d.dataset}` === selectionKey
     )
@@ -1160,6 +1174,15 @@ function Console({ auth, api }) {
               ctrl={chat}
               datasets={datasets}
               datasetsLoading={datasetsLoading}
+            />
+          </div>
+        ) : section === "analysis" ? (
+          <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+            <AnalysisView
+              api={api}
+              reportId={route.threadId}
+              onOpen={(id) => push({ section: "analysis", threadId: id })}
+              onBack={() => push({ section: "analysis" })}
             />
           </div>
         ) : section === "harvest" ? (

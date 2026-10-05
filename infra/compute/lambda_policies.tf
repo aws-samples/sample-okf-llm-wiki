@@ -129,6 +129,9 @@ data "aws_iam_policy_document" "control_api" {
       "${local.d.registry_table_arn}/index/*",
       local.d.freshness_table_arn,
       local.d.annotations_table_arn,
+      # analyses: the Analysis page's Scans, owner-only edit/delete, and the
+      # dataset-delete partition purge.
+      local.d.analyses_table_arn,
       local.d.chat_table_arn,
       local.d.chat_checkpoints_table_arn,
     ]

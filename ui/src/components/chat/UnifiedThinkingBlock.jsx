@@ -15,6 +15,7 @@ import {
   ClockFading,
   Code2,
   Lightbulb,
+  PanelRightOpen,
   ShieldAlert,
   Table2,
 } from "lucide-react"
@@ -27,6 +28,7 @@ import { SourceIcon } from "@/components/chat/SourceIcon"
 import { buildTimelineSteps, mergeThinkingSteps } from "@/components/chat/timelineParser"
 import {
   NO_RESULT_TOOLS,
+  isRefusalResult,
   parseToolResult,
   prettyName,
   toolIcon,
@@ -225,7 +227,27 @@ function SqlResultTabs({ sql, resultNode }) {
 // header is a shadcn Marker: a text-shimmer MarkerContent while running, and a
 // chevron when there's detail. (The tool's icon lives on the timeline marker,
 // not in the header.)
-function ToolResultIndicator({ toolName, input, content, isComplete, error, count }) {
+// The analysis tool steps that reference a PERSISTED document — clicking
+// their panel affordance opens it in the chat's analysis side panel (the
+// citation doc-peek UX). list is excluded: no one thing to open.
+const ANALYSIS_DOC_TOOLS = new Set([
+  "read_analysis",
+  "create_analysis",
+  "update_analysis",
+  // publish_report binds a report to an analysis — its step opens THAT
+  // analysis; the arg is `analysis`.
+  "publish_report",
+])
+
+function ToolResultIndicator({
+  toolName,
+  input,
+  content,
+  isComplete,
+  error,
+  count,
+  onOpenAnalysis,
+}) {
   // web_search and ask_human open EXPANDED: for web_search the sources are the
   // substance of the step; for ask_human the user's answers ARE the point (the
   // form never echoes the selection into the transcript, so it must show inline).
@@ -234,10 +256,17 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error, coun
     toolName === "web_search" || toolName === "ask_human"
   )
 
-  // NO_RESULT tools (read_skill / create_report) never expand: their results
-  // are acks/instructions, not evidence — the step is its label. Errors still
-  // expand (a create_report refusal must stay inspectable).
+  // NO_RESULT tools (read_skill / create_report / the analysis tools) never
+  // expand: their results are acks/instructions, not evidence — the step is
+  // its label. REFUSALS are the exception: the closure-guarded tools return
+  // their errors as OK-status content ("Error: …" strings, {error, problems}
+  // dicts), and hiding those behind a name-derived success label told the
+  // user a save happened that didn't.
   const noResult = NO_RESULT_TOOLS.has(toolName)
+  const refused = isComplete && !error && isRefusalResult(content)
+  // Everything downstream treats a refusal like a transport error: failed
+  // header, expandable error box, no success summary.
+  const failed = Boolean(error) || refused
 
   // No result payload ⇒ NO summary. The canvas-jobs drawer replays a step feed
   // that stores tool names + args only, and parsing `undefined` invents
@@ -245,17 +274,17 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error, coun
   // summary must never claim more than the data behind it.
   const view = useMemo(
     () =>
-      isComplete && !error && !noResult && content != null
+      isComplete && !failed && !noResult && content != null
         ? parseToolResult(toolName, content)
         : null,
-    [toolName, content, isComplete, error, noResult]
+    [toolName, content, isComplete, failed, noResult]
   )
 
   // Header text: while running, the tool+args label; done, that label + a
   // result summary ("Searched “races” · 12 results"); on error, "… failed".
   const label = toolLabel(toolName, input, !isComplete)
   let headerText
-  if (error) headerText = `${prettyName(toolName)} failed`
+  if (failed) headerText = `${prettyName(toolName)} failed`
   else if (!isComplete) headerText = label
   else headerText = view?.summary ? `${label} · ${view.summary}` : label
   // Collapsed repeats (canvas-jobs drawer): one step, a ×N badge.
@@ -276,7 +305,23 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error, coun
       (view && view.kind === "qa" && view.pairs?.length) ||
       (view && view.kind === "raw" && content != null) ||
       Boolean(sqlQuery) ||
-      error)
+      failed)
+
+  // Analysis steps get a side-panel affordance: clicking it opens the saved
+  // document in the chat's analysis panel (fetched fresh — after an
+  // update_analysis it shows the NEW version). Separate from the header
+  // button (which toggles the result detail), and shown only once the args
+  // have settled with a name; absent in non-chat hosts (no handler).
+  const analysisName =
+    input && typeof input === "object" ? input.name || input.analysis : null
+  const analysisTarget =
+    onOpenAnalysis && ANALYSIS_DOC_TOOLS.has(toolName) && analysisName
+      ? {
+          name: analysisName,
+          dataDomain: input.data_domain,
+          dataset: input.dataset,
+        }
+      : null
 
   const header = (
     <Marker
@@ -302,9 +347,26 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error, coun
     </Marker>
   )
 
+  const headerRow = analysisTarget ? (
+    <div className="flex items-center gap-1">
+      <div className="min-w-0 flex-1">{header}</div>
+      <button
+        type="button"
+        onClick={() => onOpenAnalysis(analysisTarget)}
+        title="Open the analysis"
+        aria-label="Open the analysis in the side panel"
+        className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <PanelRightOpen className="size-3.5" />
+      </button>
+    </div>
+  ) : (
+    header
+  )
+
   // The result body (a table/chips/raw view, or the error block) — shared by the
   // plain path and the run_sql "Data" tab.
-  const resultNode = error ? (
+  const resultNode = failed ? (
     <div className="tool-result-raw">
       <div className="tool-result-raw-header">error</div>
       <div className="tool-result-raw-scroll">
@@ -317,7 +379,7 @@ function ToolResultIndicator({ toolName, input, content, isComplete, error, coun
 
   return (
     <div className="tool-result-content">
-      {header}
+      {headerRow}
       {hasDetail ? (
         <div className={`tool-result-expand ${expanded ? "expanded" : ""}`}>
           <div>
@@ -441,7 +503,7 @@ const PolicyStep = memo(function PolicyStep({ step, isLast }) {
   )
 })
 
-const ToolStep = memo(function ToolStep({ step, isLast }) {
+const ToolStep = memo(function ToolStep({ step, isLast, onOpenAnalysis }) {
   const Icon = toolIcon(step.toolName)
   return (
     <div className={`timeline-item ${isLast ? "last" : ""}`}>
@@ -456,6 +518,7 @@ const ToolStep = memo(function ToolStep({ step, isLast }) {
           isComplete={step.isToolComplete}
           error={step.toolError}
           count={step.toolCount}
+          onOpenAnalysis={onOpenAnalysis}
         />
       </div>
     </div>
@@ -513,6 +576,9 @@ export function UnifiedThinkingBlock({
   // Non-chat hosts (the canvas-jobs drawer): no collapsible header, the
   // timeline always visible — the steps ARE the content there, not an aside.
   chromeless = false,
+  // Opens the chat's analysis side panel from an analysis tool step's
+  // affordance (threaded from ChatPanel; absent in non-chat hosts).
+  onOpenAnalysis = null,
 }) {
   const [expanded, setExpanded] = useState(chromeless)
 
@@ -590,7 +656,14 @@ export function UnifiedThinkingBlock({
               if (step.type === "policy") {
                 return <PolicyStep key={step.id} step={step} isLast={isLast} />
               }
-              return <ToolStep key={step.id} step={step} isLast={isLast} />
+              return (
+                <ToolStep
+                  key={step.id}
+                  step={step}
+                  isLast={isLast}
+                  onOpenAnalysis={onOpenAnalysis}
+                />
+              )
             })}
             {isGroupComplete ? <CompletionStep /> : null}
           </div>

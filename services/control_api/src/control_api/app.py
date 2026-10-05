@@ -97,6 +97,7 @@ class Config:
         athena_catalog: str = "AwsDataCatalog",
         computation_max_rows: int = 200,
         computation_timeout_s: float = 120.0,
+        analyses_table: str = "okf-analyses",
     ):
         self.bucket = bucket
         self.registry_table = registry_table
@@ -104,6 +105,10 @@ class Config:
         self.harvest_runtime_arn = harvest_runtime_arn
         # User-scoped wiki annotations (feedback awaiting an annotation harvest).
         self.annotations_table = annotations_table
+        # Dataset-keyed analysis documents + their report publications. The
+        # chat RUNTIME authors them; this API serves the side panel and the
+        # Analysis page (owner-only edit/delete). See okf_core.analyses.
+        self.analyses_table = analyses_table
         # Chat conversation index (sidebar list) + the LangGraph checkpoint table
         # (purged on delete). The chat RUNTIME owns the writes; the Control API
         # reads/renames/deletes for the UI.
@@ -207,6 +212,7 @@ class Config:
             annotations_table=os.environ.get(
                 "OKF_ANNOTATIONS_TABLE", "okf-annotations"
             ),
+            analyses_table=os.environ.get("OKF_ANALYSES_TABLE", "okf-analyses"),
             chat_threads_table=os.environ.get("OKF_CHAT_THREADS_TABLE", "okf-chat"),
             chat_checkpoint_table=os.environ.get(
                 "OKF_CHAT_CHECKPOINT_TABLE", "okf-chat-checkpoints"
@@ -461,6 +467,8 @@ def _r_delete_domain(cfg, params, body, query, caller):
         s3=cfg.s3,
         bundle_bucket=cfg.bucket,
         freshness_table=cfg.freshness_table,
+        # The dataset-keyed ANALYSIS#<d>#<ds> partition goes with it.
+        analyses_table=cfg.analyses_table,
     )
 
 
@@ -1379,6 +1387,56 @@ def _r_repromote_status(cfg, params, body, query, caller):
     )
 
 
+def _r_list_analysis_reports(cfg, params, body, query, caller):
+    return 200, handlers.list_analysis_reports(
+        cfg.ddb, analyses_table=cfg.analyses_table, user_sub=caller.sub
+    )
+
+
+def _r_list_analyses(cfg, params, body, query, caller):
+    return 200, handlers.list_analyses(
+        cfg.ddb, analyses_table=cfg.analyses_table, user_sub=caller.sub
+    )
+
+
+def _r_update_analysis(cfg, params, body, query, caller):
+    document = handlers._require(body, "document")
+    if not isinstance(body.get("version"), int):
+        raise ApiError(400, "missing required field: version (the version you edited)")
+    return 200, handlers.update_analysis(
+        cfg.ddb,
+        analyses_table=cfg.analyses_table,
+        user_sub=caller.sub,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        name=params["name"],
+        document=document,
+        expected_version=body["version"],
+    )
+
+
+def _r_delete_analysis(cfg, params, body, query, caller):
+    return 200, handlers.delete_analysis(
+        cfg.ddb,
+        analyses_table=cfg.analyses_table,
+        user_sub=caller.sub,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        name=params["name"],
+    )
+
+
+def _r_get_analysis(cfg, params, body, query, caller):
+    return 200, handlers.get_analysis(
+        cfg.ddb,
+        analyses_table=cfg.analyses_table,
+        user_sub=caller.sub,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        name=params["name"],
+    )
+
+
 # Order matters: more specific templates (``/bundle/{d}/{ds}/graph``) must come
 # before catch-alls with the same prefix so ``graph``/``file`` are not captured
 # as a dataset segment. We list the fixed-suffix routes first.
@@ -1474,6 +1532,15 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("POST", "/bundle/{domain}/{dataset}/computations/{slug}/run", _r_run_computation),
     ("POST", "/bundle/{domain}/{dataset}/computations/{slug}/verify", _r_verify_computation),
     ("POST", "/bundle/{domain}/{dataset}/computations/{slug}/unverify", _r_unverify_computation),
+    # Analyses (chat-authored procedure docs): the chat UI's side-panel read,
+    # plus the Analysis page's surfaces — the cross-dataset lists and the
+    # HUMAN lifecycle (full-document edit + delete, both owner-gated; the
+    # agent deliberately has no delete tool).
+    ("GET", "/analysis-reports", _r_list_analysis_reports),
+    ("GET", "/analyses", _r_list_analyses),
+    ("GET", "/analysis/{domain}/{dataset}/{name}", _r_get_analysis),
+    ("PUT", "/analysis/{domain}/{dataset}/{name}", _r_update_analysis),
+    ("DELETE", "/analysis/{domain}/{dataset}/{name}", _r_delete_analysis),
     # Bundle version history (reconstructed from S3 object versions), diff, and
     # repromote; POST repromotes, GET polls its vector-index convergence.
     ("POST", "/bundle/{domain}/{dataset}/export", _r_export_bundle),

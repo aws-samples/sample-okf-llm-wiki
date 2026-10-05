@@ -914,6 +914,7 @@ def delete_domain_mapping(
     s3=None,
     bundle_bucket: str | None = None,
     freshness_table: str | None = None,
+    analyses_table: str | None = None,
 ) -> dict[str, Any]:
     """Delete a dataset and ALL state it owns. Idempotent throughout.
 
@@ -934,7 +935,9 @@ def delete_domain_mapping(
        otherwise inherit the previous owner's gold and reports).
     2. **Freshness rows** in the freshness table: the per-table ``TABLE#.../VERSION``
        rows and the reindex dedup ``VEC#.../SEQ`` markers for this dataset.
-    3. **Harvest status + REPORT# rows** (the whole ``HARVEST#<d>#<ds>``
+    3. **Analysis rows** on the analyses table (the dataset-keyed
+       ``ANALYSIS#<d>#<ds>`` partition) when ``analyses_table`` is supplied.
+    4. **Harvest status + REPORT# rows** (the whole ``HARVEST#<d>#<ds>``
        partition) and the **mapping** (``DOMAIN#/DATASET#``) in the registry —
        deleted LAST so that if an earlier step fails and the request is
        retried, the dataset is still resolvable/visible rather than half-gone.
@@ -984,7 +987,17 @@ def delete_domain_mapping(
             ddb, freshness_table, data_domain, dataset
         )
 
-    # 3. Benchmark REPORT#/QBANK# rows, the harvest status row plus the
+    # 3. Analysis rows (the dataset-keyed ``ANALYSIS#<d>#<ds>`` partition on
+    #    the analyses table — okf_core.analyses): without this a re-registered
+    #    same-named dataset would inherit the previous owner's analyses,
+    #    citing computations the new bundle may not have.
+    purged_analyses = 0
+    if analyses_table:
+        purged_analyses = _delete_analysis_rows(
+            ddb, analyses_table, data_domain, dataset
+        )
+
+    # 4. Benchmark REPORT#/QBANK# rows, the harvest status row plus the
     #    repromote/import provenance rows (same ghost-row hazard as reports:
     #    a re-registered same-named dataset must not inherit the previous
     #    owner's convergence manifests), then the mapping (mapping last).
@@ -1005,6 +1018,7 @@ def delete_domain_mapping(
         "purged_bundle_objects": purged_objects,
         "purged_freshness_rows": purged_freshness,
         "purged_report_rows": purged_reports,
+        "purged_analysis_rows": purged_analyses,
     }
 
 
@@ -1096,6 +1110,40 @@ def _delete_report_rows(
         )
         for prefix in (br.report_sk_query_prefix(), qb.qbank_sk_query_prefix())
     )
+
+
+def _delete_analysis_rows(
+    ddb, analyses_table: str, data_domain: str, dataset: str
+) -> int:
+    """Delete the dataset's whole ``ANALYSIS#<d>#<ds>`` partition; returns the count.
+
+    Every row in the partition belongs to the dataset (analysis documents and
+    their publication rows — no prefix filter needed), so this is one Query +
+    per-row deletes, same shape as the REPORT#/QBANK# purge.
+    """
+    from okf_core.analyses import analysis_pk
+
+    deleted = 0
+    kwargs: dict[str, Any] = {
+        "TableName": analyses_table,
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": analysis_pk(data_domain, dataset)}
+        },
+    }
+    while True:
+        resp = ddb.query(**kwargs)
+        for item in resp.get("Items", []):
+            ddb.delete_item(
+                TableName=analyses_table,
+                Key={"pk": item["pk"], "sk": item["sk"]},
+            )
+            deleted += 1
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+    return deleted
 
 
 def _delete_rows_by_sk_prefix(
@@ -7459,3 +7507,332 @@ def get_report(s3, *, bucket: str, report_id: str) -> dict[str, Any]:
         ),
         "blocks_url": _sign(blocks_key) if _exists(blocks_key) else "",
     }
+
+
+# --- Analyses ----------------------------------------------------------------
+# Saved, human-owned procedure documents the chat agent executes (rows keyed by
+# DATASET on the analyses table — okf_core.analyses). The agent authors and
+# edits through chat tools; this surface serves the chat side panel and the
+# Analysis page (cross-dataset lists + the owner-only human lifecycle).
+
+
+def get_analysis(
+    ddb,
+    *,
+    analyses_table: str,
+    user_sub: str | None,
+    data_domain: str,
+    dataset: str,
+    name: str,
+) -> dict[str, Any]:
+    """One analysis document — the chat side panel's payload.
+
+    Dataset-shared by design (any signed-in user may read; ownership only
+    gates edits), so the only auth is the verified
+    subject — ``owned_by_you`` rides along for the header chip. The
+    frontmatter is parsed SERVER-side (questions list + the steps body) so
+    the SPA renders without a YAML dependency; the raw ``document`` rides
+    along for completeness.
+    """
+    user_sub = _require_user_sub(user_sub)
+    from okf_core.analyses import analysis_pk
+
+    item = ddb.get_item(
+        TableName=analyses_table,
+        Key={
+            "pk": {"S": analysis_pk(data_domain, dataset)},
+            "sk": {"S": name},
+        },
+    ).get("Item")
+    if not item:
+        raise ApiError(404, f"no analysis {name!r} for {data_domain}/{dataset}")
+
+    document = item.get("body", {}).get("S", "")
+    # The questions in the NORMALIZED ask_human shape (okf_core.analyses —
+    # what the executor's ask_human sends), so the Run dialog renders and
+    # answers exactly what a live ask_human round would. Stored docs are
+    # validated at write time; tolerate drift for display (a parse failure
+    # falls back to the raw document as the body, with no questions).
+    from okf_core.analyses import parse_analysis
+
+    questions: list[Any] = []
+    steps = document
+    parsed, errors = parse_analysis(document)
+    if not errors:
+        questions = parsed["questions"]
+        steps = parsed["body"]
+    else:
+        try:
+            from okf_core.document import OKFDocument
+
+            steps = OKFDocument.parse(document).body
+        except ValueError:  # OKFDocumentError is a ValueError
+            pass
+    return {
+        "name": item.get("name", {}).get("S", name),
+        "data_domain": data_domain,
+        "dataset": dataset,
+        "title": item.get("title", {}).get("S", ""),
+        "description": item.get("description", {}).get("S", ""),
+        "version": int(item.get("version", {}).get("N", "1")),
+        "updated_at": item.get("updated_at", {}).get("S", ""),
+        "owned_by_you": item.get("owner_sub", {}).get("S", "") == user_sub,
+        "questions": questions,
+        "body": steps,
+        "document": document,
+    }
+
+
+def list_analyses(
+    ddb, *, analyses_table: str, user_sub: str | None
+) -> dict[str, Any]:
+    """Every analysis document, across datasets — the Analysis page's list.
+
+    One Scan over the ``ANALYSIS#`` partitions (the small-table trade), split
+    into document rows and publication rows so each analysis carries its
+    published-report count. ``owned_by_you`` gates the page's edit/delete
+    affordances (the write handlers re-enforce ownership server-side).
+    """
+    user_sub = _require_user_sub(user_sub)
+    from okf_core.analyses import ANALYSIS_PK_PREFIX, PUBLICATION_SK_SEP
+
+    docs: list[dict[str, Any]] = []
+    pub_counts: dict[tuple[str, str], int] = {}
+    kwargs: dict[str, Any] = {
+        "TableName": analyses_table,
+        "FilterExpression": "begins_with(pk, :p)",
+        "ExpressionAttributeValues": {":p": {"S": ANALYSIS_PK_PREFIX}},
+        # Never ship the ≤32KB document bodies just to discard them — the
+        # listing needs metadata only. (#n: `name` is a DDB reserved word.)
+        "ProjectionExpression": "pk, sk, #n, title, description, data_domain, "
+        "dataset, questions, version, updated_at, owner_sub",
+        "ExpressionAttributeNames": {"#n": "name"},
+    }
+    while True:
+        resp = ddb.scan(**kwargs)
+        for i in resp.get("Items", []):
+            sk = i.get("sk", {}).get("S", "")
+            pk = i.get("pk", {}).get("S", "")
+            if PUBLICATION_SK_SEP in sk:
+                owner = sk.split(PUBLICATION_SK_SEP, 1)[0]
+                pub_counts[(pk, owner)] = pub_counts.get((pk, owner), 0) + 1
+                continue
+            docs.append(
+                {
+                    "_pk": pk,
+                    "name": i.get("name", {}).get("S", sk),
+                    "title": i.get("title", {}).get("S", ""),
+                    "description": i.get("description", {}).get("S", ""),
+                    "data_domain": i.get("data_domain", {}).get("S", ""),
+                    "dataset": i.get("dataset", {}).get("S", ""),
+                    "questions": int(i.get("questions", {}).get("N", "0")),
+                    "version": int(i.get("version", {}).get("N", "1")),
+                    "updated_at": i.get("updated_at", {}).get("S", ""),
+                    "owned_by_you": i.get("owner_sub", {}).get("S", "") == user_sub,
+                }
+            )
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+    for d in docs:
+        d["published_reports"] = pub_counts.get((d.pop("_pk"), d["name"]), 0)
+    docs.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
+    return {"analyses": docs}
+
+
+def _get_analysis_item(
+    ddb, *, analyses_table: str, data_domain: str, dataset: str, name: str
+) -> dict[str, Any]:
+    from okf_core.analyses import analysis_pk
+
+    item = ddb.get_item(
+        TableName=analyses_table,
+        Key={
+            "pk": {"S": analysis_pk(data_domain, dataset)},
+            "sk": {"S": name},
+        },
+    ).get("Item")
+    if not item:
+        raise ApiError(404, f"no analysis {name!r} for {data_domain}/{dataset}")
+    return item
+
+
+def update_analysis(
+    ddb,
+    *,
+    analyses_table: str,
+    user_sub: str | None,
+    data_domain: str,
+    dataset: str,
+    name: str,
+    document: str,
+    expected_version: int,
+) -> dict[str, Any]:
+    """The Analysis page's manual edit: a FULL-document replace, owner-only.
+
+    Unlike the chat tool's exact-match edit contract (built for a model), a
+    human edits the whole text — so the API takes the full document,
+    validates it with the SAME rules (okf_core.analyses.parse_analysis) and
+    replaces under an optimistic lock: ``expected_version`` is the version
+    the editor loaded, and a mismatch is a 409 (someone — human or agent —
+    saved in between; reload and re-apply).
+    """
+    user_sub = _require_user_sub(user_sub)
+    from botocore.exceptions import ClientError
+
+    from okf_core.analyses import parse_analysis
+
+    item = _get_analysis_item(
+        ddb, analyses_table=analyses_table, data_domain=data_domain,
+        dataset=dataset, name=name,
+    )
+    if item.get("owner_sub", {}).get("S", "") != user_sub:
+        raise ApiError(403, "only the owner can edit this analysis")
+    parsed, errors = parse_analysis(document or "")
+    if errors:
+        raise ApiError(400, "the document does not validate: " + "; ".join(errors))
+    version = int(item.get("version", {}).get("N", "1"))
+    if int(expected_version) != version:
+        raise ApiError(
+            409,
+            f"the analysis is at v{version}, you edited v{expected_version} — "
+            "reload and re-apply the change",
+        )
+    now = _now_iso()
+    try:
+        ddb.put_item(
+            TableName=analyses_table,
+            Item={
+                **item,
+                "title": {"S": parsed["title"]},
+                "description": {"S": parsed["description"]},
+                "questions": {"N": str(len(parsed["questions"]))},
+                "updated_at": {"S": now},
+                "version": {"N": str(version + 1)},
+                "body": {"S": document},
+            },
+            ConditionExpression="#v = :v AND owner_sub = :o",
+            ExpressionAttributeNames={"#v": "version"},
+            ExpressionAttributeValues={
+                ":v": {"N": str(version)},
+                ":o": {"S": user_sub},
+            },
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        raise ApiError(
+            409, "the analysis changed while you were editing — reload and retry"
+        ) from e
+    return {"saved": name, "version": version + 1, "updated_at": now}
+
+
+def delete_analysis(
+    ddb,
+    *,
+    analyses_table: str,
+    user_sub: str | None,
+    data_domain: str,
+    dataset: str,
+    name: str,
+) -> dict[str, Any]:
+    """The Analysis page's owner-only delete (there is deliberately NO agent
+    delete tool). Publication rows go with the document — a binding whose
+    analysis is gone is a zombie no surface can reach; the report ARTIFACTS
+    in S3 are untouched (they may still be open in someone's panel)."""
+    user_sub = _require_user_sub(user_sub)
+    from botocore.exceptions import ClientError
+
+    from okf_core.analyses import analysis_pk, publication_sk_prefix
+
+    item = _get_analysis_item(
+        ddb, analyses_table=analyses_table, data_domain=data_domain,
+        dataset=dataset, name=name,
+    )
+    if item.get("owner_sub", {}).get("S", "") != user_sub:
+        raise ApiError(403, "only the owner can delete this analysis")
+    pk = analysis_pk(data_domain, dataset)
+    # Publications FIRST, the document row LAST — the delete_domain_mapping
+    # discipline: if the per-row purge dies midway (throttle, timeout), a
+    # retried request still resolves the analysis and reaches the purge
+    # again. Doc-first inverted that: the retry 404ed at the ownership read,
+    # stranding the surviving #pub# rows as permanent orphans in
+    # GET /analysis-reports.
+    purged = _delete_rows_by_sk_prefix(
+        ddb, analyses_table, pk, publication_sk_prefix(name)
+    )
+    try:
+        ddb.delete_item(
+            TableName=analyses_table,
+            Key={"pk": {"S": pk}, "sk": {"S": name}},
+            ConditionExpression="owner_sub = :o",
+            ExpressionAttributeValues={":o": {"S": user_sub}},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        raise ApiError(409, "the analysis changed hands — nothing was deleted") from e
+    # ...and once more AFTER it: a publish_report racing this delete passes its
+    # ConditionCheck while the document still exists, landing a publication
+    # between the first purge and the document delete. With the document gone
+    # no new publish can pass, so this sweep is final.
+    purged += _delete_rows_by_sk_prefix(
+        ddb, analyses_table, pk, publication_sk_prefix(name)
+    )
+    return {"deleted": name, "purged_publications": purged}
+
+
+def list_analysis_reports(
+    ddb, *, analyses_table: str, user_sub: str | None
+) -> dict[str, Any]:
+    """Every published analysis report, across datasets — the Analysis page.
+
+    Publication rows are spread over the per-dataset ``ANALYSIS#<d>#<ds>``
+    partitions, so listing them all is the small-table Scan-with-filter
+    pattern (the harvest-status trade: the analyses table holds only analysis
+    documents and their publications — thousands of rows at most). Newest
+    first; the page filters by dataset/analysis client-side.
+    """
+    user_sub = _require_user_sub(user_sub)
+    from okf_core.analyses import ANALYSIS_PK_PREFIX, PUBLICATION_SK_SEP
+
+    rows: list[dict[str, Any]] = []
+    kwargs: dict[str, Any] = {
+        "TableName": analyses_table,
+        "FilterExpression": "begins_with(pk, :p) AND contains(sk, :sep)",
+        "ExpressionAttributeValues": {
+            ":p": {"S": ANALYSIS_PK_PREFIX},
+            ":sep": {"S": PUBLICATION_SK_SEP},
+        },
+        # Publication rows are slim, but the scan still crosses the analysis
+        # DOC rows (filtered out server-side) — the projection keeps their
+        # ≤32KB bodies out of the read path. (#n: `name` is reserved.)
+        "ProjectionExpression": "pk, sk, report_id, title, #n, "
+        "analysis_version, data_domain, dataset, published_at, published_by",
+        "ExpressionAttributeNames": {"#n": "name"},
+    }
+    while True:
+        resp = ddb.scan(**kwargs)
+        for i in resp.get("Items", []):
+            rows.append(
+                {
+                    "report_id": i.get("report_id", {}).get("S", ""),
+                    "title": i.get("title", {}).get("S", ""),
+                    "analysis": i.get("name", {}).get("S", ""),
+                    "analysis_version": int(
+                        i.get("analysis_version", {}).get("N", "1")
+                    ),
+                    "data_domain": i.get("data_domain", {}).get("S", ""),
+                    "dataset": i.get("dataset", {}).get("S", ""),
+                    "published_at": i.get("published_at", {}).get("S", ""),
+                    "published_by_you": i.get("published_by", {}).get("S", "")
+                    == user_sub,
+                }
+            )
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+    rows.sort(key=lambda r: r.get("published_at") or "", reverse=True)
+    return {"reports": rows}

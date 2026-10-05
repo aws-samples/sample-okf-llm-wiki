@@ -22,6 +22,7 @@ import {
   Link2Icon,
   ListTreeIcon,
   MessageCircleQuestionIcon,
+  MicroscopeIcon,
   OrigamiIcon,
   ScanSearchIcon,
   ScrollTextIcon,
@@ -65,16 +66,62 @@ const ICONS = {
   // folding gathered evidence into the composed artifact (origami).
   read_skill: ScrollTextIcon,
   create_report: OrigamiIcon,
+  // Analyses: saved, human-owned procedure documents the agent executes
+  // (one family glyph).
+  list_analyses: MicroscopeIcon,
+  read_analysis: MicroscopeIcon,
+  create_analysis: MicroscopeIcon,
+  update_analysis: MicroscopeIcon,
+  publish_report: MicroscopeIcon,
 }
 
 // Tools whose results are acks/instructions, not evidence: read_skill
 // returns a whole methodology text and create_report's ack is plumbing (the
 // report card is the surface) — the timeline step shows its name/label only,
-// with no expandable response.
-export const NO_RESULT_TOOLS = new Set(["read_skill", "create_report"])
+// with no expandable response. The analysis tools follow suit: their results
+// are the document itself or save acks, and the step's panel affordance
+// (AnalysisPeek) is the viewing surface — a raw JSON doc dump in the
+// timeline reads as noise. Errors still expand (refusals stay inspectable).
+export const NO_RESULT_TOOLS = new Set([
+  "read_skill",
+  "create_report",
+  "list_analyses",
+  "read_analysis",
+  "create_analysis",
+  "update_analysis",
+  "publish_report",
+])
 
 export function toolIcon(toolName) {
   return ICONS[toolName] || WrenchIcon
+}
+
+// A tool RESULT that is actually a refusal: the closure-guarded chat tools
+// (analyses, reports) return "Error: …" strings or {error, …} objects with OK
+// message status — a raise would abort the whole run — so the transport's
+// error flag alone can't spot them. Without this, a refused create_analysis
+// rode NO_RESULT_TOOLS into a collapsed step labeled "Saved analysis X": a
+// success message for a save that never happened.
+export function isRefusalResult(content) {
+  if (typeof content === "string") {
+    const t = content.trim()
+    if (t.startsWith("Error:")) return true
+    if (t.startsWith("{")) {
+      try {
+        const o = JSON.parse(t)
+        return Boolean(o && typeof o === "object" && o.error)
+      } catch {
+        return false
+      }
+    }
+    return false
+  }
+  return Boolean(
+    content &&
+    typeof content === "object" &&
+    !Array.isArray(content) &&
+    content.error
+  )
 }
 
 function s(v) {
@@ -144,6 +191,30 @@ export function toolLabel(toolName, args, running) {
       return running
         ? `Reading the ${n || "methodology"} skill`
         : `${n ? `Skill ${n}` : "Skill"}`
+    }
+    case "list_analyses":
+      return running ? "Listing analyses" : `Analyses${scopeSuffix(a)}`
+    case "read_analysis": {
+      const n = s(a.name)
+      return running ? `Reading analysis ${n}`.trim() : `Analysis ${n}`.trim()
+    }
+    case "create_analysis": {
+      const n = s(a.name)
+      return running
+        ? `Saving analysis ${n}`.trim()
+        : `Saved analysis ${n}`.trim()
+    }
+    case "update_analysis": {
+      const n = s(a.name)
+      return running
+        ? `Editing analysis ${n}`.trim()
+        : `Edited analysis ${n}`.trim()
+    }
+    case "publish_report": {
+      const n = s(a.analysis)
+      return running
+        ? `Publishing report${n ? ` to ${n}` : ""}`
+        : `Published report${n ? ` to ${n}` : ""}`
     }
     case "create_report": {
       // Title only lands on the completed label: the step is announced at

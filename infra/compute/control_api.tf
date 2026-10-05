@@ -8,7 +8,7 @@ module "control_api_fn" {
   handler     = "control_api.app.lambda_handler"
   source_dir  = "${local.build_root}/control_api"
   policy_json = data.aws_iam_policy_document.control_api.json
-  timeout = 30
+  timeout     = 30
   # 1024, not the default 512: the bundle import validate/apply endpoints hold
   # the staged zip + its decoded documents in memory at the same time (caps in
   # control_api.handlers: 64MB archive / 128MB decompressed) with a /tmp
@@ -52,6 +52,9 @@ module "control_api_fn" {
     # reads/renames/deletes for the UI (GET/PUT/DELETE /chat/threads).
     OKF_CHAT_THREADS_TABLE    = local.d.chat_table
     OKF_CHAT_CHECKPOINT_TABLE = local.d.chat_checkpoints_table
+    # Analyses: the chat side panel's read + the Analysis page (lists, owner-only
+    # edit/delete) and the dataset-delete partition purge.
+    OKF_ANALYSES_TABLE = local.d.analyses_table
     # Long-term memory management routes (empty = feature off, routes 404).
     OKF_CHAT_MEMORY_ID         = var.enable_chat_memory ? local.d.chat_memory_id : ""
     OKF_CHAT_MEMORY_DEFAULT_ON = tostring(var.chat_memory_default_on)

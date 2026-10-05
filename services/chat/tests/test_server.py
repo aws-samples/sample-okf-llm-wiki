@@ -1081,6 +1081,165 @@ def test_read_history_answer_human_resume_drops_nothing():
     assert [t["userMessage"] for t in kept] == ["q1"]
 
 
+def test_read_history_trims_inflight_continuation_to_its_start():
+    # THE reload-duplicate bug for answer_human continuations: the continuation
+    # checkpoints its own steps (the answers' ToolMessage, then prose / tools)
+    # while it runs, and resume replays it from its FIRST chunk. History must
+    # stop at the message count the continuation started from, or the replayed
+    # steps render twice.
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    ask = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "ask_human", "args": {}, "id": "call_1", "type": "tool_call"}
+        ],
+    )
+
+    class _Graph:
+        def get_state(self, cfg):
+            class _S:
+                values = {
+                    "messages": [
+                        HumanMessage(content="q1"),
+                        ask,
+                        # checkpointed by the in-flight continuation:
+                        ToolMessage(content="{}", tool_call_id="call_1", name="ask_human"),
+                        AIMessage(content="Running for season 2015."),
+                    ]
+                }
+
+            return _S()
+
+    build_agent = lambda *a, **k: _Graph()  # noqa: E731
+    out = server.read_history(
+        build_agent,
+        object(),
+        "alice:c",
+        inflight_user_message="",
+        inflight_continuation=True,
+        inflight_cut=2,
+    )
+    trimmed = out["history"]
+    # Held back for the replay: the client re-reads if the run ends first.
+    assert out["inflight"] is True
+    assert "pending_ask" not in out
+    assert [t["userMessage"] for t in trimmed] == ["q1"]
+    texts = [e.get("content") for e in trimmed[0]["aiMessage"] if e.get("type") == "text"]
+    assert "Running for season 2015." not in texts
+    # The pre-answer prefix stays (the ask_human call, not its answer).
+    tools = [e for e in trimmed[0]["aiMessage"] if e.get("type") == "tool"]
+    assert [(t["tool_name"], t["tool_start"]) for t in tools] == [("ask_human", True)]
+
+
+def test_answer_run_records_the_continuation_cut_from_the_run(monkeypatch):
+    # The cut comes from the state the run reads anyway (no extra agent build or
+    # await before the stream is registered — a dropped request must not lose
+    # the answers), reported through on_history_cut.
+    from chat import live_streams
+
+    live_streams.reset()
+
+    async def fake_producer(*args, on_history_cut=None, **kwargs):
+        on_history_cut(3)
+        yield {"end": True}
+
+    monkeypatch.setattr(server, "_produce_run_chunks", fake_producer)
+
+    async def main():
+        frames = []
+        async for f in server.answer_run(
+            {"answers": [{"id": "season", "answer": "2015"}]},
+            "alice",
+            "conv-a",
+            chat_config=object(),
+            build_agent=lambda *a, **k: None,
+            checkpointer=object(),
+        ):
+            frames.append(f)
+        return frames
+
+    asyncio.run(main())
+    stream = live_streams.get("alice:conv-a")
+    assert stream.user_message == ""
+    assert stream.history_cut == 3
+
+
+def test_read_history_continuation_hides_the_consumed_question():
+    # Before the continuation reports its cut (nothing checkpointed yet), the
+    # history is untrimmed — but the interrupt it is consuming must not
+    # resurface as a question form (answering it again duplicates the run).
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    class _Graph:
+        def get_state(self, cfg):
+            class _S:
+                values = {
+                    "messages": [
+                        HumanMessage(content="q1"),
+                        AIMessage(
+                            content="",
+                            tool_calls=[
+                                {"name": "ask_human", "args": {},
+                                 "id": "call_1", "type": "tool_call"}
+                            ],
+                        ),
+                    ]
+                }
+
+            return _S()
+
+    monkeypatch_target = server._ask_human_chunk_from_state
+    try:
+        server._ask_human_chunk_from_state = lambda g, c: {"questions": [{"id": "x"}]}
+        paused = server.read_history(lambda *a, **k: _Graph(), object(), "alice:c")
+        running = server.read_history(
+            lambda *a, **k: _Graph(), object(), "alice:c",
+            inflight_user_message="", inflight_continuation=True,
+        )
+    finally:
+        server._ask_human_chunk_from_state = monkeypatch_target
+    assert "pending_ask" in paused
+    assert "pending_ask" not in running
+    assert "inflight" not in running  # nothing was held back
+
+
+def test_resume_of_a_continuation_marks_it_instead_of_a_user_message():
+    # An answer_human continuation has no user message: the client must append
+    # its replay to the trailing turn, so resume leads with a continuation marker
+    # (never an empty user_message, which rendered as an empty bubble + new turn).
+    from chat import live_streams
+
+    live_streams.reset()
+
+    async def main():
+        gate = asyncio.Event()
+
+        async def src():
+            yield {"type": "text", "content": "continued"}
+            await gate.wait()
+            yield {"end": True}
+
+        live_streams.start("alice:conv-c", src(), user_message="", history_cut=2)
+        await asyncio.sleep(0)
+        frames = []
+
+        async def drain():
+            async for f in server.resume_run("alice", "conv-c"):
+                frames.append(f)
+
+        task = asyncio.create_task(drain())
+        await asyncio.sleep(0)
+        gate.set()
+        await task
+        return frames
+
+    chunks = _chunks(asyncio.run(main()))
+    assert chunks[0] == {"type": "continuation"}
+    assert not any(c.get("type") == "user_message" for c in chunks)
+    assert live_streams.get("alice:conv-c").history_cut == 2
+
+
 # --- optional SQL tool gating (deploy flag AND per-run opt-in) ---------------
 
 

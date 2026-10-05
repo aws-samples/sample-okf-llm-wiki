@@ -20,7 +20,9 @@ import {
   useRef,
   useState,
 } from "react"
+import { toast } from "sonner"
 
+import { AnalysisRunDialog } from "@/components/chat/AnalysisRunDialog"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { CompactionDivider } from "@/components/chat/CompactionDivider"
@@ -63,6 +65,7 @@ const prefersReducedMotion = () =>
 
 
 export function ChatThread({
+  api = null,
   chatTurns,
   isStreaming,
   error,
@@ -93,6 +96,7 @@ export function ChatThread({
   onCompact,
   onOpenDoc,
   onOpenReport,
+  onOpenAnalysis,
   disabled,
 }) {
   const viewportRef = useRef(null)
@@ -111,6 +115,39 @@ export function ChatThread({
   const roRef = useRef(null)
   const [showButton, setShowButton] = useState(false)
   const [viewportH, setViewportH] = useState(0)
+  // The "+ → Run Analysis" dialog (search → questionnaire → Run). Its Run
+  // sends a composed human prompt through the ordinary onSend. Wired into
+  // BOTH composers — the welcome one and the docked one of a populated
+  // conversation — or the feature would vanish after the first message.
+  const [analysisRunOpen, setAnalysisRunOpen] = useState(false)
+  const openAnalysisRun =
+    api && !isStreaming && !disabled && !pendingAsk && !compacting
+      ? () => setAnalysisRunOpen(true)
+      : null
+  // The composer's send guard, for the dialog's direct send: the runtime
+  // refuses a turn while compacting (or streaming), so refuse here and keep
+  // the dialog — and the answers in it — open.
+  const runAnalysis = (text) => {
+    if (compacting || isStreaming) {
+      toast.message("This Conversation Is Busy", {
+        description: compacting
+          ? "It is being compacted — run again once it finishes."
+          : "Wait for the current answer to finish, then run again.",
+      })
+      return false
+    }
+    onSend(text)
+    return true
+  }
+  const analysisRunDialog = api ? (
+    <AnalysisRunDialog
+      api={api}
+      open={analysisRunOpen}
+      onOpenChange={setAnalysisRunOpen}
+      datasetScope={datasetScope}
+      onRun={runAnalysis}
+    />
+  ) : null
   // The tail turn's reserved height is FROZEN when a new turn arrives — it must
   // NOT track viewportH live, or the composer auto-growing (as you type multiple
   // lines) shrinks the viewport → recomputes this → jerks the transcript. Only
@@ -319,7 +356,12 @@ export function ChatThread({
             ) : null}
           </div>
           <div className="w-full">
-            <ChatInput {...composerProps} disabled={disabled} />
+            <ChatInput
+              {...composerProps}
+              disabled={disabled}
+              onRunAnalysis={openAnalysisRun}
+            />
+            {analysisRunDialog}
           </div>
         </div>
       </div>
@@ -380,6 +422,7 @@ export function ChatThread({
                       wikiSources={wikiSources}
                       onOpenDoc={onOpenDoc}
                       onOpenReport={onOpenReport}
+                      onOpenAnalysis={onOpenAnalysis}
                       compactionMarks={marks.during.get(i)}
                     />
                     <CompactionDivider marks={marks.after.get(i)} />
@@ -419,7 +462,12 @@ export function ChatThread({
           </Button>
         ) : null}
 
-        <ChatInput {...composerProps} disabled={disabled || loadingHistory} />
+        <ChatInput
+          {...composerProps}
+          disabled={disabled || loadingHistory}
+          onRunAnalysis={loadingHistory ? null : openAnalysisRun}
+        />
+        {analysisRunDialog}
       </div>
     </div>
   )

@@ -52,7 +52,10 @@ function isAnswered(q, a) {
 // string|string[]). interrupt_id (tagged onto each question by the server) routes
 // the answer to its owning interrupt when the model raised more than one.
 function toAnswer(q, a) {
-  const base = q.interrupt_id != null ? { id: q.id, interrupt_id: q.interrupt_id } : { id: q.id }
+  const base =
+    q.interrupt_id != null
+      ? { id: q.id, interrupt_id: q.interrupt_id }
+      : { id: q.id }
   if (q.kind === "text") return { ...base, answer: a.text.trim() }
   if (q.kind === "multi") {
     const out = a.choices.filter((c) => c !== OTHER)
@@ -63,7 +66,15 @@ function toAnswer(q, a) {
   return { ...base, answer }
 }
 
-export function AskHumanForm({ questions, onSubmit, onCancel, disabled = false }) {
+export function AskHumanForm({
+  questions,
+  onSubmit,
+  onCancel,
+  disabled = false,
+  // The last question's action label — "Submit answers" resumes the agent
+  // (the ask_human composer); the analysis-run dialog passes "Run".
+  submitLabel = "Submit answers",
+}) {
   const qs = Array.isArray(questions) ? questions : []
   const [idx, setIdx] = useState(0)
   // One draft per question id.
@@ -134,9 +145,19 @@ export function AskHumanForm({ questions, onSubmit, onCancel, disabled = false }
             )}
           />
         ) : q.kind === "multi" ? (
-          <MultiChoice q={q} draft={a} setDraft={setDraft} disabled={disabled} />
+          <MultiChoice
+            q={q}
+            draft={a}
+            setDraft={setDraft}
+            disabled={disabled}
+          />
         ) : (
-          <SingleChoice q={q} draft={a} setDraft={setDraft} disabled={disabled} />
+          <SingleChoice
+            q={q}
+            draft={a}
+            setDraft={setDraft}
+            disabled={disabled}
+          />
         )}
       </div>
 
@@ -153,9 +174,14 @@ export function AskHumanForm({ questions, onSubmit, onCancel, disabled = false }
           Back
         </Button>
         {isLast ? (
-          <Button type="button" size="sm" onClick={submit} disabled={!allAnswered || disabled}>
+          <Button
+            type="button"
+            size="sm"
+            onClick={submit}
+            disabled={!allAnswered || disabled}
+          >
             <CheckIcon className="size-3.5" data-icon="inline-start" />
-            Submit answers
+            {submitLabel}
           </Button>
         ) : (
           <Button

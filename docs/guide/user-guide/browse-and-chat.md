@@ -27,11 +27,40 @@ Use the graph to find:
 
 ## Ask the wiki
 
-Open **Chat** and enter a question. Add an `@` dataset scope when the question belongs to one dataset.
+Open **Chat** and enter a question. Type `@` or choose **+** > **Scope To A Dataset** when the question belongs to one dataset.
 
 The agent reads wiki pages before it answers. Wiki reads and optional SQL access are read-only.
 
 When requested, Chat can save report artifacts. It can also file annotations after user confirmation.
+
+## Composer controls
+
+The row under the message box holds the run settings.
+
+| Control | Purpose |
+| --- | --- |
+| **Guardrails** | Select **Disabled**, **Computational**, **Behavioural**, or **Strict** checks on the agent's SQL |
+| **SQL** | Allow read-only SQL against the source data |
+| Model and **Effort** | Choose the model and its reasoning effort |
+| Context ring | Show how much of the model's context window the conversation uses |
+
+Guardrails only apply while **SQL** is on. The control shows **Inactive Without SQL** otherwise.
+
+Hover the model name in the **Effort** card to switch models. A started conversation can switch only within its provider family.
+
+## Long conversations
+
+Open the context ring to see usage and the compaction threshold. Choose **Compact Now** to summarize older turns early.
+
+Chat also compacts automatically near the context limit. Compaction never deletes messages, and a divider marks where it happened.
+
+Use the turn rail on the left of the transcript to jump between questions. Hover it to list every question.
+
+## Clarifying questions
+
+The agent can pause and ask you questions before it continues. Answer them in the form that replaces the message box.
+
+You can reload or leave the page while an answer runs. Reopen the conversation to follow the rest of the answer.
 
 ## Review an answer
 
@@ -44,4 +73,4 @@ Ask a narrower follow-up when the question has unclear time, region, metric, or 
 
 ## Next step
 
-[Connect an external agent](connect-an-agent.md).
+[Run saved analyses](analyses.md).

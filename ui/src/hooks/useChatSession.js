@@ -479,6 +479,11 @@ export function useChatSession({
     if (isStreaming) return false
     const controller = new AbortController()
     let opened = false // did a real chunk arrive → we created the turn?
+    // The server marks an answer_human continuation: it has no question of its
+    // own, so it continues the trailing history turn (trimmed server-side to
+    // where the continuation began) — exactly like the live answerHuman flow —
+    // instead of opening a new, empty-bubble turn that repeats the answer.
+    let continuation = false
 
     // Materialize the in-flight turn on the first real chunk (not before).
     const ensureTurnOpen = () => {
@@ -489,10 +494,14 @@ export function useChatSession({
       accRef.current = 0
       abortRef.current = controller
       setError(null)
-      setChatTurns((turns) => [
-        ...turns,
-        { id: turnId(), userMessage: "", aiMessage: [] },
-      ])
+      setChatTurns((turns) =>
+        // A continuation extends the last turn as-is — its history end marker
+        // stays, like the paused run's end does in the live answerHuman flow
+        // (it carries the prefix's token_stats, which the usage popover reads).
+        continuation && turns.length > 0
+          ? turns
+          : [...turns, { id: turnId(), userMessage: "", aiMessage: [] }]
+      )
       setIsStreaming(true)
     }
 
@@ -506,6 +515,14 @@ export function useChatSession({
         res,
         (chunk) => {
           if (chunk.type === "no_active_stream") return // nothing in flight — no-op
+          if (chunk.type === "continuation") {
+            continuation = true
+            // The run is consuming the interrupt: a history read taken while
+            // it started up may still have restored the question form —
+            // answering it again would re-attach to this run and duplicate it.
+            setPendingAsk(null)
+            return
+          }
           if (chunk.type === "error") {
             if (opened) setError(errorMessage(chunk, "the agent hit an error"))
             return
@@ -516,16 +533,31 @@ export function useChatSession({
           }
           if (chunk.type === "compaction") {
             if (chunk.compaction) {
-              setCompactions((cur) => [
-                ...cur,
-                {
-                  ...chunk.compaction,
-                  // The resumed turn opens with its first real chunk; until
-                  // then it would land on the turn before.
-                  turn: Math.max(0, turnCountRef.current - (opened ? 1 : 0)),
-                  phase: "during",
-                },
-              ])
+              const mark = {
+                ...chunk.compaction,
+                // A fresh resumed turn opens with its first real chunk; until
+                // then it would land on the turn before. A continuation's turn
+                // is the trailing history turn from the start.
+                turn: Math.max(
+                  0,
+                  turnCountRef.current - (opened || continuation ? 1 : 0)
+                ),
+                phase: "during",
+              }
+              // A continuation's turn is IN the history read, so its mark may
+              // already be there (loadHistory keeps marks on existing turns) —
+              // don't draw the replayed one twice.
+              setCompactions((cur) =>
+                cur.some(
+                  (c) =>
+                    c.turn === mark.turn &&
+                    c.phase === mark.phase &&
+                    c.pre_tokens === mark.pre_tokens &&
+                    c.post_tokens === mark.post_tokens
+                )
+                  ? cur
+                  : [...cur, mark]
+              )
             }
             return
           }
@@ -577,6 +609,7 @@ export function useChatSession({
         context: ctx,
         compactions: marks,
         model: pinned,
+        inflight,
       } = await fetchHistoryAPI({
         threadId: cfg.threadId,
         getToken: cfg.getToken,
@@ -594,6 +627,7 @@ export function useChatSession({
       if (pending && Array.isArray(pending.questions) && pending.questions.length) {
         setPendingAsk(pending)
       }
+      return { inflight }
     } catch {
       // A missing/unreadable history just means an empty conversation — fine.
     } finally {
