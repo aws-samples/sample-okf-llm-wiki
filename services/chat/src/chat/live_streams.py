@@ -42,6 +42,11 @@ class LiveStream:
     chunks: list[dict[str, Any]] = field(default_factory=list)  # buffered, for replay
     subscribers: set[asyncio.Queue] = field(default_factory=set)
     user_message: str = ""
+    # An ``answer_human`` continuation (user_message == ""): the checkpoint's
+    # message count when it started. History reads trim to it so the turn's
+    # prefix comes from the checkpoint and only the continuation replays from
+    # this buffer (None: a fresh turn, or the count couldn't be read).
+    history_cut: int | None = None
     done: bool = False
     task: asyncio.Task | None = None
     # Called (sync) if the runner is cancelled; returns extra chunks to publish
@@ -112,6 +117,7 @@ def start(
     source: AsyncGenerator[dict[str, Any], None],
     *,
     user_message: str = "",
+    history_cut: int | None = None,
     on_cancel: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> LiveStream:
     """Register a new run for ``key`` and spawn its detached runner task.
@@ -125,7 +131,12 @@ def start(
         # the caller subscribes to the existing run instead (reconnect / double-send).
         return prev
 
-    stream = LiveStream(key=key, user_message=user_message, on_cancel=on_cancel)
+    stream = LiveStream(
+        key=key,
+        user_message=user_message,
+        history_cut=history_cut,
+        on_cancel=on_cancel,
+    )
     _active[key] = stream
     stream.task = asyncio.create_task(_runner(stream, source))
     return stream

@@ -21,10 +21,30 @@ import { cn } from "@/lib/utils"
 // overflows by a few pixels. ChatThread's jump-to-bottom button uses it too, so
 // the button and the lit last tick agree on where the bottom is.
 export const SLACK = 24
-// The rail spans 4-28px in from the viewport's left edge; the column's text
-// starts 16px inside its box. Below this gap between the viewport's edge and
-// the column they would overlap.
+
+// While the sidebar is hidden (collapsed on desktop; always on mobile, where it
+// is a sheet) the expand logo floats at the inset's top-left — left-4 + a size-8
+// button, centred 32px in. left-5 + the tick's px-1.5 centres the 12px ticks on
+// that same line, so the rail sits under the logo instead of hugging the edge.
+const RAIL_COLLAPSED_LEFT =
+  "max-md:left-5 [[data-slot=sidebar][data-state=collapsed]~*_&]:left-5"
+// The rail spans 4-28px in from the viewport's left edge (20-44px while shifted
+// under the collapsed logo); the column's text starts 16px inside its box. The
+// column must start this far in for the text to clear the ticks — 24px at rest,
+// 40px shifted (the same 12px clearance).
 const RAIL_ROOM = 24
+const RAIL_ROOM_SHIFTED = 40
+
+// Mirrors RAIL_COLLAPSED_LEFT's two conditions (mobile: max-md = <768px).
+function railShifted() {
+  if (typeof document === "undefined") return false
+  return (
+    window.matchMedia?.("(max-width: 767px)").matches ||
+    Boolean(
+      document.querySelector('[data-slot="sidebar"][data-state="collapsed"]')
+    )
+  )
+}
 // The nav's cap (max-h-[calc(100%-9rem)]) leaves no room for a tick (h-2.5) in a
 // shorter viewport, where an invisible rail would still hold a tab stop.
 const MIN_HEIGHT = 154
@@ -166,7 +186,10 @@ function TurnRailImpl({
     const vr = viewport.getBoundingClientRect()
     const max = viewport.scrollHeight - viewport.clientHeight
     setOverflows(max > SLACK)
-    setRoomy(content.getBoundingClientRect().left - vr.left >= RAIL_ROOM)
+    // Read the sidebar state, not the nav's position: its `left` transitions,
+    // and a mid-animation read would misjudge the room.
+    const room = railShifted() ? RAIL_ROOM_SHIFTED : RAIL_ROOM
+    setRoomy(content.getBoundingClientRect().left - vr.left >= room)
     setHeight(viewport.clientHeight)
     const hold = holdRef.current
     if (hold) {
@@ -308,7 +331,8 @@ function TurnRailImpl({
         onPointerEnter={() => hoverSoon(true)}
         onPointerLeave={() => hoverSoon(false)}
         className={cn(
-          "absolute top-1/2 left-1 z-10 flex max-h-[calc(100%-9rem)] -translate-y-1/2 flex-col overflow-hidden transition-opacity duration-150",
+          "absolute top-1/2 left-1 z-10 flex max-h-[calc(100%-9rem)] -translate-y-1/2 flex-col overflow-hidden transition-[opacity,left] duration-150",
+          RAIL_COLLAPSED_LEFT,
           open && "opacity-0"
         )}
       >
@@ -334,6 +358,7 @@ function TurnRailImpl({
         onPointerEnter={() => hoverSoon(true)}
         onPointerLeave={() => hoverSoon(false)}
         className={cn(
+          RAIL_COLLAPSED_LEFT,
           "absolute top-1/2 left-1 z-20 flex max-h-[calc(100%-6rem)] w-72 origin-left -translate-y-1/2 flex-col overflow-y-auto overscroll-contain rounded-lg bg-popover p-1 text-popover-foreground shadow-md ring-1 ring-edge transition-[opacity,translate,scale,visibility] duration-150 ease-out motion-reduce:transition-none",
           open
             ? "visible translate-x-0 scale-100 opacity-100"

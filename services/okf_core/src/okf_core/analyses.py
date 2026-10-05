@@ -27,6 +27,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
+# The ask_human kinds + normalizer — ONE definition, shared with the chat tool.
+from okf_core.ask_human_questions import (
+    _CHOICE_KINDS,
+    _VALID_KINDS,
+    AskHumanError,
+    normalize_questions,
+)
+
 ANALYSIS_PK_PREFIX = "ANALYSIS#"
 
 # One analysis is atomic and lightweight — a procedure, not a wiki. The cap
@@ -36,6 +44,12 @@ MAX_BODY_CHARS = 32_000
 # Analysis names are slugs (the computation-slug convention): lowercase,
 # digits, hyphen/underscore, max 64 chars.
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+# A data_domain / dataset segment as it may enter a key: no ``#`` (the pk
+# separator — ``ANALYSIS#a#b#c`` would alias two locations), no ``~`` (the
+# Analysis page's ``a~<domain>~<dataset>~<name>`` id) and no ``/`` or
+# whitespace (the ``<domain>/<dataset>`` display form).
+LOCATION_SEGMENT_RE = re.compile(r"^[^#~/\s]{1,128}$")
 
 
 def analysis_pk(data_domain: str, dataset: str) -> str:
@@ -73,10 +87,6 @@ def is_publication_sk(sk: str) -> bool:
 # are deliberately no defaults, and a misspelled key would silently vanish.
 QUESTION_KEYS = {"id", "prompt", "kind", "options"}
 
-# The ask_human question kinds (mirrors chat.ask_human — single/multi require
-# options; text is free prose).
-_CHOICE_KINDS = ("single", "multi")
-_VALID_KINDS = ("single", "multi", "text")
 
 
 def parse_analysis(text: str) -> tuple[dict[str, Any], list[str]]:
@@ -125,7 +135,14 @@ def parse_analysis(text: str) -> tuple[dict[str, Any], list[str]]:
         q_errors = _check_questions(raw_questions)
         errors.extend(q_errors)
         if not q_errors:
-            questions = list(raw_questions)
+            # The normalized ask_human shape (trimmed ids/prompts/options,
+            # blank options dropped, allow_other) — what every surface (the
+            # executor's ask_human, the Run dialog via get_analysis) renders,
+            # so the answers the executor sees can't differ between them.
+            try:
+                questions = normalize_questions(raw_questions)
+            except AskHumanError as e:
+                errors.append(str(e))
 
     parsed = {
         "title": title,
@@ -139,8 +156,9 @@ def parse_analysis(text: str) -> tuple[dict[str, Any], list[str]]:
 def _check_questions(raw: Any) -> list[str]:
     """Validate the frontmatter ``questions`` list.
 
-    Mirrors ``chat.ask_human.normalize_questions`` (prompt required, kind in
-    the enum, choice kinds need options) plus the analysis-specific
+    Names every problem :func:`okf_core.ask_human_questions.normalize_questions`
+    would refuse (prompt required, kind in the enum, choice kinds need
+    options) — it stops at the first — plus the analysis-specific
     strictness: ask_human tolerates missing ids (derives ``q1``…) because an
     ad-hoc call dies with its turn; analysis questions are REFERENCED BY ID
     from the steps (``{time_window}``) and keyed by a future headless
@@ -161,7 +179,9 @@ def _check_questions(raw: Any) -> list[str]:
             errors.append(f"duplicate question id {qid!r} — ids must be unique")
         else:
             seen.add(qid)
-        unknown = sorted(set(q) - QUESTION_KEYS)
+        # str-keyed sort: YAML 1.1 coerces bare keys like `on:`/`yes:` to
+        # booleans and `1:` to ints, and a mixed-type set can't be sorted.
+        unknown = sorted((k for k in q if k not in QUESTION_KEYS), key=str)
         if unknown:
             errors.append(
                 f"question {i} carries unsupported key(s) {unknown} — only "

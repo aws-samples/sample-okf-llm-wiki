@@ -673,3 +673,73 @@ def test_publish_refuses_when_analysis_deleted_between_read_and_write(table):
         KeyConditionExpression=Key("pk").eq(an.analysis_pk("sales", "orders"))
     )
     assert resp["Items"] == []
+
+
+# --- key integrity (review fixes) ---------------------------------------------
+
+
+@pytest.mark.parametrize("loc", [("sa#les", "orders"), ("sales", "or~ders"), ("sales", "a/b")])
+def test_location_segments_that_would_break_keys_are_refused(table, loc):
+    # '#' aliases pk locations (ANALYSIS#a#b#c), '~' breaks the page's a~ id,
+    # '/' the <domain>/<dataset> form — none may enter a key.
+    out = _create(_tools(table), data_domain=loc[0], dataset=loc[1])
+    assert "not a dataset location" in str(out)
+    assert table.scan()["Items"] == []
+
+
+def test_read_and_publish_refuse_non_slug_names(table):
+    tools = _tools(table)
+    assert "created" in str(_create(tools)) or table.scan()["Items"]
+    # A publication-row-shaped name must never address a row as a document.
+    pub_like = "churn-cohort-deep-dive#pub#rep~sales~orders~20260817T120000Z~aaaa1111"
+    out = tools["read_analysis"].invoke(
+        {"name": pub_like, "data_domain": "sales", "dataset": "orders"}
+    )
+    assert "names are slugs" in str(out)
+
+
+def test_create_refuses_an_unregistered_dataset(table):
+    class _Registry:
+        def __init__(self, known):
+            self.known = known
+
+        def get_item(self, Key):
+            hit = Key == {"pk": "DOMAIN#sales", "sk": "DATASET#orders"} and self.known
+            return {"Item": {"pk": Key["pk"]}} if hit else {}
+
+    tools = {
+        t.name: t
+        for t in make_analysis_tools(table, user_sub=SUB, registry=_Registry(False))
+    }
+    out = _create(tools)
+    assert "not a registered dataset" in str(out)
+    assert table.scan()["Items"] == []
+    tools = {
+        t.name: t
+        for t in make_analysis_tools(table, user_sub=SUB, registry=_Registry(True))
+    }
+    _create(tools)
+    assert len(table.scan()["Items"]) == 1
+
+
+def test_mixed_type_yaml_keys_are_named_not_a_crash():
+    # YAML 1.1: `on:` parses as True — sorting {'default', True} raised
+    # TypeError (a 500 on the page's PUT) instead of naming the problem.
+    doc = DOC.replace(
+        "  - id: segment\n", "  - id: segment\n    default: x\n    on: y\n", 1
+    )
+    parsed, errors = an.parse_analysis(doc)
+    assert any("unsupported key(s)" in e for e in errors)
+
+
+def test_questions_come_back_normalized_from_okf_core():
+    # One normalizer for every surface: trimmed options, blanks dropped.
+    doc = DOC.replace(
+        'options: ["Last quarter", "Last 12 months"]',
+        'options: ["Last quarter", " ", "All "]',
+        1,
+    )
+    parsed, errors = an.parse_analysis(doc)
+    assert errors == []
+    assert parsed["questions"][0]["options"] == ["Last quarter", "All"]
+    assert parsed["questions"][0]["allow_other"] is True

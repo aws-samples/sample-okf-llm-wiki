@@ -67,8 +67,12 @@ def make_analysis_tools(
     dataset_scope: dict[str, str] | None = None,
     s3=None,
     bundle_bucket: str = "",
+    registry=None,
 ):
     """The analysis tools: list / read / create / update (+ publish).
+
+    ``registry`` (the resource-style registry Table) lets create refuse an
+    unregistered dataset; None skips that check.
 
     ``table`` is the resource-style analyses Table (rows keyed by dataset —
     see okf_core.analyses). ``user_sub`` is closed over from the validated
@@ -101,7 +105,23 @@ def make_analysis_tools(
             raise ValueError(
                 "name the dataset — data_domain + dataset (see list_domains)"
             )
+        if not (
+            an.LOCATION_SEGMENT_RE.match(dd) and an.LOCATION_SEGMENT_RE.match(ds)
+        ):
+            raise ValueError(
+                f"{dd!r}/{ds!r} is not a dataset location — use the exact "
+                "data_domain and dataset list_domains shows"
+            )
         return dd, ds
+
+    def _require_slug(name: str) -> None:
+        # Read paths too: a non-slug can't name a document row, and one like
+        # 'x#pub#rep~…' would address a PUBLICATION row as if it were one.
+        if not an.SLUG_RE.match(name):
+            raise ValueError(
+                f"no analysis {name!r} — names are slugs; list_analyses shows "
+                "what exists"
+            )
 
     def _get(dd: str, ds: str, name: str) -> dict | None:
         return table.get_item(
@@ -193,6 +213,7 @@ def make_analysis_tools(
     def _read(name: str, data_domain: str = "", dataset: str = "") -> Any:
         dd, ds = _location(data_domain, dataset)
         name = (name or "").strip()
+        _require_slug(name)
         row = _get(dd, ds, name)
         if not row:
             raise ValueError(
@@ -218,6 +239,16 @@ def make_analysis_tools(
             raise ValueError(
                 f"invalid name {name!r} — a slug: lowercase letters/digits/"
                 "hyphen/underscore, max 64 chars (e.g. churn-cohort-deep-dive)"
+            )
+        # Only into a REGISTERED dataset: a typo'd location would store rows
+        # no dataset deletion ever purges (skipped when no registry handle is
+        # wired — the offline tests).
+        if registry is not None and not registry.get_item(
+            Key={"pk": f"DOMAIN#{dd}", "sk": f"DATASET#{ds}"}
+        ).get("Item"):
+            raise ValueError(
+                f"{dd}/{ds} is not a registered dataset — list_domains shows "
+                "the exact data_domain and dataset"
             )
         parsed, errors = parse_analysis(body or "")
         if errors:
@@ -266,6 +297,7 @@ def make_analysis_tools(
     ) -> Any:
         dd, ds = _location(data_domain, dataset)
         name = (name or "").strip()
+        _require_slug(name)
         row = _get(dd, ds, name)
         if not row:
             raise ValueError(
@@ -332,6 +364,7 @@ def make_analysis_tools(
 
         dd, ds = _location(data_domain, dataset)
         analysis = (analysis or "").strip()
+        _require_slug(analysis)
         report_id = (report_id or "").strip()
         row = _get(dd, ds, analysis)
         if not row:

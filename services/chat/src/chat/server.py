@@ -931,6 +931,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     # puts the composed HTML/PDF under the reports/ prefix) — grabbed, not
     # popped: build_consumption_tools needs it too.
     s3_client = clients.get("s3")
+    registry_handle = clients.get("ddb")
     tools_impl = build_consumption_tools(
         config=consumption_config,
         athena=athena_client,
@@ -1097,6 +1098,8 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                     # can exist: it verifies the report's stored artifacts.
                     s3=s3_client,
                     bundle_bucket=chat_config.bundle_bucket,
+                    # create refuses a dataset that isn't registered.
+                    registry=registry_handle,
                 ),
             ]
         # Report authoring: available on every run with a verified subject —
@@ -1473,6 +1476,8 @@ def read_history(
     internal_thread_id: str,
     *,
     inflight_user_message: str | None = None,
+    inflight_continuation: bool = False,
+    inflight_cut: int | None = None,
 ) -> dict[str, Any]:
     """Return ``{"history": [chatTurns]}`` for a conversation (empty if none).
 
@@ -1490,14 +1495,27 @@ def read_history(
     committed answer TEXT (prose emitted before/between tool calls) — the old
     shape heuristic kept those half-turns and the resume replay duplicated
     them. An ``answer_human`` continuation runs with ``user_message=""`` and
-    drops nothing: its question bubble belongs to the original turn, whose
+    drops no turn: its question bubble belongs to the original turn, whose
     checkpointed prefix must stay in history while the buffer appends only the
-    continuation.
+    continuation. ``inflight_continuation`` says one is running;
+    ``inflight_cut`` is its starting message count (None until the run has
+    read it — nothing has checkpointed before then): the steps checkpointed
+    since are trimmed off, or the resume replay (which starts at the
+    continuation's first chunk) would repeat them. Its interrupt is being
+    consumed, so no ``pending_ask`` is reported either.
+
+    ``inflight: true`` in the result means part of the conversation was held
+    back for the resume replay — if the run ends before the client resumes,
+    the client must re-read history to see it.
     """
     graph = build_agent("global.anthropic.claude-opus-5-5", "high", None, checkpointer)
     cfg = {"configurable": {"thread_id": internal_thread_id}}
     state = graph.get_state(cfg)
     messages = (state.values or {}).get("messages", []) if state else []
+    held_back = False
+    if inflight_continuation and inflight_cut is not None:
+        held_back = inflight_cut < len(messages)
+        messages = messages[:inflight_cut]
     turns = _messages_to_turns(messages)
     if inflight_user_message and turns:
         last = turns[-1]
@@ -1507,12 +1525,18 @@ def read_history(
         # checkpointed yet and the trailing turn is a prior completed one — keep.
         if last.get("userMessage") == inflight_user_message:
             turns = turns[:-1]
+            held_back = True
     out: dict[str, Any] = {"history": turns}
+    if held_back:
+        out["inflight"] = True
     # If the graph is PAUSED at an ask_human interrupt, surface it so a page reload
     # re-renders the QA form and the user can still answer (the interrupt is durable
     # in the checkpoint; nothing was lost). Not dropped by drop_inflight: the paused
-    # turn IS the one awaiting input, and answer_human resumes it in place.
-    pending_ask = _ask_human_chunk_from_state(graph, cfg)
+    # turn IS the one awaiting input, and answer_human resumes it in place. A
+    # running continuation is consuming that interrupt — never report it then.
+    pending_ask = (
+        None if inflight_continuation else _ask_human_chunk_from_state(graph, cfg)
+    )
     if pending_ask is not None:
         out["pending_ask"] = pending_ask
     # The context gauge, the compaction dividers and the pinned model (the
@@ -1646,6 +1670,7 @@ async def _produce_run_chunks(
     on_graph: Callable[[Any], None],
     resume_answers: Any = None,
     memory: Any = None,
+    on_history_cut: Callable[[int], None] | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Drive one agent turn and YIELD raw typed chunk dicts (no SSE framing).
 
@@ -1663,7 +1688,9 @@ async def _produce_run_chunks(
     :func:`_build_resume_map` from the pending interrupts) rather than a new user
     message, and the run continues from the checkpoint. If the graph is NOT paused on
     any interrupt, the run ends cleanly instead (no phantom turn). The prompt is
-    ignored in that case.
+    ignored in that case. ``on_history_cut(n)`` (resume path) receives the
+    checkpoint's message count read before the continuation writes anything —
+    where a mid-run history read must stop (see :func:`read_history`).
     """
     from langchain_core.messages import AIMessageChunk
 
@@ -1746,6 +1773,8 @@ async def _produce_run_chunks(
         # before the pin carry no okf_model but were all Claude.
         prior = await asyncio.to_thread(graph.get_state, cfg)
         prior_values = (prior.values if prior else None) or {}
+        if resume_answers is not None and on_history_cut is not None:
+            on_history_cut(len(prior_values.get("messages") or []))
         pinned = prior_values.get(MODEL_KEY) or (
             LEGACY_MODEL if prior_values.get("messages") else None
         )
@@ -2127,6 +2156,12 @@ async def stream_run(
         yield _sse(chunk)
 
 
+def _set_history_cut(holder: dict[str, Any], n: int) -> None:
+    stream = holder.get("stream")
+    if stream is not None:
+        stream.history_cut = n
+
+
 async def answer_run(
     input_data: dict[str, Any],
     user_sub: str,
@@ -2183,10 +2218,20 @@ async def answer_run(
         on_graph=lambda g: graph_holder.__setitem__("graph", g),
         resume_answers=answers,
         memory=memory,
+        # The run reports where its continuation began (the state it reads
+        # anyway, before writing): a history read taken mid-continuation then
+        # shows only the pre-answer prefix and the resume replay supplies the
+        # rest — see read_history. Before it reports, nothing has checkpointed,
+        # so an untrimmed read is already just the prefix.
+        on_history_cut=lambda n: _set_history_cut(stream_holder, n),
     )
+    stream_holder: dict[str, Any] = {}
     # user_message stays empty: this turn's question bubble already rendered on the
-    # original send; resume only continues the assistant's answer.
-    live_streams.start(internal_id, source, user_message="", on_cancel=_on_cancel)
+    # original send; resume only continues the assistant's answer. Registered with
+    # no await since the source was built, so a dropped request can't lose it.
+    stream_holder["stream"] = live_streams.start(
+        internal_id, source, user_message="", on_cancel=_on_cancel
+    )
 
     async for chunk in live_streams.subscribe(internal_id):
         yield _sse(chunk)
@@ -2210,6 +2255,11 @@ async def resume_run(user_sub: str, client_thread_id: str) -> AsyncGenerator[str
     stream = live_streams.get(internal_id)
     if stream is not None and stream.user_message:
         yield _sse({"type": "user_message", "content": stream.user_message})
+    elif stream is not None:
+        # An answer_human continuation: no new turn — the client appends the
+        # replay to the trailing history turn (trimmed to the continuation's
+        # start by read_history), as the live answer flow does.
+        yield _sse({"type": "continuation"})
     async for chunk in live_streams.subscribe(internal_id):
         yield _sse(chunk)
 
@@ -2324,16 +2374,16 @@ def build_app(
                 # identity (the run's user message) — the client's follow-up
                 # resume() renders that turn fresh from the buffer.
                 live = live_streams.get(internal_id)
-                inflight = (
-                    live.user_message
-                    if live is not None and live_streams.is_active(internal_id)
-                    else None
-                )
+                running = live is not None and live_streams.is_active(internal_id)
+                inflight = live.user_message if running else None
                 data = read_history(
                     build_agent,
                     checkpointer,
                     internal_id,
                     inflight_user_message=inflight,
+                    # A continuation (no user message) trims to where it began.
+                    inflight_continuation=running and not inflight,
+                    inflight_cut=live.history_cut if running else None,
                 )
             except Exception as exc:  # noqa: BLE001
                 return JSONResponse(

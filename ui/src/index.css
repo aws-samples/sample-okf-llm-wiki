@@ -159,7 +159,7 @@
        original cool cyan-tinted grays Aug 2026) at the same tuned lightness
        steps: page 0.18 < card 0.218 < muted 0.275. NOT the light theme's
        mauve — the temperature split between modes is deliberate. */
-  --background: oklch(0.18 0 0); /* #121212 — page background (lifted from #0B0B0B: pitch black read harsh; still a clear step below the #1A1A1A cards) */
+  --background: oklch(0.196 0 0); /* #151515 — page background (lifted from #121212; still a clear step below the #1A1A1A cards) */
   --foreground: oklch(0.987 0 0);
   --card: oklch(0.218 0 0);
   --card-foreground: oklch(0.987 0 0);
@@ -206,10 +206,10 @@
        --card (0.218) with a touch more sky chroma, so the wash reads on the
        dark surface without glowing. Same hue family as the light token. */
   --xref-node-bg: oklch(0.27 0.028 240);
-  /* Darker sidebar (#161616) in dark mode — reads as a recessed panel against
-       the lighter content bg. Hover accent is a lighter gray so it stays
-       visible on the near-black surface. */
-  --sidebar: oklch(0.2002 0 0); /* #161616 */
+  /* Sidebar (#1C1C1C) one step lighter than the #151515 page in dark mode, so
+       the panel separates from the content bg. Hover accent is a lighter gray
+       so it stays visible on the dark surface. */
+  --sidebar: oklch(0.226 0 0); /* #1C1C1C */
   --sidebar-foreground: oklch(0.97 0 0);
   --sidebar-primary: oklch(0.685 0.169 237.323);
   --sidebar-primary-foreground: oklch(0.293 0.066 243.157);

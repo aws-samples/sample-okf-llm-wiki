@@ -79,8 +79,13 @@ function Conversation({
     if (!historyResume) return
     let cancelled = false
     ;(async () => {
-      await loadHistory()
-      if (!cancelled) resume()
+      const loaded = await loadHistory()
+      if (cancelled) return
+      const attached = await resume()
+      // The history held part of the conversation back for the replay, but the
+      // run finished before we re-attached (no_active_stream): re-read it, now
+      // complete, or that part would never show.
+      if (!cancelled && !attached && loaded?.inflight) await loadHistory()
     })()
     return () => {
       cancelled = true

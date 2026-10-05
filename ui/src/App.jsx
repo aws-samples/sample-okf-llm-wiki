@@ -861,7 +861,9 @@ function Console({ auth, api }) {
   // lifted here so the sidebar sub-items (ChatNav) and the chat page (ChatPanel)
   // drive the SAME conversation. Reads/writes the #/chat/<threadId> URL.
   const chat = useChatController({
-    urlThreadId: route.threadId,
+    // Only a CHAT url's trailing id is a conversation id — #/analysis/<id>
+    // shares the same slot for a report/analysis id.
+    urlThreadId: route.section === "chat" ? route.threadId : null,
     onThreadChange: setChatThread,
     // Only bind the thread into the URL while chat is the active section — see
     // useChatController: this is what stops a chat→browse→chat hop from shoving

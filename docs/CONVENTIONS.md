@@ -1875,7 +1875,11 @@ the numbered steps (ad-hoc SQL embedded as exact ```sql patterns with
 the executor forwards unresolved questions in ONE `ask_human` call
 unchanged, and a future headless trigger is the same questions arriving
 pre-answered (`{analysis, answers: {id: answer}}` — `normalize_answers`
-already accepts the mapping).
+already accepts the mapping). The normalizer itself lives in
+`okf_core.ask_human_questions` (re-exported by `chat.ask_human`): stored
+questions are normalized on parse, and `GET /analysis` serves them in that
+shape, so the Run dialog and a live `ask_human` round render — and answer —
+the same questions.
 
 **Rows (on the `okf-analyses` table, keyed by DATASET):**
 `pk = ANALYSIS#<data_domain>#<dataset>`, `sk = <name slug>` (lowercase /
@@ -1897,7 +1901,7 @@ ownership would be spoofable.
 verified subject exist; all in `_LOCATION_TAKING_TOOLS`, and a pinned
 conversation drops the location params from their schemas):
 `list_analyses`, `read_analysis`, `create_analysis(name, body)` (validates
-whole, refuses with named problems), and `update_analysis(name, old_string,
+whole, refuses with named problems; only into a REGISTERED dataset), and `update_analysis(name, old_string,
 new_string)` — the Edit-tool contract: `old_string` must match the stored
 doc verbatim and exactly once, the edited doc is re-validated whole and
 version-bumped. **There is deliberately NO agent delete tool** (and no
@@ -1949,7 +1953,9 @@ over two cross-dataset lists (both small-table Scans on `okf-analyses`):
   optimistic-locked on `version` (409 on a stale edit) — and
   `DELETE /analysis/{d}/{ds}/{name}` the owner-only delete (purges the
   analysis's publication rows FIRST, the document row last — a mid-purge
-  failure stays retryable; report artifacts stay).
+  failure stays retryable — then sweeps publications once more: a
+  `publish_report` racing the delete can pass its ConditionCheck while the
+  document still exists; report artifacts stay).
 - *Reports* — `GET /analysis-reports` (publication rows, newest first),
   filterable by dataset/analysis client-side; clicking a row renders the
   report in the main layout via the existing `GET /report/{id}` presigns
@@ -1968,6 +1974,12 @@ objects), then Run — which sends a composed human prompt (`Run the analysis
 "<name>" on <dd>/<ds>.` + `- <id>: <answer>` lines). The execution skill's
 resolve-from-context step finds every input pre-answered, so the run starts
 without an ask_human round.
+
+**Key integrity:** names are `SLUG_RE` slugs on every tool (read/publish
+too — a `<name>#pub#…` string must never address a publication row as a
+document), and `data_domain`/`dataset` must match
+`okf_core.analyses.LOCATION_SEGMENT_RE` (no `#`, `~`, `/` or whitespace —
+the pk separator, the page's `a~` id, the display form).
 
 **Env + IAM:** `OKF_ANALYSES_TABLE` (chat runtime + Control API). The chat
 role holds `GetItem/PutItem/Query/ConditionCheckItem` on the table (no

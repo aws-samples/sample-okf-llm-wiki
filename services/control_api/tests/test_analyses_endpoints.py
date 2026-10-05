@@ -323,3 +323,50 @@ def test_delete_analysis_owner_only_and_purges_publications(cfg):
             data_domain=DOMAIN, dataset=DATASET, name="churn-cohorts",
         )
     assert e.value.status == 404
+
+
+def test_delete_analysis_sweeps_a_publication_that_raced_in(cfg):
+    # A publish_report landing BETWEEN the first purge and the document delete
+    # (its ConditionCheck passed — the document still existed) must not
+    # survive as an orphan: the post-delete sweep removes it.
+    _seed_analysis(cfg.ddb)
+    real_delete = cfg.ddb.delete_item
+
+    class _Racing:
+        def __getattr__(self, attr):
+            return getattr(cfg.ddb, attr)
+
+        def delete_item(self, **kw):
+            if kw["Key"]["sk"]["S"] == "churn-cohorts":
+                _seed_publication(
+                    cfg.ddb,
+                    report_id="rep~sales~orders~20261004T101010Z~bbbb2222",
+                    title="Raced in",
+                    at="2026-10-04T10:10:10+00:00",
+                )
+            return real_delete(**kw)
+
+    out = handlers.delete_analysis(
+        _Racing(), analyses_table=ANALYSES, user_sub=SUB,
+        data_domain=DOMAIN, dataset=DATASET, name="churn-cohorts",
+    )
+    assert out["purged_publications"] == 1
+    assert cfg.ddb.scan(TableName=ANALYSES)["Items"] == []
+
+
+def test_get_analysis_serves_normalized_questions(cfg):
+    # The Run dialog renders these as-is: the ask_human shape, not raw YAML.
+    _seed_analysis(
+        cfg.ddb,
+        body=ANALYSIS_DOC.replace(
+            'options: ["Last quarter", "Last 12 months"]',
+            'options: ["Last quarter", " ", "Last 12 months "]',
+        ),
+    )
+    out = handlers.get_analysis(
+        cfg.ddb, analyses_table=ANALYSES, user_sub=SUB,
+        data_domain=DOMAIN, dataset=DATASET, name="churn-cohorts",
+    )
+    q = out["questions"][0]
+    assert q["options"] == ["Last quarter", "Last 12 months"]
+    assert q["allow_other"] is True

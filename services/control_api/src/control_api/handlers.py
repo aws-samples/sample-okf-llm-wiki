@@ -7548,19 +7548,26 @@ def get_analysis(
         raise ApiError(404, f"no analysis {name!r} for {data_domain}/{dataset}")
 
     document = item.get("body", {}).get("S", "")
-    # Stored docs are validated at write time; tolerate drift for display
-    # (a parse failure falls back to the raw document as the body).
+    # The questions in the NORMALIZED ask_human shape (okf_core.analyses —
+    # what the executor's ask_human sends), so the Run dialog renders and
+    # answers exactly what a live ask_human round would. Stored docs are
+    # validated at write time; tolerate drift for display (a parse failure
+    # falls back to the raw document as the body, with no questions).
+    from okf_core.analyses import parse_analysis
+
     questions: list[Any] = []
     steps = document
-    try:
-        from okf_core.document import OKFDocument
+    parsed, errors = parse_analysis(document)
+    if not errors:
+        questions = parsed["questions"]
+        steps = parsed["body"]
+    else:
+        try:
+            from okf_core.document import OKFDocument
 
-        doc = OKFDocument.parse(document)
-        raw = doc.frontmatter.get("questions")
-        questions = raw if isinstance(raw, list) else []
-        steps = doc.body
-    except ValueError:  # OKFDocumentError is a ValueError
-        pass
+            steps = OKFDocument.parse(document).body
+        except ValueError:  # OKFDocumentError is a ValueError
+            pass
     return {
         "name": item.get("name", {}).get("S", name),
         "data_domain": data_domain,
@@ -7766,6 +7773,13 @@ def delete_analysis(
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
         raise ApiError(409, "the analysis changed hands — nothing was deleted") from e
+    # ...and once more AFTER it: a publish_report racing this delete passes its
+    # ConditionCheck while the document still exists, landing a publication
+    # between the first purge and the document delete. With the document gone
+    # no new publish can pass, so this sweep is final.
+    purged += _delete_rows_by_sk_prefix(
+        ddb, analyses_table, pk, publication_sk_prefix(name)
+    )
     return {"deleted": name, "purged_publications": purged}
 
 

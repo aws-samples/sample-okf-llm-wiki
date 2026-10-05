@@ -24,7 +24,7 @@ import {
   Trash2Icon,
   XIcon,
 } from "lucide-react"
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 
 import { AnalysisDocument } from "@/components/chat/AnalysisPeek"
@@ -142,11 +142,11 @@ function ReportPage({ api, reportId, row, rowLoading = false, onBack }) {
       {/* Fixed header — the analysis-detail arrangement: back in the reading
           column's left gutter, heading + actions on one row, meta below.
           Only the document region scrolls (inside the iframe). */}
-      <div className="relative mx-auto w-full max-w-4xl py-3 pr-4 pl-9">
+      <div className="relative mx-auto w-full max-w-4xl pt-4 pr-4 pb-3 pl-9">
         <Button
           variant="ghost"
           size="icon"
-          className="absolute top-3 left-0 size-8 shrink-0"
+          className="absolute top-4 left-0 size-8 shrink-0"
           onClick={onBack}
           aria-label="Back to the Analysis page"
         >
@@ -215,18 +215,29 @@ function AnalysisPage({ api, target, onBack, onMutated }) {
   const [error, setError] = useState("")
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState("")
+  // The version the draft was started from — the optimistic lock's token. NOT
+  // doc.version at save time: a refetch mid-edit (the agent saved meanwhile)
+  // would otherwise stamp a stale draft with the new version and overwrite it.
+  const [baseVersion, setBaseVersion] = useState(null)
   const [saving, setSaving] = useState(false)
   const [problems, setProblems] = useState("")
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
 
+  // The latest api, read at call time: App re-creates it on every id_token
+  // renewal, and a renewal must not refetch (or reset) an open document.
+  const apiRef = useRef(api)
+  useEffect(() => {
+    apiRef.current = api
+  }, [api])
+
   const load = useCallback(() => {
     setError("")
-    api
+    apiRef.current
       .getAnalysis(domain, dataset, name)
       .then(setDoc)
       .catch((e) => setError(String(e?.message || e)))
-  }, [api, domain, dataset, name])
+  }, [domain, dataset, name])
   useEffect(() => {
     load()
   }, [load])
@@ -241,6 +252,7 @@ function AnalysisPage({ api, target, onBack, onMutated }) {
 
   const startEdit = () => {
     setDraft(doc?.document || "")
+    setBaseVersion(doc?.version ?? null)
     setProblems("")
     setEditing(true)
   }
@@ -251,14 +263,17 @@ function AnalysisPage({ api, target, onBack, onMutated }) {
     try {
       await api.updateAnalysis(domain, dataset, name, {
         document: draft,
-        version: doc.version,
+        version: baseVersion,
       })
       setEditing(false)
       load()
     } catch (err) {
       // 400 carries the named validation problems; 409 the stale-version
-      // hint — both belong beside the editor, where the fix happens.
+      // hint — both belong beside the editor, where the fix happens. A 409
+      // also refetches, so Cancel → Edit starts from the CURRENT version
+      // instead of retrying the stale one forever.
       setProblems(String(err?.message || err))
+      if (err?.status === 409) load()
     } finally {
       setSaving(false)
     }
@@ -285,14 +300,14 @@ function AnalysisPage({ api, target, onBack, onMutated }) {
           Studio arrangement: column pl-9, button at left-0), so the title
           and the document below share ONE left edge with the arrow just
           beside it. */}
-      <div className="relative mx-auto w-full max-w-4xl py-3 pr-4 pl-9">
+      <div className="relative mx-auto w-full max-w-4xl pt-4 pr-4 pb-3 pl-9">
         {/* The title ROW: a proper heading with the actions on the same
             line; the meta line sits below it. The back arrow is centered on
             the heading row (h-8, matching the buttons). */}
         <Button
           variant="ghost"
           size="icon"
-          className="absolute top-3 left-0 size-8 shrink-0"
+          className="absolute top-4 left-0 size-8 shrink-0"
           onClick={onBack}
           aria-label="Back to the Analysis page"
         >
@@ -721,7 +736,12 @@ export function AnalysisView({ api, reportId, onOpen, onBack }) {
   return (
     <div className="okf-thin-scroll min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-3 p-4">
-        <h1 className="text-lg font-semibold">Analysis</h1>
+        {/* h-8 row at the column's p-4 top: centred 32px down — the line of the
+            sidebar brand row and the collapsed logo (top-4 + size-8), as the
+            TopbarHeader pages do. */}
+        <h1 className="flex h-8 items-center text-lg font-semibold">
+          Analysis
+        </h1>
         <p className="text-sm text-muted-foreground">
           Saved analyses the agent can run on your data, and the report each run
           publishes.

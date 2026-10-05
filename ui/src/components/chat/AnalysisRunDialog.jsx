@@ -11,7 +11,7 @@
 // run starts with every input already answered and no ask_human round.
 
 import { DatabaseIcon, MicroscopeIcon, PlayIcon } from "lucide-react"
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 
 import { AskHumanForm } from "@/components/chat/AskHumanForm"
 import { Badge } from "@/components/ui/badge"
@@ -41,29 +41,11 @@ import { Skeleton } from "@/components/ui/skeleton"
 
 const FILTER_ALL = "__all__"
 
-// Raw frontmatter questions → the AskHumanForm payload shape (the server
-// normalizer's output): kind defaulted, options list-ified, free-text
-// "Other" offered on choice kinds exactly like a live ask_human round.
+// GET /analysis serves the questions ALREADY normalized server-side (the
+// ask_human shape — okf_core.ask_human_questions), so the form renders exactly
+// what a live ask_human round would. Only guard against a non-list.
 function toFormQuestions(raw) {
-  return (Array.isArray(raw) ? raw : []).map((q, i) => {
-    // Lowercase like every server validator does (`kind: Text` is a valid
-    // stored document) — exact-case matching silently degraded it to a
-    // 'single' with no options here while the live ask_human round rendered
-    // the right widget.
-    const rawKind = String(q?.kind || "single")
-      .trim()
-      .toLowerCase()
-    const kind = ["single", "multi", "text"].includes(rawKind)
-      ? rawKind
-      : "single"
-    return {
-      id: String(q?.id || `q${i + 1}`),
-      prompt: String(q?.prompt || ""),
-      kind,
-      options: Array.isArray(q?.options) ? q.options.map(String) : [],
-      allow_other: kind !== "text",
-    }
-  })
+  return Array.isArray(raw) ? raw : []
 }
 
 // The human prompt the run becomes: the analysis's address + the answers by
@@ -95,9 +77,17 @@ export function AnalysisRunDialog({
   // document (their source) loads.
   const [picked, setPicked] = useState(null)
 
+  // The latest api, read at call time: App re-creates it on every id_token
+  // renewal, and a renewal mid-questionnaire must not reset the dialog.
+  const apiRef = useRef(api)
+  useEffect(() => {
+    apiRef.current = api
+  }, [api])
+
   // Fresh state per open — the list is cheap and an analysis may have been
   // created/edited since the last open.
   useEffect(() => {
+    const api = apiRef.current
     if (!open || !api) return undefined
     let alive = true
     setAnalyses(null)
@@ -116,7 +106,7 @@ export function AnalysisRunDialog({
     return () => {
       alive = false
     }
-  }, [api, open])
+  }, [open])
 
   const pinnedKey = datasetScope
     ? `${datasetScope.data_domain}/${datasetScope.dataset}`
@@ -172,8 +162,10 @@ export function AnalysisRunDialog({
     onOpenChange(o)
   }
 
+  // onRun returns false when the prompt was NOT sent (e.g. the conversation is
+  // compacting): the dialog stays open so the answers aren't lost.
   const run = (answers) => {
-    onRun(composePrompt(picked.row, answers))
+    if (onRun(composePrompt(picked.row, answers)) === false) return
     close(false)
   }
 
@@ -235,7 +227,14 @@ export function AnalysisRunDialog({
         </DialogHeader>
         <Command className="rounded-xl">
           <CommandInput placeholder="Search analyses…" />
-          <div className="flex h-11 items-center gap-2 border-b px-3">
+          {/* Keys stop here: React portals bubble synthetic events through
+              the React tree, so the filter Select's Enter (a SelectItem
+              doesn't preventDefault it) would ALSO reach cmdk's root onKeyDown
+              and pick the highlighted analysis. */}
+          <div
+            className="flex h-11 items-center gap-2 border-b px-3"
+            onKeyDown={(e) => e.stopPropagation()}
+          >
             {pinnedKey ? (
               <>
                 <Badge variant="secondary" className="gap-1">
@@ -243,7 +242,7 @@ export function AnalysisRunDialog({
                   {pinnedKey}
                 </Badge>
                 <span className="text-xs text-muted-foreground">
-                  pinned to this conversation
+                  Pinned To This Conversation
                 </span>
               </>
             ) : (

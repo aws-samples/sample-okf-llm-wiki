@@ -20,6 +20,7 @@ import {
   useRef,
   useState,
 } from "react"
+import { toast } from "sonner"
 
 import { AnalysisRunDialog } from "@/components/chat/AnalysisRunDialog"
 import { ChatInput } from "@/components/chat/ChatInput"
@@ -120,16 +121,31 @@ export function ChatThread({
   // conversation — or the feature would vanish after the first message.
   const [analysisRunOpen, setAnalysisRunOpen] = useState(false)
   const openAnalysisRun =
-    api && !isStreaming && !disabled && !pendingAsk
+    api && !isStreaming && !disabled && !pendingAsk && !compacting
       ? () => setAnalysisRunOpen(true)
       : null
+  // The composer's send guard, for the dialog's direct send: the runtime
+  // refuses a turn while compacting (or streaming), so refuse here and keep
+  // the dialog — and the answers in it — open.
+  const runAnalysis = (text) => {
+    if (compacting || isStreaming) {
+      toast.message("This Conversation Is Busy", {
+        description: compacting
+          ? "It is being compacted — run again once it finishes."
+          : "Wait for the current answer to finish, then run again.",
+      })
+      return false
+    }
+    onSend(text)
+    return true
+  }
   const analysisRunDialog = api ? (
     <AnalysisRunDialog
       api={api}
       open={analysisRunOpen}
       onOpenChange={setAnalysisRunOpen}
       datasetScope={datasetScope}
-      onRun={(text) => onSend(text)}
+      onRun={runAnalysis}
     />
   ) : null
   // The tail turn's reserved height is FROZEN when a new turn arrives — it must

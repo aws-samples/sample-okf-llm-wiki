@@ -560,7 +560,11 @@ export function ChatInput({
           // See MOVE_MS.
           CARD_TRANSITION,
           // Slimmer and squarer at rest; the radius opens up with the box.
-          twoLine || asking ? "rounded-2xl py-2.5" : "rounded-xl py-1.5"
+          asking
+            ? "rounded-2xl py-2.5"
+            : twoLine
+              ? "rounded-2xl py-2"
+              : "rounded-xl py-1.5"
         )}
       >
         {asking ? (
@@ -578,9 +582,12 @@ export function ChatInput({
           // classes change.
           <div
             ref={setRowEl}
-            // No row gap: wrapped, the buttons' own padding is the space under
-            // the text.
-            className="flex flex-wrap items-center gap-x-2 gap-y-0"
+            // Wrapped (two-line), a row gap separates the text from the button
+            // row; one-line never wraps, so the gap only ever applies there.
+            className={cn(
+              "flex flex-wrap items-center gap-x-2",
+              twoLine ? "gap-y-2" : "gap-y-0"
+            )}
           >
             {/* The shape mirror (see shapeFor); inside the row to inherit its font. */}
             <span
