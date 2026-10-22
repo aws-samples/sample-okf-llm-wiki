@@ -397,20 +397,39 @@ function ToolResultIndicator({
   )
 }
 
-const ThinkingStep = memo(function ThinkingStep({ segments, isLast }) {
+// A reasoning step. A GPT summary part carries a `title` (its "**Title**"
+// line, split out by timelineParser): it renders as the step's LABEL — the
+// same marker row a tool step's label uses, shimmering while that part is
+// the one still streaming — with the body beneath. Untitled (Claude)
+// reasoning is just the prose.
+const ThinkingStep = memo(function ThinkingStep({ title, segments, isLast }) {
   return (
     <div className={`timeline-item ${isLast ? "last" : ""}`}>
       <div className="timeline-marker">
         <ClockFading size={18} className="timeline-icon thinking-icon" />
       </div>
       <div className="timeline-content">
-        <div className="timeline-thinking-content">
-          {segments.map((seg, i) => (
-            <div key={i} className="thinking-segment">
-              <Markdown>{seg?.content || ""}</Markdown>
-            </div>
-          ))}
-        </div>
+        {title ? (
+          <Marker className="cursor-default">
+            <MarkerContent className={cn(isLast && "text-shimmer")}>
+              {title}
+            </MarkerContent>
+          </Marker>
+        ) : null}
+        {segments.length > 0 ? (
+          <div
+            className={cn(
+              "timeline-thinking-content",
+              title && "timeline-thinking-titled"
+            )}
+          >
+            {segments.map((seg, i) => (
+              <div key={i} className="thinking-segment">
+                <Markdown>{seg?.content || ""}</Markdown>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </div>
     </div>
   )
@@ -544,6 +563,8 @@ const HEADER_MAX_WORDS = 15
 // empty) segment falls back to the previous one; "Reasoning" only when the
 // step has no text at all yet.
 function reasoningPreview(step) {
+  // A titled summary part already names what the model is doing.
+  if (step.title) return step.title
   for (let i = step.segments.length - 1; i >= 0; i--) {
     const text = (step.segments[i]?.content || "")
       .replace(/[*_`#>]+/g, " ")
@@ -648,7 +669,14 @@ export function UnifiedThinkingBlock({
             {mergedSteps.map((step, i) => {
               const isLast = !isGroupComplete && i === mergedSteps.length - 1
               if (step.type === "thinking") {
-                return <ThinkingStep key={step.id} segments={step.segments} isLast={isLast} />
+                return (
+                  <ThinkingStep
+                    key={step.id}
+                    title={step.title}
+                    segments={step.segments}
+                    isLast={isLast}
+                  />
+                )
               }
               if (step.type === "steer") {
                 return <SteeringStep key={step.id} step={step} isLast={isLast} />

@@ -277,6 +277,59 @@ export function makeApi(token) {
         `/analysis/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/${encodeURIComponent(name)}`
       ),
 
+    // Canvas (dashboards): per-user list/get/delete, the human verify flips
+    // (identity from the JWT server-side), and tile execution — `dials` is a
+    // partial override map on top of the stored dial defaults.
+    listCanvases: () => request(token, "GET", "/canvas"),
+    getCanvas: (canvasId) =>
+      request(token, "GET", `/canvas/${encodeURIComponent(canvasId)}`),
+    deleteCanvas: (canvasId) =>
+      request(token, "DELETE", `/canvas/${encodeURIComponent(canvasId)}`),
+    verifyCanvas: (canvasId) =>
+      request(token, "POST", `/canvas/${encodeURIComponent(canvasId)}/verify`),
+    unverifyCanvas: (canvasId) =>
+      request(
+        token,
+        "POST",
+        `/canvas/${encodeURIComponent(canvasId)}/unverify`
+      ),
+    // Geometry-only config patch (the drag/resize editor). `layouts` maps
+    // tile id -> {x, y, w, h}; the server validates with the lint's own
+    // layout rules and preserves status — verified included.
+    updateCanvasLayout: (canvasId, layouts) =>
+      request(token, "POST", `/canvas/${encodeURIComponent(canvasId)}/layout`, {
+        layouts,
+      }),
+    // Title-only patch (the pen next to the page title); same narrow-write
+    // posture — status survives, verified included.
+    renameCanvas: (canvasId, title) =>
+      request(token, "POST", `/canvas/${encodeURIComponent(canvasId)}/title`, {
+        title,
+      }),
+    listCanvasJobs: (activeOnly, threadId) => {
+      const params = new URLSearchParams()
+      if (activeOnly) params.set("active", "true")
+      if (threadId) params.set("thread", threadId)
+      const qs = params.toString()
+      return request(token, "GET", `/canvas-jobs${qs ? `?${qs}` : ""}`)
+    },
+    // Observed values for a column-bound dial: live SELECT DISTINCT behind a
+    // 24h server-side cache (profile evidence is cardinality-capped, so
+    // mid-cardinality columns had no type-ahead at all).
+    getColumnDomain: (domain, dataset, column) =>
+      request(
+        token,
+        "GET",
+        `/bundle/${encodeURIComponent(domain)}/${encodeURIComponent(dataset)}/column-domain?column=${encodeURIComponent(column)}`
+      ),
+    runCanvasTile: (canvasId, tileId, dials) =>
+      request(
+        token,
+        "POST",
+        `/canvas/${encodeURIComponent(canvasId)}/tiles/${encodeURIComponent(tileId)}/run`,
+        { dials }
+      ),
+
     // Bundle version history (reconstructed server-side from S3 object
     // versions; a version = one completed harvest/repromote). Diff selectors
     // are marker version_ids from listBundleVersions; both optional (default:

@@ -21,11 +21,13 @@ module "control_api_fn" {
   environment = merge(local.common_env, {
     OKF_HARVEST_RUNTIME_ARN = try(aws_bedrockagentcore_agent_runtime.harvest[0].agent_runtime_arn, "")
     OKF_ATHENA_WORKGROUP    = var.athena_workgroup
-    # Attested Computations execution for the UI's Run modal. When off, the
-    # run endpoint returns the rendered SQL without executing it (list/get/
-    # verify/unverify never need the flag).
-    OKF_COMPUTATIONS_ENABLED = tostring(var.enable_attested_computations)
-    OKF_ATHENA_OUTPUT        = var.enable_attested_computations ? local.athena_output : ""
+    # Computation execution for the UI (the Run modal, canvas tile runs, dial
+    # column-domains). When off, the run endpoints return the rendered SQL
+    # without executing it (list/get/verify/unverify never need the flag).
+    # local.computations_execution: the explicit flag OR a deployed canvas
+    # runtime — see athena.tf.
+    OKF_COMPUTATIONS_ENABLED = tostring(local.computations_execution)
+    OKF_ATHENA_OUTPUT        = local.computations_execution ? local.athena_output : ""
     OKF_COMPUTATION_MAX_ROWS = tostring(var.computation_max_rows)
     # MUST stay below this Lambda's timeout (30s): the executor's own timeout
     # is what cancels the engine query and returns the un-executed receipt —

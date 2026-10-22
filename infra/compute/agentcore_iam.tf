@@ -420,9 +420,9 @@ data "aws_iam_policy_document" "consumption" {
 
   # Optional Attested Computations execution: the SHARED ceiling
   # (computations_iam.tf) merged via source_policy_documents below — one
-  # definition for consumption / control_api instead of hand-synced copies.
-  # Only the wiki's frozen statements (typed literals substituted by the
-  # platform) reach an engine — run_computation never forwards caller SQL.
+  # definition for consumption / canvas / control_api instead of hand-synced
+  # copies. Only the wiki's frozen statements (typed literals substituted by
+  # the platform) reach an engine — run_computation never forwards caller SQL.
 
   statement {
     sid       = "BedrockEmbed"
@@ -499,6 +499,27 @@ data "aws_iam_policy_document" "chat" {
     sid       = "AnalysesRows"
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query", "dynamodb:ConditionCheckItem"]
     resources = [local.d.analyses_table_arn]
+  }
+
+  # Dashboard delegation (only when a canvas runtime is deployed): start jobs
+  # on the canvas CI runtime + write/read the job rows and read the user's
+  # canvas rows (revise checks ownership before invoking; UpdateItem is the
+  # _fail_job status flip on an invoke error).
+  dynamic "statement" {
+    for_each = var.canvas_image_uri != "" ? [1] : []
+    content {
+      sid       = "CanvasRuntimeInvoke"
+      actions   = ["bedrock-agentcore:InvokeAgentRuntime"]
+      resources = ["${aws_bedrockagentcore_agent_runtime.canvas[0].agent_runtime_arn}*"]
+    }
+  }
+  dynamic "statement" {
+    for_each = var.canvas_image_uri != "" ? [1] : []
+    content {
+      sid       = "CanvasJobRows"
+      actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query", "dynamodb:UpdateItem"]
+      resources = [local.d.canvas_table_arn]
+    }
   }
 
   statement {
@@ -609,9 +630,10 @@ data "aws_iam_policy_document" "chat" {
     sid = "ChatCheckpointOffloadRW"
     # PutObjectTagging: when a checkpoint TTL is configured, DynamoDBSaver's
     # put_object carries `Tagging: ttl-days=N` — a distinct IAM action whose
-    # absence is an AccessDenied on the WHOLE put (observed live). Chat's TTL
-    # defaults to None today, but the knob exists (checkpoint_ttl_seconds) —
-    # grant it now so flipping the knob is not an outage.
+    # absence is an AccessDenied on the WHOLE put (bit the canvas runtime
+    # live). Chat's TTL defaults to None today, but the knob exists
+    # (checkpoint_ttl_seconds) — grant it now so flipping the knob is not an
+    # outage.
     actions   = ["s3:GetObject", "s3:PutObject", "s3:PutObjectTagging", "s3:DeleteObject"]
     resources = ["${local.d.chat_checkpoint_bucket_arn}/*"]
   }

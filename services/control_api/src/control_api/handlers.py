@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import tempfile
 import time
 import uuid
@@ -714,6 +715,126 @@ def get_dataset_guidance(
         "dataset": dataset,
         **_guidance_fields(item),
     }
+
+
+_COLUMN_RE = re.compile(r"^[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*$")
+_DOMAIN_CACHE_TTL_S = 24 * 3600
+_DOMAIN_CACHE_CAP = 1000
+# DynamoDB items cap at 400KB; long-text columns can blow that with far fewer
+# than 1000 values. The serialized value list is trimmed to this budget.
+_DOMAIN_CACHE_MAX_BYTES = 300_000
+
+
+def get_column_domain(
+    ddb,
+    *,
+    registry_table: str,
+    canvas_table: str,
+    data_domain: str,
+    dataset: str,
+    column: str,
+    athena=None,
+    redshift_data=None,
+    athena_workgroup: str = "",
+    athena_output: str = "",
+    athena_catalog: str = "AwsDataCatalog",
+    timeout_s: float = 25.0,
+    enabled: bool = True,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Observed values for a `column`-bound dial: live SELECT DISTINCT,
+    cached 24h in the canvas table (pk=DOMAINCACHE#<dd>/<ds>, sk=<column> —
+    soft TTL via fetched_at, no table TTL config needed). Replaces the
+    profile-evidence path for CANVAS dials: domains.json is cardinality-
+    capped by design, so mid-cardinality columns (840 drivers) had no
+    observed values there at all — which pushed the authoring agent back to
+    hand-enumerated enums. Values stay ADVISORY (type-ahead; free text
+    legal); `exhaustive` is False when DISTINCT hit the cap."""
+    import time
+
+    from okf_core import canvas as cv
+    from okf_core.computations import ComputationError
+
+    from okf_aws import computation_run
+
+    column = str(column or "").strip().lower()
+    if not _COLUMN_RE.fullmatch(column):
+        # The identifier gate is the injection boundary for the SQL below.
+        raise ApiError(400, "column must be `table.column` (identifiers only)")
+    ts = time.time() if now is None else now
+    key = {
+        "pk": {"S": f"DOMAINCACHE#{data_domain}/{dataset}"},
+        "sk": {"S": column},
+    }
+    if not enabled:
+        # Computation execution is off on this deploy: no live DISTINCT.
+        # Advisory surface — the dial stays free-text.
+        return {"column": column, "values": [], "exhaustive": False,
+                "cached": False, "executed": False}
+    cached = ddb.get_item(TableName=canvas_table, Key=key).get("Item")
+    if cached:
+        fetched = float(cached.get("fetched_at", {}).get("N", "0") or 0)
+        if ts - fetched < _DOMAIN_CACHE_TTL_S:
+            return {
+                "column": column,
+                "values": json.loads(cached.get("values", {}).get("S", "[]")),
+                "exhaustive": cached.get("exhaustive", {}).get("BOOL", False),
+                "cached": True,
+            }
+    table, col = column.split(".", 1)
+    # One read-only statement through the SAME sanctioned executor as tiles
+    # (caps, engine routing via the dataset's source descriptor).
+    source = get_dataset_source(
+        ddb, registry_table=registry_table, data_domain=data_domain, dataset=dataset
+    )
+    comp, errors = cv.adhoc_computation(
+        "domain", f'SELECT DISTINCT "{col}" FROM "{table}" '
+        f'WHERE "{col}" IS NOT NULL ORDER BY 1 LIMIT {_DOMAIN_CACHE_CAP + 1}',
+        [],
+        cv.source_runtime(source),
+    )
+    if comp is None:
+        raise ApiError(500, "; ".join(errors))
+    try:
+        receipt = computation_run.run_computation(
+            comp, {}, athena=athena, redshift_data=redshift_data, source=source,
+            athena_workgroup=athena_workgroup, athena_output=athena_output,
+            athena_catalog=athena_catalog, max_rows=_DOMAIN_CACHE_CAP + 1,
+            timeout_s=timeout_s, execute=True,
+        )
+    except ComputationError as e:
+        raise ApiError(400, str(e)) from e
+    if not receipt.get("executed"):
+        raise ApiError(409, receipt.get("note") or "execution is not enabled")
+    rows = receipt.get("rows") or []
+    exhaustive = len(rows) <= _DOMAIN_CACHE_CAP
+    values = [str(r[0]) for r in rows[:_DOMAIN_CACHE_CAP] if r and r[0] is not None]
+    # Byte-budget the payload (the type-ahead is ADVISORY — fewer suggestions
+    # beat a DDB 400KB-item ValidationException) and keep the write
+    # best-effort: a failed put must never cost the caller the values it
+    # already paid a DISTINCT scan for.
+    kept: list[str] = []
+    size = 2  # the JSON brackets
+    for v in values:
+        size += len(v.encode()) + 4  # quotes + comma, roughly
+        if size > _DOMAIN_CACHE_MAX_BYTES:
+            exhaustive = False
+            break
+        kept.append(v)
+    values = kept
+    try:
+        ddb.put_item(
+            TableName=canvas_table,
+            Item={
+                **key,
+                "values": {"S": json.dumps(values)},
+                "exhaustive": {"BOOL": exhaustive},
+                "fetched_at": {"N": str(int(ts))},
+            },
+        )
+    except Exception:  # noqa: BLE001 — cache is an optimization, not the answer
+        log.warning("column-domain cache write failed for %s", column, exc_info=True)
+    return {"column": column, "values": values, "exhaustive": exhaustive, "cached": False}
 
 
 def get_dataset_source(
@@ -7836,3 +7957,633 @@ def list_analysis_reports(
         kwargs["ExclusiveStartKey"] = start
     rows.sort(key=lambda r: r.get("published_at") or "", reverse=True)
     return {"reports": rows}
+
+
+# ---------------------------------------------------------------------------
+# Canvas (dashboards) — the read/verify/execute surface for the UI.
+#
+# Configs only ENTER through the canvas CI runtime (lint-gated
+# submit_dashboard writes the row); this API never accepts a config body.
+# Isolation is structural: the caller's sub is in the partition key
+# (okf_core.canvas conventions), so list/get/delete/verify can only touch the
+# caller's own rows. See Roadmap.md §2 and okf_core/canvas.py.
+# ---------------------------------------------------------------------------
+
+
+def _canvas_item_meta(item: dict[str, Any]) -> dict[str, Any]:
+    def s(key: str) -> str:
+        return item.get(key, {}).get("S", "")
+
+    return {
+        "canvas_id": s("canvas_id"),
+        "title": s("title"),
+        "data_domain": s("data_domain"),
+        "dataset": s("dataset"),
+        "status": s("status"),
+        "created_at": s("created_at"),
+        "updated_at": s("updated_at"),
+        "verified_at": s("verified_at") or None,
+        "verified_by": s("verified_by") or None,
+    }
+
+
+def _get_canvas_item(
+    ddb, *, canvas_table: str, user_sub: str, canvas_id: str
+) -> dict[str, Any]:
+    from okf_core import canvas as cv
+
+    resp = ddb.get_item(
+        TableName=canvas_table,
+        Key={"pk": {"S": cv.canvas_pk(user_sub)}, "sk": {"S": canvas_id}},
+    )
+    item = resp.get("Item")
+    if not item:
+        raise ApiError(404, f"no canvas {canvas_id!r}")
+    return item
+
+
+def list_canvases(
+    ddb, *, canvas_table: str, user_sub: str | None
+) -> list[dict[str, Any]]:
+    """The caller's canvases (meta only, no configs), newest-updated first."""
+    from okf_core import canvas as cv
+
+    user_sub = _require_user_sub(user_sub)
+    items: list[dict[str, Any]] = []
+    kwargs: dict[str, Any] = {
+        "TableName": canvas_table,
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": cv.canvas_pk(user_sub)}},
+    }
+    while True:
+        resp = ddb.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+    out = [_canvas_item_meta(i) for i in items]
+    out.sort(key=lambda c: c["updated_at"], reverse=True)
+    return out
+
+
+def _canvas_computation_hashes(
+    s3, bundle_bucket: str, data_domain: str, dataset: str, config: dict[str, Any]
+) -> dict[str, str]:
+    """``{slug: sha256}`` for every bundle computation the config's tiles
+    bind ("" for one that no longer parses/exists). Ad-hoc tiles need no pin:
+    their SQL lives IN the config the human verified."""
+    from okf_aws import computation_run
+
+    out: dict[str, str] = {}
+    for t in config.get("tiles") or []:
+        data = t.get("data") if isinstance(t, dict) else None
+        slug = data.get("computation") if isinstance(data, dict) else None
+        if not slug or slug in out:
+            continue
+        comp, _errors = computation_run.load_computation(
+            s3, bundle_bucket, data_domain, dataset, str(slug)
+        )
+        out[slug] = comp.sha256 if comp is not None else ""
+    return out
+
+
+def _stale_pins(item: dict[str, Any], current: dict[str, str]) -> list[str]:
+    """Slugs whose statement changed since the Verify click (or every slug,
+    when the row predates pinning — an unpinned verification attests nothing
+    checkable)."""
+    raw = item.get("verified_computations", {}).get("S")
+    if raw is None:
+        return sorted(current) or ["(unpinned verification)"]
+    try:
+        pinned = json.loads(raw)
+    except ValueError:
+        pinned = {}
+    return sorted(
+        slug for slug in set(pinned) | set(current)
+        if not current.get(slug) or pinned.get(slug) != current.get(slug)
+    )
+
+
+def get_canvas(
+    ddb,
+    *,
+    canvas_table: str,
+    user_sub: str | None,
+    canvas_id: str,
+    s3=None,
+    bundle_bucket: str = "",
+) -> dict[str, Any]:
+    """One canvas: meta + the stored config (the CanvasView's whole payload).
+
+    ``observed`` (``{tile_id: {param: {values, exhaustive}}}``) rides along
+    for AD-HOC tile parameters that declare a ``column`` binding — the same
+    profile-evidence lookup ``describe_computation`` does for bundle
+    computations (whose contracts the UI fetches separately). Advisory only:
+    it powers the dial bar's type-ahead; free text stays legal."""
+    user_sub = _require_user_sub(user_sub)
+    item = _get_canvas_item(
+        ddb, canvas_table=canvas_table, user_sub=user_sub, canvas_id=canvas_id
+    )
+    out = _canvas_item_meta(item)
+    try:
+        out["config"] = json.loads(item.get("config", {}).get("S", "") or "{}")
+    except ValueError as e:
+        raise ApiError(500, f"stored config for {canvas_id!r} is not JSON") from e
+    if s3 is not None and bundle_bucket:
+        from okf_aws import computation_run
+        from okf_core import canvas as cv
+        from okf_core.computations import lookup_domain
+
+        observed: dict[str, Any] = {}
+        domains = None  # loaded lazily — most canvases have no column-bound ad-hoc params
+        for t in out["config"].get("tiles") or []:
+            data = t.get("data") if isinstance(t, dict) else None
+            if not isinstance(data, dict) or not data.get("sql"):
+                continue
+            for p in data.get("parameters") or []:
+                col = p.get("column") if isinstance(p, dict) else None
+                if not col:
+                    continue
+                if domains is None:
+                    domains = computation_run.load_domains(
+                        s3, bundle_bucket, out["data_domain"], out["dataset"]
+                    )
+                dom = lookup_domain(domains, str(col).lower())
+                if dom:
+                    observed.setdefault(t.get("id"), {})[p["name"]] = {
+                        "values": [str(v) for v in dom.get("values") or []],
+                        "exhaustive": bool(dom.get("exhaustive")),
+                    }
+        if observed:
+            out["observed"] = observed
+
+        # A Verify attests the SQL behind every tile AS IT WAS: the click pins
+        # each bound computation's content hash. A later statement change (a
+        # full harvest re-authors docs) voids it — the page must not keep a
+        # Verified badge over numbers nobody attested. Reset conditionally
+        # (status + updated_at as read) so a concurrent re-verify wins.
+        if out.get("status") == cv.STATUS_VERIFIED:
+            stale = _stale_pins(
+                item,
+                _canvas_computation_hashes(
+                    s3, bundle_bucket, out["data_domain"], out["dataset"],
+                    out["config"],
+                ),
+            )
+            if stale:
+                now = _now_iso()
+                try:
+                    ddb.update_item(
+                        TableName=canvas_table,
+                        Key={"pk": {"S": cv.canvas_pk(user_sub)}, "sk": {"S": canvas_id}},
+                        ConditionExpression="#s = :v AND updated_at = :prev",
+                        UpdateExpression=(
+                            "SET #s = :c, updated_at = :now "
+                            "REMOVE verified_at, verified_by, verified_computations"
+                        ),
+                        ExpressionAttributeNames={"#s": "status"},
+                        ExpressionAttributeValues={
+                            ":v": {"S": cv.STATUS_VERIFIED},
+                            ":c": {"S": cv.STATUS_CREATED},
+                            ":prev": {"S": item.get("updated_at", {}).get("S", "")},
+                            ":now": {"S": now},
+                        },
+                    )
+                except ddb.exceptions.ConditionalCheckFailedException:
+                    pass  # someone else moved the row; their state stands
+                else:
+                    out["status"] = cv.STATUS_CREATED
+                    out["updated_at"] = now
+                    out.pop("verified_at", None)
+                    out.pop("verified_by", None)
+                    out["verification_reset"] = {"changed_computations": stale}
+    return out
+
+
+def delete_canvas(
+    ddb, *, canvas_table: str, user_sub: str | None, canvas_id: str
+) -> dict[str, Any]:
+    from okf_core import canvas as cv
+
+    user_sub = _require_user_sub(user_sub)
+    ddb.delete_item(
+        TableName=canvas_table,
+        Key={"pk": {"S": cv.canvas_pk(user_sub)}, "sk": {"S": canvas_id}},
+    )
+    return {"deleted": canvas_id}
+
+
+def _flip_canvas_status(
+    ddb,
+    *,
+    canvas_table: str,
+    user_sub: str,
+    canvas_id: str,
+    expect: str,
+    to: str,
+    verified_by: str | None,
+    pins: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Conditional status flip; a lost race (or a flip from the wrong state)
+    is a 409 naming the actual state — mirrors the computation verify's
+    stale-read behavior."""
+    from okf_core import canvas as cv
+
+    now = _now_iso()
+    names = {"#s": "status"}
+    values: dict[str, Any] = {
+        ":expect": {"S": expect},
+        ":to": {"S": to},
+        ":now": {"S": now},
+    }
+    update = "SET #s = :to, updated_at = :now"
+    if to == cv.STATUS_VERIFIED:
+        update += ", verified_at = :now, verified_by = :by, verified_computations = :pins"
+        values[":by"] = {"S": verified_by or ""}
+        values[":pins"] = {"S": json.dumps(pins or {}, sort_keys=True)}
+    else:
+        update += " REMOVE verified_at, verified_by, verified_computations"
+    try:
+        resp = ddb.update_item(
+            TableName=canvas_table,
+            Key={"pk": {"S": cv.canvas_pk(user_sub)}, "sk": {"S": canvas_id}},
+            ConditionExpression="attribute_exists(pk) AND #s = :expect",
+            UpdateExpression=update,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+            ReturnValues="ALL_NEW",
+        )
+    except ddb.exceptions.ConditionalCheckFailedException:
+        item = _get_canvas_item(  # 404s if it never existed
+            ddb, canvas_table=canvas_table, user_sub=user_sub, canvas_id=canvas_id
+        )
+        actual = item.get("status", {}).get("S", "?")
+        raise ApiError(
+            409, f"canvas is {actual!r}, not {expect!r} — reload and retry"
+        ) from None
+    attrs = resp.get("Attributes", {})
+    return _canvas_item_meta(attrs)
+
+
+def verify_canvas(
+    ddb,
+    *,
+    canvas_table: str,
+    user_sub: str | None,
+    canvas_id: str,
+    verified_by: str,
+    s3=None,
+    bundle_bucket: str = "",
+) -> dict[str, Any]:
+    """A human's Verify click on a CREATED canvas. Identity comes from the
+    validated JWT only (the route never reads it from the body).
+
+    The click PINS the content hash of every bundle computation the tiles
+    bind (``verified_computations``) — get_canvas voids the verification
+    when any statement later changes. A tile whose computation no longer
+    resolves can't be attested: 409."""
+    from okf_core import canvas as cv
+
+    user_sub = _require_user_sub(user_sub)
+    if not (verified_by or "").strip():
+        raise ApiError(401, "verification requires a verified caller identity")
+    pins: dict[str, str] = {}
+    if s3 is not None and bundle_bucket:
+        item = _get_canvas_item(
+            ddb, canvas_table=canvas_table, user_sub=user_sub, canvas_id=canvas_id
+        )
+        try:
+            config = json.loads(item.get("config", {}).get("S", "") or "{}")
+        except ValueError as e:
+            raise ApiError(500, f"stored config for {canvas_id!r} is not JSON") from e
+        pins = _canvas_computation_hashes(
+            s3, bundle_bucket, item.get("data_domain", {}).get("S", ""),
+            item.get("dataset", {}).get("S", ""), config,
+        )
+        missing = sorted(slug for slug, h in pins.items() if not h)
+        if missing:
+            raise ApiError(
+                409,
+                "cannot verify: these computations no longer resolve — "
+                + ", ".join(missing),
+            )
+    return _flip_canvas_status(
+        ddb, canvas_table=canvas_table, user_sub=user_sub, canvas_id=canvas_id,
+        expect=cv.STATUS_CREATED, to=cv.STATUS_VERIFIED,
+        verified_by=verified_by.strip(), pins=pins,
+    )
+
+
+def unverify_canvas(
+    ddb, *, canvas_table: str, user_sub: str | None, canvas_id: str
+) -> dict[str, Any]:
+    from okf_core import canvas as cv
+
+    user_sub = _require_user_sub(user_sub)
+    return _flip_canvas_status(
+        ddb, canvas_table=canvas_table, user_sub=user_sub, canvas_id=canvas_id,
+        expect=cv.STATUS_VERIFIED, to=cv.STATUS_CREATED, verified_by=None,
+    )
+
+
+def update_canvas_layout(
+    ddb, *, canvas_table: str, user_sub: str | None, canvas_id: str, layouts: Any
+) -> dict[str, Any]:
+    """The user's drag/resize on the Canvas page — the ONE direct config
+    write, and it can only move geometry: ``okf_core.apply_layout_patch``
+    validates every entry with the lint's own layout rules and touches
+    nothing but ``tile["layout"]``. Status survives (verified included) —
+    rearranging tiles can't change what the numbers mean, so it must not
+    cost the human's attestation."""
+    from okf_core import canvas as cv
+
+    user_sub = _require_user_sub(user_sub)
+    item = _get_canvas_item(  # 404s when missing / not the caller's
+        ddb, canvas_table=canvas_table, user_sub=user_sub, canvas_id=canvas_id
+    )
+    try:
+        config = json.loads(item.get("config", {}).get("S", "") or "{}")
+    except ValueError as e:
+        raise ApiError(500, f"stored config for {canvas_id!r} is not JSON") from e
+    patched, errors = cv.apply_layout_patch(config, layouts)
+    if errors:
+        raise ApiError(400, "; ".join(errors))
+    now = _now_iso()
+    _conditional_canvas_config_write(
+        ddb, canvas_table=canvas_table, user_sub=user_sub, canvas_id=canvas_id,
+        item=item, config=patched, now=now,
+    )
+    out = _canvas_item_meta(item)
+    out["updated_at"] = now
+    out["config"] = patched
+    return out
+
+
+def _conditional_canvas_config_write(
+    ddb, *, canvas_table: str, user_sub: str, canvas_id: str,
+    item: dict[str, Any], config: dict[str, Any], now: str,
+    extra_sets: str = "", extra_values: dict[str, Any] | None = None,
+) -> None:
+    """The read-modify-write guard shared by the layout and title patches:
+    the update lands only if ``updated_at`` still matches what this handler
+    read — otherwise someone (another tab, or a finishing revision job's
+    row write) got there first, and blindly writing would silently revert
+    their entire config to ours-plus-one-field. 409 tells the UI to reload."""
+    from okf_core import canvas as cv
+
+    expected = item.get("updated_at", {}).get("S", "")
+    values: dict[str, Any] = {
+        ":c": {"S": json.dumps(config)},
+        ":now": {"S": now},
+        **(extra_values or {}),
+    }
+    kwargs: dict[str, Any] = {}
+    if expected:
+        kwargs["ConditionExpression"] = "updated_at = :prev"
+        values[":prev"] = {"S": expected}
+    try:
+        ddb.update_item(
+            TableName=canvas_table,
+            Key={"pk": {"S": cv.canvas_pk(user_sub)}, "sk": {"S": canvas_id}},
+            UpdateExpression="SET config = :c, updated_at = :now" + extra_sets,
+            ExpressionAttributeValues=values,
+            **kwargs,
+        )
+    except ddb.exceptions.ConditionalCheckFailedException as e:
+        raise ApiError(
+            409, "the canvas changed while you were editing — reload and retry"
+        ) from e
+
+
+def update_canvas_title(
+    ddb, *, canvas_table: str, user_sub: str | None, canvas_id: str, title: Any
+) -> dict[str, Any]:
+    """Rename a canvas — the OTHER narrow direct config write (with the
+    layout patch): it touches the top-level ``title`` and nothing else, on
+    both the row attribute (what list/describe read) and the stored config
+    (what the page and future revisions read), so the two can't drift.
+    Same cap as the lint (``okf_core.canvas.MAX_TITLE``). Status survives,
+    verified included — a display name can't change what the numbers mean."""
+    from okf_core import canvas as cv
+
+    user_sub = _require_user_sub(user_sub)
+    cleaned = str(title or "").strip() if isinstance(title, str) else ""
+    if not cleaned:
+        raise ApiError(400, "title: a non-empty string is required")
+    if len(cleaned) > cv.MAX_TITLE:
+        raise ApiError(400, f"title: at most {cv.MAX_TITLE} chars (got {len(cleaned)})")
+    item = _get_canvas_item(  # 404s when missing / not the caller's
+        ddb, canvas_table=canvas_table, user_sub=user_sub, canvas_id=canvas_id
+    )
+    try:
+        config = json.loads(item.get("config", {}).get("S", "") or "{}")
+    except ValueError as e:
+        raise ApiError(500, f"stored config for {canvas_id!r} is not JSON") from e
+    config["title"] = cleaned
+    now = _now_iso()
+    _conditional_canvas_config_write(
+        ddb, canvas_table=canvas_table, user_sub=user_sub, canvas_id=canvas_id,
+        item=item, config=config, now=now,
+        extra_sets=", title = :t", extra_values={":t": {"S": cleaned}},
+    )
+    out = _canvas_item_meta(item)
+    out["title"] = cleaned
+    out["updated_at"] = now
+    out["config"] = config
+    return out
+
+
+def list_canvas_jobs(
+    ddb,
+    *,
+    canvas_table: str,
+    user_sub: str | None,
+    active_only: bool = False,
+    thread_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """The caller's canvas CI jobs, newest first — the jobs panel's poll
+    surface. Each carries the emit-time-filtered step feed (tool labels +
+    final text; the runtime persists no reasoning) as parsed JSON.
+    ``thread_id`` narrows to the jobs one chat conversation delegated (the
+    indicator is chat-scoped: a conversation shows only its own jobs).
+
+    Bounded for the 5s poll: the thread/active narrowing runs server-side as
+    a FilterExpression (non-matching rows' step blobs never leave DynamoDB),
+    job rows expire after 30 days (TTL on ``expires_at``), and at most
+    ``_CANVAS_JOBS_LIMIT`` newest jobs are returned (Lambda's 6MB response
+    cap)."""
+    from okf_core import canvas as cv
+
+    user_sub = _require_user_sub(user_sub)
+    items: list[dict[str, Any]] = []
+    values: dict[str, Any] = {":pk": {"S": cv.canvas_job_pk(user_sub)}}
+    names: dict[str, str] = {}
+    filters: list[str] = []
+    if thread_id is not None:
+        filters.append("thread_id = :thread")
+        values[":thread"] = {"S": thread_id}
+    if active_only:
+        names["#s"] = "status"
+        keys = []
+        for i, st in enumerate(cv.JOB_ACTIVE_STATUSES):
+            values[f":st{i}"] = {"S": st}
+            keys.append(f":st{i}")
+        filters.append(f"#s IN ({', '.join(keys)})")
+    kwargs: dict[str, Any] = {
+        "TableName": canvas_table,
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": values,
+    }
+    if filters:
+        kwargs["FilterExpression"] = " AND ".join(filters)
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
+    while True:
+        resp = ddb.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            break
+        kwargs["ExclusiveStartKey"] = start
+
+    out = []
+    for item in items:
+        def s(key: str) -> str:
+            return item.get(key, {}).get("S", "")
+
+        status = s("status")  # thread/active already narrowed by the FilterExpression
+        try:
+            steps = json.loads(s("steps") or "[]")
+        except ValueError:
+            steps = []
+        out.append(
+            {
+                "job_id": s("job_id"),
+                "thread_id": s("thread_id") or None,
+                "status": status,
+                "title": s("title"),
+                "request": s("request"),
+                "data_domain": s("data_domain"),
+                "dataset": s("dataset"),
+                "canvas_id": s("canvas_id") or None,
+                "error": s("error") or None,
+                "steps": steps,
+                "created_at": s("created_at"),
+                "updated_at": s("updated_at"),
+            }
+        )
+    out.sort(key=lambda j: j["created_at"], reverse=True)
+    return out[:_CANVAS_JOBS_LIMIT]
+
+
+_CANVAS_JOBS_LIMIT = 50
+
+
+def run_canvas_tile(
+    s3,
+    ddb,
+    *,
+    bucket: str,
+    registry_table: str,
+    canvas_table: str,
+    user_sub: str | None,
+    canvas_id: str,
+    tile_id: str,
+    dials: dict[str, Any] | None,
+    athena=None,
+    redshift_data=None,
+    athena_workgroup: str = "",
+    athena_output: str = "",
+    athena_catalog: str = "AwsDataCatalog",
+    max_rows: int = 200,
+    timeout_s: float = 120.0,
+    enabled: bool = False,
+) -> dict[str, Any]:
+    """Execute one tile under the given dial state and return the receipt.
+
+    ``dials`` overrides ride on top of the stored defaults, so a partial
+    update (the user moved ONE dial) executes correctly. The tile's binds
+    resolve through the same ``tile_values`` the CI lint used, and execution
+    is the computation Run path verbatim — contract violations 400, engine
+    failures return an un-executed receipt.
+    """
+    from okf_core import canvas as cv
+
+    user_sub = _require_user_sub(user_sub)
+    item = _get_canvas_item(
+        ddb, canvas_table=canvas_table, user_sub=user_sub, canvas_id=canvas_id
+    )
+    try:
+        raw = json.loads(item.get("config", {}).get("S", "") or "{}")
+    except ValueError as e:
+        raise ApiError(500, f"stored config for {canvas_id!r} is not JSON") from e
+    canvas, _ = cv.parse_canvas(raw)
+    if canvas is None:
+        # The CI gate should make this unreachable; if a row was written
+        # around it, say so rather than executing an unvalidated config.
+        raise ApiError(500, f"stored config for {canvas_id!r} fails validation")
+    tile = next((t for t in canvas.tiles if t.id == tile_id), None)
+    if tile is None:
+        raise ApiError(404, f"canvas has no tile {tile_id!r}")
+
+    state = cv.dial_values(canvas)
+    for name, value in (dials or {}).items():
+        if name not in state:
+            legal = ", ".join(sorted(state)) or "none — it has no dials"
+            raise ApiError(400, f"unknown dial `{name}` (dials: {legal})")
+        state[name] = value
+
+    # Ad-hoc tile: synthesize the inline computation (the CI gate already
+    # validated it — a failure here means the row was written around the
+    # gate) and execute it through the SAME runner as slug tiles.
+    if tile.sql:
+        from okf_aws import computation_run
+        from okf_core.computations import ComputationError
+
+        source = get_dataset_source(
+            ddb, registry_table=registry_table,
+            data_domain=canvas.data_domain, dataset=canvas.dataset,
+        )
+        comp, errors = cv.adhoc_computation(
+            tile.id, tile.sql, tile.parameters, cv.source_runtime(source)
+        )
+        if comp is None:
+            raise ApiError(
+                500, f"stored ad-hoc tile {tile_id!r} fails validation: {'; '.join(errors)}"
+            )
+        try:
+            return computation_run.run_computation(
+                comp,
+                cv.tile_values(tile, state),
+                athena=athena,
+                redshift_data=redshift_data,
+                source=source,
+                athena_workgroup=athena_workgroup,
+                athena_output=athena_output,
+                athena_catalog=athena_catalog,
+                max_rows=max_rows,
+                timeout_s=timeout_s,
+                execute=enabled,
+            )
+        except ComputationError as e:
+            raise ApiError(400, str(e)) from e
+
+    return run_bundle_computation(
+        s3,
+        ddb,
+        bucket=bucket,
+        registry_table=registry_table,
+        data_domain=canvas.data_domain,
+        dataset=canvas.dataset,
+        slug=tile.computation,
+        values=cv.tile_values(tile, state),
+        athena=athena,
+        redshift_data=redshift_data,
+        athena_workgroup=athena_workgroup,
+        athena_output=athena_output,
+        athena_catalog=athena_catalog,
+        max_rows=max_rows,
+        timeout_s=timeout_s,
+        enabled=enabled,
+    )

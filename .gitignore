@@ -15,7 +15,9 @@ __pycache__/
 # Node / UI
 node_modules/
 ui/dist/
+ui/dist-harness/
 ui/dist-report-harness/
+services/canvas/.harness/
 site/
 # Build-time staging of the report harness into the chat image context.
 services/chat/.harness/

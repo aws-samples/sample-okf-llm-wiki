@@ -37,6 +37,30 @@ variable "chat_image_uri" {
   default     = ""
 }
 
+variable "canvas_image_uri" {
+  type        = string
+  description = "ECR image URI (ARM64) for the canvas CI runtime (dashboard authoring). Empty = no canvas runtime; the chat delegation tools stay unbound."
+  default     = ""
+}
+
+variable "canvas_model" {
+  type        = string
+  description = "Bedrock Converse model id for the canvas authoring agent. Defaults to the same global inference profile as chat."
+  default     = "global.anthropic.claude-opus-5-5"
+}
+
+variable "canvas_effort" {
+  type        = string
+  description = "Adaptive-thinking effort for the canvas authoring agent."
+  default     = "high"
+}
+
+variable "canvas_max_tokens" {
+  type        = number
+  description = "max_tokens for the canvas authoring agent."
+  default     = 32768
+}
+
 # S3 Files access point mounted (shared, runtime-scoped) at /mnt/data, rooted at
 # okf/. There is no native Terraform resource for an S3 Files access point yet,
 # so the ARN is provided out-of-band (created via CLI/console) and passed here.
@@ -308,6 +332,12 @@ variable "enable_attested_computations" {
     bundle-read to querying all cataloged source data. Chat sits behind
     Cognito USER auth (and its own per-run opt-in), which is why chat SQL can
     default on; here the operator says yes explicitly.
+
+    NOTE: deploying the canvas runtime (var.canvas_image_uri) implies the
+    CONTROL API half of this regardless of the flag — dashboards' tiles
+    execute through the Lambda's Run path, so the canvas deploy is itself
+    the operator's yes (Cognito user auth, same read-only ceiling). The MCP
+    surface's run_computation stays governed by this flag alone.
   EOT
 }
 

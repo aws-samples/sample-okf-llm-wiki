@@ -237,13 +237,24 @@ stage_images() {
   rm -rf "$ROOT/services/chat/.harness"
   cp -R "$ROOT/ui/dist-report-harness" "$ROOT/services/chat/.harness"
   CHAT_URI="$(build_push chat okf-chat)"
+  # The canvas CI image needs the pre-built harness page (the render tool's
+  # visual-inspection surface): build the ui's `harness` Vite entry and stage
+  # it where the Dockerfile COPYs it (services/canvas/.harness). Built BEFORE
+  # the config rewrite below: a failure here must leave the persisted image
+  # URIs untouched (an emptied URI makes compute destroy that runtime).
+  ( cd "$ROOT/ui" && npm run build:harness >&2 ) \
+    || die "harness build failed (ui/harness.html entry) — the canvas image needs it."
+  rm -rf "$ROOT/services/canvas/.harness"
+  cp -R "$ROOT/ui/dist-harness" "$ROOT/services/canvas/.harness"
+  CANVAS_URI="$(build_push canvas okf-canvas)"
   # Persist for the compute stage.
-  grep -v -E '^(HARVEST_IMAGE_URI|CONSUMPTION_IMAGE_URI|CHAT_IMAGE_URI)=' "$CONFIG" > "$CONFIG.tmp" 2>/dev/null || true
+  grep -v -E '^(HARVEST_IMAGE_URI|CONSUMPTION_IMAGE_URI|CHAT_IMAGE_URI|CANVAS_IMAGE_URI)=' "$CONFIG" > "$CONFIG.tmp" 2>/dev/null || true
   mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null || true
   echo "HARVEST_IMAGE_URI=$HARVEST_URI" >> "$CONFIG"
   echo "CONSUMPTION_IMAGE_URI=$CONSUMPTION_URI" >> "$CONFIG"
   echo "CHAT_IMAGE_URI=$CHAT_URI" >> "$CONFIG"
-  ok "Images pushed: $HARVEST_URI , $CONSUMPTION_URI , $CHAT_URI"
+  echo "CANVAS_IMAGE_URI=$CANVAS_URI" >> "$CONFIG"
+  ok "Images pushed: $HARVEST_URI , $CONSUMPTION_URI , $CHAT_URI , $CANVAS_URI"
 }
 
 # Verify an "<acct>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>" image tag really
@@ -270,6 +281,7 @@ stage_compute() {
   tf "$ROOT/infra/compute" init -reconfigure -input=false \
     -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
   # control_api_provisioned_concurrency: pass the -var ONLY when the operator
+  verify_ecr_image "${CANVAS_IMAGE_URI:-}"
   # explicitly set CONTROL_API_PROVISIONED_CONCURRENCY (env or config file), so
   # the Terraform default governs otherwise. The old `:-0` fallback silently
   # overrode the variable's default with an explicit 0 on every deploy —
@@ -296,6 +308,7 @@ stage_compute() {
     ${CONTROL_API_PROVISIONED_CONCURRENCY:+-var="control_api_provisioned_concurrency=$CONTROL_API_PROVISIONED_CONCURRENCY"} \
     ${ENABLE_POLICY_CHECKS:+-var="enable_policy_checks=$ENABLE_POLICY_CHECKS"} \
     ${ENABLE_POLICY_BUILD:+-var="enable_policy_build=$ENABLE_POLICY_BUILD"} \
+    -var="canvas_image_uri=${CANVAS_IMAGE_URI:-}" \
     ${ENABLE_ATTESTED_COMPUTATIONS:+-var="enable_attested_computations=$ENABLE_ATTESTED_COMPUTATIONS"}
   ok "Compute stack applied."
   backfill_registry_entity
@@ -551,7 +564,7 @@ stage_destroy() {
   if ! tf "$ROOT/infra/compute" destroy -auto-approve \
       -var="region=$AWS_REGION" -var="durable_state_bucket=$TF_STATE_BUCKET" \
       -var="harvest_image_uri=${HARVEST_IMAGE_URI:-}" -var="consumption_image_uri=${CONSUMPTION_IMAGE_URI:-}" \
-      -var="chat_image_uri=${CHAT_IMAGE_URI:-}"; then
+      -var="chat_image_uri=${CHAT_IMAGE_URI:-}" -var="canvas_image_uri=${CANVAS_IMAGE_URI:-}"; then
     die "compute destroy failed (see errors above). If it's a lingering S3 File System or a non-empty bucket, re-run: ./scripts/deploy.sh destroy --force"
   fi
   if ! tf "$ROOT/infra/durable" destroy -auto-approve -var="region=$AWS_REGION"; then

@@ -186,6 +186,12 @@ class ChatConfig:
     # by DATASET (okf_core.analyses). Always set from OKF_ANALYSES_TABLE.
     analyses_table: str = "okf-analyses"
 
+    # Canvas (dashboards): the job/canvas rows table + the CI runtime the
+    # delegation tools invoke. An empty ARN means the deploy has no canvas
+    # runtime — the tools simply aren't bound.
+    canvas_table: str = "okf-canvas"
+    canvas_runtime_arn: str = ""
+
     # Report authoring (create_report / present_report). The harness path is
     # the chart-render page baked into the image (empty = no Chromium render
     # path: chart blocks are refused; markdown/table/kpi reports still work).
@@ -282,6 +288,8 @@ class ChatConfig:
             registry_table=env.get("OKF_REGISTRY_TABLE", "okf-registry"),
             annotations_table=env.get("OKF_ANNOTATIONS_TABLE", "okf-annotations"),
             analyses_table=env.get("OKF_ANALYSES_TABLE", "okf-analyses"),
+            canvas_table=env.get("OKF_CANVAS_TABLE", "okf-canvas"),
+            canvas_runtime_arn=env.get("OKF_CANVAS_RUNTIME_ARN", ""),
             report_harness_path=env.get("OKF_CHAT_REPORT_HARNESS_PATH", ""),
             report_max_bytes=int(env.get("OKF_CHAT_REPORT_MAX_BYTES", "") or 8_000_000),
             memory_id=env.get("OKF_CHAT_MEMORY_ID", ""),

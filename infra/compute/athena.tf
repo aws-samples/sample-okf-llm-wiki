@@ -35,4 +35,13 @@ locals {
   # Where Athena writes results: the caller-provided location, or the dedicated
   # results bucket created here.
   athena_output = var.athena_output_location != "" ? var.athena_output_location : "s3://${aws_s3_bucket.athena_results.id}/harvest/"
+
+  # Computation EXECUTION on the Control API Lambda (the Run modal, canvas
+  # tile runs, dial column-domains): on when the operator enabled Attested
+  # Computations explicitly — or IMPLICITLY by deploying the canvas runtime.
+  # The CI live-validates and saves dashboards whose tiles execute through
+  # this Lambda (canvas_runtime.tf documents CI execution as independent of
+  # the flag); without this, a canvas deploy with the flag off shipped
+  # dashboards whose every tile returned "execution is not enabled".
+  computations_execution = var.enable_attested_computations || var.canvas_image_uri != ""
 }

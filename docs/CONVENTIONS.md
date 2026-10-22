@@ -839,7 +839,7 @@ See `okf_core.embedding`.
 
 ## DynamoDB tables
 
-Five tables (plus the checkpoint table the LangGraph saver owns); names come from
+Six tables (plus the checkpoint table the LangGraph saver owns); names come from
 env vars, with the defaults shown.
 
 ### `okf-registry` — domain registry, harvest status, credentials
@@ -1379,6 +1379,16 @@ attribute (`owner_sub`) enforced by conditional writes, not by the key — any
 signed-in user lists/reads/runs a dataset's analyses. Item shapes and the
 whole contract: [Analyses (saved procedures)](#analyses-saved-procedures).
 
+### `okf-canvas` — dashboards + their CI job rows
+
+Partition key `pk` (S), sort key `sk` (S); no TTL. Isolation is structural:
+the owner's Cognito `sub` is in the partition key — `CANVAS#<user_sub>` for
+configs, `CANVASJOB#<user_sub>` for job rows (`okf_core/canvas.py` owns the
+conventions). The Control API also caches dial type-ahead values on
+`pk = "DOMAINCACHE#<data_domain>/<dataset>"`, `sk = <table.column>` (soft 24h
+TTL via `fetched_at`). Item shapes and the whole contract:
+[Canvas (dashboards)](#canvas-dashboards).
+
 ### `okf-annotations` — user feedback on the wiki
 
 Partition key `pk` (S), sort key `sk` (S). A separate table (not registry/
@@ -1461,6 +1471,138 @@ ride the run. Unselected OPEN notes stay open for a later run; an unselected
 scope filter. An empty list is valid: with a dirty guidance the run still fires
 guidance-only, otherwise it short-circuits as "nothing to apply". Composes with
 `scope` (the id filter applies within the scope).
+
+## Canvas (dashboards)
+
+A canvas is agent-authored CONFIG (never code): tiles
+bind typed `@parameters` to dashboard-level dials and map result columns onto
+the fixed widget catalog (`okf_core/canvas.py` — `canvas_version: 1`,
+WIDGETS, the three-layer lint). A tile's data source is EITHER a bundle
+Attested Computation (`data.computation`) OR an inline ad-hoc query
+(`data.sql` + `data.parameters`, the same typed contract shape) — ad-hoc
+tiles are synthesized through `parse_computation_text`
+(`okf_core.canvas.adhoc_computation`), so read-only single-statement
+enforcement and typed literal substitution are inherited, not re-implemented.
+Configs only enter through the canvas CI runtime's lint-gated `save_canvas`
+(ONE step — no draft/submit phase; the canvas is live immediately); the
+Control API has NO config-write route — with TWO narrow exceptions:
+`POST /canvas/{id}/layout` patches tile GEOMETRY only (drag/resize on the
+Canvas page; `{tile_id: {x,y,w,h}}` validated by the lint's own layout rules
+via `okf_core.canvas.apply_layout_patch`, which by construction can touch
+nothing but `tile["layout"]`), and `POST /canvas/{id}/title` renames the
+canvas (the pen next to the page title; non-empty, capped at
+`okf_core.canvas.MAX_TITLE` — the lint's own cap — and written to the row
+attribute AND `config.title` together so list/describe and the page can't
+drift). Status SURVIVES both patches — verified included — because neither
+geometry nor a display name can change what the numbers mean. The view grid
+(and the CI harness) honor stored `x`/`y` explicitly, and the CI's revision
+prompt preserves human-arranged layouts unless the feedback asks otherwise.
+Tiles may NOT overlap: the grid places each tile at its explicit cell, so
+overlapping cards paint over each other. `parse_canvas` only warns (a stored
+config must keep reading and running), but every write refuses it —
+`lint_canvas` promotes the overlap to an error (the CI's save gate) and
+`apply_layout_patch` rejects it (400).
+
+**Concurrency with human edits.** Every CI save is conditional on the row's
+`updated_at` as the job last saw (revision seed) or wrote it
+(`canvas.jobs.write_canvas_row`; the canvas row's `updated_at` is
+microsecond-precision — it IS the version token). A user's layout drag,
+rename, or delete during the run makes the next `save_canvas` refuse instead
+of reverting it: a deleted canvas is never resurrected, and an edited one
+comes back with the user's current title + layouts for the agent to merge
+on top before retrying. The Control API's two patches condition on
+`updated_at` the same way (409 on a lost race).
+
+**Chat's canvas tools (six):** `list_canvases` (the user's canvases, newest
+first, optional domain/dataset filter — the way to resolve "my season
+dashboard" to a canvas_id, and the check against building a near-duplicate),
+`describe_canvas` (the SAVED config's dials + per-tile widget, layout,
+bindings and the query behind it — ad-hoc SQL verbatim, or the computation
+slug whose frozen SQL `describe_computation` reads; `include_config` for the
+raw JSON), `canvas_skeleton`, `create_canvas`, `get_canvas_status`,
+`revise_canvas`. The read pair needs only the existing chat-role grants
+(`GetItem`/`Query` on the canvas table).
+
+**Requirements capture (the skeleton):** before any job is dispatched, the
+CHAT agent agrees a tile plan with the user via its `canvas_skeleton` tool —
+each tile's `title`, `widget` (catalog-validated), one-line `represents`,
+optional `layout {w,h}` (12-col units), plus the dials
+(`{name, label, filters}`). The shape + validation live in ONE place,
+`okf_core.canvas.normalize_skeleton` (chat validates at sketch AND
+create/revise time; the widget vocabulary can never drift from WIDGETS). The
+UI lifts the tool call into an inline wireframe card
+(`CanvasSkeletonCard`, chart-style block lift) the user reacts to; the agreed
+spec then rides the job payload as REQUIREMENTS — the CI honors each tile's
+intent, owns encodings/SQL/layout detail, and names every data-forced
+deviation in its final summary. No approval state machine: agreement is
+conversational, enforced by the tool descriptions only.
+
+**Rows (in the `okf-canvas` table, per-user structural isolation):**
+- Canvas: `pk = CANVAS#<user_sub>`, `sk = <canvas_id>` (uuid hex). Attributes:
+  `canvas_id, title, data_domain, dataset, status (created|verified),
+  config (JSON string), created_at, updated_at`, plus
+  `verified_at/verified_by` + `verified_computations` (JSON `{slug:
+  sha256}`) while verified. The CI runtime writes `created`; only a human
+  flips created↔verified (Control API, identity from the JWT, conditional
+  update — 409 on a stale flip). A revision returns a verified canvas to
+  created: re-verification is a fresh human decision. **Verify pins the
+  SQL:** the click records the content hash of every bundle computation the
+  tiles bind (409 if one no longer resolves; ad-hoc SQL needs no pin — it
+  lives in the verified config). `GET /canvas/{id}` recomputes them; any
+  mismatch (a full harvest re-authored a statement) or an unpinned legacy
+  verification conditionally resets the row to `created` and returns
+  `verification_reset: {changed_computations: [...]}` — the page says so.
+  The list/chat surfaces read the stored status and catch up on the next
+  page open.
+- Job: `pk = CANVASJOB#<user_sub>`, `sk = <job_id>` (uuid hex). Attributes:
+  `job_id, status (queued|running|completed|failed|cancelled), title (the
+  canvas name the CALLING agent chose — the only text the jobs UI shows),
+  request (the raw brief — agents/debugging only, never displayed),
+  data_domain, dataset, thread_id? (the delegating CHAT conversation — the
+  UI's jobs indicator is chat-scoped: a conversation shows only its own
+  jobs), steps (JSON list, ≤200, emit-time filtered: tool NAMES + final
+  text only — the model runs with reasoning display omitted), canvas_id?,
+  error?, created_at, updated_at, expires_at` (epoch seconds — DynamoDB TTL
+  reaps job rows after `OKF_CANVAS_JOB_TTL_SECONDS`, default 30 days; canvas
+  configs never carry the attribute). The chat delegation tool writes `queued` +
+  invokes the runtime; the runtime owns every later transition. The durable
+  full record is the LangGraph checkpoint thread `<sub>:canvasjob-<job_id>`
+  in the chat checkpoint table.
+
+**Canvas invocation payload** (`InvokeAgentRuntime` on the canvas runtime;
+chat's delegation tools set `runtimeSessionId` deterministically from the job
+id): `{"mode": "canvas", "job_id", "user_sub", "data_domain", "dataset",
+"thread_id"?}` plus either `"spec"` (the normalized skeleton) and/or
+`"request"` (free-form context) for a new canvas, or `"canvas_id" +
+"feedback"` (revision — the runner seeds the stored config; an optional
+`"spec"` alongside is the agreed target structure for a structural change).
+
+**Control API surface:** `GET /canvas`, `GET|DELETE /canvas/{id}`,
+`POST /canvas/{id}/verify|unverify`, `POST /canvas/{id}/layout` (body
+`{"layouts": {tile_id: {x,y,w,h}}}` — the geometry-only patch above),
+`POST /canvas/{id}/title` (body `{"title": ...}` — the rename patch above),
+`POST /canvas/{id}/tiles/{tile_id}/run`
+(body `{"dials": {...}}` — partial overrides on the stored defaults; executes
+via the computation Run path, contract violations 400),
+`GET /bundle/{domain}/{dataset}/column-domain?column=<table.column>` (a
+column-bound dial's type-ahead: live `SELECT DISTINCT` through the same
+executor, capped at `OKF_COMPUTATION_TIMEOUT_S`, cached 24h on
+`DOMAINCACHE#` rows; returns no values with `executed: false` when
+computation execution is off), and
+`GET /canvas-jobs[?active=true][&thread=<chat thread id>]` (the chat-scoped
+jobs indicator's poll surface — thread/active narrowing is a server-side
+FilterExpression, at most the 50 newest jobs).
+
+**Env:** `OKF_CANVAS_TABLE` (everywhere), `OKF_CANVAS_RUNTIME_ARN` (chat —
+empty ⇒ delegation tools unbound), and on the canvas runtime
+`OKF_CANVAS_MODEL/EFFORT/MAX_TOKENS`, `OKF_CANVAS_HARNESS_PATH` (baked in the
+image), `OKF_CHAT_CHECKPOINT_TABLE` + `OKF_CHECKPOINT_OFFLOAD_BUCKET`, and
+the shared Athena computation vars. Canvas defaults to
+`global.anthropic.claude-opus-5-5`, `high` effort, and `32768` max tokens;
+its Converse client uses the deployment region injected as `AWS_REGION`.
+The harness page (`ui/harness.html`,
+`npm run build:harness` → `dist-harness`, staged by deploy.sh into the image)
+is NEVER shipped to CloudFront.
 
 ## Harvest invocation payload
 
@@ -2079,6 +2221,12 @@ USER — never facts about the data (tables/joins/metrics belong to the wiki):
 | `OKF_REGISTRY_TABLE` | DynamoDB registry table (default `okf-registry`) |
 | `OKF_FRESHNESS_TABLE` | DynamoDB freshness table (default `okf-freshness`) |
 | `OKF_ANALYSES_TABLE` | DynamoDB analyses table (default `okf-analyses`) — saved analysis procedures + their report publications; chat runtime + Control API (see [Analyses](#analyses-saved-procedures)) |
+| `OKF_CANVAS_TABLE` | DynamoDB canvas table (default `okf-canvas`) — dashboards, their CI job rows, and the dial type-ahead cache; canvas runtime, chat runtime, Control API (see [Canvas](#canvas-dashboards)) |
+| `OKF_CANVAS_RUNTIME_ARN` | Canvas CI runtime ARN on the chat runtime; empty (no `canvas_image_uri`) leaves the dashboard delegation tools unbound |
+| `OKF_CANVAS_MODEL` / `OKF_CANVAS_EFFORT` / `OKF_CANVAS_MAX_TOKENS` | Canvas authoring agent model (default `global.anthropic.claude-opus-5-5`), effort (`high`), max tokens (`32768`) |
+| `OKF_CANVAS_BEDROCK_READ_TIMEOUT` / `OKF_CANVAS_BEDROCK_CONNECT_TIMEOUT` / `OKF_CANVAS_BEDROCK_MAX_ATTEMPTS` | Canvas runtime's Converse client: read timeout seconds (default `600`), connect timeout (`10`), adaptive retry attempts (`5`) |
+| `OKF_CANVAS_JOB_TTL_SECONDS` | Canvas job lifetime (default `2592000`, 30 days): the job rows' DynamoDB TTL (`expires_at`) and the job checkpoint threads' TTL |
+| `OKF_CANVAS_HARNESS_PATH` | Path of the baked render harness page inside the canvas image (default `/app/harness/harness.html`; set by the Dockerfile) |
 | `OKF_ANNOTATIONS_TABLE` | DynamoDB annotations table (default `okf-annotations`) — user-scoped wiki feedback + the harvest runner's resolution write-back |
 | `OKF_HARVEST_RUNTIME_ARN` | AgentCore harvest runtime ARN |
 | `OKF_ATHENA_OUTPUT` / `OKF_ATHENA_WORKGROUP` | Athena results (glue source) |

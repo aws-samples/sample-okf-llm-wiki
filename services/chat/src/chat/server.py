@@ -715,9 +715,17 @@ def _reasoning_text(block: dict[str, Any]) -> str:
     """Pull reasoning text out of a content block across provider shapes.
 
     Converse: ``reasoning_content`` is a dict/str with ``text``. GPT Responses v1:
-    ``summary`` is a LIST of ``{text}`` items (concatenate them); a streaming delta
-    may instead put the partial text under ``summary`` as a dict or a bare string,
-    or directly on the block's ``text``.
+    ``summary`` is a LIST of ``{text}`` items; a streaming delta may instead put
+    the partial text under ``summary`` as a dict or a bare string, or directly
+    on the block's ``text``.
+
+    GPT summaries arrive as numbered PARTS (``summary_index`` → the item's
+    ``index``), each opening with its own ``**Title**`` line. The part
+    boundary must survive as a paragraph break or consecutive parts glue
+    together ("…selectors.**Refining finish metrics**"): an aggregated list
+    (history) joins distinct indexes with a blank line, and a live
+    ``reasoning_summary_part.added`` frame (an EMPTY item for index > 0)
+    becomes the blank line itself.
     """
     # Converse
     rc = block.get("reasoning_content")
@@ -728,11 +736,24 @@ def _reasoning_text(block: dict[str, Any]) -> str:
     # GPT Responses v1: summary list / dict / str
     summ = block.get("summary")
     if isinstance(summ, list):
-        return "".join(
-            s.get("text", "")
-            for s in summ
-            if isinstance(s, dict) and s.get("text")
-        )
+        items = [s for s in summ if isinstance(s, dict)]
+        if (
+            len(items) == 1
+            and not items[0].get("text")
+            and isinstance(items[0].get("index"), int)
+            and items[0]["index"] > 0
+        ):
+            return "\n\n"  # a new summary part opened mid-stream
+        out: list[str] = []
+        prev = None
+        for item in items:
+            idx = item.get("index")
+            if prev is not None and idx is not None and idx != prev:
+                out.append("\n\n")
+            out.append(item.get("text") or "")
+            if idx is not None:
+                prev = idx
+        return "".join(out)
     if isinstance(summ, dict):
         return summ.get("text", "") or ""
     if isinstance(summ, str):
@@ -802,6 +823,14 @@ def build_deps(config: Any = None):
             chat_config.analyses_table
         ),
     }
+    # Canvas (dashboards) delegation: the job/canvas rows table + the
+    # AgentCore client the tools invoke the canvas CI runtime with. Both only
+    # when the deploy has a canvas runtime to delegate to.
+    if chat_config.canvas_runtime_arn:
+        clients["canvas"] = boto3.resource("dynamodb", region_name=region).Table(
+            chat_config.canvas_table
+        )
+        clients["agentcore"] = boto3.client("bedrock-agentcore", region_name=region)
     # Athena client for the optional read-only SQL tool — only built when the
     # deploy flag is on (else the role has no Glue/Athena grants anyway).
     if chat_config.sql_enabled:
@@ -919,6 +948,8 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
     redshift_data_client = clients.pop("redshift_data", None)
     annotations_table = clients.pop("annotations", None)
     analyses_table = clients.pop("analyses", None)
+    canvas_table = clients.pop("canvas", None)
+    agentcore_client = clients.pop("agentcore", None)
     # The long-term-memory clients ride the same dict so build_app's
     # make_chat_memory can grab them, but build_consumption_tools doesn't
     # know these kwargs — POP them before the **clients splat below (missing
@@ -1046,6 +1077,7 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
         features: set[str] | None = None,
         user_sub: str = "",
         policy_checker: Any = None,
+        thread_id: str = "",
     ):
         chat_model = build_chat_model(chat_config, model, effort)
         agent_tools = make_agent_tools(tools_impl, dataset_scope=scope)
@@ -1077,6 +1109,27 @@ def make_agent_factory(chat_config: Any, consumption_config: Any, clients: dict)
                 *agent_tools,
                 make_submit_annotation_tool(
                     annotations_table, user_sub=user_sub, dataset_scope=scope
+                ),
+            ]
+        # Dashboard delegation: bound whenever the deploy has a canvas CI
+        # runtime AND the run carries a verified subject (jobs + dashboards
+        # are structurally the user's own). The tools' descriptions carry the
+        # whole contract — no prompt block needed.
+        if canvas_table is not None and agentcore_client is not None and user_sub:
+            from chat.tools import make_canvas_tools
+
+            agent_tools = [
+                *agent_tools,
+                *make_canvas_tools(
+                    canvas_table,
+                    agentcore_client,
+                    runtime_arn=chat_config.canvas_runtime_arn,
+                    user_sub=user_sub,
+                    dataset_scope=scope,
+                    # The CLIENT thread id (not the namespaced internal one):
+                    # job rows carry it so the UI shows a conversation ONLY
+                    # its own dashboard jobs.
+                    thread_id=thread_id,
                 ),
             ]
         # Analyses: saved, human-owned procedure documents the agent executes
@@ -1764,6 +1817,7 @@ async def _produce_run_chunks(
             features=features,
             user_sub=user_sub,
             policy_checker=checker,
+            thread_id=client_thread_id,
         )
         on_graph(graph)
 

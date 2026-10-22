@@ -16,17 +16,23 @@
 import {
   BarChart3Icon,
   BookOpenIcon,
+  CameraIcon,
   DatabaseIcon,
+  FileCode2Icon,
   FolderTreeIcon,
   GlobeIcon,
+  LayoutDashboardIcon,
   Link2Icon,
   ListTreeIcon,
   MessageCircleQuestionIcon,
   MicroscopeIcon,
   OrigamiIcon,
+  PencilRulerIcon,
   ScanSearchIcon,
   ScrollTextIcon,
   SearchIcon,
+  SendIcon,
+  ShieldCheckIcon,
   SigmaIcon,
   TerminalIcon,
   TextSearchIcon,
@@ -66,8 +72,25 @@ const ICONS = {
   // folding gathered evidence into the composed artifact (origami).
   read_skill: ScrollTextIcon,
   create_report: OrigamiIcon,
+  // canvas_job: the jobs drawer's synthetic FIRST timeline step (the job
+  // itself — title + status), not a real tool.
+  canvas_job: LayoutDashboardIcon,
+  // canvas_skeleton is lifted into its own wireframe block (like render_chart)
+  // and never appears in the timeline — icon + label kept as the safe fallback.
+  canvas_skeleton: PencilRulerIcon,
+  // Canvas: the chat-side delegation trio + the CI runtime's authoring
+  // quartet (the canvas-jobs drawer renders its step feed with THIS module).
+  list_canvases: LayoutDashboardIcon,
+  // describe_canvas reads a canvas's config + the SQL behind each tile
+  create_canvas: LayoutDashboardIcon,
+  describe_canvas: FileCode2Icon,
+  get_canvas_status: LayoutDashboardIcon,
+  revise_canvas: LayoutDashboardIcon,
+  lint_canvas: ShieldCheckIcon,
+  render_canvas: CameraIcon,
+  save_canvas: SendIcon,
   // Analyses: saved, human-owned procedure documents the agent executes
-  // (one family glyph).
+  // (one family glyph, like the canvas tools).
   list_analyses: MicroscopeIcon,
   read_analysis: MicroscopeIcon,
   create_analysis: MicroscopeIcon,
@@ -97,15 +120,16 @@ export function toolIcon(toolName) {
 }
 
 // A tool RESULT that is actually a refusal: the closure-guarded chat tools
-// (analyses, reports) return "Error: …" strings or {error, …} objects with OK
-// message status — a raise would abort the whole run — so the transport's
-// error flag alone can't spot them. Without this, a refused create_analysis
-// rode NO_RESULT_TOOLS into a collapsed step labeled "Saved analysis X": a
-// success message for a save that never happened.
+// (analyses, canvas, reports) return "Error: …" strings or {error, …}
+// objects with OK message status — a raise would abort the whole run — so
+// the transport's error flag alone can't spot them. Without this, a refused
+// create_analysis rode NO_RESULT_TOOLS into a collapsed step labeled
+// "Saved analysis X": a success message for a save that never happened.
 export function isRefusalResult(content) {
   if (typeof content === "string") {
     const t = content.trim()
-    if (t.startsWith("Error:")) return true
+    // Case-insensitive: the canvas tools' corrective replies are "error: …".
+    if (/^error:/i.test(t)) return true
     if (t.startsWith("{")) {
       try {
         const o = JSON.parse(t)
@@ -223,6 +247,42 @@ export function toolLabel(toolName, args, running) {
       const t = s(a.title)
       return running ? "Composing report" : `Composed report${t ? ` “${t}”` : ""}`
     }
+    case "canvas_job": {
+      // Synthetic head step in the jobs drawer: the title IS the label —
+      // shimmer conveys "running"; a failed job says so.
+      const t = s(a.title) || "Canvas"
+      return a.status === "failed" ? `${t} · failed` : t
+    }
+    case "canvas_skeleton": {
+      const t = s(a.title)
+      const quoted = t ? ` “${t}”` : ""
+      return running ? `Sketching${quoted}` : `Sketched${quoted}`
+    }
+    case "list_canvases": {
+      const scope = scopeSuffix(a)
+      return running ? `Listing canvases${scope}` : `Canvases${scope}`
+    }
+    case "describe_canvas":
+      return running ? "Reading the canvas" : "Read the canvas"
+    case "create_canvas": {
+      // While the call is still streaming its args the title is unknown —
+      // no empty “” quotes.
+      const t = s(a.title)
+      const quoted = t ? ` “${t}”` : ""
+      return running ? `Creating canvas${quoted}` : `Canvas${quoted} started`
+    }
+    case "revise_canvas":
+      return running ? "Revising the canvas" : "Canvas revision started"
+    case "get_canvas_status":
+      return running ? "Checking the canvas job" : "Checked the canvas job"
+    case "lint_canvas":
+      return running ? "Validating the canvas" : "Validated the canvas"
+    case "render_canvas":
+      return running
+        ? "Rendering the canvas"
+        : "Rendered + inspected the canvas"
+    case "save_canvas":
+      return running ? "Creating the canvas" : "Canvas created"
     case "list_computations":
       return running ? "Listing computations" : "Computations"
     case "describe_computation": {
@@ -427,6 +487,69 @@ export function parseToolResult(toolName, rawContent) {
       // enters the timeline (see buildMessageBlocks). Kept as a safe fallback —
       // label only, no expandable body (the ack is just "rendered").
       return { summary: "", kind: "none" }
+    }
+    case "canvas_skeleton": {
+      // Same arrangement as render_chart: the wireframe is its own block.
+      return { summary: "", kind: "none" }
+    }
+    case "create_canvas":
+    case "revise_canvas":
+    case "get_canvas_status": {
+      // Delegation acks are MODEL-facing plumbing ("started canvas job
+      // <hex>… check with get_canvas_status('…')", the status dict the agent
+      // relays in prose) — the user-facing surfaces are the curated label and
+      // the jobs drawer. No expandable body — EXCEPT a corrective "error:"
+      // reply, which stays inspectable so a refused call is never silently
+      // dressed up as a success.
+      const text = typeof content === "string" ? content : ""
+      if (text.startsWith("error:"))
+        return { summary: "refused", kind: "raw", raw: text }
+      return { summary: "", kind: "none" }
+    }
+    case "list_canvases": {
+      const arr = Array.isArray(content?.canvases) ? content.canvases : []
+      return {
+        summary: plural(arr.length, "canvas", "canvases"),
+        kind: "table",
+        columns: [
+          { key: "title", header: "Canvas", wrap: true },
+          { key: "dataset", header: "Dataset", mono: true },
+          { key: "status", header: "Status", mono: true },
+          { key: "updated", header: "Updated", mono: true },
+        ],
+        rows: arr.map((c) => ({
+          title: c.title,
+          dataset: [c.data_domain, c.dataset].filter(Boolean).join("/"),
+          status: c.status,
+          updated: c.updated_at,
+        })),
+      }
+    }
+    case "describe_canvas": {
+      if (typeof content === "string")
+        return { summary: "", kind: "raw", raw: content }
+      const tiles = Array.isArray(content?.tiles) ? content.tiles : []
+      const dials = Array.isArray(content?.dials) ? content.dials : []
+      return {
+        summary:
+          plural(tiles.length, "tile") +
+          (dials.length ? ` · ${plural(dials.length, "dial")}` : ""),
+        kind: "table",
+        columns: [
+          { key: "tile", header: "Tile", wrap: true },
+          { key: "widget", header: "Widget", mono: true },
+          // The tile's data source: an ad-hoc query (shown inline, collapsed to
+          // one line) or the computation slug behind it.
+          { key: "source", header: "Query", mono: true, wrap: true },
+        ],
+        rows: tiles.map((t) => ({
+          tile: t.title,
+          widget: t.widget,
+          source: t.computation
+            ? t.computation
+            : s(t.sql).replace(/\s+/g, " ").trim(),
+        })),
+      }
     }
     case "run_sql": {
       // { columns:[name], rows:[{name:value}], row_count, truncated }. Render as a

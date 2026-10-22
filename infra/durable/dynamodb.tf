@@ -240,6 +240,48 @@ resource "aws_dynamodb_table" "analyses" {
   tags = var.tags
 }
 
+# Canvases (dashboards) + their CI job lifecycle rows, one table. Isolation is
+# STRUCTURAL, mirroring `annotations`: the partition key embeds the owner's
+# Cognito subject (pk = "CANVAS#<user_sub>" for configs, "CANVASJOB#<user_sub>"
+# for job rows — okf_core/canvas.py owns the conventions), so a user's Query
+# can only ever see their own dashboards. Configs are small JSON documents;
+# the canvas CI runtime writes them (lint-gated submit), the control API
+# reads/verifies/deletes and executes tiles. The control API also caches dial
+# type-ahead values here (pk = "DOMAINCACHE#<domain>/<dataset>", soft 24h TTL
+# via fetched_at). TTL on `expires_at` reaps JOB rows only (30 days — drawer
+# history); canvas configs never carry the attribute, so a dashboard is a
+# durable artifact.
+resource "aws_dynamodb_table" "canvas" {
+  name         = "${var.name_prefix}-canvas"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = local.dynamodb_kms_key_arn
+  }
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  tags = var.tags
+}
+
 # Chat-agent conversation checkpoints. Owned + written by the LangGraph
 # `DynamoDBSaver` (langgraph-checkpoint-aws), NOT by our code — so the KEY SCHEMA
 # is DICTATED BY THAT LIBRARY, not chosen here: partition key `PK` + sort key

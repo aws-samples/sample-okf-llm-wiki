@@ -11,6 +11,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 
+import {
+  CanvasJobsButton,
+  CanvasJobsPanel,
+  useCanvasJobs,
+} from "@/components/CanvasJobs"
 import { ChatHistory } from "@/components/ChatHistory"
 import { ChatThread } from "@/components/ChatThread"
 import { AnalysisPeek } from "@/components/chat/AnalysisPeek"
@@ -181,6 +186,7 @@ export function ChatPanel({
   ctrl,
   datasets = [],
   datasetsLoading = false,
+  onOpenCanvas,
 }) {
   const {
     conv,
@@ -268,6 +274,13 @@ export function ChatPanel({
     setAnalysisTarget(null)
   }, [conv.threadId])
 
+  // Canvas jobs drawer (same clip pattern as the history drawer below). The
+  // trigger hides whenever ANY side panel is open — it must never float over
+  // the doc peek / history / its own drawer.
+  const [canvasOpen, setCanvasOpen] = useState(false)
+  const canvasJobs = useCanvasJobs(api, conv.threadId, canvasOpen)
+  useEffect(() => setCanvasOpen(false), [conv.threadId])
+
   // Resizable width: dragged from the panel's left-edge handle, persisted as a
   // preference. While a drag is live the clip's width TRANSITION is disabled —
   // otherwise every pointermove eases over 300ms and the panel rubber-bands.
@@ -311,7 +324,18 @@ export function ChatPanel({
   return (
     <div className="flex h-full min-h-0 w-full">
       {/* key=threadId remounts on new-chat / resume. */}
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+        <CanvasJobsButton
+          jobs={canvasJobs.jobs}
+          hidden={
+            slot.open ||
+            reportSlot.open ||
+            analysisSlot.open ||
+            historyOpen ||
+            canvasOpen
+          }
+          onClick={() => setCanvasOpen(true)}
+        />
         <Conversation
           key={conv.threadId}
           api={api}
@@ -445,6 +469,28 @@ export function ChatPanel({
               onResume={resumeThread}
               onDeleted={onThreadDeleted}
               onClose={() => setHistoryOpen(false)}
+            />
+          </PanelShell>
+        </div>
+      </div>
+
+      {/* The canvas-jobs drawer: same clip + PanelShell chrome as the history
+          drawer, so citations / history / jobs all read as ONE surface. Wider
+          than history (28rem): it carries the job's step TIMELINE, whose tool
+          labels wrapped to three lines at the narrower width. */}
+      <div
+        className={cn(
+          "h-full shrink-0 overflow-hidden transition-[width] duration-300 ease-in-out motion-reduce:transition-none",
+          canvasOpen ? "w-112" : "w-0"
+        )}
+        aria-hidden={!canvasOpen}
+      >
+        <div className={cn("h-full w-112", !canvasOpen && "invisible")}>
+          <PanelShell>
+            <CanvasJobsPanel
+              jobs={canvasJobs.jobs}
+              onOpenCanvas={(id) => onOpenCanvas?.(id)}
+              onClose={() => setCanvasOpen(false)}
             />
           </PanelShell>
         </div>

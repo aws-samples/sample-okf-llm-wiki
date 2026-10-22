@@ -1,0 +1,36 @@
+<!doctype html>
+<!-- Canvas CI render harness: loaded from file:// by headless Chromium inside
+     the canvas runtime (services/canvas/render.py). The renderer injects
+     window.__CANVAS__ = {config, results, dials} and window.__THEME__ before
+     navigation; harness.jsx renders the real tile components with animations
+     off and sets body[data-render-complete] when every tile settled. No auth,
+     no network — NEVER shipped to CloudFront (see vite.config.js). -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>canvas harness</title>
+    <style>
+      /* Deterministic pixels: no motion anywhere in the harness. */
+      *, *::before, *::after {
+        transition: none !important;
+        animation: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- Watchdog: a RAW script (module loading can fail wholesale — that's
+         exactly the failure this catches). If the app never stamps the
+         completion signal, stamp "timeout" so the renderer screenshots the
+         partial state instead of waiting out its own timeout blind. -->
+    <script>
+      setTimeout(function () {
+        if (!document.body.dataset.renderComplete) {
+          document.body.dataset.renderComplete = "timeout"
+        }
+      }, 12000)
+    </script>
+    <script type="module" src="/src/harness.jsx"></script>
+  </body>
+</html>
