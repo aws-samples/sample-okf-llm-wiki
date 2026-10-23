@@ -8,16 +8,18 @@
 // its markdown — completed turns and earlier blocks don't re-render. This is what
 // keeps token rendering smooth instead of getting heavier as the answer grows.
 
-import { memo, useMemo } from "react"
+import { memo, useEffect, useMemo } from "react"
 
 import { AgentAvatar } from "@/components/chat/AgentAvatar"
+import { CanvasSkeletonCard } from "@/components/chat/CanvasSkeletonCard"
 import { ChartFrame } from "@/components/chat/ChartFrame"
 import { CompactionDivider } from "@/components/chat/CompactionDivider"
 import { Markdown } from "@/components/chat/Markdown"
 import { ReportCard } from "@/components/chat/ReportCard"
 import { ResponseActions } from "@/components/chat/ResponseActions"
 import { UnifiedThinkingBlock } from "@/components/chat/UnifiedThinkingBlock"
-import { buildMessageBlocks } from "@/lib/buildMessageBlocks"
+import { CANVAS_JOBS_EVENT } from "@/components/CanvasJobs"
+import { buildMessageBlocks, CANVAS_TOOLS } from "@/lib/buildMessageBlocks"
 import { collectWebSources, webSourcesSignature } from "@/lib/sources"
 
 // A stable content signature for a block, so the memo can skip re-rendering when
@@ -32,6 +34,10 @@ function blockSig(block) {
     return `c:${block.id || ""}:${block.pending ? 1 : 0}:${block.code?.length || 0}`
   // report: the card's rendered state is fully determined by these fields —
   // reportId/isComplete flip when the ack folds in, error when the save fails.
+  // skeleton: same arrangement — the plan arrives whole on the tool call, so
+  // pending-flag + a size signature is stable (a re-sketch is a NEW tool id).
+  if (block.type === "skeleton")
+    return `s:${block.id || ""}:${block.pending ? 1 : 0}:${(block.widgets || []).length}:${(block.dials || []).length}:${block.title || ""}:${block.error || ""}`
   if (block.type === "report")
     return `r:${block.id || ""}:${block.pending ? 1 : 0}:${block.reportId || ""}:${block.isComplete ? 1 : 0}:${block.error || ""}`
   // think: signature over each segment. Include the segment INDEX and the tool
@@ -86,6 +92,19 @@ const Block = memo(
           title={block.title}
           live={live}
           pending={Boolean(block.pending)}
+        />
+      )
+    }
+    // The canvas PLAN wireframe (canvas_skeleton) — requirements capture: the
+    // user reacts to this card before any authoring job is dispatched.
+    if (block.type === "skeleton") {
+      return (
+        <CanvasSkeletonCard
+          title={block.title}
+          widgets={block.widgets}
+          dials={block.dials}
+          pending={Boolean(block.pending)}
+          error={block.error}
         />
       )
     }
@@ -152,6 +171,22 @@ function ChatMessageImpl({
     () => buildMessageBlocks(aiEvents, isEnd),
     [aiEvents, isEnd]
   )
+
+  // A canvas delegation appearing (or completing) in this turn nudges the
+  // jobs indicator awake — the delegation tool writes the queued row before
+  // its ack, so a refresh finds it without a page reload.
+  const canvasEventCount = useMemo(
+    () =>
+      aiEvents.filter(
+        (e) =>
+          (e.type === "tool" || e.type === "tool_pending") &&
+          CANVAS_TOOLS.has(e.tool_name)
+      ).length,
+    [aiEvents]
+  )
+  useEffect(() => {
+    if (canvasEventCount > 0) window.dispatchEvent(new Event(CANVAS_JOBS_EVENT))
+  }, [canvasEventCount])
 
   // URL → {title, publishedDate, text} for every page this turn's web_search
   // calls returned, so a `<cite src="https://…">` badge can show the page rather
@@ -223,9 +258,11 @@ function ChatMessageImpl({
                 ? `think-${i}`
                 : block.type === "chart"
                   ? `chart-${block.id || i}`
-                  : block.type === "report"
-                    ? `report-${block.id || i}`
-                    : `text-${i}`
+                  : block.type === "skeleton"
+                    ? `skeleton-${block.id || i}`
+                    : block.type === "report"
+                      ? `report-${block.id || i}`
+                      : `text-${i}`
             return (
               <Block
                 key={key}

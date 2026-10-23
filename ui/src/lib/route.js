@@ -33,10 +33,10 @@ export function parseHash() {
   // The Reasoning page was renamed Guardrails (2026-08-03); alias the legacy
   // section so old bookmarks/links keep resolving.
   if (section === "reasoning") section = "guardrails"
-  // Chat + analysis: the one trailing segment is the conversation / report id
-  // — never a dataset (both views span datasets; `threadId` is the generic
-  // "single trailing id" slot).
-  if (section === "chat" || section === "analysis") {
+  // Chat + canvas + analysis: the one trailing segment is the conversation /
+  // canvas / report id — never a dataset (these views span datasets;
+  // `threadId` is the generic "single trailing id" slot).
+  if (section === "chat" || section === "canvas" || section === "analysis") {
     return {
       section,
       selectionKey: null,
@@ -56,8 +56,8 @@ export function parseHash() {
 export function buildHash({ section, selectionKey, concept, threadId }) {
   const segs = []
   if (section) segs.push(section)
-  if (section === "chat" || section === "analysis") {
-    // Chat / analysis carry only their single id (no dataset/concept).
+  if (section === "chat" || section === "canvas" || section === "analysis") {
+    // Chat / canvas / analysis carry only their single id (no dataset/concept).
     if (threadId) segs.push(threadId)
   } else {
     if (selectionKey) segs.push(...selectionKey.split("/"))

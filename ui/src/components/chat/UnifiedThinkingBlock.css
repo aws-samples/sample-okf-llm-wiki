@@ -203,6 +203,12 @@
   margin-bottom: 8px;
 }
 
+/* A titled summary part: the body sits under its label row (the Marker),
+   with the same small gap a tool step's detail has under its label. */
+.timeline-thinking-titled {
+  margin-top: 4px;
+}
+
 .thinking-segment:last-child {
   margin-bottom: 0;
 }

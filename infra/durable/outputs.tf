@@ -65,6 +65,14 @@ output "analyses_table_arn" {
   value = aws_dynamodb_table.analyses.arn
 }
 
+output "canvas_table" {
+  value = aws_dynamodb_table.canvas.name
+}
+
+output "canvas_table_arn" {
+  value = aws_dynamodb_table.canvas.arn
+}
+
 output "chat_checkpoints_table" {
   value = aws_dynamodb_table.chat_checkpoints.name
 }

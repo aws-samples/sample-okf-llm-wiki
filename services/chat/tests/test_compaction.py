@@ -291,7 +291,7 @@ def app(monkeypatch):
     seen: list = []
     replies = [1_000, 2_000, 3_000, 4_000]
 
-    def build_agent(model, effort, scope, checkpointer, features=None, user_sub="", policy_checker=None):
+    def build_agent(model, effort, scope, checkpointer, features=None, user_sub="", policy_checker=None, thread_id=""):
         return build_graph(
             _recording_model(replies, seen),
             [],

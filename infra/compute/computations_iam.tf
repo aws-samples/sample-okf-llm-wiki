@@ -1,10 +1,11 @@
 # The Attested-Computations EXECUTION ceiling, defined ONCE.
 #
-# Consumers merge these via source_policy_documents, each behind its own
-# gate: the consumption MCP runtime and the Control API Lambda (both
-# var.enable_attested_computations). Before this file each kept a hand-synced
-# copy of the same statements, and the copies had already drifted (the
-# Control API's Glue read lacked GetDatabases/GetTables).
+# Three consumers merge these via source_policy_documents, each behind its
+# own gate: the consumption MCP runtime (var.enable_attested_computations),
+# the canvas CI runtime (unconditional — deploying it IS the opt-in), and the
+# Control API Lambda (local.computations_execution). Before this file each
+# kept a hand-synced copy of the same statements, and the copies had already
+# drifted (the Control API's Glue read lacked GetDatabases/GetTables).
 #
 # The ceiling is read-only by construction: catalog-wide Glue/Athena READ,
 # write only to the dedicated Athena results bucket, broad source-data READ

@@ -100,9 +100,9 @@ data "aws_iam_policy_document" "incremental" {
 # uploads, read freshness, invoke the harvest runtime.
 data "aws_iam_policy_document" "control_api" {
   source_policy_documents = concat(
-    var.enable_attested_computations ? [data.aws_iam_policy_document.computations_execution_core.json] : [],
-    var.enable_attested_computations && var.enable_lakeformation ? [data.aws_iam_policy_document.computations_execution_lakeformation.json] : [],
-    var.enable_attested_computations && var.enable_redshift ? [data.aws_iam_policy_document.computations_execution_redshift.json] : [],
+    local.computations_execution ? [data.aws_iam_policy_document.computations_execution_core.json] : [],
+    local.computations_execution && var.enable_lakeformation ? [data.aws_iam_policy_document.computations_execution_lakeformation.json] : [],
+    local.computations_execution && var.enable_redshift ? [data.aws_iam_policy_document.computations_execution_redshift.json] : [],
   )
   # checkov:skip=CKV_AWS_356:glue:GetDatabases/GetTables (read-only catalog listing for the "register a dataset" picker) targets the whole catalog by design — the API lists across all databases. InvokeAgentRuntime IS scoped to the single harvest runtime (local.harvest_invoke_resources); StopRuntimeSession stays "*" (see its statement below). logs:FilterLogEvents is already scoped to the AgentCore runtime log-group namespace; DynamoDB/S3/Cognito grants below are resource-scoped. The Redshift picker list actions (redshift:DescribeClusters/redshift-serverless:ListWorkgroups/redshift-data:ListDatabases) don't support resource-level scoping; secretsmanager:GetSecretValue is scoped to the var.redshift_secret_name_prefix name pattern (mappings are self-describing, so per-mapping secrets can't be enumerated at deploy time).
   statement {
@@ -132,6 +132,9 @@ data "aws_iam_policy_document" "control_api" {
       # analyses: the Analysis page's Scans, owner-only edit/delete, and the
       # dataset-delete partition purge.
       local.d.analyses_table_arn,
+      # canvas table: dashboard list/get/verify/delete + tile-run config reads
+      # (the canvas CI runtime owns config writes; this API flips status rows).
+      local.d.canvas_table_arn,
       local.d.chat_table_arn,
       local.d.chat_checkpoints_table_arn,
     ]
@@ -257,7 +260,7 @@ data "aws_iam_policy_document" "control_api" {
     }
   }
 
-  # Computation execution (the UI's Run modal): the SHARED ceiling
-  # (computations_iam.tf) merged via source_policy_documents above, behind
-  # var.enable_attested_computations.
+  # Computation execution (the Run modal, canvas tile runs, dial
+  # column-domains): the SHARED ceiling (computations_iam.tf) merged via
+  # source_policy_documents above, behind local.computations_execution.
 }

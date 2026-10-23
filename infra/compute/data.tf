@@ -26,6 +26,7 @@ locals {
     OKF_REGISTRY_TABLE    = local.d.registry_table
     OKF_FRESHNESS_TABLE   = local.d.freshness_table
     OKF_ANNOTATIONS_TABLE = local.d.annotations_table
+    OKF_CANVAS_TABLE      = local.d.canvas_table
   }
 
   # Source dirs for the Lambda deployment packages (populated by

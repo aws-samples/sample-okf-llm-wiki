@@ -1042,6 +1042,26 @@
   );
 }
 
+/* react-grid-layout (the canvas layout editor, CanvasLayoutEditor.jsx):
+   theme the drag placeholder (the library ships it literal red) and lift the
+   corner resize handle above the editor's iframe-shield overlay (z-10 —
+   chart iframes swallow pointer events, so each tile is covered by a
+   transparent shield while editing; the handle must stay grabbable). */
+.react-grid-item.react-grid-placeholder {
+  background: var(--primary);
+  opacity: 0.12;
+  border-radius: 0.5rem;
+}
+.react-grid-item > .react-resizable-handle {
+  z-index: 20;
+}
+/* The default handle glyph is a hardcoded dark-gray SVG arrow — invisible on
+   the dark theme. Redraw it as a small theme-colored corner bracket. */
+.react-grid-item > .react-resizable-handle::after {
+  border-right: 2px solid var(--muted-foreground);
+  border-bottom: 2px solid var(--muted-foreground);
+}
+
 /* One-line text that fades out at its end instead of an ellipsis (FadeText, the
    timeline panel's rows). Applied only while the text overflows. */
 @utility okf-fade-end {

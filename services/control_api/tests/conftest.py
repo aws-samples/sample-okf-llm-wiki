@@ -33,6 +33,7 @@ REGISTRY = "okf-registry"
 FRESHNESS = "okf-freshness"
 ANNOTATIONS = "okf-annotations"
 ANALYSES = "okf-analyses"
+CANVAS = "okf-canvas"
 CHAT_THREADS = "okf-chat"
 CHAT_CHECKPOINTS = "okf-chat-checkpoints"
 HARVEST_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/harvest-abc"
@@ -49,7 +50,7 @@ def aws():
         s3.create_bucket(Bucket=BUCKET)
         ddb = boto3.client("dynamodb", region_name=REGION)
         # Lowercase pk/sk tables (our own item shapes).
-        for name in (REGISTRY, FRESHNESS, ANNOTATIONS, ANALYSES, CHAT_THREADS):
+        for name in (REGISTRY, FRESHNESS, ANNOTATIONS, ANALYSES, CANVAS, CHAT_THREADS):
             ddb.create_table(
                 TableName=name,
                 KeySchema=[
@@ -146,6 +147,7 @@ def cfg(aws, glue, agentcore, cognito, logs, redshift, redshift_serverless, reds
         harvest_log_group=HARVEST_LOG_GROUP,
         annotations_table=ANNOTATIONS,
         analyses_table=ANALYSES,
+        canvas_table=CANVAS,
         chat_threads_table=CHAT_THREADS,
         chat_checkpoint_table=CHAT_CHECKPOINTS,
     )

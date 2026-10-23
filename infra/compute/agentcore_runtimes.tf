@@ -287,6 +287,12 @@ resource "aws_bedrockagentcore_agent_runtime" "chat" {
     # run_sql against THAT dataset's cluster/workgroup via the Redshift Data API
     # (connection read from the mapping's source descriptor). Empty when Redshift
     # is off -> a Redshift-scoped run gets no SQL tool (never Athena fallback).
+    # Dashboard delegation: the canvas CI runtime the create/revise tools
+    # invoke. Empty (no canvas runtime deployed) = the tools aren't bound.
+    OKF_CANVAS_RUNTIME_ARN = try(
+      aws_bedrockagentcore_agent_runtime.canvas[0].agent_runtime_arn, ""
+    )
+
     OKF_REDSHIFT_ENABLED = var.enable_redshift ? "true" : ""
 
     # Public web search via the AgentCore Gateway web-search connector

@@ -3,6 +3,8 @@
 // UnifiedThinkingBlock. Trimmed to the wiki chat's segment vocabulary (no web /
 // browser segments).
 
+import { splitReasoningSections } from "@/lib/reasoningSections"
+
 export function buildTimelineSteps(contentSegments) {
   if (!Array.isArray(contentSegments)) return []
 
@@ -68,5 +70,23 @@ export function mergeThinkingSteps(steps) {
     }
   }
   if (group) merged.push(group)
-  return merged
+  return merged.flatMap(sectionThinkingStep)
+}
+
+// A merged reasoning step whose text carries GPT-style summary parts
+// ("**Title**" line + body) fans out into one step PER PART, the title riding
+// as the step's label. Untitled reasoning (Claude) stays one step, untouched.
+// Ids are positional (`<id>-s<k>`), so a streaming part keeps its React key
+// as it grows and a new part only appends a step.
+function sectionThinkingStep(step) {
+  if (step.type !== "thinking") return [step]
+  const text = step.segments.map((s) => s?.content || "").join("\n\n")
+  const sections = splitReasoningSections(text)
+  if (!sections.some((s) => s.title)) return [step]
+  return sections.map((s, k) => ({
+    id: `${step.id}-s${k}`,
+    type: "thinking",
+    title: s.title,
+    segments: s.body ? [{ id: `${step.id}-s${k}-body`, content: s.body, type: "paragraph" }] : [],
+  }))
 }

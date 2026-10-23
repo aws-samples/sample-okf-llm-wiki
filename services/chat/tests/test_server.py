@@ -247,6 +247,35 @@ def test_process_stream_data_gpt_reasoning_summary_is_think():
     assert out == {"type": "think", "content": "First, consider the joins."}
 
 
+def test_gpt_summary_parts_keep_their_paragraph_break():
+    # GPT streams numbered summary PARTS, each opening with a **Title** line.
+    # Live: part.added for index > 0 is an EMPTY item — it must become the
+    # blank line, or the next part's title glues onto the previous sentence.
+    from langchain_core.messages import AIMessageChunk
+
+    def frame(summary):
+        return server.process_stream_data(
+            "messages",
+            (AIMessageChunk(content=[{"type": "reasoning", "summary": summary}]), {}),
+        )
+
+    assert frame([{"index": 0, "type": "summary_text", "text": ""}]) is None
+    assert frame([{"index": 1, "type": "summary_text", "text": ""}]) == {
+        "type": "think", "content": "\n\n"
+    }
+    assert frame([{"index": 1, "type": "summary_text", "text": "**Refining**"}]) == {
+        "type": "think", "content": "**Refining**"
+    }
+    # History: the aggregated list joins distinct parts with a blank line.
+    assert server._reasoning_text({
+        "type": "reasoning",
+        "summary": [
+            {"index": 0, "type": "summary_text", "text": "**Designing**\n\nA."},
+            {"index": 1, "type": "summary_text", "text": "**Refining**\n\nB."},
+        ],
+    }) == "**Designing**\n\nA.\n\n**Refining**\n\nB."
+
+
 def test_process_stream_data_gpt_reasoning_delta_dict_summary():
     # A streaming delta may carry `summary` as a single dict rather than a list.
     from langchain_core.messages import AIMessageChunk
@@ -406,7 +435,7 @@ def test_stream_run_emits_typed_chunks_and_end_marker():
     seen = {}
 
     def build_agent(model, effort, scope, checkpointer, features=None, user_sub="",
-                    policy_checker=None):
+                    policy_checker=None, thread_id=""):
         seen["model"], seen["effort"], seen["scope"] = model, effort, scope
         seen["features"] = features
         return _scripted_graph(checkpointer)
@@ -671,7 +700,7 @@ def test_read_history_folds_messages_into_turns():
     cp = InMemorySaver()
 
     def build_agent(model, effort, scope, checkpointer, features=None, user_sub="",
-                    policy_checker=None):
+                    policy_checker=None, thread_id=""):
         return _scripted_graph(checkpointer)
 
     # Run one turn to populate the checkpoint, then read it back.
@@ -1557,7 +1586,7 @@ def test_read_history_end_event_carries_token_stats():
     )
 
     def build_agent(model, effort, scope, checkpointer, features=None, user_sub="",
-                    policy_checker=None):
+                    policy_checker=None, thread_id=""):
         return graph
 
     out = server.read_history(build_agent, cp, "alice:conv-u")

@@ -3,17 +3,20 @@
 // wiki chat's chunk vocabulary (text / think / tool). No canvas / browser /
 // images / citations.
 //
-// Four block kinds:
+// Five block kinds:
 //   { type:"think", contentSegments:[ {type:"text",content} | {type:"tool",...} ], isComplete }
 //   { type:"text",  content, isComplete }
 //   { type:"chart", id, code, title, isComplete }
+//   { type:"skeleton", id, title, widgets, dials, pending, isComplete, error? }
 //   { type:"report", id, toolName, title, reportId, pending, isComplete, error? }
 //
 // Reasoning tokens and (most) tool calls collapse into a single "think" timeline
 // block (the collapsible ThinkingBlock renders it); an assistant text run breaks
 // the think block and starts a text block. This grouping is what makes reasoning +
 // tools read as one "working…" section above the answer, exactly like Sparky.
-//
+
+import { isRefusalResult } from "@/components/chat/wikiTools"
+
 // render_chart is special: it's a VISUAL, not a working step. Its tool START
 // BREAKS the thinking block (exactly like a text run does) and the chart becomes
 // its own block in sequence — it never appears as a step inside the timeline.
@@ -21,6 +24,18 @@
 // the updates stream); ChartFrame renders it in a sandboxed iframe with its own
 // "generating…" reveal. Any reasoning/tools after the chart open a NEW think block.
 const CHART_TOOL = "render_chart"
+
+// canvas_skeleton gets the SAME lift as render_chart: the wireframe card is a
+// visual the user reacts to (requirements capture), not a working step — its
+// tool start breaks the thinking block and the plan renders as its own block
+// from the call's args (title / widgets / dials).
+const SKELETON_TOOL = "canvas_skeleton"
+
+// Canvas delegation calls are LONG (the model writes a plan + title), so
+// their timeline step appears the moment the call is ANNOUNCED (tool_pending)
+// rather than when the args finish streaming — a placeholder segment opens
+// early and the args-complete start fills it in place.
+export const CANVAS_TOOLS = new Set(["create_canvas", "revise_canvas"])
 
 // present_report is the DISPLAY step and the only lifted report tool —
 // create_report stays an ORDINARY working step inside the thinking timeline
@@ -145,19 +160,23 @@ export function buildMessageBlocks(events, isEnd) {
   // fills it in place, and the list is appended after all other blocks.
   const reportCards = []
   const reportPendingAt = new Map()
-  // Timeline segments opened at tool_pending (create_report), by tool id —
-  // the args-complete start fills the SAME segment instead of appending a
-  // duplicate.
+  // Timeline segments opened at tool_pending (create_report, the canvas
+  // delegation calls), by tool id — the args-complete start fills the SAME
+  // segment instead of appending a duplicate.
   const pendingSeg = new Map()
+  // Same in-place-fill arrangement for skeleton wireframe blocks.
+  const skeletonPendingAt = new Map()
+  const skeletonSeen = new Set()
 
   for (const ev of events) {
     if (ev.end) continue
 
     // render_chart announced EARLY (first streamed fragment of the call): open
     // the chart block immediately, code-less — ChartFrame renders the
-    // generating theater for it while the model writes the code. Non-chart
-    // tool_pending events are ignored (the timeline waits for the reliable
-    // args-complete start from the updates stream).
+    // generating theater for it while the model writes the code. Skeletons,
+    // reports, create_report and the canvas delegation calls open early too.
+    // Other tool_pending events are ignored (the timeline waits for the
+    // reliable args-complete start from the updates stream).
     if (ev.type === "tool_pending") {
       if (
         ev.tool_name === CHART_TOOL &&
@@ -176,6 +195,47 @@ export function buildMessageBlocks(events, isEnd) {
           title: "",
           isComplete: false,
         })
+      }
+      // A skeleton announced early: hold its slot with a pending wireframe
+      // card ("Sketching…") while the model streams the plan args.
+      if (
+        ev.tool_name === SKELETON_TOOL &&
+        ev.id &&
+        !skeletonSeen.has(ev.id) &&
+        !skeletonPendingAt.has(ev.id)
+      ) {
+        closeThink()
+        closeText()
+        skeletonPendingAt.set(ev.id, blocks.length)
+        blocks.push({
+          type: "skeleton",
+          id: ev.id,
+          pending: true,
+          title: "",
+          widgets: [],
+          dials: [],
+          isComplete: false,
+        })
+      }
+      // A canvas delegation call announced early: open its TIMELINE segment
+      // now (running state — "Creating canvas…"), so the step shows the
+      // moment the call fires instead of after the long args finish.
+      if (
+        CANVAS_TOOLS.has(ev.tool_name) &&
+        ev.id &&
+        !toolSeen.has(ev.id) &&
+        !pendingSeg.has(ev.id)
+      ) {
+        const seg = {
+          type: "tool",
+          id: ev.id,
+          toolName: ev.tool_name,
+          input: undefined,
+          content: undefined,
+          isComplete: false,
+        }
+        openThink().contentSegments.push(seg)
+        pendingSeg.set(ev.id, seg)
       }
       if (
         ev.tool_name === REPORT_TOOL &&
@@ -237,6 +297,47 @@ export function buildMessageBlocks(events, isEnd) {
         if (at != null) {
           blocks[at] = filled // fill the pending block in place
           chartPendingAt.delete(ev.id)
+        } else {
+          closeThink()
+          closeText()
+          blocks.push(filled)
+        }
+      }
+      continue
+    }
+
+    // canvas_skeleton: the wireframe renders as its own block from the call's
+    // args, same lift as the chart above (pending slot filled in place).
+    if (ev.type === "tool" && ev.tool_name === SKELETON_TOOL) {
+      if (ev.tool_start && ev.id && !skeletonSeen.has(ev.id)) {
+        skeletonSeen.add(ev.id)
+        const args = ev.content && typeof ev.content === "object" ? ev.content : {}
+        const t = toolsById.get(ev.id)
+        // A plan the tool REFUSED (off-catalog widget, missing `represents`)
+        // must not render as an agreeable wireframe — the card shows the
+        // refusal instead.
+        const refused = Boolean(t?.isComplete && isRefusalResult(t.content))
+        const filled = {
+          type: "skeleton",
+          id: ev.id,
+          title: typeof args.title === "string" ? args.title : "",
+          widgets: Array.isArray(args.widgets) ? args.widgets : [],
+          dials: Array.isArray(args.dials) ? args.dials : [],
+          isComplete: Boolean(t?.isComplete),
+          error: refused
+            ? String(
+                typeof t.content === "string"
+                  ? t.content
+                  : t.content?.error || "the plan was refused"
+              )
+                .replace(/^error:\s*/i, "")
+                .slice(0, 400)
+            : "",
+        }
+        const at = skeletonPendingAt.get(ev.id)
+        if (at != null) {
+          blocks[at] = filled
+          skeletonPendingAt.delete(ev.id)
         } else {
           closeThink()
           closeText()

@@ -12,6 +12,7 @@ import {
   GlobeIcon,
   HistoryIcon,
   KeyRoundIcon,
+  LayoutDashboardIcon,
   LogInIcon,
   LogOutIcon,
   MessageSquarePlusIcon,
@@ -106,6 +107,7 @@ import { POLICY_CHECK_ENABLED } from "@/lib/chatFeatures"
 import BenchmarkReportView from "@/views/BenchmarkReportView.jsx"
 import BrowseView from "@/views/BrowseView.jsx"
 import { AnalysisView } from "@/views/AnalysisView.jsx"
+import { CanvasView } from "@/views/CanvasView.jsx"
 import GraphView from "@/views/GraphView.jsx"
 import MemoryView from "@/views/MemoryView.jsx"
 
@@ -139,8 +141,17 @@ const NAV = [
     needsSelection: true,
     group: "primary",
   },
-  // Saved analyses + their published reports span datasets like chat; the
-  // trailing URL segment is the report id (#/analysis/<report_id>).
+  // Canvases span datasets like chat (a canvas names its own dataset), so
+  // no pre-selected dataset; the trailing URL segment is the canvas id.
+  {
+    key: "canvas",
+    label: "Canvas",
+    icon: LayoutDashboardIcon,
+    needsSelection: false,
+    group: "primary",
+  },
+  // Published analysis reports span datasets like canvases; the trailing URL
+  // segment is the report id (#/analysis/<report_id>).
   {
     key: "analysis",
     label: "Analysis",
@@ -861,8 +872,10 @@ function Console({ auth, api }) {
   // lifted here so the sidebar sub-items (ChatNav) and the chat page (ChatPanel)
   // drive the SAME conversation. Reads/writes the #/chat/<threadId> URL.
   const chat = useChatController({
-    // Only a CHAT url's trailing id is a conversation id — #/analysis/<id>
-    // shares the same slot for a report/analysis id.
+    // route.threadId is the GENERIC trailing-id slot — #/canvas/<id> fills it
+    // too (route.js). Only a chat URL names a conversation; passing the slot
+    // through unguarded made a reload landing on a canvas page adopt the
+    // CANVAS id as a started chat (and persist it as the last chat).
     urlThreadId: route.section === "chat" ? route.threadId : null,
     onThreadChange: setChatThread,
     // Only bind the thread into the URL while chat is the active section — see
@@ -959,9 +972,15 @@ function Console({ auth, api }) {
     // not a dataset, so it never has a selectionKey. Skip normalization here — it
     // would rewrite #/chat/<threadId> to #/chat and strip the conversation id
     // (buildHash drops selectionKey/concept for chat). The chat controller owns
-    // the threadId in the URL. Analysis is the same shape (#/analysis/<id>) —
-    // skip normalization too.
-    if (route.section === "chat" || route.section === "analysis") return
+    // the threadId in the URL.
+    // Canvas + analysis are the same shape (#/canvas/<id>, #/analysis/<id>)
+    // — skip normalization too.
+    if (
+      route.section === "chat" ||
+      route.section === "canvas" ||
+      route.section === "analysis"
+    )
+      return
     const known = datasets.some(
       (d) => `${d.data_domain}/${d.dataset}` === selectionKey
     )
@@ -1174,6 +1193,16 @@ function Console({ auth, api }) {
               ctrl={chat}
               datasets={datasets}
               datasetsLoading={datasetsLoading}
+              onOpenCanvas={(id) => push({ section: "canvas", threadId: id })}
+            />
+          </div>
+        ) : section === "canvas" ? (
+          <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+            <CanvasView
+              api={api}
+              canvasId={route.threadId}
+              onOpen={(id) => push({ section: "canvas", threadId: id })}
+              onBack={() => push({ section: "canvas" })}
             />
           </div>
         ) : section === "analysis" ? (

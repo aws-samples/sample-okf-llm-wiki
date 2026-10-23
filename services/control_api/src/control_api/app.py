@@ -98,6 +98,7 @@ class Config:
         computation_max_rows: int = 200,
         computation_timeout_s: float = 120.0,
         analyses_table: str = "okf-analyses",
+        canvas_table: str = "okf-canvas",
     ):
         self.bucket = bucket
         self.registry_table = registry_table
@@ -109,6 +110,10 @@ class Config:
         # chat RUNTIME authors them; this API serves the side panel and the
         # Analysis page (owner-only edit/delete). See okf_core.analyses.
         self.analyses_table = analyses_table
+        # User-scoped canvases (dashboards) + their CI job rows. The canvas
+        # RUNTIME owns the writes; this API reads, verifies, deletes, and
+        # executes tiles for the UI (okf_core.canvas item conventions).
+        self.canvas_table = canvas_table
         # Chat conversation index (sidebar list) + the LangGraph checkpoint table
         # (purged on delete). The chat RUNTIME owns the writes; the Control API
         # reads/renames/deletes for the UI.
@@ -213,6 +218,7 @@ class Config:
                 "OKF_ANNOTATIONS_TABLE", "okf-annotations"
             ),
             analyses_table=os.environ.get("OKF_ANALYSES_TABLE", "okf-analyses"),
+            canvas_table=os.environ.get("OKF_CANVAS_TABLE", "okf-canvas"),
             chat_threads_table=os.environ.get("OKF_CHAT_THREADS_TABLE", "okf-chat"),
             chat_checkpoint_table=os.environ.get(
                 "OKF_CHAT_CHECKPOINT_TABLE", "okf-chat-checkpoints"
@@ -1331,6 +1337,137 @@ def _r_unverify_computation(cfg, params, body, query, caller):
     )
 
 
+# -- Canvas (dashboards) ------------------------------------------------------
+
+
+def _r_list_canvases(cfg, params, body, query, caller):
+    return 200, handlers.list_canvases(
+        cfg.ddb, canvas_table=cfg.canvas_table, user_sub=caller.sub
+    )
+
+
+def _r_get_canvas(cfg, params, body, query, caller):
+    return 200, handlers.get_canvas(
+        cfg.ddb,
+        canvas_table=cfg.canvas_table,
+        user_sub=caller.sub,
+        canvas_id=params["canvas_id"],
+        # For the ad-hoc-tile type-ahead enrichment (profile evidence).
+        s3=cfg.s3,
+        bundle_bucket=cfg.bucket,
+    )
+
+
+def _r_delete_canvas(cfg, params, body, query, caller):
+    return 200, handlers.delete_canvas(
+        cfg.ddb,
+        canvas_table=cfg.canvas_table,
+        user_sub=caller.sub,
+        canvas_id=params["canvas_id"],
+    )
+
+
+def _r_verify_canvas(cfg, params, body, query, caller):
+    # Identity from the validated JWT ONLY, as with computation verify.
+    return 200, handlers.verify_canvas(
+        cfg.ddb,
+        canvas_table=cfg.canvas_table,
+        user_sub=caller.sub,
+        canvas_id=params["canvas_id"],
+        verified_by=caller.ident or "",
+        s3=cfg.s3,
+        bundle_bucket=cfg.bucket,
+    )
+
+
+def _r_unverify_canvas(cfg, params, body, query, caller):
+    return 200, handlers.unverify_canvas(
+        cfg.ddb,
+        canvas_table=cfg.canvas_table,
+        user_sub=caller.sub,
+        canvas_id=params["canvas_id"],
+    )
+
+
+def _r_update_canvas_layout(cfg, params, body, query, caller):
+    # Geometry-only config patch (drag/resize on the Canvas page). Everything
+    # else still enters through the CI runtime's lint-gated save.
+    return 200, handlers.update_canvas_layout(
+        cfg.ddb,
+        canvas_table=cfg.canvas_table,
+        user_sub=caller.sub,
+        canvas_id=params["canvas_id"],
+        layouts=(body or {}).get("layouts"),
+    )
+
+
+def _r_update_canvas_title(cfg, params, body, query, caller):
+    # Title-only patch (the pen next to the page title) — same narrow-write
+    # posture as the layout route.
+    return 200, handlers.update_canvas_title(
+        cfg.ddb,
+        canvas_table=cfg.canvas_table,
+        user_sub=caller.sub,
+        canvas_id=params["canvas_id"],
+        title=(body or {}).get("title"),
+    )
+
+
+def _r_list_canvas_jobs(cfg, params, body, query, caller):
+    return 200, handlers.list_canvas_jobs(
+        cfg.ddb,
+        canvas_table=cfg.canvas_table,
+        user_sub=caller.sub,
+        active_only=(query.get("active") or "").lower() in ("1", "true", "yes"),
+        # ?thread=<chat thread id>: only the jobs that conversation delegated.
+        thread_id=query.get("thread"),
+    )
+
+
+def _r_column_domain(cfg, params, body, query, caller):
+    # Live-DISTINCT (24h-cached) observed values for a column-bound dial.
+    return 200, handlers.get_column_domain(
+        cfg.ddb,
+        registry_table=cfg.registry_table,
+        canvas_table=cfg.canvas_table,
+        data_domain=params["domain"],
+        dataset=params["dataset"],
+        column=(query.get("column") or ""),
+        athena=cfg.athena,
+        redshift_data=cfg.redshift_data if cfg.computations_enabled else None,
+        athena_workgroup=cfg.athena_workgroup,
+        athena_output=cfg.athena_output,
+        athena_catalog=cfg.athena_catalog,
+        # Same cap as tile runs: MUST stay under the 30s Lambda/API GW
+        # ceiling so the executor cancels the query, not the platform.
+        timeout_s=cfg.computation_timeout_s,
+        enabled=cfg.computations_enabled,
+    )
+
+
+def _r_run_canvas_tile(cfg, params, body, query, caller):
+    return 200, handlers.run_canvas_tile(
+        cfg.s3,
+        cfg.ddb,
+        bucket=cfg.bucket,
+        registry_table=cfg.registry_table,
+        canvas_table=cfg.canvas_table,
+        user_sub=caller.sub,
+        canvas_id=params["canvas_id"],
+        tile_id=params["tile_id"],
+        dials=(body or {}).get("dials") or {},
+        athena=cfg.athena,
+        redshift_data=cfg.redshift_data if cfg.computations_enabled else None,
+        athena_workgroup=cfg.athena_workgroup,
+        athena_output=cfg.athena_output,
+        athena_catalog=cfg.athena_catalog,
+        max_rows=cfg.computation_max_rows,
+        timeout_s=cfg.computation_timeout_s,
+        enabled=cfg.computations_enabled,
+    )
+
+
+
 def _r_repromote_bundle(cfg, params, body, query, caller):
     return 200, handlers.repromote_bundle(
         cfg.s3,
@@ -1532,6 +1669,18 @@ _ROUTES: list[tuple[str, str, RouteFn]] = [
     ("POST", "/bundle/{domain}/{dataset}/computations/{slug}/run", _r_run_computation),
     ("POST", "/bundle/{domain}/{dataset}/computations/{slug}/verify", _r_verify_computation),
     ("POST", "/bundle/{domain}/{dataset}/computations/{slug}/unverify", _r_unverify_computation),
+    # Canvas (dashboards): configs only enter through the canvas CI runtime;
+    # this surface reads, verifies, deletes, and executes tiles.
+    ("GET", "/canvas-jobs", _r_list_canvas_jobs),
+    ("GET", "/canvas", _r_list_canvases),
+    ("GET", "/canvas/{canvas_id}", _r_get_canvas),
+    ("DELETE", "/canvas/{canvas_id}", _r_delete_canvas),
+    ("POST", "/canvas/{canvas_id}/verify", _r_verify_canvas),
+    ("POST", "/canvas/{canvas_id}/unverify", _r_unverify_canvas),
+    ("POST", "/canvas/{canvas_id}/layout", _r_update_canvas_layout),
+    ("POST", "/canvas/{canvas_id}/title", _r_update_canvas_title),
+    ("GET", "/bundle/{domain}/{dataset}/column-domain", _r_column_domain),
+    ("POST", "/canvas/{canvas_id}/tiles/{tile_id}/run", _r_run_canvas_tile),
     # Analyses (chat-authored procedure docs): the chat UI's side-panel read,
     # plus the Analysis page's surfaces — the cross-dataset lists and the
     # HUMAN lifecycle (full-document edit + delete, both owner-gated; the
