@@ -31,7 +31,7 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "date-fns": "^4.4.0",
-    "dompurify": "^3.4.16",
+    "dompurify": "^3.4.17",
     "highlight.js": "^11.11.1",
     "html-to-image": "^1.11.13",
     "htmldiff-js": "^1.0.5",
